@@ -32,6 +32,22 @@ test("removes bridge-only instructions from displayed history", () => {
   assert.equal(stripBridgeInstructions("普通历史消息"), "普通历史消息");
 });
 
+test("injects private knowledge without exposing it in displayed history", () => {
+  const prompt = buildPrompt("继续处理", [], "WeChat", [{
+    id: "knowledge-one",
+    kind: "preference",
+    scope: "account",
+    title: "回复风格",
+    content: "结论优先，保持简洁",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z"
+  }]);
+
+  assert.match(prompt, /结论优先，保持简洁/);
+  assert.match(prompt, /remember/);
+  assert.equal(stripBridgeInstructions(prompt), "继续处理");
+});
+
 test("parses Web attachment metadata out of displayed history", () => {
   const prompt = buildPrompt("分析这份文件", [{
     kind: "file",

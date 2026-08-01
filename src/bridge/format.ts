@@ -1,4 +1,5 @@
 import type { PromptBufferItem } from "./prompt-buffer.js";
+import type { KnowledgeEntry } from "../state/knowledge.js";
 
 const BRIDGE_ACTION_INSTRUCTIONS = [
   "WeChat bridge rule: when you need to send a local image, video, or file to the user, do not use Markdown local file links.",
@@ -10,13 +11,16 @@ const BRIDGE_ACTION_INSTRUCTIONS = [
 ].join("\n");
 const LEGACY_BRIDGE_ACTION_INSTRUCTIONS = BRIDGE_ACTION_INSTRUCTIONS
   .replaceAll("codex-weixin-actions", "codex-weixin-server-actions");
+const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
+const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
 
 export function buildPrompt(
   text: string,
   attachments: PromptBufferItem[] = [],
-  attachmentSource: "WeChat" | "Web" = "WeChat"
+  attachmentSource: "WeChat" | "Web" = "WeChat",
+  knowledge: readonly KnowledgeEntry[] = []
 ): string {
-  const lines: string[] = [BRIDGE_ACTION_INSTRUCTIONS];
+  const lines: string[] = [BRIDGE_ACTION_INSTRUCTIONS, buildKnowledgeContext(knowledge)];
   if (text.trim()) {
     lines.push(text.trim());
   }
@@ -28,6 +32,22 @@ export function buildPrompt(
     }
   }
   return lines.join("\n\n").trim();
+}
+
+function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[]): string {
+  const entries = knowledge.map((entry) =>
+    `- [${entry.kind}/${entry.scope}] ${entry.title}: ${entry.content}`
+  );
+  return [
+    KNOWLEDGE_CONTEXT_START,
+    "Private knowledge belongs only to this WeChat account. Use relevant entries to personalize the answer.",
+    ...(entries.length ? ["Known reusable knowledge:", ...entries] : ["Known reusable knowledge: none yet."]),
+    "After answering, add at most 3 stable reusable facts to the codex-weixin-actions JSON under remember.",
+    "Each item must be {\"kind\":\"preference|skill|knowledge|workflow\",\"scope\":\"account|project\",\"title\":\"...\",\"content\":\"...\"}.",
+    "Remember explicit preferences, repeatable work methods, durable domain knowledge, or reusable workflows only.",
+    "Never remember secrets, credentials, private keys, access tokens, transient task status, or guesses. Omit remember when nothing qualifies.",
+    KNOWLEDGE_CONTEXT_END
+  ].join("\n");
 }
 
 export type PromptAttachment = {
@@ -65,6 +85,10 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
       break;
     }
   }
+  normalized = normalized.replace(
+    new RegExp(`^${escapeRegExp(KNOWLEDGE_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(KNOWLEDGE_CONTEXT_END)}\\s*`),
+    ""
+  );
   const attachments: PromptAttachment[] = [];
   const visibleText = normalized.replace(
     /^\[(WeChat|Web) (file|image|video|audio): (.+) saved to (.+)]\nInspect the saved local attachment before answering\.$/gm,
@@ -74,6 +98,10 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
     }
   ).replace(/\n{3,}/g, "\n\n").trim();
   return { text: visibleText, attachments };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export function stripBridgeInstructions(text: string): string {

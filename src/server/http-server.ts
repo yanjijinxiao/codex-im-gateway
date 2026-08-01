@@ -15,6 +15,7 @@ import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-run
 import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, SessionUpload } from "./account-manager.js";
 import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
+import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const accountDisplayNameSchema = z.object({
@@ -22,6 +23,42 @@ const accountDisplayNameSchema = z.object({
 });
 const accountDeleteSchema = z.object({
   retainHistory: z.boolean().optional()
+});
+const channelAccountSchema = z.discriminatedUnion("channel", [
+  z.object({
+    channel: z.literal("wecom"),
+    botId: z.string().trim().min(1).max(200),
+    secret: z.string().trim().min(1).max(500),
+    displayName: z.string().trim().max(40).optional()
+  }),
+  z.object({
+    channel: z.literal("feishu"),
+    appId: z.string().trim().min(1).max(200),
+    appSecret: z.string().trim().min(1).max(500),
+    displayName: z.string().trim().max(40).optional()
+  })
+]);
+const projectCreateSchema = z.object({
+  accountId: z.string().min(1),
+  name: z.string().trim().min(1).max(60),
+  workspace: z.string().min(1),
+  source: z.literal("codex-history")
+});
+const projectPatchSchema = z.object({
+  name: z.string().trim().min(1).max(60)
+});
+const projectNotificationsSchema = z.object({
+  notifications: z.array(z.object({
+    accountId: z.string().trim().min(1),
+    recipientId: z.string().trim().min(1).max(300),
+    enabled: z.boolean()
+  })).max(20)
+});
+const sessionCreateSchema = z.object({
+  accountId: z.string().min(1),
+  senderId: z.string().min(1),
+  title: z.string().max(80).optional(),
+  projectId: z.string().min(1)
 });
 const sessionPatchSchema = z.object({
   title: z.string().max(80).optional(),
@@ -53,6 +90,7 @@ export type LocalHttpServerOptions = {
   codexCheck?: () => Promise<{ ready: boolean; version?: string; error?: string }>;
   codexRuntimeCheck?: () => Promise<CodexRuntimeInfo>;
   codexModelsCheck?: () => Promise<CodexModelOption[]>;
+  codexProjectsProvider?: () => readonly CodexProjectCandidate[];
   updateService?: UpdateService;
   onUpdateInstalled?: (version: string) => void;
 };
@@ -145,6 +183,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       codexRuntime,
       codexModels,
       accounts: context.accountManager.listAccounts(),
+      projects: context.accountManager.listProjects(),
       sessions: context.accountManager.listSessions()
     });
     return;
@@ -180,8 +219,66 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { accounts: context.accountManager.listAccounts() });
     return;
   }
+  if (method === "POST" && url.pathname === "/api/accounts") {
+    const body = channelAccountSchema.parse(await readJsonBody(request));
+    sendJson(response, 201, { account: await context.accountManager.addChannelAccount(body) });
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/sessions") {
     sendJson(response, 200, { sessions: context.accountManager.listSessions() });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/codex-projects") {
+    sendJson(response, 200, { projects: readCodexProjects(context) });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/projects") {
+    sendJson(response, 200, { projects: context.accountManager.listProjects() });
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/projects") {
+    const body = projectCreateSchema.parse(await readJsonBody(request));
+    const workspace = path.resolve(body.workspace);
+    const candidate = readCodexProjects(context)
+      .find((project) => project.workspace === workspace);
+    if (!candidate) {
+      throw new Error(`Invalid Codex project workspace: ${workspace}`);
+    }
+    const config = loadConfig(context.paths);
+    if (!config.allowedWorkspaces.some((allowed) => path.resolve(allowed) === workspace)) {
+      saveConfig(context.paths, {
+        ...config,
+        allowedWorkspaces: [...config.allowedWorkspaces, workspace]
+      });
+    }
+    sendJson(response, 201, {
+      project: context.accountManager.createProject(body.accountId, body.name, workspace)
+    });
+    return;
+  }
+  const projectNotificationMatch = matchPath(url.pathname, "/api/projects/:accountId/:projectId/notifications");
+  if (method === "PUT" && projectNotificationMatch) {
+    const body = projectNotificationsSchema.parse(await readJsonBody(request));
+    sendJson(response, 200, {
+      project: context.accountManager.setProjectNotifications(
+        projectNotificationMatch.accountId,
+        projectNotificationMatch.projectId,
+        body.notifications
+      )
+    });
+    return;
+  }
+  const projectMatch = matchPath(url.pathname, "/api/projects/:accountId/:projectId");
+  if (method === "PATCH" && projectMatch) {
+    const body = projectPatchSchema.parse(await readJsonBody(request));
+    sendJson(response, 200, {
+      project: context.accountManager.renameProject(projectMatch.accountId, projectMatch.projectId, body.name)
+    });
+    return;
+  }
+  if (method === "DELETE" && projectMatch) {
+    context.accountManager.deleteProject(projectMatch.accountId, projectMatch.projectId);
+    sendJson(response, 200, { ok: true });
     return;
   }
   if (method === "POST" && url.pathname === "/api/logins") {
@@ -233,12 +330,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
 
   if (method === "POST" && url.pathname === "/api/sessions") {
-    const body = bodySchema.parse(await readJsonBody(request));
+    const body = sessionCreateSchema.parse(await readJsonBody(request));
     const session = context.accountManager.createSession(
-      requiredString(body.accountId, "accountId"),
-      requiredString(body.senderId, "senderId"),
-      optionalString(body.workspace),
-      optionalString(body.title)
+      body.accountId,
+      body.senderId,
+      undefined,
+      body.title,
+      body.projectId
     );
     sendJson(response, 201, { session });
     return;
@@ -379,6 +477,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   sendJson(response, 404, { error: "Not found" });
+}
+
+function readCodexProjects(context: HandlerContext): readonly CodexProjectCandidate[] {
+  return context.codexProjectsProvider?.() ?? listCodexProjectCandidates();
 }
 
 function readProductVersion(): string {

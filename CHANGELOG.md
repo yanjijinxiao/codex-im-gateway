@@ -2,6 +2,22 @@
 
 All notable changes to `codex-weixin` are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added Enterprise WeChat and Feishu bot channels through their official long-connection SDKs, with credential redaction and independent runtime state.
+- Added per-project completion notifications that can deliver successful or failed task results through any configured channel.
+- Added an isolated personal knowledge base for every WeChat account. WeChat and Web turns automatically extract and reuse durable preferences, work techniques, knowledge, and workflows without an extra model call.
+- Added `/memory` controls to inspect, enable, disable, delete, and clear account knowledge, with secret filtering, project scoping, deduplication, and bounded storage.
+- Added Codex-history project discovery, project-scoped session binding, `/sessions` and `/session`, and short aliases for every top-level chat command.
+- Added live task monitoring for Codex Desktop, Web, and chat sessions, with bound-session and running-task visibility in the management console.
+
+### Changed
+
+- Reworked the Add Channel dialog with channel-specific fields, embedded setup instructions, and direct links to the Enterprise WeChat and Feishu consoles and official documentation.
+- Clarified notification state with a persistent enabled badge and a high-contrast active bell button in project lists.
+
 ## [0.3.8] - 2026-07-20
 
 ### Fixed

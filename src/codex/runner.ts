@@ -7,6 +7,7 @@ import {
 } from "./app-server-runner.js";
 import { CodexExecRunner, type CodexRunResult } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
+import type { CodexAccountBalance } from "./account-balance.js";
 
 export type CodexBackend = "auto" | "app-server" | "exec";
 
@@ -73,6 +74,10 @@ export class HybridCodexRunner {
 
   async listModels(): Promise<CodexModelOption[]> {
     return this.appServer.listModels();
+  }
+
+  async getAccountRateLimits(): Promise<CodexAccountBalance> {
+    return this.appServer.getAccountRateLimits();
   }
 
   close(): void {

@@ -95,3 +95,35 @@ test("accepts legacy codex-weixin-server action blocks from existing threads", (
 
   assert.deepEqual(parsed.actions.send, [{ type: "file", path: "/tmp/legacy.txt" }]);
 });
+
+test("parses bounded personal knowledge actions", () => {
+  const parsed = parseActionBlocks([
+    "已按你的习惯处理。",
+    "```codex-weixin-actions",
+    JSON.stringify({
+      remember: [
+        { kind: "preference", scope: "account", title: "回复语言", content: "默认使用简体中文" },
+        { kind: "workflow", scope: "project", title: "发布检查", content: "发布前先运行测试和构建" }
+      ]
+    }),
+    "```"
+  ].join("\n"));
+
+  assert.equal(parsed.visibleText, "已按你的习惯处理。");
+  assert.deepEqual(parsed.actions.remember, [
+    { kind: "preference", scope: "account", title: "回复语言", content: "默认使用简体中文" },
+    { kind: "workflow", scope: "project", title: "发布检查", content: "发布前先运行测试和构建" }
+  ]);
+});
+
+test("ignores malformed optional knowledge without hiding the reply", () => {
+  const parsed = parseActionBlocks([
+    "正常回复。",
+    "```codex-weixin-actions",
+    JSON.stringify({ remember: [{ kind: "secret", scope: "account", title: "x", content: "y" }] }),
+    "```"
+  ].join("\n"));
+
+  assert.equal(parsed.visibleText, "正常回复。");
+  assert.deepEqual(parsed.actions.remember, []);
+});

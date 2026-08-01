@@ -7,21 +7,42 @@ import { buildPrompt, buildPromptPreview, parsePrompt } from "../bridge/format.j
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
+import { FeishuChannelAdapter } from "../channels/feishu.js";
+import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
+import { WeComChannelAdapter } from "../channels/wecom.js";
 import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
+import type { CodexAccountBalance } from "../codex/account-balance.js";
 import { isWorkspaceAllowed, loadConfig, type CodexWeixinConfig } from "../state/config.js";
 import { accountStatePaths, type StatePaths } from "../state/paths.js";
-import { RuntimeStateStore, type ManagedSession, type SessionRuntimeOverrides } from "../state/runtime-state.js";
 import {
+  CodexSessionCompletionMonitor,
+  type CodexSessionCompletion,
+  type CodexSessionTask
+} from "./codex-session-monitor.js";
+import {
+  RuntimeStateStore,
+  type ManagedProject,
+  type ManagedSession,
+  type ProjectNotificationTarget,
+  type SessionRuntimeOverrides
+} from "../state/runtime-state.js";
+import {
+  accountChannel,
   deleteAccount,
   forgetRetainedAccount,
   listAccounts,
   loadAccount,
   publicAccount,
   retainAccountHistory,
+  saveAccount,
   setAccountDisplayName,
   setAccountEnabled,
+  normalizeAccountId,
+  type ChannelAccount,
+  type FeishuAccount,
   type PublicWeixinAccount,
+  type WeComAccount,
   type WeixinAccount
 } from "../weixin/accounts.js";
 import { WeixinApiClient } from "../weixin/api.js";
@@ -42,6 +63,30 @@ export type AccountSession = ManagedSession & {
   accountId: string;
   active: boolean;
   responding: boolean;
+};
+
+export type AccountProject = ManagedProject & {
+  accountId: string;
+  sessionCount: number;
+  boundSessions: AccountProjectSession[];
+  activeTaskCount: number;
+  runningTasks: AccountProjectTask[];
+};
+
+export type AccountProjectSession = {
+  id: string;
+  title: string;
+  active: boolean;
+  hasThread: boolean;
+  updatedAt: string;
+};
+
+export type AccountProjectTask = {
+  id: string;
+  title: string;
+  source: "managed" | "codex";
+  startedAt: string;
+  updatedAt: string;
 };
 
 export type SessionChatResult = {
@@ -80,6 +125,7 @@ type RuntimeEntry = {
   task?: Promise<void>;
   service?: BridgeService;
   store?: RuntimeStateStore;
+  client?: ChannelTextClient;
   error?: string;
 };
 
@@ -87,9 +133,16 @@ export type AccountManagerOptions = {
   paths: StatePaths;
   configProvider?: () => CodexWeixinConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
+  channelFactory?: (account: WeComAccount | FeishuAccount) => ChannelAdapter;
   bridgeFactory?: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   monitor?: (options: MonitorOptions) => Promise<void>;
   runnerFactory?: (config: CodexWeixinConfig) => HybridCodexRunner;
+  codexSessionMonitorFactory?: (
+    handlers: {
+      onCompletion: (completion: CodexSessionCompletion) => Promise<void>;
+      onTaskChanged: (task: CodexSessionTask) => void;
+    }
+  ) => CodexSessionCompletionMonitor;
 };
 
 export class AccountManager {
@@ -98,9 +151,13 @@ export class AccountManager {
   private readonly configProvider: () => CodexWeixinConfig;
   private readonly clientFactory: (account: WeixinAccount) => WeixinApiClient;
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
+  private readonly channelFactory: (account: WeComAccount | FeishuAccount) => ChannelAdapter;
   private readonly monitor: (options: MonitorOptions) => Promise<void>;
   private readonly runnerFactory: (config: CodexWeixinConfig) => HybridCodexRunner;
+  private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
+  private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private runner?: HybridCodexRunner;
+  private codexSessionMonitor?: CodexSessionCompletionMonitor;
 
   constructor(private readonly options: AccountManagerOptions) {
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
@@ -109,21 +166,30 @@ export class AccountManager {
       token: account.token
     }));
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
+    this.channelFactory = options.channelFactory ?? ((account) => account.channel === "wecom"
+      ? new WeComChannelAdapter(account)
+      : new FeishuChannelAdapter(account));
     this.monitor = options.monitor ?? monitorWeixin;
     this.runnerFactory = options.runnerFactory ?? ((config) => new HybridCodexRunner({
       backend: config.codexBackend,
       codexBin: config.codexBin,
       execSandbox: config.codexExecSandbox
     }));
+    this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
+      ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
   }
 
   async startAll(): Promise<void> {
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => account.enabled)
       .map((account) => this.startAccount(account.accountId, false)));
+    this.ensureCodexSessionMonitor();
   }
 
   async stopAll(): Promise<void> {
+    this.codexSessionMonitor?.stop();
+    this.codexSessionMonitor = undefined;
+    this.externalCodexTasks.clear();
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => this.stopAccount(account.accountId, false)));
@@ -158,7 +224,9 @@ export class AccountManager {
     const controller = new AbortController();
     const statePaths = accountStatePaths(this.options.paths, account.accountId);
     const store = new RuntimeStateStore(statePaths);
-    const client = this.clientFactory(account);
+    const channel = accountChannel(account);
+    const adapter = channel === "weixin" ? undefined : this.channelFactory(account as WeComAccount | FeishuAccount);
+    const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
     const config = this.configProvider();
     const service = this.bridgeFactory({
       config,
@@ -167,27 +235,45 @@ export class AccountManager {
       inboundDir: statePaths.inboundDir,
       runner: this.runnerFor(config),
       listCodexModels: () => this.getCodexModels(),
-      onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active)
+      getCodexBalance: () => this.getCodexBalance(),
+      onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
+      onTurnCompleted: ({ sessionId, text, success }) => this.notifyProjectCompletion(
+        account.accountId,
+        sessionId,
+        text,
+        success
+      )
     });
-    const entry: RuntimeEntry = { status: "starting", controller, service, store };
+    const entry: RuntimeEntry = { status: "starting", controller, service, store, client };
     this.entries.set(account.accountId, entry);
 
     entry.status = "running";
-    entry.task = this.monitor({
-      client,
+    const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      if (channel !== "weixin") service.allowSender(message.senderId);
+      await service.handleMessage(message);
+    };
+    const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      await client.sendText({
+        toUserId: message.senderId,
+        text: userFacingMessageHandlingError(error),
+        contextToken: store.getContextToken(message.senderId)
+      });
+    };
+    const task = adapter ? adapter.monitor({
+      signal: controller.signal,
+      claimMessage: (message) => store.claimProcessedMessage(message.id),
+      onMessage: handleMessage,
+      onMessageError
+    }) : this.monitor({
+      client: client as WeixinApiClient,
       signal: controller.signal,
       initialSyncKey: store.getSyncKey(),
       onSyncKey: (syncKey) => store.setSyncKey(syncKey),
       claimMessage: (message) => store.claimProcessedMessage(message.id),
-      onMessage: (message) => service.handleMessage(message),
-      onMessageError: async (error, message) => {
-        await client.sendText({
-          toUserId: message.senderId,
-          text: userFacingMessageHandlingError(error),
-          contextToken: store.getContextToken(message.senderId)
-        });
-      }
-    }).then(() => {
+      onMessage: handleMessage,
+      onMessageError
+    });
+    entry.task = task.then(() => {
       entry.status = "stopped";
     }).catch((error: unknown) => {
       if (controller.signal.aborted) {
@@ -213,14 +299,16 @@ export class AccountManager {
 
   async removeAccount(accountId: string, options: { retainHistory?: boolean } = {}): Promise<void> {
     const account = loadAccount(this.options.paths, accountId);
+    const retainHistory = options.retainHistory === true && accountChannel(account) === "weixin";
     await this.stopAccount(accountId, false);
-    if (options.retainHistory) {
-      retainAccountHistory(this.options.paths, account);
-    } else if (account.userId) {
-      forgetRetainedAccount(this.options.paths, { accountId: account.accountId, userId: account.userId });
+    if (retainHistory) {
+      retainAccountHistory(this.options.paths, account as WeixinAccount);
+    } else if (accountChannel(account) === "weixin" && (account as WeixinAccount).userId) {
+      const weixin = account as WeixinAccount;
+      forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId: weixin.userId! });
     }
     deleteAccount(this.options.paths, accountId);
-    if (!options.retainHistory) {
+    if (!retainHistory) {
       fs.rmSync(path.dirname(accountStatePaths(this.options.paths, account.accountId).statePath), {
         recursive: true,
         force: true
@@ -235,6 +323,35 @@ export class AccountManager {
       throw new Error("Account display name must be 40 characters or fewer");
     }
     return this.summary(setAccountDisplayName(this.options.paths, accountId, normalized));
+  }
+
+  addChannelAccount(input:
+    | { channel: "wecom"; botId: string; secret: string; displayName?: string }
+    | { channel: "feishu"; appId: string; appSecret: string; displayName?: string }
+  ): Promise<AccountSummary> {
+    const savedAt = new Date().toISOString();
+    const displayName = input.displayName?.trim();
+    const account: WeComAccount | FeishuAccount = input.channel === "wecom"
+      ? {
+        channel: "wecom",
+        accountId: uniqueAccountId(this.options.paths, `wecom-${normalizeAccountId(input.botId)}`),
+        botId: input.botId.trim(),
+        secret: input.secret.trim(),
+        ...(displayName ? { displayName } : {}),
+        savedAt,
+        enabled: true
+      }
+      : {
+        channel: "feishu",
+        accountId: uniqueAccountId(this.options.paths, `feishu-${normalizeAccountId(input.appId)}`),
+        appId: input.appId.trim(),
+        appSecret: input.appSecret.trim(),
+        ...(displayName ? { displayName } : {}),
+        savedAt,
+        enabled: true
+      };
+    saveAccount(this.options.paths, account);
+    return this.startAccount(account.accountId, false);
   }
 
   listAccounts(): AccountSummary[] {
@@ -252,6 +369,48 @@ export class AccountManager {
         responding: this.isSessionResponding(account.accountId, session.id)
       }));
     }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  listProjects(accountId?: string): AccountProject[] {
+    const accounts = accountId ? [loadAccount(this.options.paths, accountId)] : listAccounts(this.options.paths);
+    return accounts.flatMap((account) => {
+      const store = this.storeFor(account.accountId);
+      return store.listProjects().map((project) => this.projectSummary(account.accountId, project, store));
+    }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  createProject(accountId: string, name: string, workspace: string): AccountProject {
+    const config = this.configProvider();
+    const targetWorkspace = path.resolve(workspace);
+    if (!isWorkspaceAllowed(targetWorkspace, config.allowedWorkspaces)) {
+      throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
+    }
+    const store = this.storeFor(accountId);
+    const project = store.createProject(name, targetWorkspace);
+    this.ensureCodexSessionMonitor();
+    return this.projectSummary(accountId, project, store);
+  }
+
+  renameProject(accountId: string, projectId: string, name: string): AccountProject {
+    const store = this.storeFor(accountId);
+    const project = store.renameProject(projectId, name);
+    return this.projectSummary(accountId, project, store);
+  }
+
+  setProjectNotifications(
+    accountId: string,
+    projectId: string,
+    targets: ProjectNotificationTarget[]
+  ): AccountProject {
+    for (const target of targets) loadAccount(this.options.paths, target.accountId);
+    const store = this.storeFor(accountId);
+    const project = store.setProjectNotifications(projectId, targets);
+    this.ensureCodexSessionMonitor();
+    return this.projectSummary(accountId, project, store);
+  }
+
+  deleteProject(accountId: string, projectId: string): void {
+    this.storeFor(accountId).deleteProject(projectId);
   }
 
   async getCodexRuntimeInfo(): Promise<CodexRuntimeInfo> {
@@ -284,13 +443,29 @@ export class AccountManager {
     return addProviderModelFamily(models, runtime.provider);
   }
 
-  createSession(accountId: string, senderId: string, workspace?: string, title?: string): AccountSession {
+  async getCodexBalance(): Promise<CodexAccountBalance> {
+    return this.runnerFor().getAccountRateLimits();
+  }
+
+  createSession(
+    accountId: string,
+    senderId: string,
+    workspace?: string,
+    title?: string,
+    projectId?: string
+  ): AccountSession {
     const config = this.configProvider();
-    const targetWorkspace = workspace ?? config.defaultCwd;
+    const project = projectId
+      ? this.storeFor(accountId).listProjects().find((candidate) => candidate.id === projectId)
+      : undefined;
+    if (projectId && !project) {
+      throw new Error(`Managed project not found: ${projectId}`);
+    }
+    const targetWorkspace = project?.workspace ?? workspace ?? config.defaultCwd;
     if (!isWorkspaceAllowed(targetWorkspace, config.allowedWorkspaces)) {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
-    const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title);
+    const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title, project?.id);
     return this.sessionSummary(accountId, session, true);
   }
 
@@ -395,7 +570,12 @@ export class AccountManager {
     this.setSessionResponding(accountId, session.id, true);
     try {
       const result = await this.runnerFor(config).run({
-        prompt: buildPrompt(prompt, attachments, "Web"),
+        prompt: buildPrompt(
+          prompt,
+          attachments,
+          "Web",
+          store.relevantKnowledge(promptPreview ?? prompt, session.projectId)
+        ),
         cwd: session.workspace,
         threadId: session.threadId,
         model: session.model ?? config.model,
@@ -410,7 +590,10 @@ export class AccountManager {
       }
       store.setSessionThread(session.id, threadId);
       const parsed = parseAssistantMessage(result.text);
-      return {
+      for (const memory of parsed.actions.remember) {
+        store.rememberKnowledge(memory, session.projectId, session.id);
+      }
+      const response: SessionChatResult = {
         threadId,
         message: {
           id: crypto.randomUUID(),
@@ -423,6 +606,16 @@ export class AccountManager {
           })
         }
       };
+      await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim());
+      return response;
+    } catch (error) {
+      await this.notifyProjectCompletion(
+        accountId,
+        session.id,
+        error instanceof Error ? error.message : String(error),
+        false
+      );
+      throw error;
     } finally {
       this.setSessionResponding(accountId, session.id, false);
     }
@@ -518,7 +711,152 @@ export class AccountManager {
     this.runner = undefined;
   }
 
-  private summary(account: WeixinAccount): AccountSummary {
+  private async notifyProjectCompletion(
+    ownerAccountId: string,
+    sessionId: string,
+    resultText: string,
+    success = true
+  ): Promise<void> {
+    const ownerStore = this.storeFor(ownerAccountId);
+    const session = ownerStore.getSession(sessionId);
+    const project = session?.projectId
+      ? ownerStore.listProjects().find((candidate) => candidate.id === session.projectId)
+      : undefined;
+    if (!session || !project) return;
+    await this.sendProjectCompletion(project, session.title, resultText, success);
+  }
+
+  private ensureCodexSessionMonitor(): void {
+    if (this.codexSessionMonitor || !this.hasManagedProjects()) return;
+    this.codexSessionMonitor = this.codexSessionMonitorFactory({
+      onCompletion: (completion) => this.notifyExternalCodexCompletion(completion),
+      onTaskChanged: (task) => this.updateExternalCodexTask(task)
+    });
+    this.codexSessionMonitor.start();
+  }
+
+  private hasManagedProjects(): boolean {
+    return listAccounts(this.options.paths).some((account) =>
+      this.storeFor(account.accountId).listProjects().length > 0
+    );
+  }
+
+  private updateExternalCodexTask(task: CodexSessionTask): void {
+    const key = `${task.sessionId}\n${task.turnId}`;
+    if (task.status === "running") {
+      this.externalCodexTasks.set(key, task);
+    } else {
+      this.externalCodexTasks.delete(key);
+    }
+  }
+
+  private projectSummary(
+    accountId: string,
+    project: ManagedProject,
+    store = this.storeFor(accountId)
+  ): AccountProject {
+    const sessions = store.listSessions().filter((session) => session.projectId === project.id);
+    const activeSessionIds = new Set(Object.values(store.snapshot.activeSessionIds));
+    const boundSessions: AccountProjectSession[] = sessions.slice(0, 10).map((session) => ({
+      id: session.id,
+      title: session.title,
+      active: activeSessionIds.has(session.id),
+      hasThread: Boolean(session.threadId),
+      updatedAt: session.updatedAt
+    }));
+    const managedThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
+      this.storeFor(account.accountId).listSessions().flatMap((session) => session.threadId ? [session.threadId] : [])
+    ));
+    const managedTasks: AccountProjectTask[] = sessions
+      .filter((session) => this.isSessionResponding(accountId, session.id))
+      .map((session) => ({
+        id: `managed:${accountId}:${session.id}`,
+        title: session.title,
+        source: "managed",
+        startedAt: session.updatedAt,
+        updatedAt: session.updatedAt
+      }));
+    const workspace = canonicalWorkspace(project.workspace);
+    const externalTasks: AccountProjectTask[] = [...this.externalCodexTasks.values()]
+      .filter((task) =>
+        canonicalWorkspace(task.workspace) === workspace
+        && !managedThreadIds.has(task.sessionId)
+      )
+      .map((task) => ({
+        id: `codex:${task.sessionId}:${task.turnId}`,
+        title: task.title,
+        source: "codex",
+        startedAt: task.startedAt,
+        updatedAt: task.updatedAt
+      }));
+    const runningTasks = [...managedTasks, ...externalTasks]
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return {
+      ...project,
+      accountId,
+      sessionCount: sessions.length,
+      boundSessions,
+      activeTaskCount: runningTasks.length,
+      runningTasks
+    };
+  }
+
+  private async notifyExternalCodexCompletion(completion: CodexSessionCompletion): Promise<void> {
+    const accounts = listAccounts(this.options.paths);
+    const stores = accounts.map((account) => ({ account, store: this.storeFor(account.accountId) }));
+    const managedByService = stores.some(({ store }) =>
+      store.listSessions().some((session) => session.threadId === completion.sessionId)
+    );
+    if (managedByService) return;
+    const workspace = path.resolve(completion.workspace);
+    await Promise.all(stores.flatMap(({ store }) =>
+      store.listProjects()
+        .filter((project) => path.resolve(project.workspace) === workspace)
+        .map((project) => this.sendProjectCompletion(
+          project,
+          completion.taskTitle,
+          completion.text,
+          completion.success
+        ))
+    ));
+  }
+
+  private async sendProjectCompletion(
+    project: ManagedProject,
+    taskTitle: string,
+    resultText: string,
+    success: boolean
+  ): Promise<void> {
+    const targets = (project.notifications ?? []).filter((target) => target.enabled);
+    if (!targets.length) return;
+    const excerpt = resultText.replace(/\s+/g, " ").trim().slice(0, 500);
+    const text = [
+      success ? "【Codex 任务已完成】" : "【Codex 任务执行失败】",
+      `项目：${project.name}`,
+      `任务：${taskTitle.replace(/\s+/g, " ").trim().slice(0, 100) || "Codex 会话"}`,
+      ...(excerpt ? [`${success ? "结果" : "错误"}：${excerpt}`] : [])
+    ].join("\n");
+    await Promise.allSettled(targets.map(async (target) => {
+      const entry = this.entries.get(target.accountId);
+      if (!entry?.client || entry.status !== "running") {
+        throw new Error(`Notification channel is not running: ${target.accountId}`);
+      }
+      const contextToken = entry.store?.getContextToken(target.recipientId);
+      await entry.client.sendText({
+        toUserId: target.recipientId,
+        text,
+        ...(contextToken ? { contextToken } : {})
+      });
+    })).then((results) => {
+      for (const result of results) {
+        if (result.status === "rejected") {
+          console.error(`[codex-weixin] project completion notification failed: ${String(result.reason)}`);
+        }
+      }
+    });
+  }
+
+  private summary(account: ChannelAccount): AccountSummary {
     const entry = this.entries.get(account.accountId);
     const store = entry?.store ?? new RuntimeStateStore(accountStatePaths(this.options.paths, account.accountId));
     return {
@@ -544,7 +882,7 @@ function parseAssistantMessage(text: string): ReturnType<typeof parseActionBlock
   try {
     return parseActionBlocks(text);
   } catch {
-    return { visibleText: text.trim(), actions: { send: [], control: [] } };
+    return { visibleText: text.trim(), actions: { send: [], control: [], remember: [] } };
   }
 }
 
@@ -589,8 +927,26 @@ function isPathWithin(root: string, candidate: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function canonicalWorkspace(workspace: string): string {
+  const resolved = path.resolve(workspace);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 function sessionRuntimeKey(accountId: string, sessionId: string): string {
   return `${accountId}\n${sessionId}`;
+}
+
+function uniqueAccountId(paths: StatePaths, preferred: string): string {
+  const existing = new Set(listAccounts(paths).map((account) => account.accountId));
+  if (!existing.has(preferred)) return preferred;
+  for (let index = 2; ; index += 1) {
+    const candidate = `${preferred}-${index}`;
+    if (!existing.has(candidate)) return candidate;
+  }
 }
 
 function addProviderModelFamily(models: CodexModelOption[], provider?: string): CodexModelOption[] {

@@ -2,6 +2,8 @@ const state = {
   version: "",
   requestToken: "",
   accounts: [],
+  projects: [],
+  codexProjects: [],
   sessions: [],
   config: null,
   codex: null,
@@ -18,7 +20,8 @@ const state = {
   updateChecking: false,
   updateInstalling: false,
   selectedAccountId: "",
-  chatFiles: []
+  chatFiles: [],
+  collapsedProjectKeys: new Set()
 };
 
 const MAX_CHAT_FILES = 10;
@@ -57,6 +60,7 @@ document.addEventListener("DOMContentLoaded", () => {
     qrDialog: document.querySelector("#qrDialog"),
     qrFrame: document.querySelector("#qrFrame"),
     qrStatus: document.querySelector("#qrStatus"),
+    channelDialog: document.querySelector("#channelDialog"),
     updateDialog: document.querySelector("#updateDialog"),
     updateCurrentVersion: document.querySelector("#updateCurrentVersion"),
     updateLatestVersion: document.querySelector("#updateLatestVersion"),
@@ -69,7 +73,9 @@ document.addEventListener("DOMContentLoaded", () => {
     settingsVersionValue: document.querySelector("#settingsVersionValue"),
     accountDialog: document.querySelector("#accountDialog"),
     removeAccountDialog: document.querySelector("#removeAccountDialog"),
-    sessionDialog: document.querySelector("#sessionDialog")
+    sessionDialog: document.querySelector("#sessionDialog"),
+    projectDialog: document.querySelector("#projectDialog"),
+    projectNotificationDialog: document.querySelector("#projectNotificationDialog")
   });
   bindEvents();
   void bootstrap();
@@ -78,10 +84,11 @@ document.addEventListener("DOMContentLoaded", () => {
 function bindEvents() {
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(button.dataset.closeDialog)));
-  document.querySelector("#addAccountButton").addEventListener("click", () => void beginLogin());
+  document.querySelector("#addAccountButton").addEventListener("click", openChannelDialog);
   document.querySelector("#refreshQrButton").addEventListener("click", () => void beginLogin());
   document.querySelector("#refreshAccountsButton").addEventListener("click", () => void refreshData(true));
   document.querySelector("#newSessionButton").addEventListener("click", openNewSessionDialog);
+  document.querySelector("#addProjectButton").addEventListener("click", () => void openNewProjectDialog());
   document.querySelector("#settingsForm").addEventListener("submit", (event) => void saveSettings(event));
   document.querySelector("#modelInput").addEventListener("change", () => renderEffortOptions(""));
   els.sessionModelInput.addEventListener("change", () => void handleSessionModelChange());
@@ -90,6 +97,13 @@ function bindEvents() {
   document.querySelector("#accountForm").addEventListener("submit", (event) => void saveAccountRemark(event));
   document.querySelector("#removeAccountForm").addEventListener("submit", (event) => void removeAccount(event));
   document.querySelector("#sessionForm").addEventListener("submit", (event) => void saveSession(event));
+  document.querySelector("#projectForm").addEventListener("submit", (event) => void saveProject(event));
+  document.querySelector("#channelForm").addEventListener("submit", (event) => void saveChannel(event));
+  document.querySelector("#channelTypeInput").addEventListener("change", renderChannelFields);
+  document.querySelector("#projectNotificationForm").addEventListener("submit", (event) => void saveProjectNotifications(event));
+  document.querySelector("#notificationEnabledInput").addEventListener("change", updateNotificationFields);
+  document.querySelector("#projectAccountInput").addEventListener("change", renderCodexProjectOptions);
+  document.querySelector("#projectWorkspaceInput").addEventListener("change", updateProjectNameFromSelection);
   document.querySelector("#sessionSenderInput").addEventListener("change", updateNewSessionDefaultTitle);
   els.chatComposer.addEventListener("submit", (event) => void sendSessionMessage(event));
   els.chatInput.addEventListener("input", updateComposerState);
@@ -99,7 +113,9 @@ function bindEvents() {
   els.composerFiles.addEventListener("click", handleComposerFileAction);
   els.refreshMessagesButton.addEventListener("click", () => void loadSelectedSessionMessages());
   els.accountsList.addEventListener("click", (event) => void handleAccountAction(event));
+  els.accountsList.addEventListener("click", (event) => void handleProjectAction(event));
   els.sessionsList.addEventListener("click", (event) => void handleSessionAction(event));
+  els.sessionsList.addEventListener("click", (event) => void handleProjectAction(event));
   els.sessionAccountTabs.addEventListener("click", handleSessionAccountTab);
   els.qrDialog.addEventListener("close", stopLoginPoll);
   els.updateLaterButton.addEventListener("click", dismissUpdate);
@@ -118,6 +134,7 @@ async function bootstrap() {
     state.requestToken = data.requestToken;
     state.version = data.version || "";
     state.accounts = data.accounts;
+    state.projects = data.projects || [];
     state.sessions = data.sessions;
     state.config = data.config;
     state.codex = data.codex;
@@ -291,8 +308,13 @@ function delay(ms) {
 async function refreshData(notify) {
   try {
     const previousSession = selectedSession();
-    const [accounts, sessions] = await Promise.all([api("/api/accounts"), api("/api/sessions")]);
+    const [accounts, projects, sessions] = await Promise.all([
+      api("/api/accounts"),
+      api("/api/projects"),
+      api("/api/sessions")
+    ]);
     state.accounts = accounts.accounts;
+    state.projects = projects.projects;
     state.sessions = sessions.sessions;
     renderMetrics();
     renderAccounts();
@@ -356,7 +378,7 @@ function renderAccounts() {
       .filter(Boolean)
   );
   if (!state.accounts.length) {
-    els.accountsList.innerHTML = emptyState("scan-line", "还没有微信账号", "", `<button class="button button-primary" type="button" data-account-action="add"><i data-lucide="scan-line"></i><span>添加微信</span></button>`);
+    els.accountsList.innerHTML = emptyState("message-square-plus", "还没有消息渠道", "", `<button class="button button-primary" type="button" data-account-action="add"><i data-lucide="message-square-plus"></i><span>添加渠道</span></button>`);
     drawIcons();
     return;
   }
@@ -364,13 +386,16 @@ function renderAccounts() {
     const pendingSender = account.lastActiveSenderId && !account.pairedSenderIds.includes(account.lastActiveSenderId)
       ? account.lastActiveSenderId : "";
     const authorized = account.pairedSenderIds.length > 0;
+    const channel = account.channel || "weixin";
+    const channelMeta = channelInfo(channel);
+    const projects = state.projects.filter((project) => project.accountId === account.accountId);
     return `<article class="account-card">
       <div class="account-main">
         <div class="account-identity">
-          <span class="account-avatar"><i data-lucide="message-circle"></i></span>
+          <span class="account-avatar"><i data-lucide="${channelMeta.icon}"></i></span>
           <div class="account-name">
             <strong>${escapeHtml(accountDisplayName(account.accountId))}</strong>
-            <div class="account-description">个人微信接入</div>
+            <div class="account-description">${channelMeta.label}</div>
           </div>
         </div>
         <div class="account-stat"><span>状态</span><strong class="status-label status-${escapeAttr(account.status)}">${statusText(account.status)}</strong></div>
@@ -383,48 +408,85 @@ function renderAccounts() {
       </div>
       <details class="account-identifiers" data-account-id="${escapeAttr(account.accountId)}"${expandedAccountIds.has(account.accountId) ? " open" : ""}>
         <summary>
-          <span class="account-identifiers-title"><i data-lucide="fingerprint"></i><strong>账号 ID</strong><small>Bot ID 与 User ID</small></span>
+          <span class="account-identifiers-title"><i data-lucide="fingerprint"></i><strong>渠道 ID</strong><small>${channelMeta.label}</small></span>
           <i class="account-identifiers-chevron" data-lucide="chevron-down"></i>
         </summary>
         <dl class="account-identifiers-grid">
-          <div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div>
-          <div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>
+          ${renderChannelIdentifiers(account)}
         </dl>
       </details>
       <div class="account-detail">${renderAuthorizationState(account, pendingSender)}</div>
+      ${authorized ? renderAccountProjects(account, projects) : ""}
       ${authorized && pendingSender ? `<div class="pending-access"><div><strong>新的微信访问请求</strong><span>当前授权不受影响，可选择允许新的访问</span></div><button class="button button-secondary" type="button" data-account-action="allow" data-account-id="${escapeAttr(account.accountId)}" data-sender-id="${escapeAttr(pendingSender)}"><i data-lucide="user-check"></i><span>允许访问</span></button></div>` : ""}
       ${account.error ? `<div class="pending-access"><div><strong>账号运行错误</strong><span>${escapeHtml(account.error)}</span></div></div>` : ""}
     </article>`;
   }).join("");
 }
 
+function renderAccountProjects(account, projects) {
+  const accountName = accountDisplayName(account.accountId);
+  const rows = projects.length
+    ? projects.map((project) => {
+      const notificationsEnabled = project.notifications?.some((target) => target.enabled === true) === true;
+      const notificationTitle = notificationsEnabled ? "任务完成通知已开启" : "任务完成通知未开启";
+      const runningTasks = project.runningTasks || [];
+      const boundSessions = project.boundSessions || [];
+      return `<li class="account-project-row${notificationsEnabled ? " has-notifications" : ""}">
+        <span class="account-project-icon" aria-hidden="true"><i data-lucide="folder"></i></span>
+        <span class="account-project-copy">
+          <span class="account-project-title-line"><strong title="${escapeAttr(project.name)}">${escapeHtml(project.name)}</strong>${notificationsEnabled ? `<span class="project-notification-status"><i data-lucide="bell-ring"></i>通知已开启</span>` : ""}</span>
+          <small title="${escapeAttr(project.workspace)}">${escapeHtml(project.workspace)}</small>
+          ${runningTasks.length ? `<span class="account-project-running-tasks">${runningTasks.map((task) => `<span class="account-project-running-task" title="${escapeAttr(task.title)}"><i data-lucide="loader-circle"></i><b>${escapeHtml(task.title)}</b><em>${task.source === "codex" ? "Codex Desktop" : "消息渠道"}</em></span>`).join("")}</span>` : ""}
+          <span class="account-project-bound-heading"><i data-lucide="messages-square"></i>已绑定会话 ${project.sessionCount || 0}</span>
+          ${boundSessions.length ? `<span class="account-project-bound-sessions">${boundSessions.map((session) => `<span class="account-project-bound-session${session.active ? " is-active" : ""}" title="${escapeAttr(session.title)}"><i data-lucide="message-square"></i><b>${escapeHtml(session.title)}</b>${session.active ? "<em>当前</em>" : ""}</span>`).join("")}</span>` : `<span class="account-project-no-session">尚未绑定会话</span>`}
+        </span>
+        <span class="account-project-task-count${runningTasks.length ? " is-running" : ""}">${runningTasks.length} 个运行中</span>
+        <span class="account-project-actions">
+          <button class="icon-button notification-button${notificationsEnabled ? " is-notification-active" : ""}" type="button" data-project-action="notifications" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="${notificationTitle}" aria-label="配置“${escapeAttr(project.name)}”任务通知，${notificationsEnabled ? "当前已开启" : "当前未开启"}" aria-pressed="${notificationsEnabled}"><i data-lucide="${notificationsEnabled ? "bell-ring" : "bell"}"></i></button>
+          <button class="icon-button" type="button" data-project-action="rename" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="重命名项目" aria-label="重命名“${escapeAttr(project.name)}”"><i data-lucide="pencil"></i></button>
+          <button class="icon-button is-danger" type="button" data-project-action="delete" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" ${project.sessionCount ? `data-project-blocked="true"` : ""} title="${project.sessionCount ? "请先删除项目内任务" : "移除项目"}" aria-label="${project.sessionCount ? `无法移除“${escapeAttr(project.name)}”：项目内还有任务` : `移除“${escapeAttr(project.name)}”`}"><i data-lucide="trash-2"></i></button>
+        </span>
+      </li>`;
+    }).join("")
+    : `<li class="account-project-empty"><i data-lucide="folder-search"></i><span>还没有管理 Codex 项目</span></li>`;
+  return `<section class="account-projects" aria-label="${escapeAttr(accountName)}的 Codex 项目">
+    <div class="account-projects-head">
+      <span><i data-lucide="folder-kanban"></i><strong>Codex 项目</strong><b>${projects.length}</b></span>
+      <button class="button button-secondary" type="button" data-project-action="new" data-account-id="${escapeAttr(account.accountId)}" aria-label="为${escapeAttr(accountName)}添加已有 Codex 项目"><i data-lucide="folder-plus"></i><span>添加已有项目</span></button>
+    </div>
+    <ul class="account-project-list">${rows}</ul>
+  </section>`;
+}
+
 function renderAuthorizationState(account, pendingSender) {
   const accountId = escapeAttr(account.accountId);
+  const channel = account.channel || "weixin";
+  const platform = channelInfo(channel).shortLabel;
   if (account.pairedSenderIds.length) {
     return `<div class="authorization-state is-authorized" aria-label="授权状态：已授权">
       <span class="authorization-icon"><i data-lucide="shield-check"></i></span>
-      <div class="authorization-copy"><strong>已授权</strong><span>可以从微信控制 Codex</span></div>
+      <div class="authorization-copy"><strong>已连接会话</strong><span>可以从${platform}控制 Codex</span></div>
       <button class="button button-secondary authorization-action" type="button" data-account-action="revoke-all" data-account-id="${accountId}"><i data-lucide="shield-x"></i><span>撤销授权</span></button>
     </div>`;
   }
   if (pendingSender) {
     return `<div class="authorization-state is-pending" aria-label="授权状态：待授权">
       <span class="authorization-icon"><i data-lucide="shield-alert"></i></span>
-      <div class="authorization-copy"><strong>待授权</strong><span>检测到新的微信访问请求</span></div>
+      <div class="authorization-copy"><strong>待授权</strong><span>检测到新的${platform}访问请求</span></div>
       <button class="button button-primary authorization-action" type="button" data-account-action="allow" data-account-id="${accountId}" data-sender-id="${escapeAttr(pendingSender)}"><i data-lucide="user-check"></i><span>允许访问</span></button>
     </div>`;
   }
   return `<div class="authorization-state is-unauthorized" aria-label="授权状态：未授权">
     <span class="authorization-icon"><i data-lucide="shield"></i></span>
-    <div class="authorization-copy"><strong>未授权</strong><span>请先从微信向此账号发送一条消息</span></div>
+    <div class="authorization-copy"><strong>等待消息</strong><span>请先从${platform}向机器人发送一条消息</span></div>
   </div>`;
 }
 
 function renderSessions() {
-  if (!state.sessions.length) {
+  if (!state.sessions.length && !state.projects.length) {
     els.sessionListCount.textContent = "0";
     els.sessionAccountTabs.innerHTML = "";
-    els.sessionsList.innerHTML = emptyState("messages-square", "还没有受管会话", "", `<button class="button button-secondary" type="button" data-session-action="new"><i data-lucide="plus"></i><span>新建会话</span></button>`);
+    els.sessionsList.innerHTML = emptyState("folder-plus", "还没有 Codex 项目", "先从 Codex 历史项目中选择，再在项目下创建任务", `<button class="button button-secondary" type="button" data-project-action="new"><i data-lucide="folder-plus"></i><span>添加项目</span></button>`);
     state.selectedSessionKey = "";
     state.sessionMessages = [];
     state.loadedSessionKey = "";
@@ -434,8 +496,12 @@ function renderSessions() {
   }
   const accountIds = [...new Set([
     ...state.accounts.map((account) => account.accountId),
+    ...state.projects.map((project) => project.accountId),
     ...state.sessions.map((session) => session.accountId)
-  ])].filter((accountId) => state.sessions.some((session) => session.accountId === accountId));
+  ])].filter((accountId) =>
+    state.projects.some((project) => project.accountId === accountId)
+    || state.sessions.some((session) => session.accountId === accountId)
+  );
   if (!accountIds.includes(state.selectedAccountId)) {
     const selected = selectedSession();
     state.selectedAccountId = selected && accountIds.includes(selected.accountId) ? selected.accountId : accountIds[0];
@@ -449,12 +515,16 @@ function renderSessions() {
   }).join("");
   let shouldLoad = false;
   if (!visibleSessions.some((session) => sessionKey(session) === state.selectedSessionKey)) {
-    state.selectedSessionKey = sessionKey(visibleSessions[0]);
+    state.selectedSessionKey = visibleSessions[0] ? sessionKey(visibleSessions[0]) : "";
     state.sessionMessages = [];
     state.loadedSessionKey = "";
-    shouldLoad = true;
+    shouldLoad = Boolean(visibleSessions[0]);
   }
-  els.sessionsList.innerHTML = visibleSessions.map((session) => {
+  const visibleProjects = state.projects.filter((project) => project.accountId === state.selectedAccountId);
+  const orphanSessions = visibleSessions.filter((session) =>
+    !visibleProjects.some((project) => project.id === session.projectId)
+  );
+  const renderSession = (session) => {
     const selected = sessionKey(session) === state.selectedSessionKey;
     return `<article class="session-card${selected ? " is-selected" : ""}">
       <button class="session-open" type="button" data-session-action="open" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" aria-pressed="${selected}">
@@ -470,7 +540,41 @@ function renderSessions() {
         <button class="icon-button is-danger" type="button" data-session-action="delete" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" title="删除受管会话" aria-label="删除受管会话"><i data-lucide="trash-2"></i></button>
       </div>
     </article>`;
-  }).join("");
+  };
+  const renderExternalTask = (task) => `<article class="external-task-card">
+    <span class="external-task-icon"><i data-lucide="loader-circle"></i></span>
+    <span class="external-task-copy"><strong title="${escapeAttr(task.title)}">${escapeHtml(task.title)}</strong><small>Codex Desktop 会话</small></span>
+    <span class="external-task-status"><i data-lucide="activity"></i>运行中</span>
+  </article>`;
+  const groups = visibleProjects.map((project) => {
+    const projectSessions = visibleSessions.filter((session) => session.projectId === project.id);
+    const externalTasks = (project.runningTasks || []).filter((task) => task.source === "codex");
+    const projectKey = `${project.accountId}\n${project.id}`;
+    const collapsed = state.collapsedProjectKeys.has(projectKey);
+    const active = projectSessions.some((session) => session.active) || (project.activeTaskCount || 0) > 0;
+    const notificationsEnabled = project.notifications?.some((target) => target.enabled === true) === true;
+    const notificationTitle = notificationsEnabled ? "任务完成通知已开启" : "任务完成通知未开启";
+    return `<section class="project-group${collapsed ? " is-collapsed" : ""}${active ? " is-active" : ""}${notificationsEnabled ? " has-notifications" : ""}" data-project-key="${escapeAttr(projectKey)}">
+      <div class="project-group-head">
+        <button class="project-toggle" type="button" data-project-action="toggle" aria-expanded="${!collapsed}">
+          <i data-lucide="${collapsed ? "folder" : "folder-open"}"></i>
+          <span><span class="project-title-line"><strong title="${escapeAttr(project.name)}">${escapeHtml(project.name)}</strong>${notificationsEnabled ? `<span class="project-notification-status"><i data-lucide="bell-ring"></i>通知已开启</span>` : ""}</span><small title="${escapeAttr(project.workspace)}">${escapeHtml(project.workspace)}</small></span>
+          <b class="${project.activeTaskCount ? "is-running" : ""}" title="当前运行任务">${project.activeTaskCount || 0}</b>
+        </button>
+        <div class="project-actions">
+          <button class="icon-button" type="button" data-project-action="new-session" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="在项目中新建任务" aria-label="在“${escapeAttr(project.name)}”中新建任务"><i data-lucide="file-plus-2"></i></button>
+          <button class="icon-button notification-button${notificationsEnabled ? " is-notification-active" : ""}" type="button" data-project-action="notifications" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="${notificationTitle}" aria-label="配置“${escapeAttr(project.name)}”任务通知，${notificationsEnabled ? "当前已开启" : "当前未开启"}" aria-pressed="${notificationsEnabled}"><i data-lucide="${notificationsEnabled ? "bell-ring" : "bell"}"></i></button>
+          <button class="icon-button" type="button" data-project-action="rename" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="重命名项目" aria-label="重命名“${escapeAttr(project.name)}”"><i data-lucide="pencil"></i></button>
+          <button class="icon-button is-danger" type="button" data-project-action="delete" data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" ${projectSessions.length ? `data-project-blocked="true"` : ""} title="${projectSessions.length ? "请先删除项目内任务" : "删除项目"}" aria-label="${projectSessions.length ? `无法删除“${escapeAttr(project.name)}”：项目内还有任务` : `删除“${escapeAttr(project.name)}”`}"><i data-lucide="trash-2"></i></button>
+        </div>
+      </div>
+      <div class="project-session-list">${projectSessions.map(renderSession).join("")}${externalTasks.map(renderExternalTask).join("")}${!projectSessions.length && !externalTasks.length ? `<p class="project-empty">当前没有运行任务</p>` : ""}</div>
+    </section>`;
+  });
+  if (orphanSessions.length) {
+    groups.push(`<section class="project-group"><div class="project-group-head project-legacy"><span><i data-lucide="folder"></i><strong>未归类任务</strong></span></div><div class="project-session-list">${orphanSessions.map(renderSession).join("")}</div></section>`);
+  }
+  els.sessionsList.innerHTML = groups.join("");
   renderChatPanel();
   drawIcons();
   if (shouldLoad) void loadSelectedSessionMessages();
@@ -554,7 +658,7 @@ async function handleAccountAction(event) {
   const button = event.target.closest("[data-account-action]");
   if (!button) return;
   const action = button.dataset.accountAction;
-  if (action === "add") return beginLogin();
+  if (action === "add") return openChannelDialog();
   const accountId = button.dataset.accountId;
   const account = state.accounts.find((item) => item.accountId === accountId);
   if (action === "rename") {
@@ -597,6 +701,9 @@ function openRemoveAccountDialog(account) {
   document.querySelector("#removingAccountId").value = account.accountId;
   document.querySelector("#removingAccountName").textContent = accountDisplayName(account.accountId);
   document.querySelector('input[name="retainHistory"][value="true"]').checked = true;
+  const canRetain = (account.channel || "weixin") === "weixin";
+  document.querySelector(".account-removal-choices").hidden = !canRetain;
+  document.querySelector('input[name="retainHistory"][value="false"]').checked = !canRetain;
   els.removeAccountDialog.showModal();
   drawIcons();
 }
@@ -669,6 +776,46 @@ async function handleSessionAction(event) {
     toast(error.message, true);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function handleProjectAction(event) {
+  const button = event.target.closest("[data-project-action]");
+  if (!button) return;
+  const action = button.dataset.projectAction;
+  if (action === "new") return void openNewProjectDialog(button.dataset.accountId);
+  if (action === "toggle") {
+    const group = button.closest(".project-group");
+    const collapsed = group.classList.toggle("is-collapsed");
+    const projectKey = group.dataset.projectKey;
+    if (collapsed) state.collapsedProjectKeys.add(projectKey);
+    else state.collapsedProjectKeys.delete(projectKey);
+    button.setAttribute("aria-expanded", String(!collapsed));
+    button.querySelector("svg")?.setAttribute("data-lucide", collapsed ? "folder" : "folder-open");
+    drawIcons();
+    return;
+  }
+  const project = state.projects.find((item) =>
+    item.accountId === button.dataset.accountId && item.id === button.dataset.projectId
+  );
+  if (!project) return;
+  if (action === "rename") return openRenameProjectDialog(project);
+  if (action === "notifications") return openProjectNotificationDialog(project);
+  if (action === "new-session") return openNewSessionDialog(project);
+  if (action === "delete") {
+    if (button.dataset.projectBlocked === "true") {
+      toast("项目内还有任务，请先删除或迁移任务后再移除项目", true);
+      return;
+    }
+    if (!window.confirm(`删除 Codex 项目“${project.name}”？不会删除磁盘目录。`)) return;
+    try {
+      await api(`/api/projects/${encodeURIComponent(project.accountId)}/${encodeURIComponent(project.id)}`, {
+        method: "DELETE"
+      });
+      await refreshData(false);
+    } catch (error) {
+      toast(error.message, true);
+    }
   }
 }
 
@@ -1174,6 +1321,131 @@ async function beginLogin() {
   }
 }
 
+function openChannelDialog() {
+  document.querySelector("#channelForm").reset();
+  renderChannelFields();
+  els.channelDialog.showModal();
+  document.querySelector("#channelTypeInput").focus();
+}
+
+function renderChannelFields() {
+  const channel = document.querySelector("#channelTypeInput").value;
+  const wecom = channel === "wecom";
+  const feishu = channel === "feishu";
+  document.querySelector("#channelNameField").hidden = channel === "weixin";
+  document.querySelector("#wecomBotIdField").hidden = !wecom;
+  document.querySelector("#wecomSecretField").hidden = !wecom;
+  document.querySelector("#feishuAppIdField").hidden = !feishu;
+  document.querySelector("#feishuSecretField").hidden = !feishu;
+  document.querySelector("#wecomBotIdInput").required = wecom;
+  document.querySelector("#wecomSecretInput").required = wecom;
+  document.querySelector("#feishuAppIdInput").required = feishu;
+  document.querySelector("#feishuSecretInput").required = feishu;
+  document.querySelectorAll("[data-channel-tutorial]").forEach((tutorial) => {
+    tutorial.hidden = tutorial.dataset.channelTutorial !== channel;
+  });
+  document.querySelector("#channelSubmitLabel").textContent = channel === "weixin"
+    ? "扫码登录"
+    : channel === "wecom"
+      ? "添加企业微信"
+      : "添加飞书";
+  document.querySelector("#channelSetupHint span").textContent = channel === "weixin"
+    ? "个人微信通过二维码登录，不需要填写凭据。"
+    : channel === "wecom"
+      ? "Bot ID 与 Secret 只保存在本机，不会返回浏览器。"
+      : "App ID 与 App Secret 只保存在本机，不会返回浏览器。";
+  drawIcons();
+}
+
+async function saveChannel(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  const channel = document.querySelector("#channelTypeInput").value;
+  if (channel === "weixin") {
+    els.channelDialog.close();
+    await beginLogin();
+    return;
+  }
+  const body = channel === "wecom" ? {
+    channel,
+    displayName: document.querySelector("#channelNameInput").value.trim(),
+    botId: document.querySelector("#wecomBotIdInput").value.trim(),
+    secret: document.querySelector("#wecomSecretInput").value.trim()
+  } : {
+    channel,
+    displayName: document.querySelector("#channelNameInput").value.trim(),
+    appId: document.querySelector("#feishuAppIdInput").value.trim(),
+    appSecret: document.querySelector("#feishuSecretInput").value.trim()
+  };
+  try {
+    button.disabled = true;
+    await api("/api/accounts", { method: "POST", body });
+    els.channelDialog.close();
+    await refreshData(false);
+    toast(`${channelInfo(channel).label}已添加`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openProjectNotificationDialog(project) {
+  const current = project.notifications?.[0];
+  document.querySelector("#projectNotificationDialogTitle").textContent = `${project.name} · 任务通知`;
+  document.querySelector("#notificationProjectAccountId").value = project.accountId;
+  document.querySelector("#notificationProjectId").value = project.id;
+  const accountInput = document.querySelector("#notificationAccountInput");
+  accountInput.innerHTML = state.accounts.map((account) =>
+    `<option value="${escapeAttr(account.accountId)}">${escapeHtml(accountDisplayName(account.accountId))} · ${escapeHtml(channelInfo(account.channel || "weixin").label)}</option>`
+  ).join("");
+  const defaultAccount = state.accounts.find((account) => account.accountId === project.accountId) || state.accounts[0];
+  accountInput.value = current?.accountId || defaultAccount?.accountId || "";
+  const selectedAccount = state.accounts.find((account) => account.accountId === accountInput.value);
+  document.querySelector("#notificationRecipientInput").value = current?.recipientId
+    || selectedAccount?.lastActiveSenderId
+    || selectedAccount?.pairedSenderIds?.[0]
+    || "";
+  document.querySelector("#notificationEnabledInput").checked = current?.enabled === true;
+  updateNotificationFields();
+  els.projectNotificationDialog.showModal();
+}
+
+function updateNotificationFields() {
+  const enabled = document.querySelector("#notificationEnabledInput").checked;
+  document.querySelector("#notificationAccountInput").disabled = !enabled;
+  const recipient = document.querySelector("#notificationRecipientInput");
+  recipient.disabled = !enabled;
+  recipient.required = enabled;
+}
+
+async function saveProjectNotifications(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  const accountId = document.querySelector("#notificationProjectAccountId").value;
+  const projectId = document.querySelector("#notificationProjectId").value;
+  const enabled = document.querySelector("#notificationEnabledInput").checked;
+  const notifications = enabled ? [{
+    accountId: document.querySelector("#notificationAccountInput").value,
+    recipientId: document.querySelector("#notificationRecipientInput").value.trim(),
+    enabled: true
+  }] : [];
+  try {
+    button.disabled = true;
+    await api(`/api/projects/${encodeURIComponent(accountId)}/${encodeURIComponent(projectId)}/notifications`, {
+      method: "PUT",
+      body: { notifications }
+    });
+    els.projectNotificationDialog.close();
+    await refreshData(false);
+    toast(enabled ? "项目任务通知已开启" : "项目任务通知已关闭");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function pollLogin(id) {
   try {
     const result = await api(`/api/logins/${encodeURIComponent(id)}`, { token: false });
@@ -1205,15 +1477,16 @@ function setQrStatus(text, kind = "") {
   els.qrStatus.className = `qr-status${kind ? ` is-${kind}` : ""}`;
 }
 
-function openNewSessionDialog() {
+function openNewSessionDialog(preselectedProject) {
   const options = state.accounts.flatMap((account) => {
     const sender = account.lastActiveSenderId && account.pairedSenderIds.includes(account.lastActiveSenderId)
       ? account.lastActiveSenderId
       : account.pairedSenderIds[0];
-    return sender ? [{ account, sender }] : [];
+    const hasProject = state.projects.some((project) => project.accountId === account.accountId);
+    return sender && hasProject ? [{ account, sender }] : [];
   });
   if (!options.length) {
-    toast("请先在微信发送消息，并在账号页允许该联系人", true);
+    toast("请先授权微信联系人，并从 Codex 历史中添加项目", true);
     showView("accounts");
     return;
   }
@@ -1221,13 +1494,16 @@ function openNewSessionDialog() {
   document.querySelector("#editingSessionId").value = "";
   document.querySelector("#editingAccountId").value = "";
   document.querySelector("#senderField").hidden = false;
-  document.querySelector("#sessionWorkspaceField").hidden = false;
   const senderInput = document.querySelector("#sessionSenderInput");
+  senderInput.disabled = false;
   senderInput.innerHTML = options.map(({ account, sender }) => `<option value="${escapeAttr(`${account.accountId}\n${sender}`)}">${escapeHtml(accountDisplayName(account.accountId))}</option>`).join("");
   const selectedOption = options.find(({ account }) => account.accountId === state.selectedAccountId) ?? options[0];
-  senderInput.value = `${selectedOption.account.accountId}\n${selectedOption.sender}`;
+  const accountOption = preselectedProject
+    ? options.find(({ account }) => account.accountId === preselectedProject.accountId) ?? selectedOption
+    : selectedOption;
+  senderInput.value = `${accountOption.account.accountId}\n${accountOption.sender}`;
   updateNewSessionDefaultTitle();
-  document.querySelector("#sessionWorkspaceInput").value = state.config.defaultCwd;
+  updateSessionProjectOptions(preselectedProject?.id);
   els.sessionDialog.showModal();
   document.querySelector("#sessionTitleInput").focus();
 }
@@ -1237,6 +1513,145 @@ function updateNewSessionDefaultTitle() {
   const [accountId] = document.querySelector("#sessionSenderInput").value.split("\n");
   const accountSessionCount = state.sessions.filter((session) => session.accountId === accountId).length;
   document.querySelector("#sessionTitleInput").value = `会话 ${accountSessionCount + 1}`;
+  updateSessionProjectOptions();
+}
+
+function updateSessionProjectOptions(preferredProjectId = "") {
+  const [accountId] = document.querySelector("#sessionSenderInput").value.split("\n");
+  const projects = state.projects.filter((project) => project.accountId === accountId);
+  const input = document.querySelector("#sessionProjectInput");
+  input.innerHTML = projects.map((project) =>
+    `<option value="${escapeAttr(project.id)}">${escapeHtml(project.name)} — ${escapeHtml(project.workspace)}</option>`
+  ).join("");
+  input.value = projects.some((project) => project.id === preferredProjectId)
+    ? preferredProjectId
+    : projects[0]?.id || "";
+  document.querySelector("#sessionProjectField").hidden = false;
+  input.disabled = false;
+}
+
+async function openNewProjectDialog(preselectedAccountId = "") {
+  const accounts = state.accounts.filter((account) => account.pairedSenderIds.length);
+  if (!accounts.length) {
+    toast("请先授权一个微信联系人", true);
+    showView("accounts");
+    return;
+  }
+  document.querySelector("#projectDialogTitle").textContent = "添加 Codex 项目";
+  document.querySelector("#editingProjectId").value = "";
+  document.querySelector("#editingProjectAccountId").value = "";
+  document.querySelector("#projectAccountField").hidden = false;
+  document.querySelector("#projectWorkspaceField").hidden = false;
+  const input = document.querySelector("#projectAccountInput");
+  input.disabled = false;
+  const workspaceInput = document.querySelector("#projectWorkspaceInput");
+  const saveButton = document.querySelector("#saveProjectButton");
+  workspaceInput.innerHTML = `<option value="">正在读取 Codex 项目…</option>`;
+  workspaceInput.disabled = true;
+  saveButton.disabled = true;
+  input.innerHTML = accounts.map((account) =>
+    `<option value="${escapeAttr(account.accountId)}">${escapeHtml(accountDisplayName(account.accountId))}</option>`
+  ).join("");
+  const preferredAccountId = typeof preselectedAccountId === "string" && preselectedAccountId
+    ? preselectedAccountId
+    : state.selectedAccountId;
+  input.value = accounts.some((account) => account.accountId === preferredAccountId)
+    ? preferredAccountId
+    : accounts[0].accountId;
+  document.querySelector("#projectNameInput").value = "";
+  els.projectDialog.showModal();
+  try {
+    const result = await api("/api/codex-projects");
+    state.codexProjects = result.projects || [];
+    renderCodexProjectOptions();
+    document.querySelector("#projectWorkspaceInput").focus();
+  } catch (error) {
+    document.querySelector("#projectWorkspaceHint").textContent = "无法读取 Codex 项目数据，请刷新后重试。";
+    workspaceInput.innerHTML = `<option value="">读取失败</option>`;
+    toast(error.message, true);
+  }
+}
+
+function renderCodexProjectOptions() {
+  const accountId = document.querySelector("#projectAccountInput").value;
+  const managedWorkspaces = new Set(
+    state.projects
+      .filter((project) => project.accountId === accountId)
+      .map((project) => project.workspace)
+  );
+  const input = document.querySelector("#projectWorkspaceInput");
+  const available = state.codexProjects.filter((project) => !managedWorkspaces.has(project.workspace));
+  input.innerHTML = state.codexProjects.length
+    ? state.codexProjects.map((project) => {
+      const managed = managedWorkspaces.has(project.workspace);
+      const suffix = managed ? "（已添加）" : `（${project.sessionCount} 个 Codex 会话）`;
+      return `<option value="${escapeAttr(project.workspace)}"${managed ? " disabled" : ""}>${escapeHtml(project.name)} — ${escapeHtml(project.workspace)} ${escapeHtml(suffix)}</option>`;
+    }).join("")
+    : `<option value="">Codex 暂无项目记录</option>`;
+  input.disabled = !available.length;
+  input.value = available[0]?.workspace || "";
+  document.querySelector("#saveProjectButton").disabled = !available.length;
+  document.querySelector("#projectWorkspaceHint").textContent = available.length
+    ? `共读取到 ${state.codexProjects.length} 个 Codex 项目；已添加到此微信的项目不可重复选择。`
+    : state.codexProjects.length
+      ? "Codex 记录中的项目都已添加到此微信。"
+      : "Codex 本地会话历史中暂时没有可用项目。";
+  updateProjectNameFromSelection();
+}
+
+function updateProjectNameFromSelection() {
+  const workspace = document.querySelector("#projectWorkspaceInput").value;
+  const project = state.codexProjects.find((candidate) => candidate.workspace === workspace);
+  if (project) document.querySelector("#projectNameInput").value = project.name;
+}
+
+function openRenameProjectDialog(project) {
+  document.querySelector("#projectDialogTitle").textContent = "重命名 Codex 项目";
+  document.querySelector("#editingProjectId").value = project.id;
+  document.querySelector("#editingProjectAccountId").value = project.accountId;
+  document.querySelector("#projectAccountField").hidden = true;
+  document.querySelector("#projectWorkspaceField").hidden = true;
+  document.querySelector("#projectAccountInput").disabled = true;
+  document.querySelector("#projectWorkspaceInput").disabled = true;
+  document.querySelector("#saveProjectButton").disabled = false;
+  document.querySelector("#projectNameInput").value = project.name;
+  els.projectDialog.showModal();
+  document.querySelector("#projectNameInput").select();
+}
+
+async function saveProject(event) {
+  event.preventDefault();
+  const submitButton = event.submitter;
+  const projectId = document.querySelector("#editingProjectId").value;
+  const name = document.querySelector("#projectNameInput").value.trim();
+  try {
+    if (submitButton) submitButton.disabled = true;
+    if (projectId) {
+      const accountId = document.querySelector("#editingProjectAccountId").value;
+      await api(`/api/projects/${encodeURIComponent(accountId)}/${encodeURIComponent(projectId)}`, {
+        method: "PATCH",
+        body: { name }
+      });
+    } else {
+      const accountId = document.querySelector("#projectAccountInput").value;
+      await api("/api/projects", {
+        method: "POST",
+        body: {
+          accountId,
+          name,
+          workspace: document.querySelector("#projectWorkspaceInput").value,
+          source: "codex-history"
+        }
+      });
+      state.selectedAccountId = accountId;
+    }
+    els.projectDialog.close();
+    await refreshData(false);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (submitButton) submitButton.disabled = false;
+  }
 }
 
 function openRenameSessionDialog(session) {
@@ -1244,7 +1659,9 @@ function openRenameSessionDialog(session) {
   document.querySelector("#editingSessionId").value = session.id;
   document.querySelector("#editingAccountId").value = session.accountId;
   document.querySelector("#senderField").hidden = true;
-  document.querySelector("#sessionWorkspaceField").hidden = true;
+  document.querySelector("#sessionProjectField").hidden = true;
+  document.querySelector("#sessionSenderInput").disabled = true;
+  document.querySelector("#sessionProjectInput").disabled = true;
   document.querySelector("#sessionTitleInput").value = session.title;
   els.sessionDialog.showModal();
   document.querySelector("#sessionTitleInput").select();
@@ -1260,7 +1677,16 @@ async function saveSession(event) {
       await api(`/api/sessions/${encodeURIComponent(accountId)}/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: { title } });
     } else {
       const [accountId, senderId] = document.querySelector("#sessionSenderInput").value.split("\n");
-      const created = await api("/api/sessions", { method: "POST", body: { accountId, senderId, title, workspace: document.querySelector("#sessionWorkspaceInput").value.trim() } });
+      const projectId = document.querySelector("#sessionProjectInput").value;
+      const created = await api("/api/sessions", {
+        method: "POST",
+        body: {
+          accountId,
+          senderId,
+          title,
+          projectId
+        }
+      });
       state.selectedAccountId = accountId;
       state.selectedSessionKey = sessionKey(created.session);
       state.sessionMessages = [];
@@ -1378,7 +1804,27 @@ function emptyState(icon, title, description = "", action = "") {
 function accountDisplayName(accountId) {
   const account = state.accounts.find((item) => item.accountId === accountId);
   const index = state.accounts.findIndex((item) => item.accountId === accountId);
-  return account?.displayName || `微信账号 ${index >= 0 ? index + 1 : ""}`.trim();
+  const label = channelInfo(account?.channel || "weixin").shortLabel;
+  return account?.displayName || `${label} ${index >= 0 ? index + 1 : ""}`.trim();
+}
+
+function channelInfo(channel) {
+  return ({
+    weixin: { label: "个人微信接入", shortLabel: "微信", icon: "message-circle" },
+    wecom: { label: "企业微信智能机器人", shortLabel: "企业微信", icon: "building-2" },
+    feishu: { label: "飞书自建应用", shortLabel: "飞书", icon: "send" }
+  })[channel] || { label: "消息渠道", shortLabel: "渠道", icon: "message-circle" };
+}
+
+function renderChannelIdentifiers(account) {
+  const channel = account.channel || "weixin";
+  if (channel === "wecom") {
+    return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>`;
+  }
+  if (channel === "feishu") {
+    return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div><div><dt>最近 Chat ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>`;
+  }
+  return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>`;
 }
 
 function statusText(status) {

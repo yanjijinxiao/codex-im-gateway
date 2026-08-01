@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { AccountManager } from "../src/server/account-manager.js";
 import { checkCodex, startLocalHttpServer } from "../src/server/http-server.js";
-import { defaultConfig, saveConfig } from "../src/state/config.js";
+import { defaultConfig, loadConfig, saveConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 
@@ -58,6 +58,145 @@ test("account deletion passes the session-history retention choice", async (t) =
   ]);
 });
 
+test("channel and project notification APIs validate and forward configuration", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-channel-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: unknown[] = [];
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: {
+      async addChannelAccount(input: unknown) {
+        calls.push(input);
+        return { accountId: "wecom-bot", channel: "wecom", status: "running" };
+      },
+      setProjectNotifications(accountId: string, projectId: string, notifications: unknown[]) {
+        calls.push({ accountId, projectId, notifications });
+        return { accountId, id: projectId, notifications };
+      }
+    } as never,
+    port: 0
+  });
+  t.after(() => server.close());
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Codex-Weixin-Token": server.requestToken,
+    Origin: server.url
+  };
+
+  const channel = await fetch(`${server.url}/api/accounts`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ channel: "wecom", botId: "bot", secret: "secret" })
+  });
+  assert.equal(channel.status, 201);
+
+  const notifications = await fetch(`${server.url}/api/projects/owner/project/notifications`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ notifications: [{ accountId: "wecom-bot", recipientId: "engineering", enabled: true }] })
+  });
+  assert.equal(notifications.status, 200);
+  assert.deepEqual(calls, [
+    { channel: "wecom", botId: "bot", secret: "secret" },
+    {
+      accountId: "owner",
+      projectId: "project",
+      notifications: [{ accountId: "wecom-bot", recipientId: "engineering", enabled: true }]
+    }
+  ]);
+});
+
+test("Codex project API lists session-derived projects and authorizes the selected workspace", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-codex-projects-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const allowedRoot = path.join(root, "allowed");
+  const existingProject = path.join(root, "existing-codex-project");
+  fs.mkdirSync(allowedRoot);
+  fs.mkdirSync(existingProject);
+  const paths = resolveStatePaths(path.join(root, "state"));
+  saveConfig(paths, {
+    ...defaultConfig(allowedRoot),
+    defaultCwd: allowedRoot,
+    allowedWorkspaces: [allowedRoot]
+  });
+  saveAccount(paths, {
+    accountId: "account-one",
+    token: "secret",
+    baseUrl: "https://example.test",
+    cdnBaseUrl: "https://cdn.example.test",
+    savedAt: new Date().toISOString(),
+    enabled: false
+  });
+  const manager = new AccountManager({ paths });
+  const candidate = {
+    name: "existing-codex-project",
+    workspace: existingProject,
+    lastUsedAt: "2026-07-30T08:00:00.000Z",
+    sessionCount: 3
+  };
+  const server = await startLocalHttpServer({
+    paths,
+    accountManager: manager,
+    port: 0,
+    codexProjectsProvider: () => [candidate]
+  });
+  t.after(() => server.close());
+  t.after(() => manager.stopAll());
+
+  // Given Codex session history, when the picker loads
+  const listResponse = await fetch(`${server.url}/api/codex-projects`);
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual(await listResponse.json(), { projects: [candidate] });
+
+  // When the local admin selects that Codex project
+  const createResponse = await fetch(`${server.url}/api/projects`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": server.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      accountId: "account-one",
+      name: candidate.name,
+      workspace: candidate.workspace,
+      source: "codex-history"
+    })
+  });
+
+  // Then that exact project is managed and added to the allowlist
+  assert.equal(createResponse.status, 201);
+  const created = await createResponse.json() as { project: { workspace: string } };
+  assert.equal(created.project.workspace, existingProject);
+  assert.equal(loadConfig(paths).allowedWorkspaces.includes(existingProject), true);
+
+  // Requests that do not prove the workspace came from the Codex picker are rejected.
+  const nonCandidate = path.join(allowedRoot, "not-in-codex-history");
+  fs.mkdirSync(nonCandidate);
+  for (const body of [{
+    accountId: "account-one",
+    name: "missing-source",
+    workspace: nonCandidate
+  }, {
+    accountId: "account-one",
+    name: "not-a-candidate",
+    workspace: nonCandidate,
+    source: "codex-history"
+  }]) {
+    const rejected = await fetch(`${server.url}/api/projects`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Codex-Weixin-Token": server.requestToken,
+        Origin: server.url
+      },
+      body: JSON.stringify(body)
+    });
+    assert.equal(rejected.status, 400);
+  }
+  assert.equal(manager.listProjects("account-one").length, 1);
+});
+
 test("local API redacts credentials and protects mutations", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-http-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -72,6 +211,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
     enabled: false
   });
   const manager = new AccountManager({ paths });
+  const managedProject = manager.createProject("account-one", "Web project", root);
   let resolveRestart!: (version: string) => void;
   const restartRequested = new Promise<string>((resolve) => {
     resolveRestart = resolve;
@@ -108,6 +248,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
     onUpdateInstalled: resolveRestart
   });
   t.after(() => server.close());
+  t.after(() => manager.stopAll());
 
   const bootstrapResponse = await fetch(`${server.url}/api/bootstrap`);
   assert.equal(bootstrapResponse.status, 200);
@@ -133,7 +274,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.match(pageHtml, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml">/);
   assert.match(
     pageHtml,
-    /href="https:\/\/github\.com\/XavierJiezou\/codex-weixin" target="_blank" rel="noopener noreferrer"/
+    /href="https:\/\/github\.com\/lsiten\/codex-weixin" target="_blank" rel="noopener noreferrer"/
   );
   assert.match(pageHtml, /id="updateCheckButton"/);
   assert.match(pageHtml, /id="removeAccountDialog"/);
@@ -204,7 +345,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
   });
   assert.equal(unauthorized.status, 403);
 
-  const authorized = await fetch(`${server.url}/api/sessions`, {
+  const workspaceBypass = await fetch(`${server.url}/api/sessions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -215,6 +356,22 @@ test("local API redacts credentials and protects mutations", async (t) => {
       accountId: "account-one",
       senderId: "alice@im.wechat",
       workspace: root,
+      title: "Bypass session"
+    })
+  });
+  assert.equal(workspaceBypass.status, 400);
+
+  const authorized = await fetch(`${server.url}/api/sessions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      accountId: "account-one",
+      senderId: "alice@im.wechat",
+      projectId: managedProject.id,
       title: "Web session"
     })
   });

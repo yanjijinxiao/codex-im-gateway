@@ -117,6 +117,25 @@ rl.on("line", (line) => {
     return;
   }
 
+  if (message.method === "account/rateLimits/read") {
+    respond(message.id, {
+      rateLimits: {
+        limitId: "codex",
+        limitName: "Codex",
+        primary: { usedPercent: 18.5, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: { usedPercent: 42, windowDurationMins: 10_080, resetsAt: 1_800_604_800 },
+        credits: { hasCredits: true, unlimited: false, balance: "12.34" },
+        individualLimit: null,
+        spendControlReached: false,
+        planType: "plus",
+        rateLimitReachedType: null
+      },
+      rateLimitsByLimitId: null,
+      rateLimitResetCredits: null
+    });
+    return;
+  }
+
   if (message.method === "thread/list") {
     respond(message.id, { data: [{ id: "thread-new" }], nextCursor: null, backwardsCursor: null });
     return;

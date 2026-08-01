@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { buildPrompt } from "../src/bridge/format.js";
 import { AccountManager } from "../src/server/account-manager.js";
+import type { CodexSessionCompletion, CodexSessionTask } from "../src/server/codex-session-monitor.js";
 import { defaultConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
@@ -27,12 +28,15 @@ function setup(t: test.TestContext) {
     });
   }
   const starts: string[] = [];
+  const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
   const runs: Array<Record<string, unknown>> = [];
   let runtimeInfo: { model?: string; effort?: string; provider?: string } = {
     model: "runtime-model",
     effort: "medium"
   };
   let runHandler: ((input: Record<string, unknown>) => Promise<{ raw: string; text: string; threadId?: string }>) | undefined;
+  let externalCompletionHandler: ((completion: CodexSessionCompletion) => Promise<void>) | undefined;
+  let externalTaskHandler: ((task: CodexSessionTask) => void) | undefined;
   const history = [
     { id: "user-1", role: "user" as const, text: buildPrompt("历史问题") },
     { id: "assistant-1", role: "assistant" as const, text: "历史回答" }
@@ -65,7 +69,25 @@ function setup(t: test.TestContext) {
   const manager = new AccountManager({
     paths,
     configProvider: () => defaultConfig(root),
-    clientFactory: (account) => ({ accountId: account.accountId }) as never,
+    clientFactory: (account) => ({
+      accountId: account.accountId,
+      async sendText(input: { toUserId: string; text: string }) {
+        sent.push({ accountId: account.accountId, ...input });
+        return { messageId: "sent" };
+      }
+    }) as never,
+    channelFactory: (account) => ({
+      client: {
+        async sendText(input: { toUserId: string; text: string }) {
+          sent.push({ accountId: account.accountId, ...input });
+          return { messageId: "sent" };
+        }
+      },
+      async monitor({ signal }) {
+        starts.push(account.accountId);
+        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      }
+    }),
     bridgeFactory: (input) => ({
       handleMessage: async () => {},
       allowSender(senderId: string) {
@@ -79,7 +101,12 @@ function setup(t: test.TestContext) {
       starts.push((client as never as { accountId: string }).accountId);
       await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
     },
-    runnerFactory: () => runner as never
+    runnerFactory: () => runner as never,
+    codexSessionMonitorFactory: (handlers) => {
+      externalCompletionHandler = handlers.onCompletion;
+      externalTaskHandler = handlers.onTaskChanged;
+      return { start() {}, stop() {} } as never;
+    }
   });
   return {
     manager,
@@ -88,6 +115,15 @@ function setup(t: test.TestContext) {
     root,
     runs,
     history,
+    sent,
+    async emitCodexCompletion(completion: CodexSessionCompletion) {
+      assert.ok(externalCompletionHandler, "Codex session monitor should be active");
+      await externalCompletionHandler(completion);
+    },
+    emitCodexTask(task: CodexSessionTask) {
+      assert.ok(externalTaskHandler, "Codex task status monitor should be active");
+      externalTaskHandler(task);
+    },
     setRunHandler(handler: typeof runHandler) {
       runHandler = handler;
     },
@@ -96,6 +132,22 @@ function setup(t: test.TestContext) {
     }
   };
 }
+
+test("isolates personal knowledge by WeChat account", (t) => {
+  const { paths } = setup(t);
+  const first = new RuntimeStateStore(accountStatePaths(paths, "account-one"));
+  const second = new RuntimeStateStore(accountStatePaths(paths, "account-two"));
+
+  first.rememberKnowledge({
+    kind: "skill",
+    scope: "account",
+    title: "内容复盘",
+    content: "每周复盘标题点击率"
+  });
+
+  assert.equal(first.listKnowledge().length, 1);
+  assert.equal(second.listKnowledge().length, 0);
+});
 
 test("starts and stops multiple accounts independently", async (t) => {
   const { manager, starts } = setup(t);
@@ -108,6 +160,98 @@ test("starts and stops multiple accounts independently", async (t) => {
   assert.equal(manager.listAccounts().find((account) => account.accountId === "account-one")?.status, "stopped");
   assert.equal(manager.listAccounts().find((account) => account.accountId === "account-two")?.status, "running");
   await manager.stopAccount("account-two");
+});
+
+test("adds redacted enterprise channels and stops them cleanly", async (t) => {
+  const { manager } = setup(t);
+
+  const wecom = await manager.addChannelAccount({
+    channel: "wecom",
+    botId: "bot-123",
+    secret: "wecom-secret",
+    displayName: "企业通知"
+  });
+  const feishu = await manager.addChannelAccount({
+    channel: "feishu",
+    appId: "cli_app_123",
+    appSecret: "feishu-secret"
+  });
+
+  assert.equal(wecom.channel, "wecom");
+  assert.equal("secret" in wecom, false);
+  assert.equal(feishu.channel, "feishu");
+  assert.equal("appSecret" in feishu, false);
+  await manager.stopAccount(wecom.accountId, false);
+  await manager.stopAccount(feishu.accountId, false);
+});
+
+test("notifies the configured channel when a project Web task ends", async (t) => {
+  const { manager, root, sent } = setup(t);
+  await manager.startAll();
+  const project = manager.createProject("account-one", "发布项目", path.join(root, "release"));
+  const session = manager.createSession("account-one", "alice@im.wechat", undefined, "发布检查", project.id);
+  manager.setProjectNotifications("account-one", project.id, [{
+    accountId: "account-two",
+    recipientId: "release-room",
+    enabled: true
+  }]);
+
+  await manager.continueSession("account-one", session.id, "执行发布检查");
+
+  assert.deepEqual(sent, [{
+    accountId: "account-two",
+    toUserId: "release-room",
+    text: "【Codex 任务已完成】\n项目：发布项目\n任务：发布检查\n结果：Web reply"
+  }]);
+  await manager.stopAll();
+});
+
+test("notifies the configured channel when an existing Codex client task ends", async (t) => {
+  const { manager, root, sent, emitCodexCompletion } = setup(t);
+  await manager.startAll();
+  const workspace = path.join(root, "existing-codex-project");
+  const project = manager.createProject("account-one", "已有 Codex 项目", workspace);
+  manager.setProjectNotifications("account-one", project.id, [{
+    accountId: "account-two",
+    recipientId: "existing-room",
+    enabled: true
+  }]);
+
+  await emitCodexCompletion({
+    sessionId: "desktop-thread",
+    turnId: "desktop-turn",
+    workspace,
+    taskTitle: "修复已有会话通知",
+    text: "通知链路已恢复",
+    success: true,
+    completedAt: "2026-08-01T08:00:00.000Z"
+  });
+
+  assert.deepEqual(sent, [{
+    accountId: "account-two",
+    toUserId: "existing-room",
+    text: "【Codex 任务已完成】\n项目：已有 Codex 项目\n任务：修复已有会话通知\n结果：通知链路已恢复"
+  }]);
+
+  const managedSession = manager.createSession(
+    "account-one",
+    "alice@im.wechat",
+    undefined,
+    "服务内任务",
+    project.id
+  );
+  await manager.continueSession("account-one", managedSession.id, "执行服务内任务");
+  await emitCodexCompletion({
+    sessionId: "thread-web",
+    turnId: "managed-turn",
+    workspace,
+    taskTitle: "服务内任务",
+    text: "Web reply",
+    success: true,
+    completedAt: "2026-08-01T08:01:00.000Z"
+  });
+  assert.equal(sent.length, 2, "managed sessions should not send a duplicate filesystem notification");
+  await manager.stopAll();
 });
 
 test("refreshes a running account so new credentials take effect", async (t) => {
@@ -135,6 +279,75 @@ test("isolates senders and managed sessions by account", async (t) => {
   assert.deepEqual(manager.listSessions().map((session) => session.accountId).sort(), ["account-one", "account-two"]);
   await manager.stopAccount("account-one");
   await manager.stopAccount("account-two");
+});
+
+test("isolates managed projects by WeChat account", (t) => {
+  const { manager, root } = setup(t);
+  const one = manager.createProject("account-one", "账号一项目", path.join(root, "one"));
+  const two = manager.createProject("account-two", "账号二项目", path.join(root, "two"));
+
+  assert.deepEqual(manager.listProjects("account-one").map((project) => project.id), [one.id]);
+  assert.deepEqual(manager.listProjects("account-two").map((project) => project.id), [two.id]);
+  assert.equal(manager.listProjects("account-one").some((project) => project.id === two.id), false);
+  assert.throws(
+    () => manager.createSession("account-one", "alice@im.wechat", undefined, undefined, two.id),
+    /Managed project not found/
+  );
+});
+
+test("tracks currently running Codex client tasks for a managed project", (t) => {
+  const { manager, root, emitCodexTask } = setup(t);
+  const workspace = path.join(root, "running-project");
+  const project = manager.createProject("account-one", "运行项目", workspace);
+  const runningTask: CodexSessionTask = {
+    sessionId: "desktop-thread",
+    turnId: "desktop-turn",
+    workspace,
+    title: "监听运行状态",
+    status: "running",
+    startedAt: "2026-08-01T08:00:00.000Z",
+    updatedAt: "2026-08-01T08:00:01.000Z"
+  };
+
+  emitCodexTask(runningTask);
+  const running = manager.listProjects("account-one").find((item) => item.id === project.id);
+  assert.equal(running?.activeTaskCount, 1);
+  assert.deepEqual(running?.runningTasks, [{
+    id: "codex:desktop-thread:desktop-turn",
+    title: "监听运行状态",
+    source: "codex",
+    startedAt: "2026-08-01T08:00:00.000Z",
+    updatedAt: "2026-08-01T08:00:01.000Z"
+  }]);
+
+  emitCodexTask({ ...runningTask, status: "completed", updatedAt: "2026-08-01T08:01:00.000Z" });
+  assert.equal(manager.listProjects("account-one").find((item) => item.id === project.id)?.activeTaskCount, 0);
+});
+
+test("includes the project's bound sessions and active marker in project summaries", (t) => {
+  const { manager, root } = setup(t);
+  const workspace = path.join(root, "bound-project");
+  const project = manager.createProject("account-one", "绑定项目", workspace);
+  const session = manager.createSession("account-one", "alice@im.wechat", undefined, "需求讨论", project.id);
+
+  const summary = manager.listProjects("account-one").find((item) => item.id === project.id);
+  assert.equal(summary?.sessionCount, 1);
+  assert.deepEqual(summary?.boundSessions, [{
+    id: session.id,
+    title: "需求讨论",
+    active: true,
+    hasThread: false,
+    updatedAt: session.updatedAt
+  }]);
+});
+
+test("rejects projects outside the configured workspace allowlist", (t) => {
+  const { manager } = setup(t);
+
+  assert.throws(
+    () => manager.createProject("account-one", "越界项目", "/definitely/outside"),
+    /Workspace is not allowed/
+  );
 });
 
 test("persists and clears a local account display name", (t) => {
@@ -236,6 +449,36 @@ test("reads managed thread history and continues the same session from Web", asy
     { id: "user-1", role: "user", text: "历史问题", attachments: [] },
     { id: "assistant-1", role: "assistant", text: "历史回答", attachments: [] }
   ]);
+});
+
+test("Web turns learn and reuse the owning WeChat account knowledge", async (t) => {
+  const { manager, paths, root, runs, setRunHandler } = setup(t);
+  const session = manager.createSession("account-one", "alice@im.wechat", root, "Knowledge chat");
+  setRunHandler(async () => ({
+    raw: "",
+    threadId: "thread-knowledge",
+    text: [
+      "已记录。",
+      "```codex-weixin-actions",
+      JSON.stringify({
+        remember: [{
+          kind: "workflow",
+          scope: "account",
+          title: "交付检查",
+          content: "交付前运行测试、类型检查和构建"
+        }]
+      }),
+      "```"
+    ].join("\n")
+  }));
+
+  const first = await manager.continueSession("account-one", session.id, "记住交付检查流程");
+  assert.equal(first.message.text, "已记录。");
+  assert.equal(new RuntimeStateStore(accountStatePaths(paths, "account-one")).listKnowledge().length, 1);
+
+  setRunHandler(async (input) => ({ raw: "", text: "开始检查。", threadId: String(input.threadId) }));
+  await manager.continueSession("account-one", session.id, "准备交付");
+  assert.match(String(runs[1].prompt), /交付前运行测试、类型检查和构建/);
 });
 
 test("uses WeChat session model overrides when continuing the same session from Web", async (t) => {

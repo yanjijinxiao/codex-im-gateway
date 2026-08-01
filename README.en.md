@@ -9,16 +9,16 @@
 </p>
 
 <p align="center">
-  <strong>Connect multiple personal WeChat accounts to a local OpenAI Codex installation.</strong>
+  <strong>Connect WeChat, Enterprise WeChat, and Feishu to a local OpenAI Codex installation.</strong>
 </p>
 
-`codex-weixin` is a cross-platform, local-only WeChat service dedicated to Codex. Starting it opens a Web management page where users scan a WeChat QR code, manage accounts and workspaces, and switch Codex sessions.
+`codex-weixin` is a cross-platform, local-only messaging bridge for Codex. Its Web console adds personal WeChat, Enterprise WeChat, and Feishu channels, manages projects and bound sessions, and configures task-completion notifications.
 
 ```text
-Multiple WeChat accounts <-> codex-weixin <-> local Codex <-> allowed workspaces
+WeChat / Enterprise WeChat / Feishu <-> codex-weixin <-> local Codex <-> bound projects
 ```
 
-It is not a general messaging gateway. The management page is never exposed to the LAN or public Internet.
+Service data and credentials remain local. The management page is never exposed to the LAN or public Internet.
 
 ## Feature status
 
@@ -27,11 +27,15 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 | Status | Feature | Details | Screenshot |
 | --- | --- | --- | --- |
 | ✅ | Local Web management | A `127.0.0.1`-only page manages WeChat accounts, sessions, workspaces, and Codex settings. | [Web sessions](docs/images/screenshots/web-session-management.png) |
-| ✅ | Multiple WeChat accounts | One service runs multiple accounts with local remarks and isolated authorization, attachments, and sessions; account removal can retain history. | [Web sessions](docs/images/screenshots/web-session-management.png) |
+| ✅ | Multiple WeChat accounts | One service runs multiple accounts with local remarks and isolated authorization, attachments, sessions, and personal knowledge; account removal can retain history. | [Web sessions](docs/images/screenshots/web-session-management.png) |
+| ✅ | Enterprise channels | Enterprise WeChat smart bots and Feishu custom apps connect through official long-connection SDKs without a public callback URL. | Pending: `docs/images/screenshots/web-channels.png` |
+| ✅ | Projects and live tasks | Projects show bound sessions and currently running tasks while monitoring Codex Desktop, Web, and chat session state. | [Web sessions](docs/images/screenshots/web-session-management.png) |
+| ✅ | Completion notifications | Each project can notify a selected channel recipient when a task succeeds, fails, or is interrupted. | Pending: `docs/images/screenshots/web-notifications.png` |
 | ✅ | Browser QR connection | Shows waiting, scanned, connected, and expired QR states. | Pending: `docs/images/screenshots/wechat-qr-login.png` |
 | ✅ | Session management | Grouped account tabs, Markdown history, continued Codex threads, and create, rename, activate, reset, and delete actions. | [Web sessions](docs/images/screenshots/web-session-management.png) |
 | ✅ | Web text and attachments | Send text with up to 10 files (100 MiB total), with media playback, preview, and download in history. | Pending: `docs/images/screenshots/web-attachments.png` |
-| ✅ | WeChat private-chat control | Supports regular messages plus `/status`, `/new`, `/resume`, `/bind`, `/model`, `/effort`, `/prompt start`, `/prompt done`, and `/stop`. | Pending: `docs/images/screenshots/wechat-chat.png` |
+| ✅ | WeChat private-chat control | Supports regular messages plus `/help`, `/status`, `/balance`, `/memory`, `/project`, `/sessions`, `/session`, `/new`, `/resume`, `/model`, `/effort`, `/prompt start`, `/prompt done`, and `/stop`. | Pending: `docs/images/screenshots/wechat-chat.png` |
+| ✅ | Per-account personal knowledge | Each WeChat account automatically learns reusable preferences, skills, knowledge, and workflows, then injects relevant entries into later WeChat and Web turns without sharing across accounts. | Pending: `docs/images/screenshots/wechat-memory.png` |
 | ✅ | WeChat media input | Accepts transcribed voice, images, audio, video, and files up to 100 MiB each, with a direct notice when the limit is exceeded. | Pending: `docs/images/screenshots/wechat-media-input.png` |
 | ✅ | File delivery to WeChat | Codex can return local images, videos, and files as native WeChat messages. | Pending: `docs/images/screenshots/wechat-media-output.png` |
 | ✅ | Models and reasoning effort | Model-aware dropdowns loaded from app-server, including GPT-5.6 Sol, Terra, and Luna for IkunCoding. | Pending: `docs/images/screenshots/web-model-settings.png` |
@@ -70,7 +74,7 @@ codex-weixin
 Or install from source:
 
 ```bash
-git clone https://github.com/XavierJiezou/codex-weixin.git
+git clone https://github.com/lsiten/codex-weixin.git
 cd codex-weixin
 npm install
 npm run build
@@ -84,7 +88,17 @@ The service opens [http://127.0.0.1:8787](http://127.0.0.1:8787). To run without
 npm start
 ```
 
-## First connection
+## Add a message channel
+
+Select **Add Channel** in the Web console:
+
+- **Personal WeChat**: scan the QR code; unknown senders still require explicit authorization in the console.
+- **Enterprise WeChat**: create a smart bot in API mode and enter its Bot ID and Secret.
+- **Feishu**: create a custom app, enable its bot and long-connection event subscription, then enter its App ID and App Secret.
+
+Enterprise WeChat and Feishu use official long-connection SDKs, so the local service needs no public domain or callback URL. See [Message channel and task notification setup](./docs/channel-setup.md) for complete steps and official console links. Credentials stay under `~/.codex-weixin/` and are never returned by the management API.
+
+## First personal WeChat connection
 
 1. Open Settings and confirm the default and allowed Codex workspaces.
 2. Select Add WeChat, scan the QR code, and confirm in WeChat.
@@ -106,30 +120,50 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Activate chooses which Codex thread receives the sender's next message.
 - Reset clears the recorded thread so the next message starts fresh context.
 - Delete removes only the bridge record, not Codex's own history files.
-- `/new` creates a new managed session for the current sender.
-- `/resume` lists this sender's sessions with recent prompt summaries, timestamps, and distinct `R1`, `R2` selection codes; `/resume R1` switches back to the selected Codex thread without confusing the code with a title such as `Session 6`.
+- `/sessions` lists up to ten recently active bridge or Codex Desktop sessions from the current project; `/session R1` binds the real Codex thread and continues it. `/resume` remains a compatibility alias.
+- `/new` creates and binds a new managed session inside the current project.
+
+## Projects, running tasks, and notifications
+
+- Projects are selected from local Codex history and grouped by working directory. Switching projects limits the session list to that project's ten most recently active sessions.
+- The console shows bound sessions and currently running tasks while monitoring Codex Desktop, Web, and chat session lifecycle changes.
+- Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
+- A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
 ## WeChat commands
 
 ```text
-/help                         Show commands
-/status                       Show session, workspace, thread, backend, effective model, and reasoning effort
-/bind <absolute-path>          Bind to an allowed workspace
-/new                          Create a new managed Codex session
-/resume                       List historical sessions with recent prompt summaries
-/resume R<number>             Continue a session by its distinct R selection code
-/model                        Show the current and available models
+/help            /h           Show commands
+/status          /st          Show session, workspace, thread, backend, effective model, and reasoning effort
+/balance         /bal         Show the current Codex login plan, remaining limits, and reset times
+/memory          /mem         Show this WeChat account's personal knowledge
+/memory <on|off>              Enable or disable automatic learning and injection
+/memory forget K1 /mem f K1   Delete one knowledge entry
+/memory clear     /mem c      Clear personal knowledge after confirmation
+/project list    /p l         List projects bound to this WeChat account
+/project add     /p a         List projects available from Codex history
+/project add C1  /p a C1      Add a Codex-history project by C code
+/project P1      /p P1        Switch to a bound project
+/project rename P1|name /p rn P1|name  Rename a project
+/project delete P1      /p d P1        Remove a project with no running tasks
+/sessions        /ss          List the current project's ten most recent sessions
+/session R1      /s R1        Bind and continue a session from the current project
+/new             /n           Create and bind a session in the current project
+/resume R1       /r R1        Compatibility alias for session listing and switching
+/model           /m           Show the current and available models
 /model <number|model|default>  Switch this session's model or restore inheritance
-/effort                       Show reasoning efforts supported by the current model
+/effort          /e           Show reasoning efforts supported by the current model
 /effort <number|level|default> Switch this session's effort or restore inheritance
-/stream                       Show this session's process-progress setting
+/stream          /str         Show this session's process-progress setting
 /stream <on|off|default>       Enable, disable, or restore global process progress
-/prompt start                 Buffer multiple WeChat messages
-/prompt done                  Submit the buffer as one Codex turn
-/stop                         Interrupt the current Codex task
+/prompt start    /pp s        Buffer multiple WeChat messages
+/prompt done     /pp d        Submit the buffer as one Codex turn
+/stop            /x           Interrupt the current Codex task
 ```
 
 Regular messages enter the active session. Images, files, videos, and voice/audio without transcription are saved under the account's inbound directory and added to the prompt by local path. WeChat voice transcription is preferred when available.
+
+After each turn, Codex may extract up to three durable entries from explicit preferences, reusable work techniques, stable domain knowledge, or repeatable workflows. Account-scoped entries work across that account's projects, while project-scoped entries stay in their project. Duplicate titles are updated instead of appended, with a maximum of 200 entries. Passwords, tokens, API keys, private keys, and transient task status are excluded. Relevant knowledge is available to both WeChat and Web turns for the same account and is never shared with another WeChat account.
 
 ## Sending local files
 
@@ -171,7 +205,7 @@ Service state and the default Codex workspace share this directory:
 ~/.codex-weixin/
   accounts/                 One credential file per WeChat account
   retained-accounts.json    Recovery index for removed accounts; never stores tokens
-  runtime/<account-id>/     Sender authorization and managed sessions
+  runtime/<account-id>/     Sender authorization, managed sessions, and personal knowledge
   inbound/<account-id>/     Inbound WeChat attachments
   config.json               Codex and workspace configuration
   logs/
@@ -195,7 +229,7 @@ CODEX_WEIXIN_OPEN=0
 - Every mutating API call requires an in-memory page token.
 - WeChat credentials never reach the management page.
 - Unknown senders are denied until explicitly allowed.
-- `/bind` accepts only absolute paths under the workspace allowlist.
+- Projects can only be selected from local Codex session history; manual path binding is disabled.
 - `danger-full-access` bypasses the Codex filesystem sandbox and must be enabled only when full-machine access is acceptable.
 - Concurrent accounts share local compute resources and Codex quotas.
 
@@ -209,7 +243,7 @@ npm run typecheck
 npm run build
 ```
 
-The project is a clean-room independent implementation under the MIT License. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public Codex/WeChat projects for app-server, media-transfer, and security-boundary practices. No AGPL source code was copied.
+The project originated from [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) and is now maintained at [lsiten/codex-weixin](https://github.com/lsiten/codex-weixin). It is distributed under the MIT License. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public Codex/WeChat projects for app-server, media-transfer, and security-boundary practices. No AGPL source code was copied.
 
 When started from a source checkout with `npm run dev` or `npm start`, the Web page checks for updates but does not install them; update the Git checkout and rebuild instead. Global installations and isolated `node_modules/codex-weixin` runtimes update the npm prefix that owns the active package and verify the target version and service entry before restarting. On Windows, the updater first releases any process working-directory lock inside the package tree so npm can replace it without `EBUSY`.
 

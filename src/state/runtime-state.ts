@@ -2,6 +2,13 @@ import crypto from "node:crypto";
 import path from "node:path";
 
 import { readJsonFile, writeJsonFile } from "./json-store.js";
+import {
+  cleanKnowledgeInput,
+  knowledgeIdentity,
+  selectRelevantKnowledge,
+  type KnowledgeEntry,
+  type KnowledgeInput
+} from "./knowledge.js";
 import type { StatePaths } from "./paths.js";
 
 export type ManagedSession = {
@@ -9,6 +16,7 @@ export type ManagedSession = {
   senderId: string;
   title: string;
   workspace: string;
+  projectId?: string;
   threadId?: string;
   lastPromptPreview?: string;
   model?: string;
@@ -16,6 +24,21 @@ export type ManagedSession = {
   streamReplies?: boolean;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ManagedProject = {
+  id: string;
+  name: string;
+  workspace: string;
+  notifications?: ProjectNotificationTarget[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProjectNotificationTarget = {
+  accountId: string;
+  recipientId: string;
+  enabled: boolean;
 };
 
 export type SessionRuntimeOverrides = {
@@ -31,6 +54,7 @@ export type RuntimeState = {
   processedMessageIds: string[];
   contextTokens: Record<string, string>;
   sessions: ManagedSession[];
+  projects: ManagedProject[];
   activeSessionIds: Record<string, string>;
   pendingDeliveries: Array<{
     id: string;
@@ -38,6 +62,8 @@ export type RuntimeState = {
     text: string;
     createdAt: string;
   }>;
+  knowledge: KnowledgeEntry[];
+  knowledgeEnabled: boolean;
 };
 
 export function emptyRuntimeState(): RuntimeState {
@@ -46,8 +72,11 @@ export function emptyRuntimeState(): RuntimeState {
     processedMessageIds: [],
     contextTokens: {},
     sessions: [],
+    projects: [],
     activeSessionIds: {},
-    pendingDeliveries: []
+    pendingDeliveries: [],
+    knowledge: [],
+    knowledgeEnabled: true
   };
 }
 
@@ -56,6 +85,7 @@ export class RuntimeStateStore {
 
   constructor(private readonly paths: StatePaths) {
     this.state = normalizeRuntimeState(readJsonFile<Partial<RuntimeState>>(paths.statePath, {}));
+    this.save();
   }
 
   get snapshot(): RuntimeState {
@@ -115,7 +145,10 @@ export class RuntimeStateStore {
   setWorkspace(senderId: string, workspace: string): void {
     this.ensureActiveSession(senderId, workspace);
     const session = this.mutableActiveSession(senderId)!;
-    session.workspace = path.resolve(workspace);
+    const resolvedWorkspace = path.resolve(workspace);
+    const project = this.projectForWorkspace(resolvedWorkspace);
+    session.workspace = resolvedWorkspace;
+    session.projectId = project.id;
     delete session.threadId;
     session.updatedAt = new Date().toISOString();
     this.save();
@@ -190,6 +223,124 @@ export class RuntimeStateStore {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  listProjects(): ManagedProject[] {
+    return structuredClone(this.state.projects)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  listKnowledge(): KnowledgeEntry[] {
+    return structuredClone(this.state.knowledge)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  relevantKnowledge(query: string, projectId?: string, limit = 20): KnowledgeEntry[] {
+    if (!this.state.knowledgeEnabled) return [];
+    return selectRelevantKnowledge(this.state.knowledge, query, projectId, limit);
+  }
+
+  rememberKnowledge(input: KnowledgeInput, projectId?: string, sourceSessionId?: string): KnowledgeEntry | undefined {
+    if (!this.state.knowledgeEnabled) return undefined;
+    const clean = cleanKnowledgeInput(input);
+    if (!clean) return undefined;
+    const scopedProjectId = clean.scope === "project" ? projectId : undefined;
+    if (clean.scope === "project" && !scopedProjectId) return undefined;
+    const identity = knowledgeIdentity(clean, scopedProjectId);
+    const existing = this.state.knowledge.find((entry) => knowledgeIdentity(entry, entry.projectId) === identity);
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.content = clean.content;
+      existing.updatedAt = now;
+      if (sourceSessionId) existing.sourceSessionId = sourceSessionId;
+      this.save();
+      return structuredClone(existing);
+    }
+    const entry: KnowledgeEntry = {
+      id: crypto.randomUUID(),
+      ...clean,
+      ...(scopedProjectId ? { projectId: scopedProjectId } : {}),
+      ...(sourceSessionId ? { sourceSessionId } : {}),
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.knowledge.unshift(entry);
+    this.state.knowledge = this.state.knowledge.slice(0, 200);
+    this.save();
+    return structuredClone(entry);
+  }
+
+  deleteKnowledge(knowledgeId: string): void {
+    if (!this.state.knowledge.some((entry) => entry.id === knowledgeId)) {
+      throw new Error(`Knowledge entry not found: ${knowledgeId}`);
+    }
+    this.state.knowledge = this.state.knowledge.filter((entry) => entry.id !== knowledgeId);
+    this.save();
+  }
+
+  clearKnowledge(): void {
+    this.state.knowledge = [];
+    this.save();
+  }
+
+  isKnowledgeEnabled(): boolean {
+    return this.state.knowledgeEnabled;
+  }
+
+  setKnowledgeEnabled(enabled: boolean): void {
+    this.state.knowledgeEnabled = enabled;
+    this.save();
+  }
+
+  createProject(name: string, workspace: string): ManagedProject {
+    const resolvedWorkspace = path.resolve(workspace);
+    const existing = this.state.projects.find((project) => project.workspace === resolvedWorkspace);
+    if (existing) {
+      throw new Error(`Project workspace already exists: ${resolvedWorkspace}`);
+    }
+    const now = new Date().toISOString();
+    const project: ManagedProject = {
+      id: crypto.randomUUID(),
+      name: cleanProjectName(name),
+      workspace: resolvedWorkspace,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.projects.push(project);
+    this.save();
+    return structuredClone(project);
+  }
+
+  renameProject(projectId: string, name: string): ManagedProject {
+    const project = this.mutableProject(projectId);
+    project.name = cleanProjectName(name);
+    project.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(project);
+  }
+
+  setProjectNotifications(projectId: string, targets: ProjectNotificationTarget[]): ManagedProject {
+    const project = this.mutableProject(projectId);
+    const unique = new Map<string, ProjectNotificationTarget>();
+    for (const target of targets) {
+      const accountId = target.accountId.trim();
+      const recipientId = target.recipientId.trim();
+      if (!accountId || !recipientId) continue;
+      unique.set(`${accountId}\u0000${recipientId}`, { accountId, recipientId, enabled: target.enabled });
+    }
+    project.notifications = [...unique.values()].slice(0, 20);
+    project.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(project);
+  }
+
+  deleteProject(projectId: string): void {
+    this.mutableProject(projectId);
+    if (this.state.sessions.some((session) => session.projectId === projectId)) {
+      throw new Error("Project still has sessions");
+    }
+    this.state.projects = this.state.projects.filter((project) => project.id !== projectId);
+    this.save();
+  }
+
   getSession(sessionId: string): ManagedSession | undefined {
     const session = this.state.sessions.find((candidate) => candidate.id === sessionId);
     return session ? structuredClone(session) : undefined;
@@ -209,14 +360,22 @@ export class RuntimeStateStore {
     return this.createSession(senderId, workspace);
   }
 
-  createSession(senderId: string, workspace: string, title?: string): ManagedSession {
+  createSession(senderId: string, workspace: string, title?: string, projectId?: string): ManagedSession {
     const now = new Date().toISOString();
+    const resolvedWorkspace = path.resolve(workspace);
+    const project = projectId
+      ? this.mutableProject(projectId)
+      : this.projectForWorkspace(resolvedWorkspace);
+    if (project && project.workspace !== resolvedWorkspace) {
+      throw new Error("Session workspace must match its project");
+    }
     const number = this.state.sessions.filter((session) => session.senderId === senderId).length + 1;
     const session: ManagedSession = {
       id: crypto.randomUUID(),
       senderId,
       title: cleanTitle(title) ?? `会话 ${number}`,
-      workspace: path.resolve(workspace),
+      workspace: resolvedWorkspace,
+      ...(project ? { projectId: project.id } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -320,6 +479,29 @@ export class RuntimeStateStore {
     return session;
   }
 
+  private mutableProject(projectId: string): ManagedProject {
+    const project = this.state.projects.find((candidate) => candidate.id === projectId);
+    if (!project) {
+      throw new Error(`Managed project not found: ${projectId}`);
+    }
+    return project;
+  }
+
+  private projectForWorkspace(workspace: string): ManagedProject {
+    const existing = this.state.projects.find((project) => project.workspace === workspace);
+    if (existing) return existing;
+    const now = new Date().toISOString();
+    const project: ManagedProject = {
+      id: crypto.randomUUID(),
+      name: path.basename(workspace) || workspace,
+      workspace,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.projects.push(project);
+    return project;
+  }
+
   private mutableActiveSession(senderId: string): ManagedSession | undefined {
     const sessionId = this.state.activeSessionIds[senderId];
     return this.state.sessions.find((candidate) => candidate.id === sessionId && candidate.senderId === senderId);
@@ -327,6 +509,39 @@ export class RuntimeStateStore {
 }
 
 function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
+  const sessions = Array.isArray(value.sessions) ? value.sessions : [];
+  const projects = Array.isArray(value.projects) ? value.projects : [];
+  for (const project of projects) {
+    project.notifications = Array.isArray(project.notifications)
+      ? project.notifications.filter((target) => Boolean(
+        target
+        && typeof target.accountId === "string"
+        && typeof target.recipientId === "string"
+        && typeof target.enabled === "boolean"
+      ))
+      : [];
+  }
+  const projectsByWorkspace = new Map(projects.map((project) => [path.resolve(project.workspace), project]));
+  for (const session of sessions) {
+    const workspace = path.resolve(session.workspace);
+    let project = session.projectId ? projects.find((candidate) => candidate.id === session.projectId) : undefined;
+    if (!project) {
+      project = projectsByWorkspace.get(workspace);
+    }
+    if (!project) {
+      const now = session.createdAt || new Date().toISOString();
+      project = {
+        id: crypto.randomUUID(),
+        name: path.basename(workspace) || workspace,
+        workspace,
+        createdAt: now,
+        updatedAt: session.updatedAt || now
+      };
+      projects.push(project);
+      projectsByWorkspace.set(workspace, project);
+    }
+    session.projectId = project.id;
+  }
   return {
     ...emptyRuntimeState(),
     ...value,
@@ -335,10 +550,21 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
       ? value.processedMessageIds.filter((id): id is string => typeof id === "string").slice(-1_000)
       : [],
     contextTokens: value.contextTokens && typeof value.contextTokens === "object" ? value.contextTokens : {},
-    sessions: Array.isArray(value.sessions) ? value.sessions : [],
+    sessions,
+    projects,
     activeSessionIds: value.activeSessionIds && typeof value.activeSessionIds === "object" ? value.activeSessionIds : {},
-    pendingDeliveries: Array.isArray(value.pendingDeliveries) ? value.pendingDeliveries : []
+    pendingDeliveries: Array.isArray(value.pendingDeliveries) ? value.pendingDeliveries : [],
+    knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
+    knowledgeEnabled: value.knowledgeEnabled !== false
   };
+}
+
+function cleanProjectName(value: string): string {
+  const clean = value.trim().replace(/\s+/g, " ").slice(0, 60);
+  if (!clean) {
+    throw new Error("Project name cannot be empty");
+  }
+  return clean;
 }
 
 function cleanTitle(value?: string): string | undefined {

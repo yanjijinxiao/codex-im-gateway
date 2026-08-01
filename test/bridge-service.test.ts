@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { BridgeService } from "../src/bridge/service.js";
+import { BridgeService, parseCommand } from "../src/bridge/service.js";
 import { buildPrompt } from "../src/bridge/format.js";
 import { defaultConfig, MAX_INBOUND_BYTES } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
@@ -17,6 +17,7 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-status-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const replies: string[] = [];
   const statuses: Array<{ senderId: string; sessionId: string; active: boolean }> = [];
   const service = new BridgeService({
@@ -69,6 +70,153 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
   assert.match(replies.at(-1) ?? "", /effort: high/);
 });
 
+test("lists every built-in command and reports the current Codex account balance without a project", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-balance-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: { async stop() {} } as never,
+    getCodexBalance: async () => ({
+      limitName: "Codex",
+      planType: "plus",
+      primary: { usedPercent: 18.5, windowDurationMins: 300, resetsAt: null },
+      secondary: { usedPercent: 42, windowDurationMins: 10_080, resetsAt: null },
+      credits: { hasCredits: true, unlimited: false, balance: "12.34" },
+      spendControlReached: false
+    })
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  await send("help", "/help");
+  const help = replies.at(-1) ?? "";
+  for (const command of [
+    "/help", "/status", "/balance", "/memory", "/project", "/new", "/sessions", "/session", "/resume",
+    "/model", "/effort", "/stream", "/prompt start", "/prompt done", "/stop"
+  ]) {
+    assert.match(help, new RegExp(command.replace("/", "\\/")));
+  }
+  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/b", "/ss", "/s", "/r", "/n", "/m", "/e", "/str", "/pp", "/x"]) {
+    assert.match(help, new RegExp(alias.replace("/", "\\/")));
+  }
+
+  await send("balance", "/balance");
+  assert.equal(stateStore.listProjects().length, 0);
+  assert.match(replies.at(-1) ?? "", /Codex 当前账号用量/);
+  assert.match(replies.at(-1) ?? "", /套餐：Plus/);
+  assert.match(replies.at(-1) ?? "", /5 小时额度：剩余 81\.5%/);
+  assert.match(replies.at(-1) ?? "", /7 天额度：剩余 58%/);
+  assert.match(replies.at(-1) ?? "", /Credits：12\.34/);
+});
+
+test("maps every documented short command to its canonical command", () => {
+  const aliases: Record<string, string> = {
+    h: "help",
+    st: "status",
+    bal: "balance",
+    mem: "memory",
+    p: "project",
+    b: "bind",
+    ss: "sessions",
+    s: "session",
+    r: "resume",
+    n: "new",
+    m: "model",
+    e: "effort",
+    str: "stream",
+    pp: "prompt",
+    x: "stop"
+  };
+  for (const [alias, command] of Object.entries(aliases)) {
+    assert.deepEqual(parseCommand(`/${alias} argument`), { name: command, arg: "argument" });
+  }
+});
+
+test("automatically learns and reuses account knowledge with user controls", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-knowledge-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("内容项目", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "内容任务", project.id);
+  const prompts: string[] = [];
+  const replies: string[] = [];
+  let runCount = 0;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async run(input: { prompt: string }) {
+        prompts.push(input.prompt);
+        runCount += 1;
+        if (runCount === 1) {
+          return {
+            raw: "",
+            text: [
+              "记住了。",
+              "```codex-weixin-actions",
+              JSON.stringify({
+                remember: [{
+                  kind: "preference",
+                  scope: "account",
+                  title: "回复风格",
+                  content: "默认使用简体中文，并先给结论"
+                }]
+              }),
+              "```"
+            ].join("\n")
+          };
+        }
+        return { raw: "", text: "继续处理。" };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  await send("learn", "以后请用中文并先给结论");
+  assert.equal(stateStore.listKnowledge()[0]?.title, "回复风格");
+  assert.equal(replies.at(-1), "记住了。");
+
+  await send("reuse", "继续规划下一篇内容");
+  assert.match(prompts[1] ?? "", /默认使用简体中文，并先给结论/);
+
+  await send("list", "/memory");
+  assert.match(replies.at(-1) ?? "", /\[K1\].*偏好/);
+  assert.match(replies.at(-1) ?? "", /回复风格/);
+
+  await send("disable", "/memory off");
+  await send("disabled-turn", "再处理一篇");
+  assert.doesNotMatch(prompts.at(-1) ?? "", /默认使用简体中文，并先给结论/);
+});
+
 test("sends local markdown images as native WeChat image messages", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -77,6 +225,7 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   const markdownPath = imagePath.replace(/\\/g, "/");
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -156,6 +305,7 @@ test("sends local markdown videos as native WeChat video messages", async (t) =>
   const markdownPath = videoPath.replace(/\\/g, "/");
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -234,6 +384,7 @@ test("buffers inbound image attachments and includes local paths in prompt done"
   const aesKeyBase64 = Buffer.from(key.toString("hex"), "utf8").toString("base64");
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -275,7 +426,7 @@ test("buffers inbound image attachments and includes local paths in prompt done"
     id: "start",
     senderId: "alice@im.wechat",
     contextToken: "ctx",
-    text: "/prompt start",
+    text: "/pp s",
     raw: {}
   });
 
@@ -308,7 +459,7 @@ test("buffers inbound image attachments and includes local paths in prompt done"
     id: "done",
     senderId: "alice@im.wechat",
     contextToken: "ctx",
-    text: "/prompt done",
+    text: "/pp d",
     raw: {}
   });
 
@@ -324,6 +475,7 @@ test("replies directly when a WeChat attachment exceeds 100 MiB", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-oversize-notice-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const replies: string[] = [];
   let runnerCalled = false;
   const service = new BridgeService({
@@ -375,11 +527,15 @@ test("lists resumable sessions with unambiguous R codes and switches by code", a
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-resume-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const first = stateStore.createSession("alice@im.wechat", "/work/one", "更新修复");
+  const project = stateStore.createProject("桌面客户端", "/work/one");
+  const first = stateStore.createSession("alice@im.wechat", project.workspace, "更新修复", project.id);
   stateStore.setThread("alice@im.wechat", "thread-one");
   stateStore.setSessionPromptPreview(first.id, "修复 macOS 自动更新");
-  const second = stateStore.createSession("alice@im.wechat", "/work/two", "季度报告");
+  const second = stateStore.createSession("alice@im.wechat", project.workspace, "季度报告", project.id);
   stateStore.setThread("alice@im.wechat", "thread-two");
+  const unrelatedProject = stateStore.createProject("其他项目", "/work/two");
+  stateStore.createSession("alice@im.wechat", unrelatedProject.workspace, "不应出现", unrelatedProject.id);
+  stateStore.activateSession(second.id);
   const replies: string[] = [];
   const runs: Array<{ prompt: string; threadId?: string }> = [];
   const service = new BridgeService({
@@ -424,21 +580,23 @@ test("lists resumable sessions with unambiguous R codes and switches by code", a
   });
 
   const listedSessions = stateStore.listSessions()
-    .filter((session) => session.senderId === "alice@im.wechat");
+    .filter((session) => session.senderId === "alice@im.wechat" && session.projectId === project.id);
   const firstNumber = listedSessions.findIndex((session) => session.id === first.id) + 1;
   const secondNumber = listedSessions.findIndex((session) => session.id === second.id) + 1;
 
-  await send("resume-list", "/resume");
+  await send("resume-list", "/sessions");
   const listReply = replies.at(-1) ?? "";
+  assert.match(listReply, /项目“桌面客户端”最近活跃的会话（最多 10 个）/);
   assert.match(listReply, new RegExp(`\\[R${secondNumber}\\] 【当前】季度报告`));
   assert.match(listReply, /最近内容：分析季度报告 文件：report\.pdf/);
   assert.match(listReply, new RegExp(`\\[R${firstNumber}\\] 更新修复`));
   assert.match(listReply, /修复 macOS 自动更新/);
-  assert.match(listReply, /R1 是切换编号，“会话 6”等是会话名称/);
+  assert.match(listReply, /\/session R1 绑定并继续对应会话/);
+  assert.doesNotMatch(listReply, /不应出现/);
   assert.doesNotMatch(listReply, /thread-one|thread-two|private\/report/);
   assert.equal(stateStore.getSession(second.id)?.lastPromptPreview, "分析季度报告 文件：report.pdf");
 
-  await send("resume-bare-number", "/resume 2");
+  await send("resume-bare-number", "/session 2");
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
   assert.match(replies.at(-1) ?? "", /R 开头的切换编号/);
 
@@ -446,13 +604,184 @@ test("lists resumable sessions with unambiguous R codes and switches by code", a
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
   assert.match(replies.at(-1) ?? "", /没有这个切换编号/);
 
-  await send("resume-first", `/resume r${firstNumber}`);
+  await send("resume-first", `/session r${firstNumber}`);
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, first.id);
-  assert.match(replies.at(-1) ?? "", new RegExp(`已通过 R${firstNumber} 切换到：更新修复`));
+  assert.match(replies.at(-1) ?? "", /已绑定项目“桌面客户端”的会话：更新修复/);
   assert.doesNotMatch(replies.at(-1) ?? "", /thread-one/);
 
   await send("continued-turn", "继续处理");
   assert.equal(runs.at(-1)?.threadId, "thread-one");
+});
+
+test("lists only the ten most recent sessions in the current project", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-sessions-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("当前项目", path.join(tmpDir, "current"));
+  const sessions = Array.from({ length: 11 }, (_, index) =>
+    stateStore.createSession("alice@im.wechat", project.workspace, `项目会话 ${index + 1}`, project.id)
+  );
+  const other = stateStore.createProject("其他项目", path.join(tmpDir, "other"));
+  stateStore.createSession("alice@im.wechat", other.workspace, "其他项目会话", other.id);
+  stateStore.activateSession(sessions.at(-1)!.id);
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: { async stop() {} } as never
+  });
+
+  await service.handleMessage({
+    id: "sessions",
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text: "/sessions",
+    raw: {}
+  });
+
+  const reply = replies.join("\n");
+  assert.equal(reply.match(/\[R\d+\]/g)?.length, 10);
+  assert.doesNotMatch(reply, /\[R11\]/);
+  assert.doesNotMatch(reply, /其他项目会话/);
+});
+
+test("binds a Codex Desktop session from the current project and continues its thread", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bind-desktop-session-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("桌面项目", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "桥接会话", project.id);
+  const replies: string[] = [];
+  const runs: Array<{ threadId?: string }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    listCodexSessions: () => [{
+      threadId: "desktop-thread",
+      workspace: tmpDir,
+      lastUsedAt: "2099-08-01T09:00:00.000Z",
+      lastUserMessage: buildPrompt("继续桌面端方案")
+    }],
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async run(input: { threadId?: string }) {
+        runs.push(input);
+        return { raw: "", text: "已继续", threadId: input.threadId };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  await send("list", "/sessions");
+  assert.match(replies.at(-1) ?? "", /\[R1\] 继续桌面端方案/);
+  await send("bind", "/session R1");
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.threadId, "desktop-thread");
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, project.id);
+  assert.match(replies.at(-1) ?? "", /下一条消息将继续该历史会话/);
+
+  await send("continue", "接着完成");
+  assert.equal(runs.at(-1)?.threadId, "desktop-thread");
+});
+
+test("authorized WeChat can add, list, and switch Codex projects", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-command-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const replies: string[] = [];
+  const workspace = path.join(tmpDir, "jiaxing-ai");
+  fs.mkdirSync(workspace);
+  const candidate = {
+    name: "嘉兴AI社区",
+    workspace,
+    lastUsedAt: "2026-07-30T08:00:00.000Z",
+    sessionCount: 3
+  };
+  const serviceWithProjects = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      }
+    } as never,
+    runner: { async run() { return { raw: "", text: "ok" }; }, async stop() {} } as never,
+    listCodexProjects: () => [candidate]
+  });
+  const sendWithProjects = (id: string, text: string) => serviceWithProjects.handleMessage({
+    id,
+    senderId: "alice@im.wechat",
+    contextToken: "ctx",
+    text,
+    raw: {}
+  });
+
+  // Commands and ordinary messages on a fresh account do not create a default-directory project.
+  for (const [id, text] of [
+    ["project-help", "/help"],
+    ["project-status", "/status"],
+    ["project-new", "/new"],
+    ["project-model", "/model"],
+    ["project-message", "开始处理任务"]
+  ]) {
+    await sendWithProjects(id, text);
+    assert.equal(stateStore.listProjects().length, 0);
+    assert.equal(stateStore.listSessions().length, 0);
+  }
+
+  // Given an authorized sender, when they choose a project sourced from Codex history
+  await sendWithProjects("project-discover", "/p a");
+  assert.match(replies.at(-1) ?? "", /\[C1\] 嘉兴AI社区/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /项目名称\|绝对路径/);
+  await sendWithProjects("project-add", "/p a C1");
+  await sendWithProjects("project-list", "/p l");
+  const projects = stateStore.listProjects();
+  const projectNumber = projects.findIndex((project) => project.name === "嘉兴AI社区") + 1;
+  const addedProject = projects[projectNumber - 1];
+  assert.match(replies.at(-1) ?? "", /已绑定的 Codex 项目/);
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区`));
+
+  // Legacy manual workspace binding cannot bypass the Codex candidate list.
+  const manualWorkspace = path.join(tmpDir, "manual-path");
+  await sendWithProjects("manual-bind", `/bind ${manualWorkspace}`);
+  assert.match(replies.at(-1) ?? "", /手工路径绑定已停用/);
+  assert.equal(stateStore.listProjects().some((project) => project.workspace === manualWorkspace), false);
+
+  await sendWithProjects("project-rename", `/p rn P${projectNumber}|嘉兴AI社区`);
+  assert.match(replies.at(-1) ?? "", /已重命名 Codex 项目/);
+  await sendWithProjects("project-switch", `/p P${projectNumber}`);
+  assert.match(replies.at(-1) ?? "", /项目暂无会话，已新建并绑定/);
+
+  // Then the active Codex task is pinned to that project workspace
+  assert.equal(stateStore.getWorkspace("alice@im.wechat"), workspace);
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, addedProject?.id);
+
+  await sendWithProjects("project-new-session", "/new");
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, addedProject?.id);
+  assert.match(replies.at(-1) ?? "", /已在当前项目“嘉兴AI社区”新建并绑定会话/);
+  await sendWithProjects("project-delete-blocked", `/p d P${projectNumber}`);
+  assert.match(replies.at(-1) ?? "", /项目下还有任务/);
 });
 
 test("lists and switches model and reasoning effort for the active WeChat session", async (t) => {
@@ -460,6 +789,7 @@ test("lists and switches model and reasoning effort for the active WeChat sessio
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const paths = resolveStatePaths(path.join(tmpDir, "state"));
   const stateStore = new RuntimeStateStore(paths);
+  stateStore.createProject("Test project", tmpDir);
   const replies: string[] = [];
   const runs: Array<{ model?: string; effort?: string }> = [];
   const models = [{
@@ -560,6 +890,7 @@ test("streams process progress but sends the final WeChat answer as one message"
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-stream-command-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const replies: string[] = [];
   const service = new BridgeService({
     config: {
@@ -630,6 +961,7 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-long-reply-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Test project", tmpDir);
   const replies: string[] = [];
   const finalText = `${"长回答".repeat(700)}\n\n来源：arXiv 官方作者检索。`;
   const service = new BridgeService({

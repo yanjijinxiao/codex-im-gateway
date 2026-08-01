@@ -5,6 +5,7 @@ import { ensureDir, readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { StatePaths } from "../state/paths.js";
 
 export type WeixinAccount = {
+  channel?: "weixin";
   accountId: string;
   botId?: string;
   token: string;
@@ -15,6 +16,29 @@ export type WeixinAccount = {
   savedAt: string;
   enabled: boolean;
 };
+
+export type WeComAccount = {
+  channel: "wecom";
+  accountId: string;
+  botId: string;
+  secret: string;
+  displayName?: string;
+  savedAt: string;
+  enabled: boolean;
+};
+
+export type FeishuAccount = {
+  channel: "feishu";
+  accountId: string;
+  appId: string;
+  appSecret: string;
+  displayName?: string;
+  savedAt: string;
+  enabled: boolean;
+};
+
+export type ChannelAccount = WeixinAccount | WeComAccount | FeishuAccount;
+export type ChannelKind = "weixin" | "wecom" | "feishu";
 
 export type RetainedWeixinAccount = {
   accountId: string;
@@ -30,7 +54,11 @@ export function normalizeAccountId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_.-]/g, "-");
 }
 
-export function saveAccount(paths: StatePaths, account: WeixinAccount): void {
+export function accountChannel(account: ChannelAccount): ChannelKind {
+  return account.channel ?? "weixin";
+}
+
+export function saveAccount(paths: StatePaths, account: ChannelAccount): void {
   ensureDir(paths.accountsDir);
   writeJsonFile(path.join(paths.accountsDir, `${normalizeAccountId(account.accountId)}.json`), account);
 }
@@ -45,8 +73,9 @@ export function saveScannedAccount(
   scanned: WeixinAccount,
   targetAccountId?: string
 ): SaveScannedAccountResult {
-  const accounts = listAccounts(paths);
-  const target = targetAccountId ? loadAccount(paths, targetAccountId) : undefined;
+  const accounts = listAccounts(paths).filter((account): account is WeixinAccount => accountChannel(account) === "weixin");
+  const loadedTarget = targetAccountId ? loadAccount(paths, targetAccountId) : undefined;
+  const target = loadedTarget && accountChannel(loadedTarget) === "weixin" ? loadedTarget as WeixinAccount : undefined;
   if (target?.userId && scanned.userId && target.userId !== scanned.userId) {
     throw new Error("The scanned WeChat account does not match the existing account");
   }
@@ -122,25 +151,25 @@ export function forgetRetainedAccount(
   }
 }
 
-export function listAccounts(paths: StatePaths): WeixinAccount[] {
+export function listAccounts(paths: StatePaths): ChannelAccount[] {
   ensureDir(paths.accountsDir);
   return fs.readdirSync(paths.accountsDir)
     .filter((name) => name.endsWith(".json"))
-    .map((name) => readJsonFile<WeixinAccount>(path.join(paths.accountsDir, name), undefined as never))
+    .map((name) => readJsonFile<ChannelAccount>(path.join(paths.accountsDir, name), undefined as never))
     .map((account) => ({ ...account, enabled: account.enabled !== false }))
     .sort((a, b) => a.accountId.localeCompare(b.accountId));
 }
 
-export function setAccountEnabled(paths: StatePaths, accountId: string, enabled: boolean): WeixinAccount {
+export function setAccountEnabled(paths: StatePaths, accountId: string, enabled: boolean): ChannelAccount {
   const account = loadAccount(paths, accountId);
   const updated = { ...account, enabled };
   saveAccount(paths, updated);
   return updated;
 }
 
-export function setAccountDisplayName(paths: StatePaths, accountId: string, displayName: string): WeixinAccount {
+export function setAccountDisplayName(paths: StatePaths, accountId: string, displayName: string): ChannelAccount {
   const account = loadAccount(paths, accountId);
-  const updated: WeixinAccount = { ...account };
+  const updated: ChannelAccount = { ...account };
   const normalized = displayName.trim();
   if (normalized) {
     updated.displayName = normalized;
@@ -156,14 +185,27 @@ export function deleteAccount(paths: StatePaths, accountId: string): void {
   fs.rmSync(path.join(paths.accountsDir, `${normalizeAccountId(account.accountId)}.json`), { force: true });
 }
 
-export type PublicWeixinAccount = Omit<WeixinAccount, "token">;
+export type PublicChannelAccount =
+  | (Omit<WeixinAccount, "token"> & { channel: "weixin" })
+  | Omit<WeComAccount, "secret">
+  | Omit<FeishuAccount, "appSecret">;
 
-export function publicAccount(account: WeixinAccount): PublicWeixinAccount {
-  const { token: _token, ...safe } = account;
-  return safe;
+export type PublicWeixinAccount = PublicChannelAccount;
+
+export function publicAccount(account: ChannelAccount): PublicChannelAccount {
+  if (accountChannel(account) === "wecom") {
+    const { secret: _secret, ...safe } = account as WeComAccount;
+    return safe;
+  }
+  if (accountChannel(account) === "feishu") {
+    const { appSecret: _appSecret, ...safe } = account as FeishuAccount;
+    return safe;
+  }
+  const { token: _token, ...safe } = account as WeixinAccount;
+  return { ...safe, channel: "weixin" };
 }
 
-export function loadAccount(paths: StatePaths, accountId?: string): WeixinAccount {
+export function loadAccount(paths: StatePaths, accountId?: string): ChannelAccount {
   const accounts = listAccounts(paths);
   if (accounts.length === 0) {
     throw new Error("No WeChat account found. Open codex-weixin and add an account.");

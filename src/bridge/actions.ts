@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { inferMediaKind } from "../weixin/media.js";
+import { KNOWLEDGE_KINDS, type KnowledgeInput } from "../state/knowledge.js";
 
 export type SendAction = {
   type: "image" | "file" | "video";
@@ -16,6 +17,7 @@ export type ControlAction =
 export type BridgeActions = {
   send: SendAction[];
   control: ControlAction[];
+  remember: KnowledgeInput[];
 };
 
 export type ParsedActionBlocks = {
@@ -127,12 +129,43 @@ function normalizeControlAction(raw: unknown): ControlAction {
   throw new Error(`unsupported control action type: ${String(candidate.type)}`);
 }
 
+function normalizeKnowledgeAction(raw: unknown): KnowledgeInput {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("remember action must be an object");
+  }
+  const candidate = raw as { kind?: unknown; scope?: unknown; title?: unknown; content?: unknown };
+  if (!KNOWLEDGE_KINDS.includes(candidate.kind as KnowledgeInput["kind"])) {
+    throw new Error("remember action kind must be preference, skill, knowledge, or workflow");
+  }
+  if (candidate.scope !== "account" && candidate.scope !== "project") {
+    throw new Error("remember action scope must be account or project");
+  }
+  if (typeof candidate.title !== "string" || typeof candidate.content !== "string") {
+    throw new Error("remember action title and content are required");
+  }
+  return {
+    kind: candidate.kind as KnowledgeInput["kind"],
+    scope: candidate.scope,
+    title: candidate.title,
+    content: candidate.content
+  };
+}
+
+function tryNormalizeKnowledgeAction(raw: unknown): KnowledgeInput | undefined {
+  try {
+    return normalizeKnowledgeAction(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseActionBlocks(text: string): ParsedActionBlocks {
-  const actions: BridgeActions = { send: [], control: [] };
+  const actions: BridgeActions = { send: [], control: [], remember: [] };
   const visibleTextWithoutBlocks = text.replace(ACTION_BLOCK_RE, (_match, body: string) => {
     const parsed = JSON.parse(String(body).trim()) as {
       send?: unknown;
       control?: unknown;
+      remember?: unknown;
     };
 
     if (Array.isArray(parsed.send)) {
@@ -143,6 +176,12 @@ export function parseActionBlocks(text: string): ParsedActionBlocks {
     }
     if (Array.isArray(parsed.control)) {
       actions.control.push(...parsed.control.map(normalizeControlAction));
+    }
+    if (Array.isArray(parsed.remember)) {
+      for (const raw of parsed.remember.slice(0, 3)) {
+        const action = tryNormalizeKnowledgeAction(raw);
+        if (action) actions.remember.push(action);
+      }
     }
 
     return "";

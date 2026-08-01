@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
 
 import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
+import { parseAccountRateLimits, type CodexAccountBalance } from "./account-balance.js";
 
 export type AppServerRunnerOptions = {
   codexBin?: string;
@@ -217,6 +218,11 @@ export class AppServerCodexRunner {
     } while (cursor);
     this.modelOptions = models;
     return structuredClone(models);
+  }
+
+  async getAccountRateLimits(): Promise<CodexAccountBalance> {
+    await this.ensureConnected();
+    return parseAccountRateLimits(await this.request("account/rateLimits/read", {}));
   }
 
   async stop(threadId?: string): Promise<void> {

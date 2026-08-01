@@ -96,6 +96,15 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
       { effort: "high", description: "Deeper reasoning" }
     ]
   }]);
+  assert.deepEqual(await runner.getAccountRateLimits(), {
+    limitId: "codex",
+    limitName: "Codex",
+    planType: "plus",
+    primary: { usedPercent: 18.5, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+    secondary: { usedPercent: 42, windowDurationMins: 10_080, resetsAt: 1_800_604_800 },
+    credits: { hasCredits: true, unlimited: false, balance: "12.34" },
+    spendControlReached: false
+  });
 });
 
 test("interrupts the active V2 turn with both threadId and turnId", async (t) => {

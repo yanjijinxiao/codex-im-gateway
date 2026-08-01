@@ -69,6 +69,58 @@ test("keeps sessions for different senders independent", (t) => {
   assert.equal(store.getWorkspace("bob@im.wechat"), path.resolve("/bob"));
 });
 
+test("manages projects and keeps sessions attached to their project", (t) => {
+  const store = createStore(t);
+
+  // Given an account-local project
+  const project = store.createProject("嘉兴AI社区", "/work/jiaxing");
+
+  // When a task is created inside it
+  const session = store.createSession("alice@im.wechat", project.workspace, "整理创业想法", project.id);
+
+  // Then project metadata and task ownership persist together
+  assert.equal(store.listProjects()[0]?.name, "嘉兴AI社区");
+  assert.equal(store.getSession(session.id)?.projectId, project.id);
+  assert.equal(store.renameProject(project.id, "嘉兴 AI 社区").name, "嘉兴 AI 社区");
+});
+
+test("persists deduplicated project completion notification targets", (t) => {
+  const store = createStore(t);
+  const project = store.createProject("通知项目", "/work/notifications");
+
+  store.setProjectNotifications(project.id, [
+    { accountId: "wecom-bot", recipientId: "engineering", enabled: true },
+    { accountId: "wecom-bot", recipientId: "engineering", enabled: false },
+    { accountId: "feishu-app", recipientId: "oc_chat", enabled: true }
+  ]);
+
+  assert.deepEqual(store.listProjects()[0].notifications, [
+    { accountId: "wecom-bot", recipientId: "engineering", enabled: false },
+    { accountId: "feishu-app", recipientId: "oc_chat", enabled: true }
+  ]);
+});
+
+test("prevents deleting a project that still owns sessions", (t) => {
+  const store = createStore(t);
+  const project = store.createProject("内容运营", "/work/content");
+  store.createSession("alice@im.wechat", project.workspace, "首篇小红书", project.id);
+
+  assert.throws(() => store.deleteProject(project.id), /still has sessions/);
+});
+
+test("migrates existing session workspaces into account-local projects", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-migration-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const paths = resolveStatePaths(root);
+  const original = new RuntimeStateStore(paths);
+  const session = original.createSession("alice@im.wechat", "/work/legacy", "旧任务");
+
+  const reloaded = new RuntimeStateStore(paths);
+  const project = reloaded.listProjects()[0];
+  assert.equal(project?.workspace, path.resolve("/work/legacy"));
+  assert.equal(reloaded.getSession(session.id)?.projectId, project?.id);
+});
+
 test("persists model and reasoning effort overrides per managed session", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-session-runtime-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -109,6 +161,47 @@ test("updates model, effort, and streaming by managed session id for Web control
   assert.equal(store.getSession(first.id)?.model, undefined);
   assert.equal(store.getSession(first.id)?.effort, undefined);
   assert.equal(store.getSession(first.id)?.streamReplies, undefined);
+});
+
+test("persists, deduplicates, scopes, and filters personal knowledge", (t) => {
+  const store = createStore(t);
+  const firstProject = store.createProject("内容运营", "/work/content");
+  const secondProject = store.createProject("产品研发", "/work/product");
+  const session = store.createSession("alice@im.wechat", firstProject.workspace, "首篇内容", firstProject.id);
+
+  store.rememberKnowledge({
+    kind: "preference",
+    scope: "account",
+    title: " 回复风格 ",
+    content: " 结论优先，使用中文 "
+  }, firstProject.id, session.id);
+  store.rememberKnowledge({
+    kind: "preference",
+    scope: "account",
+    title: "回复风格",
+    content: "结论优先，必要时补充步骤"
+  }, firstProject.id, session.id);
+  store.rememberKnowledge({
+    kind: "workflow",
+    scope: "project",
+    title: "发布流程",
+    content: "发布前运行测试和构建"
+  }, firstProject.id, session.id);
+  const rejected = store.rememberKnowledge({
+    kind: "knowledge",
+    scope: "account",
+    title: "部署密钥",
+    content: "API_KEY: should-not-be-stored"
+  });
+
+  assert.equal(rejected, undefined);
+  assert.equal(store.listKnowledge().length, 2);
+  assert.equal(store.listKnowledge().find((entry) => entry.title === "回复风格")?.content, "结论优先，必要时补充步骤");
+  assert.equal(store.relevantKnowledge("准备发布", firstProject.id).length, 2);
+  assert.deepEqual(
+    store.relevantKnowledge("准备发布", secondProject.id).map((entry) => entry.title),
+    ["回复风格"]
+  );
 });
 
 test("persistently claims inbound message ids once and bounds the history", (t) => {

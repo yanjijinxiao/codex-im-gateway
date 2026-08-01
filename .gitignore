@@ -3,6 +3,7 @@ dist/
 coverage/
 output/
 .playwright-cli/
+.omo/
 .env
 .codex-weixin/
 *.log

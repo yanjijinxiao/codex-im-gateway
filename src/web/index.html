@@ -24,17 +24,17 @@
         <span class="brand-version" id="productVersion" aria-label="codex-weixin 版本" hidden></span>
       </a>
       <nav class="view-tabs" aria-label="管理视图">
-        <button class="tab is-active" type="button" data-view="accounts">微信账号</button>
+        <button class="tab is-active" type="button" data-view="accounts">消息渠道</button>
         <button class="tab" type="button" data-view="sessions">会话</button>
         <button class="tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="header-actions">
-        <a class="icon-button github-link" href="https://github.com/XavierJiezou/codex-weixin" target="_blank" rel="noopener noreferrer" title="前往 GitHub" aria-label="前往 codex-weixin GitHub 仓库">
+        <a class="icon-button github-link" href="https://github.com/lsiten/codex-weixin" target="_blank" rel="noopener noreferrer" title="前往 GitHub" aria-label="前往 codex-weixin GitHub 仓库">
           <i data-lucide="github"></i>
         </a>
-        <button class="button button-primary header-action" id="addAccountButton" type="button" title="添加微信" aria-label="添加微信">
-          <i data-lucide="scan-line"></i>
-          <span>添加微信</span>
+        <button class="button button-primary header-action" id="addAccountButton" type="button" title="添加消息渠道" aria-label="添加消息渠道">
+          <i data-lucide="message-square-plus"></i>
+          <span>添加渠道</span>
         </button>
       </div>
     </div>
@@ -56,7 +56,7 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">WECHAT ACCOUNTS</p>
-          <h1>微信账号</h1>
+          <h1>消息渠道</h1>
         </div>
         <button class="icon-button" id="refreshAccountsButton" type="button" title="刷新账号状态" aria-label="刷新账号状态">
           <i data-lucide="refresh-cw"></i>
@@ -71,10 +71,16 @@
           <p class="eyebrow">CODEX SESSIONS</p>
           <h1>会话</h1>
         </div>
-        <button class="button button-secondary" id="newSessionButton" type="button">
-          <i data-lucide="plus"></i>
-          <span>新建会话</span>
-        </button>
+        <div class="heading-actions">
+          <button class="button button-secondary" id="addProjectButton" type="button">
+            <i data-lucide="folder-plus"></i>
+            <span>添加 Codex 项目</span>
+          </button>
+          <button class="button button-primary" id="newSessionButton" type="button">
+            <i data-lucide="plus"></i>
+            <span>新建任务</span>
+          </button>
+        </div>
       </div>
       <div class="session-account-bar" aria-label="微信账号筛选">
         <span class="session-account-bar-label"><i data-lucide="users"></i><span>微信账号</span></span>
@@ -253,6 +259,59 @@
     </div>
   </dialog>
 
+  <dialog class="modal channel-modal" id="channelDialog" aria-labelledby="channelDialogTitle">
+    <form id="channelForm" method="dialog">
+      <div class="modal-header">
+        <div><p class="eyebrow">MESSAGE CHANNEL</p><h2 id="channelDialogTitle">添加消息渠道</h2></div>
+        <button class="icon-button" type="button" data-close-dialog="channelDialog" title="关闭" aria-label="关闭添加渠道窗口"><i data-lucide="x"></i></button>
+      </div>
+      <div class="modal-body form-stack">
+        <label><span>渠道类型</span><select id="channelTypeInput"><option value="weixin">个人微信（扫码）</option><option value="wecom">企业微信智能机器人</option><option value="feishu">飞书自建应用</option></select></label>
+        <section class="channel-tutorial" data-channel-tutorial="weixin">
+          <div class="channel-tutorial-head"><span><i data-lucide="book-open-check"></i></span><div><strong>个人微信添加教程</strong><small>约 1 分钟</small></div></div>
+          <ol>
+            <li><span>1</span><p>点击下方“扫码登录”，页面会生成专用二维码。</p></li>
+            <li><span>2</span><p>使用要接入的个人微信扫码，并在手机上确认登录。</p></li>
+            <li><span>3</span><p>登录成功后，给机器人发送一条消息，再回管理页允许该联系人访问。</p></li>
+          </ol>
+          <div class="channel-local-note"><i data-lucide="circle-check"></i><span>无需前往其他后台配置，直接点击下方“扫码登录”。</span></div>
+        </section>
+        <section class="channel-tutorial" data-channel-tutorial="wecom" hidden>
+          <div class="channel-tutorial-head"><span><i data-lucide="book-open-check"></i></span><div><strong>企业微信添加教程</strong><small>需要管理员权限</small></div></div>
+          <ol>
+            <li><span>1</span><p>在企业微信工作台进入“智能机器人”，创建一个 <b>API 模式机器人</b>。</p></li>
+            <li><span>2</span><p>在机器人 API 设置中选择 <b>WebSocket 长连接</b>，无需填写公网回调地址。</p></li>
+            <li><span>3</span><p>复制机器人页面提供的 <b>Bot ID</b> 和 <b>Secret</b>，填入下方对应字段。</p></li>
+            <li><span>4</span><p>添加完成后，在企业微信中向机器人发送一条消息，系统会自动登记接收会话。</p></li>
+          </ol>
+          <div class="channel-client-note"><i data-lucide="monitor-smartphone"></i><span>创建智能机器人需在企业微信客户端的“工作台”中完成。</span></div>
+          <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://work.weixin.qq.com/wework_admin/frame#apps" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开企业微信管理后台</span></a><a class="channel-doc-link" href="https://developer.work.weixin.qq.com/document/path/101463" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方长连接文档</span></a></div>
+        </section>
+        <section class="channel-tutorial" data-channel-tutorial="feishu" hidden>
+          <div class="channel-tutorial-head"><span><i data-lucide="book-open-check"></i></span><div><strong>飞书添加教程</strong><small>企业自建应用</small></div></div>
+          <ol>
+            <li><span>1</span><p>进入飞书开放平台“开发者后台”，创建 <b>企业自建应用</b>，并添加机器人能力。</p></li>
+            <li><span>2</span><p>在“凭证与基础信息”复制 <b>App ID</b> 和 <b>App Secret</b>，填入下方字段。</p></li>
+            <li><span>3</span><p>开通机器人收发消息权限：单聊消息、群聊中 @ 机器人消息、以应用身份发消息。</p></li>
+            <li><span>4</span><p>在“事件与回调”选择 <b>长连接</b>，添加“接收消息”事件 <code>im.message.receive_v1</code>。</p></li>
+            <li><span>5</span><p>创建版本并发布应用，再向机器人发送一条消息以登记接收会话。</p></li>
+          </ol>
+          <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开飞书开发者后台</span></a><a class="channel-doc-link" href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方长连接文档</span></a></div>
+        </section>
+        <label id="channelNameField" hidden><span>备注名称</span><input id="channelNameInput" maxlength="40" autocomplete="off" placeholder="例如：研发通知机器人"></label>
+        <label id="wecomBotIdField" hidden><span>Bot ID</span><input id="wecomBotIdInput" maxlength="200" autocomplete="off"></label>
+        <label id="wecomSecretField" hidden><span>Secret</span><input id="wecomSecretInput" type="password" maxlength="500" autocomplete="new-password"></label>
+        <label id="feishuAppIdField" hidden><span>App ID</span><input id="feishuAppIdInput" maxlength="200" autocomplete="off"></label>
+        <label id="feishuSecretField" hidden><span>App Secret</span><input id="feishuSecretInput" type="password" maxlength="500" autocomplete="new-password"></label>
+        <small class="field-hint channel-security-hint" id="channelSetupHint"><i data-lucide="shield-check"></i><span>个人微信通过二维码登录，不需要填写凭据。</span></small>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="channelDialog">取消</button>
+        <button class="button button-primary" type="submit"><i data-lucide="plus"></i><span id="channelSubmitLabel">扫码登录</span></button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog class="modal qr-modal" id="qrDialog">
     <div class="modal-header">
       <div>
@@ -348,7 +407,7 @@
     </form>
   </dialog>
 
-  <dialog class="modal session-modal" id="sessionDialog">
+  <dialog class="modal session-modal" id="sessionDialog" aria-labelledby="sessionDialogTitle">
     <form id="sessionForm" method="dialog">
       <div class="modal-header">
         <div>
@@ -370,9 +429,9 @@
           <span>会话名称</span>
           <input id="sessionTitleInput" maxlength="80" autocomplete="off" required>
         </label>
-        <label id="sessionWorkspaceField">
-          <span>工作目录</span>
-          <input id="sessionWorkspaceInput" autocomplete="off" required>
+        <label id="sessionProjectField">
+          <span>Codex 项目</span>
+          <select id="sessionProjectInput" required></select>
         </label>
       </div>
       <div class="modal-footer">
@@ -381,6 +440,61 @@
           <i data-lucide="check"></i>
           <span>保存</span>
         </button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="projectDialog" aria-labelledby="projectDialogTitle">
+    <form id="projectForm" method="dialog">
+      <div class="modal-header">
+        <div>
+          <p class="eyebrow">CODEX PROJECT</p>
+          <h2 id="projectDialogTitle">添加 Codex 项目</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="projectDialog" title="关闭" aria-label="关闭项目窗口">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <input id="editingProjectId" type="hidden">
+      <input id="editingProjectAccountId" type="hidden">
+      <div class="modal-body form-stack">
+        <label id="projectAccountField">
+          <span>授权微信</span>
+          <select id="projectAccountInput" required></select>
+        </label>
+        <label>
+          <span>项目名称</span>
+          <input id="projectNameInput" maxlength="60" autocomplete="off" placeholder="例如：嘉兴AI社区" required>
+        </label>
+        <label id="projectWorkspaceField">
+          <span>从 Codex 数据选择</span>
+          <select id="projectWorkspaceInput" required></select>
+          <small class="field-hint" id="projectWorkspaceHint">从 Codex 本地会话历史读取最近使用的项目，不扫描普通目录。</small>
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="projectDialog">取消</button>
+        <button class="button button-primary" id="saveProjectButton" type="submit"><i data-lucide="check"></i><span>保存项目</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="projectNotificationDialog" aria-labelledby="projectNotificationDialogTitle">
+    <form id="projectNotificationForm" method="dialog">
+      <div class="modal-header">
+        <div><p class="eyebrow">TASK NOTIFICATION</p><h2 id="projectNotificationDialogTitle">项目任务通知</h2></div>
+        <button class="icon-button" type="button" data-close-dialog="projectNotificationDialog" title="关闭" aria-label="关闭项目通知窗口"><i data-lucide="x"></i></button>
+      </div>
+      <input id="notificationProjectAccountId" type="hidden">
+      <input id="notificationProjectId" type="hidden">
+      <div class="modal-body form-stack">
+        <label class="toggle-field" for="notificationEnabledInput"><span>任务结束时通知</span><span class="toggle-control"><input id="notificationEnabledInput" type="checkbox"><span aria-hidden="true"></span></span></label>
+        <label><span>通知渠道</span><select id="notificationAccountInput"></select></label>
+        <label><span>接收会话 / 用户 ID</span><input id="notificationRecipientInput" maxlength="300" autocomplete="off" placeholder="例如：oc_xxx、ou_xxx 或企业微信 userid" required><small class="field-hint">可先向机器人发送一条消息，再从账号卡片复制最近使用的会话 ID。</small></label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="projectNotificationDialog">取消</button>
+        <button class="button button-primary" type="submit"><i data-lucide="bell"></i><span>保存通知</span></button>
       </div>
     </form>
   </dialog>
