@@ -637,7 +637,7 @@ export class BridgeService {
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     try {
       await this.withTyping(message.senderId, async () => {
-        console.log(`[codex-weixin] starting Codex turn for ${message.senderId} in ${workspace}`);
+        console.log(`[codex-channel-bridge] starting Codex turn for ${message.senderId} in ${workspace}`);
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
         const result = await this.runner.run({
           prompt: buildPrompt(text, attachments, "WeChat", knowledge),
@@ -654,7 +654,7 @@ export class BridgeService {
             }
           } : {})
         });
-        console.log(`[codex-weixin] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
+        console.log(`[codex-channel-bridge] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
           this.options.stateStore.setThread(message.senderId, result.threadId);
         }
@@ -708,7 +708,7 @@ export class BridgeService {
         kind: action.type
       });
     } catch (error) {
-      await this.reply(senderId, `[codex-weixin] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
+      await this.reply(senderId, `[codex-channel-bridge] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -746,7 +746,7 @@ export class BridgeService {
     const workspace = session?.workspace ?? this.options.config.defaultCwd;
     const runtime = await this.effectiveRuntime(senderId);
     return [
-      "codex-weixin status",
+      "codex-channel-bridge status",
       `sender: ${senderId}`,
       `session: ${session?.title ?? "(new)"}`,
       `workspace: ${workspace}`,
@@ -797,9 +797,9 @@ export class BridgeService {
   private async reply(senderId: string, text: string): Promise<void> {
     const contextToken = this.options.stateStore.getContextToken(senderId);
     try {
-      console.log(`[codex-weixin] sending reply to ${senderId}; text=${text.length} chars`);
+      console.log(`[codex-channel-bridge] sending reply to ${senderId}; text=${text.length} chars`);
       await this.options.weixin.sendText({ toUserId: senderId, text, contextToken });
-      console.log(`[codex-weixin] sent reply to ${senderId}`);
+      console.log(`[codex-channel-bridge] sent reply to ${senderId}`);
     } catch (error) {
       if (isStaleContextError(error)) {
         console.warn(`WeChat context token is stale for ${senderId}; ask user to send a fresh message.`);

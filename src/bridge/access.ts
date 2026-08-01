@@ -27,7 +27,7 @@ export class AccessController {
 
     return {
       allowed: false,
-      message: `Access denied. Open the codex-weixin management page and allow sender: ${senderId}`
+      message: `Access denied. Open the Codex Channel Bridge management page and allow sender: ${senderId}`
     };
   }
 

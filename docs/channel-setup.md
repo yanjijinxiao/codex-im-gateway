@@ -4,7 +4,7 @@
 
 ## 中文
 
-所有渠道都在本机管理页 `http://127.0.0.1:8787` 的“账号”页面添加。凭据只保存在 `~/.codex-weixin/`，管理 API 不会把 Secret 或 Token 返回给浏览器。
+所有渠道都在 Codex Channel Bridge 本机管理页 `http://127.0.0.1:8787` 的“账号”页面添加。凭据只保存在兼容数据目录 `~/.codex-weixin/`，管理 API 不会把 Secret 或 Token 返回给浏览器。
 
 ### 个人微信
 
@@ -47,7 +47,7 @@
 
 ## English
 
-Add all channels from the **Accounts** page at `http://127.0.0.1:8787`. Credentials stay under `~/.codex-weixin/`; the management API never returns secrets or tokens to the browser.
+Add all channels from the Codex Channel Bridge **Accounts** page at `http://127.0.0.1:8787`. Credentials stay in the compatibility data directory `~/.codex-weixin/`; the management API never returns secrets or tokens to the browser.
 
 ### Personal WeChat
 

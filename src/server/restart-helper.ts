@@ -28,7 +28,7 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void>
   const deadline = Date.now() + timeoutMs;
   while (processExists(pid)) {
     if (Date.now() >= deadline) {
-      throw new Error("Timed out waiting for codex-weixin to stop");
+      throw new Error("Timed out waiting for codex-channel-bridge to stop");
     }
     await delay(200);
   }

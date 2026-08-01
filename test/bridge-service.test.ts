@@ -292,7 +292,7 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   assert.equal(imageMessages[0].toUserId, "alice@im.wechat");
   assert.equal(imageMessages[0].contextToken, "ctx");
   assert.equal(imageMessages[0].encryptQueryParam, "download-param");
-  assert.equal(textReplies.some((reply) => reply.includes("[codex-weixin] File send requested")), false);
+  assert.equal(textReplies.some((reply) => reply.includes("[codex-channel-bridge] File send requested")), false);
   assert.equal(textReplies.some((reply) => reply.includes(markdownPath)), false);
   assert.equal(textReplies.join("\n").includes("如果图片没有直接显示"), false);
 });

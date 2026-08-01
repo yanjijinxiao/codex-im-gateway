@@ -1,7 +1,7 @@
-<h1 align="center">codex-weixin</h1>
+<h1 align="center">Codex Channel Bridge</h1>
 
 <p align="center">
-  <img src="src/web/favicon.svg" alt="codex-weixin logo" width="128" height="128" />
+  <img src="src/web/favicon.svg" alt="Codex Channel Bridge logo" width="128" height="128" />
 </p>
 
 <p align="center">
@@ -12,10 +12,10 @@
   <strong>Connect WeChat, Enterprise WeChat, and Feishu to a local OpenAI Codex installation.</strong>
 </p>
 
-`codex-weixin` is a cross-platform, local-only messaging bridge for Codex. Its Web console adds personal WeChat, Enterprise WeChat, and Feishu channels, manages projects and bound sessions, and configures task-completion notifications.
+`codex-channel-bridge` is a cross-platform, local-only messaging bridge for Codex. Its Web console adds personal WeChat, Enterprise WeChat, and Feishu channels, manages projects and bound sessions, and configures task-completion notifications.
 
 ```text
-WeChat / Enterprise WeChat / Feishu <-> codex-weixin <-> local Codex <-> bound projects
+WeChat / Enterprise WeChat / Feishu <-> Codex Channel Bridge <-> local Codex <-> bound projects
 ```
 
 Service data and credentials remain local. The management page is never exposed to the LAN or public Internet.
@@ -42,12 +42,12 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 | ✅ | Process progress | Enabled by default; Codex progress reaches WeChat immediately and appears in a collapsible Web timeline with elapsed time, while final answers stay intact. | Pending: `docs/images/screenshots/web-process-progress.png` |
 | ✅ | Typing state and deduplication | Web typing state plus persistent sync cursors and message IDs prevent duplicate replies. | Pending: `docs/images/screenshots/wechat-typing.png` |
 | ✅ | App-server first | New and resumed sessions prefer Codex app-server V2 and fall back to `codex exec` when unavailable. | Pending: `docs/images/screenshots/wechat-status.png` |
-| ✅ | Web auto-update | Selects npm or npmmirror, updates the active npm runtime, verifies it, then restarts and reconnects. | Pending: `docs/images/screenshots/web-auto-update.png` |
+| ✅ | Local source operation | Installs locked dependencies, builds locally, and runs directly with Node.js; the project is not published as an npm package. | [Local run guide](docs/local-run.md) |
 
 ## Web management preview
 
 <p align="center">
-  <img src="docs/images/screenshots/web-session-management.png" alt="codex-weixin Web session management" width="100%" />
+  <img src="docs/images/screenshots/web-session-management.png" alt="Codex Channel Bridge Web session management" width="100%" />
 </p>
 
 ## Requirements
@@ -62,31 +62,19 @@ codex --version
 codex
 ```
 
-## Install and start
+## Run locally
 
-Install globally from npm:
-
-```bash
-npm install -g codex-weixin
-codex-weixin
-```
-
-Or install from source:
+This project is available only as GitHub source. It is not published as an npm package; do not run `npm install -g codex-channel-bridge` or `npm publish`.
 
 ```bash
-git clone https://github.com/lsiten/codex-weixin.git
-cd codex-weixin
-npm install
+git clone https://github.com/lsiten/codex-channel-bridge.git
+cd codex-channel-bridge
+npm ci
 npm run build
-npm install -g .
-codex-weixin
+node dist/server/index.js
 ```
 
-The service opens [http://127.0.0.1:8787](http://127.0.0.1:8787). To run without a global install:
-
-```bash
-npm start
-```
+Here npm only installs locked dependencies and runs the build; it does not install or start this service. Node.js starts the service directly and opens [http://127.0.0.1:8787](http://127.0.0.1:8787). See the [local run guide](./docs/local-run.md) for update, start, and stop instructions.
 
 ## Add a message channel
 
@@ -170,7 +158,7 @@ After each turn, Codex may extract up to three durable entries from explicit pre
 Codex can request local-file delivery in its final response:
 
 ````text
-```codex-weixin-actions
+```codex-channel-bridge-actions
 {
   "send": [
     { "type": "image", "path": "/absolute/path/chart.png" },
@@ -218,9 +206,9 @@ Do not commit or share this directory. The management API never returns WeChat t
 The server always binds to `127.0.0.1`. Environment variables can change its port and state directory or disable automatic browser opening:
 
 ```text
-CODEX_WEIXIN_PORT=8787
-CODEX_WEIXIN_STATE_DIR=/absolute/private/path
-CODEX_WEIXIN_OPEN=0
+CODEX_CHANNEL_BRIDGE_PORT=8787
+CODEX_CHANNEL_BRIDGE_STATE_DIR=/absolute/private/path
+CODEX_CHANNEL_BRIDGE_OPEN=0
 ```
 
 ## Security model
@@ -233,18 +221,18 @@ CODEX_WEIXIN_OPEN=0
 - `danger-full-access` bypasses the Codex filesystem sandbox and must be enabled only when full-machine access is acceptable.
 - Concurrent accounts share local compute resources and Codex quotas.
 
-## Development
+## Development and verification
 
 ```bash
 npm install
-npm run dev
 npm test
 npm run typecheck
 npm run build
+node dist/server/index.js
 ```
 
-The project originated from [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) and is now maintained at [lsiten/codex-weixin](https://github.com/lsiten/codex-weixin). It is distributed under the MIT License. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public Codex/WeChat projects for app-server, media-transfer, and security-boundary practices. No AGPL source code was copied.
+The project originated from [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) and is now independently maintained as [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge). The legacy `~/.codex-weixin` directory, `CODEX_WEIXIN_*` variables, and old action blocks remain compatibility interfaces for existing installations. It is distributed under the MIT License. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public Codex/WeChat projects for app-server, media-transfer, and security-boundary practices. No AGPL source code was copied.
 
-When started from a source checkout with `npm run dev` or `npm start`, the Web page checks for updates but does not install them; update the Git checkout and rebuild instead. Global installations and isolated `node_modules/codex-weixin` runtimes update the npm prefix that owns the active package and verify the target version and service entry before restarting. On Windows, the updater first releases any process working-directory lock inside the package tree so npm can replace it without `EBUSY`.
+The project is never published to npm and the Web page does not install updates. Update the Git checkout, run `npm ci` and `npm run build`, then restart it with `node dist/server/index.js`.
 
 See [CHANGELOG.md](./CHANGELOG.md) for release history.

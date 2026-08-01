@@ -9,6 +9,7 @@ const UPDATE_REGISTRY_URLS = {
   npmmirror: "https://registry.npmmirror.com"
 } as const;
 const UPDATE_REGISTRY_IDS = Object.keys(UPDATE_REGISTRY_URLS) as UpdateRegistryId[];
+const PACKAGE_NAME = "codex-channel-bridge";
 const MAX_REGISTRY_RESPONSE_BYTES = 64 * 1024;
 const MAX_INSTALL_OUTPUT_BYTES = 20 * 1024;
 const STABLE_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -100,10 +101,10 @@ export class UpdateManager implements UpdateService {
     try {
       const status = await this.check(true);
       if (status.error) {
-        throw new Error("Unable to verify the latest codex-weixin version");
+        throw new Error(`Unable to verify the latest ${PACKAGE_NAME} version`);
       }
       if (!status.latestVersion || !status.updateAvailable) {
-        throw new Error("No newer codex-weixin version is available");
+        throw new Error(`No newer ${PACKAGE_NAME} version is available`);
       }
       if (!status.registry) {
         throw new Error("Unable to select an npm Registry");
@@ -165,7 +166,7 @@ export class UpdateManager implements UpdateService {
     registry: UpdateRegistryId,
     signal: AbortSignal
   ): Promise<{ latestVersion: string; registry: UpdateRegistryId }> {
-    const response = await this.fetchImpl(`${UPDATE_REGISTRY_URLS[registry]}/codex-weixin/latest`, {
+    const response = await this.fetchImpl(`${UPDATE_REGISTRY_URLS[registry]}/${PACKAGE_NAME}/latest`, {
       headers: { Accept: "application/json" },
       signal
     });
@@ -220,7 +221,7 @@ export function buildNpmInstallCommand(
     installPrefix,
     "--no-save",
     "--package-lock=false",
-    `codex-weixin@${safeVersion}`,
+    `${PACKAGE_NAME}@${safeVersion}`,
     `--registry=${UPDATE_REGISTRY_URLS[safeRegistry]}`,
     "--no-audit",
     "--no-fund"
@@ -292,7 +293,7 @@ export function resolveNpmInstallTarget(
   const pathApi = platform === "win32" ? path.win32 : path.posix;
   if (!pathApi.isAbsolute(packageRoot)) return undefined;
   const normalizedRoot = pathApi.resolve(packageRoot);
-  if (pathApi.basename(normalizedRoot).toLowerCase() !== "codex-weixin") return undefined;
+  if (pathApi.basename(normalizedRoot).toLowerCase() !== PACKAGE_NAME) return undefined;
   const nodeModulesDir = pathApi.dirname(normalizedRoot);
   if (pathApi.basename(nodeModulesDir).toLowerCase() !== "node_modules") return undefined;
   const packagePrefix = pathApi.dirname(nodeModulesDir);
@@ -318,7 +319,7 @@ export function releaseRuntimeDirectoryLock(
   const safePrefix = requireInstallPrefix(installPrefix, platform);
   const comparablePrefix = resolveComparablePath(safePrefix, platform, pathApi);
   const packageRoot = resolveComparablePath(
-    options.packageRoot ?? pathApi.join(comparablePrefix, "node_modules", "codex-weixin"),
+    options.packageRoot ?? pathApi.join(comparablePrefix, "node_modules", PACKAGE_NAME),
     platform,
     pathApi
   );
@@ -356,7 +357,7 @@ async function installCurrentRuntimeVersion(
   }
 ): Promise<void> {
   if (!options.installTarget) {
-    throw new Error("源码运行方式不支持网页自动安装，请更新 Git 源码、执行 npm install 和 npm run build 后重启");
+    throw new Error("仅支持本地源码更新：请更新 Git 源码、执行 npm ci 和 npm run build，再用 node dist/server/index.js 重启");
   }
   const target = options.installTarget;
   releaseRuntimeDirectoryLock(target.installPrefix, {
@@ -426,7 +427,7 @@ export function describeInstallFailure(code: number | null, output: string, plat
     return `npm 更新失败：运行目录正被占用（EBUSY，退出码 ${normalizedCode ?? "unknown"}）`;
   }
   const permissionHint = /EACCES|EPERM|permission/i.test(output)
-    ? " npm does not have permission to update the current codex-weixin runtime."
+    ? ` npm does not have permission to update the current ${PACKAGE_NAME} runtime.`
     : "";
   return `npm update failed with exit code ${normalizedCode ?? "unknown"}.${permissionHint}`;
 }
@@ -438,7 +439,7 @@ function verifyInstalledRuntime(packageRoot: string, version: string): void {
     const value = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { version?: unknown };
     if (value.version !== version || !fs.existsSync(entryPath)) throw new Error("version mismatch");
   } catch {
-    throw new Error("npm completed, but the active codex-weixin runtime was not updated");
+    throw new Error(`npm completed, but the active ${PACKAGE_NAME} runtime was not updated`);
   }
 }
 

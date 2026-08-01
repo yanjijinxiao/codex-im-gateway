@@ -1,4 +1,4 @@
-# codex-weixin Design System
+# Codex Channel Bridge Design System
 
 ## 0. Research Log
 

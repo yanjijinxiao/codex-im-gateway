@@ -72,7 +72,7 @@ export class CodexSessionCompletionMonitor {
       this.cursors.set(filePath, cursor);
       const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
       if (task) void Promise.resolve(this.options.onTaskChanged?.(task)).catch((error) => {
-        console.error(`[codex-weixin] unable to restore Codex task status: ${String(error)}`);
+        console.error(`[codex-channel-bridge] unable to restore Codex task status: ${String(error)}`);
       });
     }
     for (const root of this.sessionRoots()) this.watchRoot(root);
@@ -112,7 +112,7 @@ export class CodexSessionCompletionMonitor {
       });
       this.watchers.push(watcher);
     } catch (error) {
-      console.warn(`[codex-weixin] unable to watch Codex sessions under ${root}: ${String(error)}`);
+      console.warn(`[codex-channel-bridge] unable to watch Codex sessions under ${root}: ${String(error)}`);
     }
   }
 
@@ -144,7 +144,7 @@ export class CodexSessionCompletionMonitor {
         await this.processEvent(cursor, event);
       }
     } catch (error) {
-      console.error(`[codex-weixin] unable to read Codex session completion: ${String(error)}`);
+      console.error(`[codex-channel-bridge] unable to read Codex session completion: ${String(error)}`);
     } finally {
       this.processingFiles.delete(filePath);
     }

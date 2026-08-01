@@ -49,40 +49,40 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
       }
     } catch (error) {
       const retryMs = retryBackoff.next();
-      console.error(`[codex-weixin] monitor poll failed; retrying in ${retryMs}ms: ${errorDetail(error)}`);
+      console.error(`[codex-channel-bridge] monitor poll failed; retrying in ${retryMs}ms: ${errorDetail(error)}`);
       await delay(retryMs, options.signal);
       continue;
     }
     retryBackoff.reset();
     const { messages } = batch;
     if (messages.length) {
-      console.log(`[codex-weixin] received ${messages.length} update(s)`);
+      console.log(`[codex-channel-bridge] received ${messages.length} update(s)`);
     }
     for (const raw of messages) {
       let normalized: NormalizedWeixinMessage | undefined;
       try {
         normalized = normalizeWeixinMessage(raw);
       } catch (error) {
-        console.error(`[codex-weixin] failed to normalize message: ${errorDetail(error)}`);
+        console.error(`[codex-channel-bridge] failed to normalize message: ${errorDetail(error)}`);
         continue;
       }
       if (!normalized) {
         continue;
       }
       if (options.claimMessage && !options.claimMessage(normalized)) {
-        console.log(`[codex-weixin] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
+        console.log(`[codex-channel-bridge] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
         continue;
       }
       try {
-        console.log(`[codex-weixin] handling message ${normalized.id} from ${normalized.senderId}`);
+        console.log(`[codex-channel-bridge] handling message ${normalized.id} from ${normalized.senderId}`);
         await options.onMessage(normalized);
-        console.log(`[codex-weixin] handled message ${normalized.id} from ${normalized.senderId}`);
+        console.log(`[codex-channel-bridge] handled message ${normalized.id} from ${normalized.senderId}`);
       } catch (error) {
-        console.error(`[codex-weixin] message handling failed for ${normalized.senderId}: ${errorDetail(error)}`);
+        console.error(`[codex-channel-bridge] message handling failed for ${normalized.senderId}: ${errorDetail(error)}`);
         try {
           await options.onMessageError?.(error, normalized);
         } catch (reportError) {
-          console.error(`[codex-weixin] failed to report message error for ${normalized.senderId}: ${errorDetail(reportError)}`);
+          console.error(`[codex-channel-bridge] failed to report message error for ${normalized.senderId}: ${errorDetail(reportError)}`);
         }
       }
     }

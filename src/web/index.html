@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>codex-weixin</title>
+  <title>Codex Channel Bridge</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
   <script defer src="/vendor/lucide.min.js"></script>
@@ -15,13 +15,13 @@
 <body>
   <header class="app-header">
     <div class="header-inner">
-      <a class="brand" href="#accounts" aria-label="codex-weixin 首页">
+      <a class="brand" href="#accounts" aria-label="Codex Channel Bridge 首页">
         <span class="brand-mark" aria-hidden="true">
           <i data-lucide="terminal-square"></i>
           <i data-lucide="message-circle"></i>
         </span>
-        <span class="brand-name">codex-weixin</span>
-        <span class="brand-version" id="productVersion" aria-label="codex-weixin 版本" hidden></span>
+        <span class="brand-name">Codex Channel Bridge</span>
+        <span class="brand-version" id="productVersion" aria-label="Codex Channel Bridge 版本" hidden></span>
       </a>
       <nav class="view-tabs" aria-label="管理视图">
         <button class="tab is-active" type="button" data-view="accounts">消息渠道</button>
@@ -29,7 +29,7 @@
         <button class="tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="header-actions">
-        <a class="icon-button github-link" href="https://github.com/lsiten/codex-weixin" target="_blank" rel="noopener noreferrer" title="前往 GitHub" aria-label="前往 codex-weixin GitHub 仓库">
+        <a class="icon-button github-link" href="https://github.com/lsiten/codex-channel-bridge" target="_blank" rel="noopener noreferrer" title="前往 GitHub" aria-label="前往 Codex Channel Bridge GitHub 仓库">
           <i data-lucide="github"></i>
         </a>
         <button class="button button-primary header-action" id="addAccountButton" type="button" title="添加消息渠道" aria-label="添加消息渠道">
@@ -214,7 +214,11 @@
               <small>当前版本</small>
               <strong id="settingsVersionValue">--</strong>
             </span>
-            <button class="button button-secondary" id="updateCheckButton" type="button">
+            <a class="button button-secondary" href="https://github.com/lsiten/codex-channel-bridge" target="_blank" rel="noopener noreferrer">
+              <i data-lucide="github"></i>
+              <span>查看源码更新</span>
+            </a>
+            <button class="button button-secondary" id="updateCheckButton" type="button" hidden>
               <i data-lucide="refresh-cw"></i>
               <span>检查更新</span>
             </button>

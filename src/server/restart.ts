@@ -28,16 +28,16 @@ export function launchRestartHelper(options: RestartHelperOptions): void {
     detached: true,
     env: {
       ...process.env,
-      CODEX_WEIXIN_OPEN: "0",
-      CODEX_WEIXIN_PORT: String(options.port),
-      CODEX_WEIXIN_STATE_DIR: options.stateDir
+      CODEX_CHANNEL_BRIDGE_OPEN: "0",
+      CODEX_CHANNEL_BRIDGE_PORT: String(options.port),
+      CODEX_CHANNEL_BRIDGE_STATE_DIR: options.stateDir
     },
     shell: false,
     stdio: "ignore",
     windowsHide: true
   });
   child.once("error", (error) => {
-    console.error(`[codex-weixin] unable to launch restart helper: ${error.message}`);
+    console.error(`[codex-channel-bridge] unable to launch restart helper: ${error.message}`);
   });
   child.unref();
 }

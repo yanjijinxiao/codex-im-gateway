@@ -850,7 +850,7 @@ export class AccountManager {
     })).then((results) => {
       for (const result of results) {
         if (result.status === "rejected") {
-          console.error(`[codex-weixin] project completion notification failed: ${String(result.reason)}`);
+          console.error(`[codex-channel-bridge] project completion notification failed: ${String(result.reason)}`);
         }
       }
     });

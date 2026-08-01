@@ -38,7 +38,7 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
         try {
           await options.onMessageError?.(error, message);
         } catch (reportError) {
-          console.error(`[codex-weixin] failed to report WeCom message error: ${errorDetail(reportError)}`);
+          console.error(`[codex-channel-bridge] failed to report WeCom message error: ${errorDetail(reportError)}`);
         }
       });
     };

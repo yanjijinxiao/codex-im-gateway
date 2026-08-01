@@ -290,7 +290,7 @@ export class AppServerCodexRunner {
     try {
       await this.request("initialize", {
         clientInfo: {
-          name: "codex-weixin",
+          name: "codex-channel-bridge",
           title: "Codex Weixin",
           version: "0.2.0"
         },
@@ -556,7 +556,7 @@ export class AppServerCodexRunner {
         this.send({
           id,
           result: {
-            contentItems: [{ type: "inputText", text: "Dynamic tools are not available in codex-weixin." }],
+            contentItems: [{ type: "inputText", text: "Dynamic tools are not available in codex-channel-bridge." }],
             success: false
           }
         });

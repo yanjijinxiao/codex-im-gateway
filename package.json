@@ -1,16 +1,17 @@
 {
-  "name": "codex-weixin",
-  "version": "0.3.8",
-  "description": "Local multi-account WeChat server for OpenAI Codex.",
+  "name": "codex-channel-bridge",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Local OpenAI Codex bridge for WeChat, Enterprise WeChat, and Feishu.",
   "license": "MIT",
   "author": "Xuechao Zou",
-  "homepage": "https://github.com/lsiten/codex-weixin#readme",
+  "homepage": "https://github.com/lsiten/codex-channel-bridge#readme",
   "bugs": {
-    "url": "https://github.com/lsiten/codex-weixin/issues"
+    "url": "https://github.com/lsiten/codex-channel-bridge/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lsiten/codex-weixin.git"
+    "url": "git+https://github.com/lsiten/codex-channel-bridge.git"
   },
   "keywords": [
     "codex",
@@ -20,27 +21,13 @@
     "bridge"
   ],
   "type": "module",
-  "bin": {
-    "codex-weixin": "dist/server/index.js"
-  },
-  "files": [
-    "dist/",
-    "src/web/favicon.svg",
-    "README.md",
-    "README.en.md",
-    "CHANGELOG.md",
-    "LICENSE",
-    "NOTICE"
-  ],
   "scripts": {
     "build": "tsc -p tsconfig.json && npm run copy:web",
     "copy:web": "node scripts/copy-web-assets.mjs",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "tsx src/server/index.ts",
-    "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx test/*.test.ts",
-    "prepack": "npm run clean && npm run build"
+    "test": "node --test --import tsx test/*.test.ts"
   },
   "engines": {
     "node": ">=22"

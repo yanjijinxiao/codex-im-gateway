@@ -45,7 +45,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           try {
             await options.onMessageError?.(error, message);
           } catch (reportError) {
-            console.error(`[codex-weixin] failed to report Feishu message error: ${errorDetail(reportError)}`);
+            console.error(`[codex-channel-bridge] failed to report Feishu message error: ${errorDetail(reportError)}`);
           }
         });
       }

@@ -11,8 +11,8 @@ import { acquireServiceProcessLock } from "./process-lock.js";
 import { launchRestartHelper } from "./restart.js";
 
 async function main(): Promise<void> {
-  const stateDir = process.env.CODEX_WEIXIN_STATE_DIR;
-  const port = parsePort(process.env.CODEX_WEIXIN_PORT);
+  const stateDir = process.env.CODEX_CHANNEL_BRIDGE_STATE_DIR ?? process.env.CODEX_WEIXIN_STATE_DIR;
+  const port = parsePort(process.env.CODEX_CHANNEL_BRIDGE_PORT ?? process.env.CODEX_WEIXIN_PORT);
   const paths = resolveStatePaths(stateDir);
   const processLock = acquireServiceProcessLock(paths.root);
   const accountManager = new AccountManager({ paths });
@@ -42,10 +42,10 @@ async function main(): Promise<void> {
         });
       } catch (error) {
         restartScheduled = false;
-        console.error(`[codex-weixin] unable to restart after update: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`[codex-channel-bridge] unable to restart after update: ${error instanceof Error ? error.message : String(error)}`);
         return;
       }
-      console.log(`[codex-weixin] updated to ${version}; restarting`);
+      console.log(`[codex-channel-bridge] updated to ${version}; restarting`);
       void shutdown().finally(() => process.exit(0));
     }, 500);
     timer.unref();
@@ -60,9 +60,9 @@ async function main(): Promise<void> {
     throw error;
   }
 
-  console.log(`codex-weixin is running at ${server.url}`);
+  console.log(`codex-channel-bridge is running at ${server.url}`);
   console.log(`State directory: ${paths.root}`);
-  if (process.env.CODEX_WEIXIN_OPEN !== "0") {
+  if ((process.env.CODEX_CHANNEL_BRIDGE_OPEN ?? process.env.CODEX_WEIXIN_OPEN) !== "0") {
     void open(server.url).catch((error: unknown) => {
       console.warn(`Unable to open the browser automatically: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -76,7 +76,7 @@ function parsePort(value: string | undefined): number {
   if (!value) return 8787;
   const port = Number(value);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
-    throw new Error(`Invalid CODEX_WEIXIN_PORT: ${value}`);
+    throw new Error(`Invalid CODEX_CHANNEL_BRIDGE_PORT: ${value}`);
   }
   return port;
 }

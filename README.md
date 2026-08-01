@@ -1,7 +1,7 @@
-<h1 align="center">codex-weixin</h1>
+<h1 align="center">Codex Channel Bridge</h1>
 
 <p align="center">
-  <img src="src/web/favicon.svg" alt="codex-weixin logo" width="128" height="128" />
+  <img src="src/web/favicon.svg" alt="Codex Channel Bridge logo" width="128" height="128" />
 </p>
 
 <p align="center">
@@ -12,10 +12,10 @@
   <strong>通过个人微信、企业微信和飞书连接本机 OpenAI Codex。</strong>
 </p>
 
-`codex-weixin` 是一个跨平台、本机运行的 Codex 消息桥接服务。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信或飞书渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
+`codex-channel-bridge` 是一个跨平台、本机运行的 Codex 消息桥接服务。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信或飞书渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
 
 ```text
-个人微信 / 企业微信 / 飞书 <-> codex-weixin <-> 本机 Codex <-> 已绑定项目
+个人微信 / 企业微信 / 飞书 <-> Codex Channel Bridge <-> 本机 Codex <-> 已绑定项目
 ```
 
 服务与凭据都保存在本机，管理页面不会开放到局域网或公网。
@@ -61,7 +61,7 @@
 管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人和飞书企业自建应用。企业微信与飞书使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-multi-account.png" alt="codex-weixin 多微信账号管理" width="100%" />
+  <img src="docs/images/screenshots/web-multi-account.png" alt="Codex Channel Bridge 多账号管理" width="100%" />
 </p>
 
 ### 6. Web 会话管理
@@ -69,15 +69,15 @@
 Web 端可以按微信账号查看 Markdown 历史、继续同一个 Codex thread，并支持新建、重命名、切换、重置和删除会话。页面也支持直接发送文本和附件，每次最多 10 个文件、合计 100 MiB。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-session-management.png" alt="codex-weixin Web 会话管理" width="100%" />
+  <img src="docs/images/screenshots/web-session-management.png" alt="Codex Channel Bridge Web 会话管理" width="100%" />
 </p>
 
-### 7. Web 全局设置与自动更新
+### 7. Web 全局设置
 
-Web 端可以配置工作目录、Codex 后端、模型、推理强度和过程进度，也可以检查并安装新版本。全局 npm 安装会更新当前实际运行的 runtime，完成校验后自动重启并恢复连接。
+Web 端可以配置工作目录、Codex 后端、模型、推理强度和过程进度。项目只从 GitHub 获取源码并在本机运行，不通过 npm 发布或安装。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-global-settings.png" alt="codex-weixin Web 全局设置" width="100%" />
+  <img src="docs/images/screenshots/web-global-settings.png" alt="Codex Channel Bridge Web 全局设置" width="100%" />
 </p>
 
 ## 环境要求
@@ -92,30 +92,19 @@ codex --version
 codex
 ```
 
-## 安装
+## 本地运行
 
-推荐从 npm 全局安装：
-
-```bash
-npm install -g codex-weixin
-codex-weixin
-```
-
-也可以从源码安装：
+项目只支持从 GitHub 获取源码后在本机运行，不提供 npm 包，也不要执行 `npm install -g codex-channel-bridge` 或 `npm publish`。
 
 ```bash
-git clone https://github.com/lsiten/codex-weixin.git
-cd codex-weixin
-npm install
+git clone https://github.com/lsiten/codex-channel-bridge.git
+cd codex-channel-bridge
+npm ci
 npm run build
-npm install -g .
+node dist/server/index.js
 ```
 
-服务会自动打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。如果不希望全局安装，也可以在项目目录运行：
-
-```bash
-npm start
-```
+这里的 npm 只用于按锁文件安装依赖和执行构建，不安装或启动本服务。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)。
 
 ## 添加消息渠道
 
@@ -199,7 +188,7 @@ npm start
 Codex 可以在最终回复中声明需要发送的本机文件：
 
 ````text
-```codex-weixin-actions
+```codex-channel-bridge-actions
 {
   "send": [
     { "type": "image", "path": "/absolute/path/chart.png" },
@@ -247,16 +236,16 @@ IkunCoding 提供方会额外显示 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6
 服务始终只绑定 `127.0.0.1`。可以通过环境变量改变端口、状态目录或关闭自动打开浏览器：
 
 ```text
-CODEX_WEIXIN_PORT=8787
-CODEX_WEIXIN_STATE_DIR=/absolute/private/path
-CODEX_WEIXIN_OPEN=0
+CODEX_CHANNEL_BRIDGE_PORT=8787
+CODEX_CHANNEL_BRIDGE_STATE_DIR=/absolute/private/path
+CODEX_CHANNEL_BRIDGE_OPEN=0
 ```
 
 Windows PowerShell 示例：
 
 ```powershell
-$env:CODEX_WEIXIN_OPEN="0"
-codex-weixin
+$env:CODEX_CHANNEL_BRIDGE_OPEN="0"
+node dist/server/index.js
 ```
 
 ## 安全边界
@@ -269,23 +258,23 @@ codex-weixin
 - `danger-full-access` 会绕过 Codex 文件系统 sandbox；只有接受整机访问风险时才启用。
 - 多账号可以并行触发 Codex，会共同占用本机 CPU、内存和 Codex 配额。
 
-## 开发
+## 开发与验证
 
 ```bash
 npm install
-npm run dev
 npm test
 npm run typecheck
 npm run build
+node dist/server/index.js
 ```
 
 开发入口同样只启动本机 Web 服务。浏览器页面、JSON API、多账号运行时、扫码状态机和受管会话都有自动化测试。
 
-源码目录通过 `npm run dev` 或 `npm start` 启动时，Web 只检查新版本，不会自动安装；请通过 Git 更新源码后重新构建。全局安装和独立 `node_modules/codex-weixin` runtime 会更新当前实际运行的 npm prefix，并在重启前验证目标版本和服务入口。Windows 更新前会自动释放服务进程对包目录的工作目录占用，避免 npm 因 `EBUSY` 无法替换文件。
+项目不会发布 npm 包，也不会从 Web 安装更新。更新时请在源码目录执行 `git pull --ff-only`、`npm ci` 和 `npm run build`，然后使用 `node dist/server/index.js` 重新启动。
 
 ## 参考与许可
 
-项目最初来自 [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin)，当前维护仓库为 [lsiten/codex-weixin](https://github.com/lsiten/codex-weixin)。微信 iLink 接入形态参考 `Tencent/openclaw-weixin`，并参考了公开的 Codex/微信桥接项目在 Codex app-server、媒体传输和安全边界方面的实践。项目未复制 AGPL 项目源码，使用 MIT License。
+项目最初来自 [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin)，当前以独立名称维护于 [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge)。`~/.codex-weixin`、`CODEX_WEIXIN_*` 和旧 action block 仅作为现有安装的兼容接口保留。微信 iLink 接入形态参考 `Tencent/openclaw-weixin`，并参考了公开的 Codex/微信桥接项目在 Codex app-server、媒体传输和安全边界方面的实践。项目未复制 AGPL 项目源码，使用 MIT License。
 
 版本变更见 [CHANGELOG.md](./CHANGELOG.md)。
 

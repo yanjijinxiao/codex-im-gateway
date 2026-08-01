@@ -1,8 +1,8 @@
 # Changelog
 
-All notable changes to `codex-weixin` are documented in this file.
+All notable changes to Codex Channel Bridge are documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-01
 
 ### Added
 
@@ -15,6 +15,8 @@ All notable changes to `codex-weixin` are documented in this file.
 
 ### Changed
 
+- Renamed the local project, Web brand, repository, and direct Node.js entry to Codex Channel Bridge; legacy state paths, environment variables, and action blocks remain compatible.
+- Marked the package private and removed npm publishing, global installation, and GitHub npm-release automation. The supported deployment is GitHub source built locally and started with Node.js.
 - Reworked the Add Channel dialog with channel-specific fields, embedded setup instructions, and direct links to the Enterprise WeChat and Feishu consoles and official documentation.
 - Clarified notification state with a persistent enabled badge and a high-contrast active bell button in project lists.
 
@@ -224,6 +226,7 @@ All notable changes to `codex-weixin` are documented in this file.
 - Kept GPT-5.6 options available after selecting a different model.
 - Removed extra message spacing and hid internal WeChat and Codex routing identifiers from the normal UI.
 
+[0.4.0]: https://github.com/lsiten/codex-channel-bridge/releases/tag/v0.4.0
 [0.3.7]: https://github.com/XavierJiezou/codex-weixin/releases/tag/v0.3.7
 [0.3.6]: https://github.com/XavierJiezou/codex-weixin/releases/tag/v0.3.6
 [0.3.5]: https://github.com/XavierJiezou/codex-weixin/releases/tag/v0.3.5

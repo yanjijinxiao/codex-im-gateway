@@ -3,10 +3,10 @@ import test from "node:test";
 
 import { parseActionBlocks } from "../src/bridge/actions.js";
 
-test("parses explicit codex-weixin action blocks and ignores prose paths", () => {
+test("parses explicit codex-channel-bridge action blocks and ignores prose paths", () => {
   const text = [
     "Report saved at C:/tmp/report.pdf but do not send it.",
-    "```codex-weixin-actions",
+    "```codex-channel-bridge-actions",
     JSON.stringify({
       send: [
         { type: "image", path: "C:/tmp/chart.png" },
@@ -26,7 +26,7 @@ test("parses explicit codex-weixin action blocks and ignores prose paths", () =>
 
 test("rejects relative outbound file paths in action blocks", () => {
   const text = [
-    "```codex-weixin-actions",
+    "```codex-channel-bridge-actions",
     JSON.stringify({ send: [{ type: "file", path: "relative/report.pdf" }] }),
     "```"
   ].join("\n");
