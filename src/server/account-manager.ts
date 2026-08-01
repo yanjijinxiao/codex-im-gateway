@@ -578,6 +578,7 @@ export class AccountManager {
         ),
         cwd: session.workspace,
         threadId: session.threadId,
+        queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
         ...((session.streamReplies ?? config.streamReplies) && onProgress

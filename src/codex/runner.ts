@@ -21,6 +21,7 @@ export type HybridCodexRunnerOptions = {
 export class HybridCodexRunner {
   private readonly appServer: AppServerCodexRunner;
   private readonly exec: CodexExecRunner;
+  private readonly runTails = new Map<string, Promise<void>>();
 
   constructor(private readonly options: HybridCodexRunnerOptions) {
     this.appServer = new AppServerCodexRunner({
@@ -35,6 +36,31 @@ export class HybridCodexRunner {
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    const queueKey = input.queueKey ?? input.threadId;
+    if (!queueKey) return this.runImmediately(input);
+
+    const predecessor = this.runTails.get(queueKey);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = (predecessor ?? Promise.resolve()).catch(() => undefined).then(() => gate);
+    this.runTails.set(queueKey, tail);
+    try {
+      if (predecessor) {
+        await input.onProgress?.("当前会话的上一条消息仍在处理中，已加入队列。");
+        await predecessor.catch(() => undefined);
+      }
+      return await this.runImmediately(input);
+    } finally {
+      release();
+      if (this.runTails.get(queueKey) === tail) {
+        this.runTails.delete(queueKey);
+      }
+    }
+  }
+
+  private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
     const requiresAppServerForStreaming = Boolean(input.onDelta || input.onProgress);
     if (this.options.backend === "exec" && !requiresAppServerForStreaming) {
       return this.exec.run(input);

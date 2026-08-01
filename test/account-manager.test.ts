@@ -442,6 +442,7 @@ test("reads managed thread history and continues the same session from Web", asy
   assert.equal(result.threadId, "thread-web");
   assert.equal(result.message.text, "Web reply");
   assert.equal(runs[0].threadId, undefined);
+  assert.equal(runs[0].queueKey, session.id);
   assert.match(String(runs[0].prompt), /继续这个会话/);
   assert.equal(manager.listSessions()[0].threadId, "thread-web");
   assert.equal(manager.listSessions()[0].lastPromptPreview, "继续这个会话");

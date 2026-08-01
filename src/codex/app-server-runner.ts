@@ -13,6 +13,7 @@ export type CodexRunnerInput = {
   prompt: string;
   cwd: string;
   threadId?: string;
+  queueKey?: string;
   model?: string;
   effort?: string;
   onDelta?: (delta: string) => Promise<void> | void;
@@ -115,6 +116,10 @@ export class AppServerCodexRunner {
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
     await this.ensureConnected();
 
+    if (input.threadId) {
+      await this.waitForThreadIdle(input.threadId, input.onProgress);
+    }
+
     const threadResponse = await this.request(
       input.threadId ? "thread/resume" : "thread/start",
       compactObject({
@@ -131,14 +136,23 @@ export class AppServerCodexRunner {
     }
     this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
 
-    const turnResponse = await this.request("turn/start", compactObject({
+    const turnParams = compactObject({
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
       cwd: input.cwd,
       approvalPolicy: "never",
       model: input.model,
       effort: input.effort
-    })) as Record<string, unknown>;
+    });
+    let turnResponse: Record<string, unknown>;
+    try {
+      turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+    } catch (error) {
+      if (!input.threadId || !isThreadBusyError(error)) throw error;
+      await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
+      await this.waitForThreadIdle(input.threadId);
+      turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+    }
     const turn = turnResponse.turn as Record<string, unknown> | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
     if (!turnId) {
@@ -482,6 +496,36 @@ export class AppServerCodexRunner {
     });
   }
 
+  private async waitForThreadIdle(
+    threadId: string,
+    onProgress?: (message: string) => Promise<void> | void
+  ): Promise<void> {
+    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
+    const deadline = Date.now() + timeoutMs;
+    let notified = false;
+    while (true) {
+      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
+      const thread = response.thread as Record<string, unknown> | undefined;
+      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+      const busy = turns.slice(-1).some((value) => {
+        const turn = value as Record<string, unknown>;
+        const status = typeof turn.status === "string"
+          ? turn.status.replace(/[_\s-]/g, "").toLowerCase()
+          : "";
+        return status === "inprogress" || status === "running" || status === "started";
+      });
+      if (!busy) return;
+      if (!notified) {
+        notified = true;
+        await onProgress?.("当前会话的上一条任务仍在执行，已排队等待完成。");
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`等待已有会话空闲超时（${Math.round(timeoutMs / 1_000)} 秒）`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
   private async finishTurn(
     threadId: string,
     key: string,
@@ -608,6 +652,11 @@ export class AppServerCodexRunner {
     this.runtimeInfoByThread.clear();
     this.modelOptions = undefined;
   }
+}
+
+function isThreadBusyError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /already.*(active|running)|turn.*(active|in progress|running)|thread.*busy/i.test(message);
 }
 
 function turnKeyFromParams(params: Record<string, unknown>): string | undefined {

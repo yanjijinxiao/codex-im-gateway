@@ -643,6 +643,7 @@ export class BridgeService {
           prompt: buildPrompt(text, attachments, "WeChat", knowledge),
           cwd: workspace,
           threadId,
+          queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
           ...(progressEnabled ? {

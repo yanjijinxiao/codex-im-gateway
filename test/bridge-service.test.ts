@@ -659,7 +659,7 @@ test("binds a Codex Desktop session from the current project and continues its t
   const project = stateStore.createProject("桌面项目", tmpDir);
   stateStore.createSession("alice@im.wechat", project.workspace, "桥接会话", project.id);
   const replies: string[] = [];
-  const runs: Array<{ threadId?: string }> = [];
+  const runs: Array<{ threadId?: string; queueKey?: string }> = [];
   const service = new BridgeService({
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
@@ -677,7 +677,7 @@ test("binds a Codex Desktop session from the current project and continues its t
       }
     } as never,
     runner: {
-      async run(input: { threadId?: string }) {
+      async run(input: { threadId?: string; queueKey?: string }) {
         runs.push(input);
         return { raw: "", text: "已继续", threadId: input.threadId };
       },
@@ -701,6 +701,7 @@ test("binds a Codex Desktop session from the current project and continues its t
 
   await send("continue", "接着完成");
   assert.equal(runs.at(-1)?.threadId, "desktop-thread");
+  assert.equal(runs.at(-1)?.queueKey, "desktop-thread");
 });
 
 test("authorized WeChat can add, list, and switch Codex projects", async (t) => {

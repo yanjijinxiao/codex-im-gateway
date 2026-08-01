@@ -127,6 +127,55 @@ test("interrupts the active V2 turn with both threadId and turnId", async (t) =>
   assert.match(result.error?.message ?? "", /interrupted/i);
 });
 
+test("serializes concurrent turns for the same managed session", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const completionOrder: string[] = [];
+  const first = runner.run({
+    prompt: "slow:first",
+    cwd: "/tmp/project",
+    queueKey: "managed-session"
+  }).then(() => completionOrder.push("first"));
+  const second = runner.run({
+    prompt: "second",
+    cwd: "/tmp/project",
+    queueKey: "managed-session"
+  }).then(() => completionOrder.push("second"));
+
+  await Promise.all([first, second]);
+  assert.deepEqual(completionOrder, ["first", "second"]);
+});
+
+test("waits for an existing thread turn before continuing it", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const active = runner.run({ prompt: "hold", cwd: "/tmp/project", threadId: "thread-shared" });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const progress: string[] = [];
+  const queued = runner.run({
+    prompt: "continue",
+    cwd: "/tmp/project",
+    threadId: "thread-shared",
+    onProgress: (message) => progress.push(message)
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await runner.stop("thread-shared");
+
+  await assert.rejects(active, /interrupted/i);
+  const result = await queued;
+  assert.equal(result.text, "reply:continue");
+  assert.deepEqual(progress, ["当前会话的上一条任务仍在执行，已排队等待完成。", "working:continue"]);
+});
+
 test("auto backend falls back to codex exec for an existing thread", async (t) => {
   const runner = new HybridCodexRunner({
     backend: "auto",

@@ -142,6 +142,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/read") {
+    const activeTurnId = activeTurns.get(message.params.threadId);
     respond(message.id, {
       thread: {
         id: message.params.threadId,
@@ -174,7 +175,8 @@ rl.on("line", (line) => {
               },
               { type: "reasoning", id: "history-reasoning-1", summary: [], content: ["hidden"] }
             ]
-          }
+          },
+          ...(activeTurnId ? [completedTurn(activeTurnId, "inProgress")] : [])
         ]
       }
     });
@@ -245,7 +247,7 @@ rl.on("line", (line) => {
         params: { threadId: message.params.threadId, turn: completedTurn(turnId, "completed") }
       });
       activeTurns.delete(message.params.threadId);
-    }, 5);
+    }, prompt.startsWith("slow:") ? 75 : 5);
     return;
   }
 
