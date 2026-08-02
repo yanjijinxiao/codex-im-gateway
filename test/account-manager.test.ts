@@ -34,7 +34,7 @@ function setup(t: test.TestContext) {
     model: "runtime-model",
     effort: "medium"
   };
-  let runHandler: ((input: Record<string, unknown>) => Promise<{ raw: string; text: string; threadId?: string }>) | undefined;
+  let runHandler: ((input: Record<string, unknown>) => Promise<{ raw: string; text: string; threadId?: string; turnId?: string }>) | undefined;
   let externalCompletionHandler: ((completion: CodexSessionCompletion) => Promise<void>) | undefined;
   let externalTaskHandler: ((task: CodexSessionTask) => void) | undefined;
   const history = [
@@ -45,7 +45,7 @@ function setup(t: test.TestContext) {
     async run(input: Record<string, unknown>) {
       runs.push(input);
       if (runHandler) return runHandler(input);
-      return { raw: "", text: "Web reply", threadId: input.threadId ?? "thread-web" };
+      return { raw: "", text: "Web reply", threadId: input.threadId ?? "thread-web", turnId: "turn-web" };
     },
     async getHistory() {
       return structuredClone(history);
@@ -207,7 +207,7 @@ test("notifies the configured channel when a project Web task ends", async (t) =
 });
 
 test("notifies the configured channel when an existing Codex client task ends", async (t) => {
-  const { manager, root, sent, emitCodexCompletion } = setup(t);
+  const { manager, paths, root, sent, emitCodexCompletion } = setup(t);
   await manager.startAll();
   const workspace = path.join(root, "existing-codex-project");
   const project = manager.createProject("account-one", "已有 Codex 项目", workspace);
@@ -233,6 +233,26 @@ test("notifies the configured channel when an existing Codex client task ends", 
     text: "【Codex 任务已完成】\n项目：已有 Codex 项目\n任务：修复已有会话通知\n结果：通知链路已恢复"
   }]);
 
+  const boundDesktopSession = manager.createSession(
+    "account-one",
+    "alice@im.wechat",
+    undefined,
+    "已绑定桌面任务",
+    project.id
+  );
+  new RuntimeStateStore(accountStatePaths(paths, "account-one"))
+    .setSessionThread(boundDesktopSession.id, "bound-desktop-thread");
+  await emitCodexCompletion({
+    sessionId: "bound-desktop-thread",
+    turnId: "bound-desktop-turn",
+    workspace,
+    taskTitle: "已绑定但由桌面执行",
+    text: "桌面任务完成",
+    success: true,
+    completedAt: "2026-08-01T08:00:30.000Z"
+  });
+  assert.equal(sent.length, 2, "bound desktop sessions should still send filesystem notifications");
+
   const managedSession = manager.createSession(
     "account-one",
     "alice@im.wechat",
@@ -243,14 +263,14 @@ test("notifies the configured channel when an existing Codex client task ends", 
   await manager.continueSession("account-one", managedSession.id, "执行服务内任务");
   await emitCodexCompletion({
     sessionId: "thread-web",
-    turnId: "managed-turn",
+    turnId: "turn-web",
     workspace,
     taskTitle: "服务内任务",
     text: "Web reply",
     success: true,
     completedAt: "2026-08-01T08:01:00.000Z"
   });
-  assert.equal(sent.length, 2, "managed sessions should not send a duplicate filesystem notification");
+  assert.equal(sent.length, 3, "managed sessions should not send a duplicate filesystem notification");
   await manager.stopAll();
 });
 
@@ -296,9 +316,19 @@ test("isolates managed projects by WeChat account", (t) => {
 });
 
 test("tracks currently running Codex client tasks for a managed project", (t) => {
-  const { manager, root, emitCodexTask } = setup(t);
+  const { manager, paths, root, emitCodexTask } = setup(t);
   const workspace = path.join(root, "running-project");
   const project = manager.createProject("account-one", "运行项目", workspace);
+  const otherAccountProject = manager.createProject("account-two", "另一个账号的同目录项目", workspace);
+  const boundSession = manager.createSession(
+    "account-one",
+    "alice@im.wechat",
+    undefined,
+    "已绑定桌面会话",
+    project.id
+  );
+  new RuntimeStateStore(accountStatePaths(paths, "account-one"))
+    .setSessionThread(boundSession.id, "desktop-thread");
   const runningTask: CodexSessionTask = {
     sessionId: "desktop-thread",
     turnId: "desktop-turn",
@@ -319,6 +349,10 @@ test("tracks currently running Codex client tasks for a managed project", (t) =>
     startedAt: "2026-08-01T08:00:00.000Z",
     updatedAt: "2026-08-01T08:00:01.000Z"
   }]);
+  assert.equal(
+    manager.listProjects("account-two").find((item) => item.id === otherAccountProject.id)?.activeTaskCount,
+    0
+  );
 
   emitCodexTask({ ...runningTask, status: "completed", updatedAt: "2026-08-01T08:01:00.000Z" });
   assert.equal(manager.listProjects("account-one").find((item) => item.id === project.id)?.activeTaskCount, 0);
@@ -547,18 +581,34 @@ test("stores Web uploads per session and exposes them in user history", async (t
 });
 
 test("reports a managed session as responding only while its Web turn is active", async (t) => {
-  const { manager, root, setRunHandler } = setup(t);
+  const { manager, paths, root, emitCodexTask, setRunHandler } = setup(t);
   let finish: ((value: { raw: string; text: string; threadId: string }) => void) | undefined;
   setRunHandler(() => new Promise((resolve) => {
     finish = resolve;
   }));
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Busy chat");
+  new RuntimeStateStore(accountStatePaths(paths, "account-one"))
+    .setSessionThread(session.id, "thread-busy");
+  await manager.startAll();
 
   const pending = manager.continueSession("account-one", session.id, "继续");
   assert.equal(manager.listSessions().find((item) => item.id === session.id)?.responding, true);
+  emitCodexTask({
+    sessionId: "thread-busy",
+    turnId: "turn-busy",
+    workspace: root,
+    title: "Busy chat",
+    status: "running",
+    startedAt: "2026-08-01T08:00:00.000Z",
+    updatedAt: "2026-08-01T08:00:01.000Z"
+  });
+  const project = manager.listProjects("account-one").find((item) => item.id === session.projectId);
+  assert.equal(project?.activeTaskCount, 1);
+  assert.deepEqual(project?.runningTasks.map((task) => task.source), ["managed"]);
   finish?.({ raw: "", text: "完成", threadId: "thread-busy" });
   await pending;
   assert.equal(manager.listSessions().find((item) => item.id === session.id)?.responding, false);
+  await manager.stopAll();
 });
 
 test("exposes files sent by Codex as session attachments", async (t) => {

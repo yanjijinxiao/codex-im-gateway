@@ -156,6 +156,7 @@ export class AccountManager {
   private readonly runnerFactory: (config: CodexWeixinConfig) => HybridCodexRunner;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
+  private readonly managedTurnCompletions = new Set<string>();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
 
@@ -190,6 +191,7 @@ export class AccountManager {
     this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
+    this.managedTurnCompletions.clear();
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => this.stopAccount(account.accountId, false)));
@@ -237,11 +239,12 @@ export class AccountManager {
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
-      onTurnCompleted: ({ sessionId, text, success }) => this.notifyProjectCompletion(
+      onTurnCompleted: ({ sessionId, text, success, turnId }) => this.notifyProjectCompletion(
         account.accountId,
         sessionId,
         text,
-        success
+        success,
+        turnId
       )
     });
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client };
@@ -607,7 +610,7 @@ export class AccountManager {
           })
         }
       };
-      await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim());
+      await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim(), true, result.turnId);
       return response;
     } catch (error) {
       await this.notifyProjectCompletion(
@@ -716,7 +719,8 @@ export class AccountManager {
     ownerAccountId: string,
     sessionId: string,
     resultText: string,
-    success = true
+    success = true,
+    turnId?: string
   ): Promise<void> {
     const ownerStore = this.storeFor(ownerAccountId);
     const session = ownerStore.getSession(sessionId);
@@ -724,6 +728,9 @@ export class AccountManager {
       ? ownerStore.listProjects().find((candidate) => candidate.id === session.projectId)
       : undefined;
     if (!session || !project) return;
+    if (session.threadId && turnId) {
+      this.managedTurnCompletions.add(taskRuntimeKey(session.threadId, turnId));
+    }
     await this.sendProjectCompletion(project, session.title, resultText, success);
   }
 
@@ -765,9 +772,15 @@ export class AccountManager {
       hasThread: Boolean(session.threadId),
       updatedAt: session.updatedAt
     }));
-    const managedThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
+    const respondingThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
+      this.storeFor(account.accountId).listSessions().flatMap((session) =>
+        session.threadId && this.isSessionResponding(account.accountId, session.id) ? [session.threadId] : []
+      )
+    ));
+    const boundThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
       this.storeFor(account.accountId).listSessions().flatMap((session) => session.threadId ? [session.threadId] : [])
     ));
+    const projectThreadIds = new Set(sessions.flatMap((session) => session.threadId ? [session.threadId] : []));
     const managedTasks: AccountProjectTask[] = sessions
       .filter((session) => this.isSessionResponding(accountId, session.id))
       .map((session) => ({
@@ -781,7 +794,8 @@ export class AccountManager {
     const externalTasks: AccountProjectTask[] = [...this.externalCodexTasks.values()]
       .filter((task) =>
         canonicalWorkspace(task.workspace) === workspace
-        && !managedThreadIds.has(task.sessionId)
+        && !respondingThreadIds.has(task.sessionId)
+        && (!boundThreadIds.has(task.sessionId) || projectThreadIds.has(task.sessionId))
       )
       .map((task) => ({
         id: `codex:${task.sessionId}:${task.turnId}`,
@@ -805,14 +819,28 @@ export class AccountManager {
   private async notifyExternalCodexCompletion(completion: CodexSessionCompletion): Promise<void> {
     const accounts = listAccounts(this.options.paths);
     const stores = accounts.map((account) => ({ account, store: this.storeFor(account.accountId) }));
-    const managedByService = stores.some(({ store }) =>
-      store.listSessions().some((session) => session.threadId === completion.sessionId)
+    const managedByService = stores.some(({ account, store }) =>
+      store.listSessions().some((session) =>
+        session.threadId === completion.sessionId
+        && this.isSessionResponding(account.accountId, session.id)
+      )
     );
-    if (managedByService) return;
+    const completionKey = taskRuntimeKey(completion.sessionId, completion.turnId);
+    if (managedByService || this.managedTurnCompletions.delete(completionKey)) return;
     const workspace = path.resolve(completion.workspace);
-    await Promise.all(stores.flatMap(({ store }) =>
+    const boundProjects = new Set(stores.flatMap(({ account, store }) =>
+      store.listSessions().flatMap((session) =>
+        session.threadId === completion.sessionId && session.projectId
+          ? [`${account.accountId}\n${session.projectId}`]
+          : []
+      )
+    ));
+    await Promise.all(stores.flatMap(({ account, store }) =>
       store.listProjects()
-        .filter((project) => path.resolve(project.workspace) === workspace)
+        .filter((project) =>
+          path.resolve(project.workspace) === workspace
+          && (!boundProjects.size || boundProjects.has(`${account.accountId}\n${project.id}`))
+        )
         .map((project) => this.sendProjectCompletion(
           project,
           completion.taskTitle,
@@ -939,6 +967,10 @@ function canonicalWorkspace(workspace: string): string {
 
 function sessionRuntimeKey(accountId: string, sessionId: string): string {
   return `${accountId}\n${sessionId}`;
+}
+
+function taskRuntimeKey(sessionId: string, turnId: string): string {
+  return `${sessionId}\n${turnId}`;
 }
 
 function uniqueAccountId(paths: StatePaths, preferred: string): string {

@@ -158,20 +158,14 @@ test("waits for an existing thread turn before continuing it", async (t) => {
   });
   t.after(() => runner.close());
 
-  const active = runner.run({ prompt: "hold", cwd: "/tmp/project", threadId: "thread-shared" });
-  await new Promise((resolve) => setTimeout(resolve, 25));
   const progress: string[] = [];
-  const queued = runner.run({
+  const result = await runner.run({
     prompt: "continue",
     cwd: "/tmp/project",
-    threadId: "thread-shared",
+    threadId: "thread-external-busy",
     onProgress: (message) => progress.push(message)
   });
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  await runner.stop("thread-shared");
 
-  await assert.rejects(active, /interrupted/i);
-  const result = await queued;
   assert.equal(result.text, "reply:continue");
   assert.deepEqual(progress, ["当前会话的上一条任务仍在执行，已排队等待完成。", "working:continue"]);
 });

@@ -47,6 +47,7 @@ export type BridgeServiceOptions = {
     sessionId: string;
     text: string;
     success: boolean;
+    turnId?: string;
   }) => Promise<void> | void;
 };
 
@@ -676,7 +677,8 @@ export class BridgeService {
           senderId: message.senderId,
           sessionId: session.id,
           text: parsed.visibleText.trim(),
-          success: true
+          success: true,
+          turnId: result.turnId
         });
       });
     } catch (error) {

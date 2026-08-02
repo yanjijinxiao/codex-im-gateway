@@ -55,6 +55,7 @@ export type CodexExecRunnerOptions = {
 export type CodexRunResult = {
   text: string;
   threadId?: string;
+  turnId?: string;
   raw: string;
 };
 

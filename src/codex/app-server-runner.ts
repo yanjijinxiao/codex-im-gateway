@@ -541,7 +541,7 @@ export class AppServerCodexRunner {
     this.queuedTurnEvents.delete(key);
     this.itemPhasesByTurn.delete(key);
     if (completion.status === "completed") {
-      resolve({ text: completion.text, threadId, raw: completion.raw });
+      resolve({ text: completion.text, threadId, turnId: key.slice(threadId.length + 1), raw: completion.raw });
       return;
     }
     if (completion.status === "interrupted") {

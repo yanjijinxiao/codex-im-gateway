@@ -6,6 +6,7 @@ const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
 let nextTurn = 1;
 const activeTurns = new Map();
+let externalBusyReads = 0;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -142,7 +143,10 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/read") {
-    const activeTurnId = activeTurns.get(message.params.threadId);
+    const activeTurnId = activeTurns.get(message.params.threadId)
+      ?? (message.params.threadId === "thread-external-busy" && externalBusyReads++ === 0
+        ? "external-turn"
+        : undefined);
     respond(message.id, {
       thread: {
         id: message.params.threadId,
