@@ -57,6 +57,14 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 - Accessibility: connection meaning is expressed in text as well as color; paths remain selectable and horizontally wrap instead of clipping.
 - Security: the URL field accepts HTTP loopback origins only; remote Taskboard endpoints are outside this local-console contract.
 
+### Taskboard Workbench
+
+- Structure: compact status metrics, project/status/search filters, a dense issue list, and a detail panel with description, Codex thread attribution, progress comments, and workflow actions.
+- States: connected, unavailable, empty, filtered-empty, loading detail, selected issue, read-only unbound issue, actionable issue, blocked, in review, and done.
+- Workflow: the workbench exposes only mapped workspaces; comments and transitions require an existing Codex thread. `blocked` and `in_review` require evidence, and `done` is available only from `in_review` through an explicit acceptance dialog.
+- Accessibility: issue rows are pressed-state buttons, filters have visible labels, status is always expressed in text, and workflow confirmation uses a labelled modal.
+- Layout: the list/detail split follows the Session Workbench and collapses to a single column below 760px without horizontal scrolling.
+
 ## 6. Motion & Interaction
 
 Use the existing 160ms micro-interaction timing. Respect `prefers-reduced-motion`; no layout animation.

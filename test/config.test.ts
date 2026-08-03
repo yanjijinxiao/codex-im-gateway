@@ -14,6 +14,7 @@ test("uses ~/.codex-weixin as the default Codex workspace", () => {
   assert.equal(defaultConfig().maxInboundBytes, 100 * 1024 * 1024);
   assert.equal(defaultConfig().taskboardEnabled, true);
   assert.equal(defaultConfig().taskboardUrl, "http://127.0.0.1:47823");
+  assert.equal(resolveStatePaths("/tmp/codex-weixin-test").taskboardDir, "/tmp/codex-weixin-test/taskboard");
 });
 
 test("migrates the legacy inbound limit and never exceeds 100 MiB", (t) => {

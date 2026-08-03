@@ -6,7 +6,7 @@ import { parseActionBlocks } from "./actions.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
 import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
-import type { CodexApprovalRequest } from "../codex/approval.js";
+import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { HybridCodexRunner } from "../codex/runner.js";
 import type { CodexWeixinConfig } from "../state/config.js";
 import { RuntimeStateStore, type ManagedProject, type ManagedSession } from "../state/runtime-state.js";
@@ -967,6 +967,10 @@ export class BridgeService {
 
   listAllowedSenders(): string[] {
     return this.access.listPairedSenderIds();
+  }
+
+  requestApproval(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
+    return this.approvals.request(senderId, request);
   }
 }
 

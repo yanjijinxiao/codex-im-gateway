@@ -121,6 +121,12 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
 - A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
+## Taskboard integration
+
+Settings connects to the local `http://127.0.0.1:47823` service and maps Codex projects by canonical workspace path. Taskboard remains the only source of truth for issue state; the bridge does not copy issues into its own runtime state, and only HTTP loopback origins are accepted.
+
+The Taskboard page summarizes mapped issues and supports project, status, and text filters. Its detail pane exposes the description, priority, Codex thread attribution, and progress comments. Issues with a real Codex thread can be commented on and moved through the guarded workflow: start, block, resume, submit for review, return to progress, and explicitly accept as done. Blocking and review require evidence, and completion is available only from review through a dedicated acceptance confirmation. Relations, attachments, and planning remain in the full Taskboard UI.
+
 ## Message-channel commands
 
 ```text
@@ -137,6 +143,15 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 /project P1      /p P1        Switch to a bound project
 /project rename P1|name /p rn P1|name  Rename a project
 /project delete P1      /p d P1        Remove a project with no running tasks
+/task            /tb          List unfinished Taskboard issues in the current project
+/task ISSUE                   Bind and continue the issue's Codex thread
+/task new title               Create, claim, and start a new issue
+/task start ISSUE             Claim and start an existing issue
+/task comment ISSUE text      Add a thread-attributed comment and optional attachments
+/task attach ISSUE            Upload the current message attachments
+/task block ISSUE reason      Record the blocker and mark the issue blocked
+/task review ISSUE            Verify, record evidence, and submit for review
+/task accept ISSUE            Complete only after explicit user acceptance
 /sessions        /ss          List the current project's ten most recent sessions
 /session R1      /s R1        Bind and continue a session from the current project
 /new             /n           Create and bind a session in the current project

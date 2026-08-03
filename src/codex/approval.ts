@@ -38,6 +38,11 @@ export function parseAppServerApproval(
   const itemId = stringValue(params.itemId);
   if (!threadId || !turnId || !itemId) return undefined;
 
+  const command = stringValue(params.command);
+  const cwd = stringValue(params.cwd);
+  const reason = stringValue(params.reason);
+  const grantRoot = stringValue(params.grantRoot);
+  const permissions = recordValue(params.permissions);
   return {
     kind: method === "item/commandExecution/requestApproval"
       ? "command"
@@ -47,11 +52,11 @@ export function parseAppServerApproval(
     threadId,
     turnId,
     itemId,
-    command: stringValue(params.command),
-    cwd: stringValue(params.cwd),
-    reason: stringValue(params.reason),
-    grantRoot: stringValue(params.grantRoot),
-    permissions: recordValue(params.permissions)
+    ...(command ? { command } : {}),
+    ...(cwd ? { cwd } : {}),
+    ...(reason ? { reason } : {}),
+    ...(grantRoot ? { grantRoot } : {}),
+    ...(permissions ? { permissions } : {})
   };
 }
 

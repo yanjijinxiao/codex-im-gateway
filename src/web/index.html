@@ -26,6 +26,7 @@
       <nav class="view-tabs" aria-label="管理视图">
         <button class="tab is-active" type="button" data-view="accounts">消息渠道</button>
         <button class="tab" type="button" data-view="sessions">会话</button>
+        <button class="tab" type="button" data-view="taskboard">任务面板</button>
         <button class="tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="header-actions">
@@ -142,6 +143,32 @@
             <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
           </form>
         </section>
+      </div>
+    </section>
+
+    <section class="view taskboard-view" id="taskboardView" data-view-panel="taskboard" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">TASK OPERATIONS</p>
+          <h1>任务面板</h1>
+        </div>
+        <div class="heading-actions">
+          <a class="button button-secondary" id="openTaskboardButton" href="http://127.0.0.1:47823" target="_blank" rel="noopener noreferrer"><i data-lucide="external-link"></i><span>完整看板</span></a>
+          <button class="icon-button" id="refreshTaskboardButton" type="button" title="刷新任务" aria-label="刷新任务"><i data-lucide="refresh-cw"></i></button>
+        </div>
+      </div>
+      <dl class="taskboard-metrics" id="taskboardMetrics" aria-label="任务状态概览"></dl>
+      <div class="taskboard-toolbar" aria-label="任务筛选">
+        <label><span>项目</span><select id="taskboardProjectFilter"><option value="">全部项目</option></select></label>
+        <label><span>状态</span><select id="taskboardStatusFilter"><option value="">全部状态</option><option value="todo">待处理</option><option value="in_progress">处理中</option><option value="blocked">阻塞</option><option value="in_review">待验收</option><option value="done">已完成</option><option value="backlog">待规划</option><option value="canceled">已取消</option></select></label>
+        <label class="taskboard-search"><span>搜索</span><input id="taskboardSearchInput" type="search" autocomplete="off" placeholder="Issue 编号或标题"></label>
+      </div>
+      <div class="taskboard-workbench">
+        <section class="taskboard-issue-list-panel" aria-label="任务列表">
+          <header><span>已映射任务</span><strong id="taskboardIssueCount">0</strong></header>
+          <div class="taskboard-issue-list" id="taskboardIssueList" aria-live="polite"></div>
+        </section>
+        <section class="taskboard-detail" id="taskboardDetail" aria-live="polite"></section>
       </div>
     </section>
 
@@ -517,6 +544,26 @@
       <div class="modal-footer">
         <button class="button button-secondary" type="button" data-close-dialog="projectNotificationDialog">取消</button>
         <button class="button button-primary" type="submit"><i data-lucide="bell"></i><span>保存通知</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal taskboard-action-modal" id="taskboardActionDialog" aria-labelledby="taskboardActionDialogTitle">
+    <form id="taskboardActionForm" method="dialog">
+      <div class="modal-header">
+        <div><p class="eyebrow">TASK WORKFLOW</p><h2 id="taskboardActionDialogTitle">更新任务状态</h2></div>
+        <button class="icon-button" type="button" data-close-dialog="taskboardActionDialog" title="关闭" aria-label="关闭任务操作窗口"><i data-lucide="x"></i></button>
+      </div>
+      <input id="taskboardActionIdentifier" type="hidden">
+      <input id="taskboardActionStatus" type="hidden">
+      <input id="taskboardActionVersion" type="hidden">
+      <div class="modal-body form-stack">
+        <p class="taskboard-action-copy" id="taskboardActionCopy"></p>
+        <label id="taskboardActionCommentField"><span id="taskboardActionCommentLabel">说明</span><textarea id="taskboardActionComment" rows="5" maxlength="100000"></textarea><small class="field-hint" id="taskboardActionHint"></small></label>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="taskboardActionDialog">取消</button>
+        <button class="button button-primary" id="taskboardActionSubmit" type="submit"><i data-lucide="check"></i><span>确认更新</span></button>
       </div>
     </form>
   </dialog>

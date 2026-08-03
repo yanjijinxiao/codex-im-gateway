@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { buildPrompt } from "../src/bridge/format.js";
 import { AccountManager } from "../src/server/account-manager.js";
+import type { CodexDesktopApproval } from "../src/server/codex-desktop-approval-monitor.js";
 import type { CodexSessionCompletion, CodexSessionTask } from "../src/server/codex-session-monitor.js";
 import { defaultConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
@@ -37,6 +38,9 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
   let runHandler: ((input: Record<string, unknown>) => Promise<{ raw: string; text: string; threadId?: string; turnId?: string }>) | undefined;
   let externalCompletionHandler: ((completion: CodexSessionCompletion) => Promise<void>) | undefined;
   let externalTaskHandler: ((task: CodexSessionTask) => void) | undefined;
+  let desktopApprovalHandler: ((approval: CodexDesktopApproval) => Promise<"accept" | "decline" | undefined>) | undefined;
+  const followedDesktopThreads: string[] = [];
+  const channelApprovals: Array<{ senderId: string; request: Record<string, unknown> }> = [];
   const history = [
     { id: "user-1", role: "user" as const, text: buildPrompt("历史问题") },
     { id: "assistant-1", role: "assistant" as const, text: "历史回答" }
@@ -91,6 +95,10 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
     }),
     bridgeFactory: (input) => ({
       handleMessage: async () => {},
+      async requestApproval(senderId: string, request: Record<string, unknown>) {
+        channelApprovals.push({ senderId, request });
+        return "accept" as const;
+      },
       allowSender(senderId: string) {
         input.stateStore.setPairedSenderIds([...input.stateStore.listPairedSenderIds(), senderId]);
       },
@@ -107,6 +115,14 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
       externalCompletionHandler = handlers.onCompletion;
       externalTaskHandler = handlers.onTaskChanged;
       return { start() {}, stop() {} } as never;
+    },
+    codexDesktopApprovalMonitorFactory: (handlers) => {
+      desktopApprovalHandler = handlers.onApproval;
+      return {
+        start() {},
+        stop() {},
+        followThread(threadId: string) { followedDesktopThreads.push(threadId); }
+      } as never;
     }
   });
   return {
@@ -125,6 +141,12 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
       assert.ok(externalTaskHandler, "Codex task status monitor should be active");
       externalTaskHandler(task);
     },
+    async emitDesktopApproval(approval: CodexDesktopApproval) {
+      assert.ok(desktopApprovalHandler, "Codex Desktop approval monitor should be active");
+      return desktopApprovalHandler(approval);
+    },
+    followedDesktopThreads,
+    channelApprovals,
     setRunHandler(handler: typeof runHandler) {
       runHandler = handler;
     },
@@ -374,6 +396,65 @@ test("notifies the configured channel when an existing Codex client task ends", 
     completedAt: "2026-08-01T08:01:00.000Z"
   });
   assert.equal(sent.length, 3, "managed sessions should not send a duplicate filesystem notification");
+  await manager.stopAll();
+});
+
+test("forwards an existing Codex Desktop approval to the project's configured channel", async (t) => {
+  const {
+    manager,
+    paths,
+    root,
+    emitCodexTask,
+    emitDesktopApproval,
+    followedDesktopThreads,
+    channelApprovals
+  } = setup(t);
+  await manager.startAll();
+  const workspace = path.join(root, "desktop-approval-project");
+  const project = manager.createProject("account-one", "桌面审批项目", workspace);
+  const session = manager.createSession("account-one", "alice@im.wechat", undefined, "桌面会话", project.id);
+  new RuntimeStateStore(accountStatePaths(paths, "account-one"))
+    .setSessionThread(session.id, "desktop-approval-thread");
+  manager.setProjectNotifications("account-one", project.id, [{
+    accountId: "account-two",
+    recipientId: "approval-room",
+    enabled: true
+  }]);
+
+  emitCodexTask({
+    sessionId: "desktop-approval-thread",
+    turnId: "desktop-turn",
+    workspace,
+    title: "等待修改文件审批",
+    status: "running",
+    startedAt: "2026-08-04T00:00:00.000Z",
+    updatedAt: "2026-08-04T00:00:01.000Z"
+  });
+  assert.deepEqual(followedDesktopThreads, ["desktop-approval-thread"]);
+
+  const decision = await emitDesktopApproval({
+    requestId: 127,
+    method: "item/fileChange/requestApproval",
+    request: {
+      kind: "file",
+      threadId: "desktop-approval-thread",
+      turnId: "desktop-turn",
+      itemId: "desktop-item",
+      cwd: workspace
+    }
+  });
+
+  assert.equal(decision, "accept");
+  assert.deepEqual(channelApprovals, [{
+    senderId: "approval-room",
+    request: {
+      kind: "file",
+      threadId: "desktop-approval-thread",
+      turnId: "desktop-turn",
+      itemId: "desktop-item",
+      cwd: workspace
+    }
+  }]);
   await manager.stopAll();
 });
 

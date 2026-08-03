@@ -106,7 +106,7 @@ npm run build
 node dist/server/index.js
 ```
 
-这里的 npm 只用于按锁文件安装依赖和执行构建，不安装或启动本服务。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)。
+这里的 npm 只用于按锁文件安装依赖和执行构建，不发布本服务。也可以执行 `npm run install:local` 一次完成 Bridge、内置 Taskboard、`taskctl` 和 `manage-taskboard` Skill 的本机准备。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)，Taskboard 的安装、数据迁移和回滚见 [内置 Taskboard 模块指南](./docs/taskboard-module.md)。
 
 ## 添加消息渠道
 
@@ -154,9 +154,11 @@ node dist/server/index.js
 
 ## Taskboard 联动
 
-“设置”页面默认连接本机 `http://127.0.0.1:47823`，按绝对工作目录把 Codex 项目映射到 Taskboard 项目。Taskboard 始终是 Issue 状态的唯一事实源，桥接服务不会把看板任务复制进自己的状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
+Taskboard 已内置为 `packages/taskboard/` workspace 模块。Bridge 启动时会一并启动 `http://127.0.0.1:47823`，并按绝对工作目录把 Codex 项目映射到 Taskboard 项目；退出或重启时也会统一关闭。Taskboard 始终是 Issue 状态的唯一事实源，数据保存在 `~/.codex-weixin/taskboard/`，不会复制进 Bridge 的 JSON 状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
 
-将 Taskboard 仓库中的 `skills/manage-taskboard` 复制或软链接到 `~/.codex/skills/manage-taskboard` 后，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+管理后台的“任务面板”会汇总所有已映射项目的状态数量，并提供项目、状态和关键词筛选。选中 Issue 后可查看说明、优先级、Codex threadId 和进展评论，也可添加评论及执行开始处理、阻塞、恢复、提交验收、退回和验收完成。没有真实 Codex threadId 的 Issue 只能查看；阻塞和提交验收必须填写证据；“验收完成”只在待验收状态出现，并要求在独立确认窗口中显式验收。完整的关系、附件和规划仍在 Taskboard 原生页面处理。
+
+执行 `npm run install:local` 后，内置模块的 `manage-taskboard` Skill 和 `taskctl` 会链接到用户目录，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
 
 ## 消息渠道内命令
 
@@ -248,6 +250,7 @@ IkunCoding 提供方会额外显示 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6
   inbound/<account-id>/     微信入站附件
   config.json               Codex 和工作区配置
   logs/
+  taskboard/                内置 Taskboard 的 SQLite、附件与本地云伴侣配置
 ```
 
 不要提交或分享该目录。管理 API 不会把微信 token 返回给浏览器。

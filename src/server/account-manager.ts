@@ -13,6 +13,7 @@ import { WeComChannelAdapter } from "../channels/wecom.js";
 import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
 import type { CodexAccountBalance } from "../codex/account-balance.js";
+import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { isWorkspaceAllowed, loadConfig, type CodexWeixinConfig } from "../state/config.js";
 import { accountStatePaths, type StatePaths } from "../state/paths.js";
 import {
@@ -20,6 +21,10 @@ import {
   type CodexSessionCompletion,
   type CodexSessionTask
 } from "./codex-session-monitor.js";
+import {
+  CodexDesktopApprovalMonitor,
+  type CodexDesktopApproval
+} from "./codex-desktop-approval-monitor.js";
 import {
   RuntimeStateStore,
   type ManagedProject,
@@ -48,7 +53,14 @@ import {
 import { WeixinApiClient } from "../weixin/api.js";
 import { monitorWeixin, type MonitorOptions } from "../weixin/monitor.js";
 import { inferMediaKind, sanitizeFileName } from "../weixin/media.js";
-import { TaskboardClient, type TaskboardEvent, type TaskboardIssue } from "../taskboard/client.js";
+import {
+  TaskboardClient,
+  type TaskboardComment,
+  type TaskboardEvent,
+  type TaskboardIssue,
+  type TaskboardProject,
+  type TaskboardStatus
+} from "../taskboard/client.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -92,6 +104,7 @@ export type AccountProjectTask = {
 
 export type TaskboardIntegrationStatus = {
   enabled: boolean;
+  managed: boolean;
   available: boolean;
   url: string;
   error?: string;
@@ -104,6 +117,21 @@ export type TaskboardIntegrationStatus = {
     taskboardProjectName?: string;
     issueCount?: number;
   }>;
+};
+
+export type TaskboardIssueSummary = TaskboardIssue & {
+  taskboardProjectName: string;
+  workspace: string;
+  managedProjects: Array<{
+    accountId: string;
+    projectId: string;
+    projectName: string;
+  }>;
+};
+
+export type TaskboardIssueDetail = {
+  issue: TaskboardIssueSummary;
+  comments: TaskboardComment[];
 };
 
 export type SessionChatResult = {
@@ -160,6 +188,11 @@ export type AccountManagerOptions = {
       onTaskChanged: (task: CodexSessionTask) => void;
     }
   ) => CodexSessionCompletionMonitor;
+  codexDesktopApprovalMonitorFactory?: (
+    handlers: {
+      onApproval: (approval: CodexDesktopApproval) => Promise<CodexApprovalDecision | undefined>;
+    }
+  ) => CodexDesktopApprovalMonitor;
   taskboardClientFactory?: (url: string) => TaskboardClient;
 };
 
@@ -173,12 +206,14 @@ export class AccountManager {
   private readonly monitor: (options: MonitorOptions) => Promise<void>;
   private readonly runnerFactory: (config: CodexWeixinConfig) => HybridCodexRunner;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
+  private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
+  private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
   private taskboard?: TaskboardClient;
   private taskboardController?: AbortController;
   private taskboardTask?: Promise<void>;
@@ -201,6 +236,8 @@ export class AccountManager {
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
+    this.codexDesktopApprovalMonitorFactory = options.codexDesktopApprovalMonitorFactory
+      ?? ((handlers) => new CodexDesktopApprovalMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
   }
 
@@ -208,11 +245,14 @@ export class AccountManager {
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => account.enabled)
       .map((account) => this.startAccount(account.accountId, false)));
+    this.ensureCodexDesktopApprovalMonitor();
     this.ensureCodexSessionMonitor();
     this.startTaskboardMonitor();
   }
 
   async stopAll(): Promise<void> {
+    this.codexDesktopApprovalMonitor?.stop();
+    this.codexDesktopApprovalMonitor = undefined;
     this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
@@ -622,6 +662,7 @@ export class AccountManager {
         queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
+        onApproval: (request: CodexApprovalRequest) => this.requestProjectApprovalForSession(accountId, session, request),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
           ? { onProgress }
           : {})
@@ -774,6 +815,7 @@ export class AccountManager {
 
   private ensureCodexSessionMonitor(): void {
     if (this.codexSessionMonitor || !this.hasManagedProjects()) return;
+    this.ensureCodexDesktopApprovalMonitor();
     this.codexSessionMonitor = this.codexSessionMonitorFactory({
       onCompletion: (completion) => this.notifyExternalCodexCompletion(completion),
       onTaskChanged: (task) => this.updateExternalCodexTask(task)
@@ -791,9 +833,76 @@ export class AccountManager {
     const key = `${task.sessionId}\n${task.turnId}`;
     if (task.status === "running") {
       this.externalCodexTasks.set(key, task);
+      if (this.projectForExternalThread(task.sessionId, task.workspace)) {
+        this.codexDesktopApprovalMonitor?.followThread(task.sessionId);
+      }
     } else {
       this.externalCodexTasks.delete(key);
     }
+  }
+
+  private ensureCodexDesktopApprovalMonitor(): void {
+    if (this.codexDesktopApprovalMonitor || !this.hasManagedProjects()) return;
+    this.codexDesktopApprovalMonitor = this.codexDesktopApprovalMonitorFactory({
+      onApproval: (approval) => this.handleDesktopApproval(approval)
+    });
+    this.codexDesktopApprovalMonitor.start();
+  }
+
+  private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
+    const project = this.projectForExternalThread(approval.request.threadId, approval.request.cwd);
+    if (!project) {
+      console.warn(`[codex-channel-bridge] no managed project found for Codex Desktop approval ${approval.requestId}`);
+      return undefined;
+    }
+    return this.requestProjectApproval(project, approval.request);
+  }
+
+  private requestProjectApprovalForSession(
+    accountId: string,
+    session: ManagedSession,
+    request: CodexApprovalRequest
+  ): Promise<CodexApprovalDecision> {
+    const project = session.projectId
+      ? this.storeFor(accountId).listProjects().find((candidate) => candidate.id === session.projectId)
+      : undefined;
+    if (!project) return Promise.resolve("decline");
+    return this.requestProjectApproval(project, request).then((decision) => decision ?? "decline");
+  }
+
+  private async requestProjectApproval(
+    project: ManagedProject,
+    request: CodexApprovalRequest
+  ): Promise<CodexApprovalDecision | undefined> {
+    const target = (project.notifications ?? [])
+      .filter((candidate) => candidate.enabled)
+      .find((candidate) => {
+        const entry = this.entries.get(candidate.accountId);
+        return entry?.status === "running" && Boolean(entry.service);
+      });
+    if (!target) {
+      console.warn(`[codex-channel-bridge] no running notification channel for approval in project ${project.name}`);
+      return undefined;
+    }
+    return this.entries.get(target.accountId)!.service!.requestApproval(target.recipientId, request);
+  }
+
+  private projectForExternalThread(threadId: string, workspace?: string): ManagedProject | undefined {
+    const contexts = listAccounts(this.options.paths).flatMap((account) => {
+      const store = this.storeFor(account.accountId);
+      const projects = new Map(store.listProjects().map((project) => [project.id, project]));
+      return store.listSessions().flatMap((session) => {
+        const project = session.projectId ? projects.get(session.projectId) : undefined;
+        return project ? [{ session, project }] : [];
+      });
+    });
+    const exact = contexts.find(({ session }) => session.threadId === threadId)?.project;
+    if (exact) return exact;
+    if (!workspace) return undefined;
+    const canonical = canonicalWorkspace(workspace);
+    return contexts.find(({ project }) => canonicalWorkspace(project.workspace) === canonical)?.project
+      ?? listAccounts(this.options.paths).flatMap((account) => this.storeFor(account.accountId).listProjects())
+        .find((project) => canonicalWorkspace(project.workspace) === canonical);
   }
 
   private projectSummary(
@@ -932,13 +1041,14 @@ export class AccountManager {
     const config = this.configProvider();
     const managed = this.listProjects();
     if (!config.taskboardEnabled) {
-      return { enabled: false, available: false, url: config.taskboardUrl, projects: managed.map(taskboardProjectBase) };
+      return { enabled: false, managed: true, available: false, url: config.taskboardUrl, projects: managed.map(taskboardProjectBase) };
     }
     try {
       const client = this.taskboardFor(config)!;
       const projects = await client.listProjects();
       return {
         enabled: true,
+        managed: true,
         available: true,
         url: client.baseUrl,
         projects: managed.map((project) => {
@@ -957,12 +1067,94 @@ export class AccountManager {
     } catch (error) {
       return {
         enabled: true,
+        managed: true,
         available: false,
         url: config.taskboardUrl,
         error: error instanceof Error ? error.message : String(error),
         projects: managed.map(taskboardProjectBase)
       };
     }
+  }
+
+  async listTaskboardIssues(): Promise<TaskboardIssueSummary[]> {
+    const client = this.requireTaskboard();
+    const contexts = this.mappedTaskboardProjects(await client.listProjects());
+    const batches = await Promise.all(contexts.map(async (context) => ({
+      context,
+      issues: await client.listIssues({ projectId: context.taskboardProject.id })
+    })));
+    return batches.flatMap(({ context, issues }) => issues.map((issue) =>
+      taskboardIssueSummary(issue, context.taskboardProject, context.managedProjects)
+    )).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async getTaskboardIssue(identifier: string): Promise<TaskboardIssueDetail> {
+    const { client, issue, taskboardProject, managedProjects } = await this.taskboardIssueContext(identifier);
+    return {
+      issue: taskboardIssueSummary(issue, taskboardProject, managedProjects),
+      comments: await client.listComments(issue.id)
+    };
+  }
+
+  async commentTaskboardIssue(identifier: string, body: string): Promise<TaskboardComment> {
+    const { client, issue } = await this.taskboardIssueContext(identifier);
+    const threadId = requireTaskboardThread(issue);
+    return client.addComment(issue.id, body.trim(), threadId);
+  }
+
+  async moveTaskboardIssue(
+    identifier: string,
+    status: TaskboardStatus,
+    version: number,
+    comment?: string
+  ): Promise<TaskboardIssue> {
+    const { client, issue } = await this.taskboardIssueContext(identifier);
+    const threadId = requireTaskboardThread(issue);
+    if (issue.version !== version) {
+      throw new Error(`Taskboard issue version changed: expected ${version}, current ${issue.version}`);
+    }
+    if (!taskboardTransitions(issue.status).includes(status)) {
+      throw new Error(`Invalid Taskboard transition: ${issue.status} -> ${status}`);
+    }
+    const note = comment?.trim();
+    if (["blocked", "in_review"].includes(status) && !note) {
+      throw new Error(`Taskboard transition to ${status} requires a comment`);
+    }
+    if (note) await client.addComment(issue.id, note, threadId);
+    return client.moveIssue(issue.id, status, version, threadId);
+  }
+
+  private requireTaskboard(): TaskboardClient {
+    const client = this.taskboardFor();
+    if (!client) throw new Error("Taskboard integration is disabled");
+    return client;
+  }
+
+  private mappedTaskboardProjects(projects: TaskboardProject[]): Array<{
+    taskboardProject: TaskboardProject;
+    managedProjects: AccountProject[];
+  }> {
+    const managed = this.listProjects();
+    return projects.flatMap((taskboardProject) => {
+      if (!taskboardProject.workspacePath) return [];
+      const workspace = canonicalWorkspace(taskboardProject.workspacePath);
+      const managedProjects = managed.filter((project) => canonicalWorkspace(project.workspace) === workspace);
+      return managedProjects.length ? [{ taskboardProject, managedProjects }] : [];
+    });
+  }
+
+  private async taskboardIssueContext(identifier: string): Promise<{
+    client: TaskboardClient;
+    issue: TaskboardIssue;
+    taskboardProject: TaskboardProject;
+    managedProjects: AccountProject[];
+  }> {
+    const client = this.requireTaskboard();
+    const [issue, projects] = await Promise.all([client.getIssue(identifier), client.listProjects()]);
+    const context = this.mappedTaskboardProjects(projects)
+      .find((candidate) => candidate.taskboardProject.id === issue.projectId);
+    if (!context) throw new Error(`Taskboard issue is outside managed workspaces: ${identifier}`);
+    return { client, issue, ...context };
   }
 
   private taskboardFor(config = this.configProvider()): TaskboardClient | undefined {
@@ -1169,6 +1361,40 @@ function taskboardProjectBase(project: AccountProject): TaskboardIntegrationStat
     projectName: project.name,
     workspace: project.workspace
   };
+}
+
+function taskboardIssueSummary(
+  issue: TaskboardIssue,
+  project: TaskboardProject,
+  managedProjects: AccountProject[]
+): TaskboardIssueSummary {
+  return {
+    ...issue,
+    taskboardProjectName: project.name,
+    workspace: project.workspacePath ?? "",
+    managedProjects: managedProjects.map((managed) => ({
+      accountId: managed.accountId,
+      projectId: managed.id,
+      projectName: managed.name
+    }))
+  };
+}
+
+function requireTaskboardThread(issue: TaskboardIssue): string {
+  if (!issue.threadId) throw new Error(`Taskboard issue has no Codex thread: ${issue.identifier}`);
+  return issue.threadId;
+}
+
+function taskboardTransitions(status: TaskboardStatus): readonly TaskboardStatus[] {
+  return ({
+    backlog: [],
+    todo: ["in_progress"],
+    in_progress: ["blocked", "in_review"],
+    in_review: ["in_progress", "done"],
+    blocked: ["in_progress"],
+    done: [],
+    canceled: []
+  } as const)[status];
 }
 
 function formatTaskboardStatus(status: TaskboardIssue["status"]): string {

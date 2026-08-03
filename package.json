@@ -21,8 +21,13 @@
     "bridge"
   ],
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run copy:web",
+    "install:local": "node scripts/install-local.mjs",
+    "install:check": "node scripts/install-local.mjs --check",
+    "build": "npm run build:web --workspace codex-taskboard && tsc -p tsconfig.json && npm run copy:web",
     "copy:web": "node scripts/copy-web-assets.mjs",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "tsx src/server/index.ts",
@@ -35,6 +40,7 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.72.0",
     "@wecom/aibot-node-sdk": "^1.0.7",
+    "codex-taskboard": "file:packages/taskboard",
     "dompurify": "^3.4.12",
     "lucide": "^0.468.0",
     "marked": "^18.0.6",

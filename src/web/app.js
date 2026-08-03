@@ -10,6 +10,10 @@ const state = {
   codexRuntime: null,
   codexModels: [],
   taskboard: null,
+  taskboardIssues: [],
+  taskboardIssueDetail: null,
+  taskboardIssueError: "",
+  selectedTaskboardIssue: "",
   loginPoll: null,
   selectedSessionKey: "",
   sessionMessages: [],
@@ -75,7 +79,10 @@ document.addEventListener("DOMContentLoaded", () => {
     removeAccountDialog: document.querySelector("#removeAccountDialog"),
     sessionDialog: document.querySelector("#sessionDialog"),
     projectDialog: document.querySelector("#projectDialog"),
-    projectNotificationDialog: document.querySelector("#projectNotificationDialog")
+    projectNotificationDialog: document.querySelector("#projectNotificationDialog"),
+    taskboardIssueList: document.querySelector("#taskboardIssueList"),
+    taskboardDetail: document.querySelector("#taskboardDetail"),
+    taskboardActionDialog: document.querySelector("#taskboardActionDialog")
   });
   bindEvents();
   void bootstrap();
@@ -104,6 +111,14 @@ function bindEvents() {
   document.querySelector("#notificationEnabledInput").addEventListener("change", updateNotificationFields);
   document.querySelector("#projectAccountInput").addEventListener("change", renderCodexProjectOptions);
   document.querySelector("#projectWorkspaceInput").addEventListener("change", updateProjectNameFromSelection);
+  document.querySelector("#refreshTaskboardButton").addEventListener("click", () => void refreshTaskboardIssues(true));
+  document.querySelector("#taskboardProjectFilter").addEventListener("change", renderTaskboardWorkbench);
+  document.querySelector("#taskboardStatusFilter").addEventListener("change", renderTaskboardWorkbench);
+  document.querySelector("#taskboardSearchInput").addEventListener("input", renderTaskboardWorkbench);
+  document.querySelector("#taskboardActionForm").addEventListener("submit", (event) => void submitTaskboardAction(event));
+  els.taskboardIssueList.addEventListener("click", (event) => void handleTaskboardIssueSelection(event));
+  els.taskboardDetail.addEventListener("click", handleTaskboardDetailAction);
+  els.taskboardDetail.addEventListener("submit", (event) => void submitTaskboardComment(event));
   document.querySelector("#sessionSenderInput").addEventListener("change", updateNewSessionDefaultTitle);
   els.chatComposer.addEventListener("submit", (event) => void sendSessionMessage(event));
   els.chatInput.addEventListener("input", updateComposerState);
@@ -144,6 +159,7 @@ async function bootstrap() {
     state.codexRuntime = data.codexRuntime;
     state.codexModels = data.codexModels || [];
     state.taskboard = taskboard;
+    await loadTaskboardIssues();
     renderAll();
     showView(location.hash.slice(1) || "accounts", false);
     window.setInterval(() => void refreshData(false), 5000);
@@ -310,6 +326,7 @@ function delay(ms) {
 async function refreshData(notify) {
   try {
     const previousSession = selectedSession();
+    const taskboardEditing = isTaskboardEditing();
     const [accounts, projects, sessions, taskboard] = await Promise.all([
       api("/api/accounts"),
       api("/api/projects"),
@@ -320,10 +337,12 @@ async function refreshData(notify) {
     state.projects = projects.projects;
     state.sessions = sessions.sessions;
     state.taskboard = taskboard;
+    await loadTaskboardIssues(!taskboardEditing && !document.querySelector("#taskboardView").hidden);
     renderMetrics();
     renderAccounts();
     renderSessions();
     renderTaskboardStatus();
+    if (!taskboardEditing) renderTaskboardWorkbench();
     drawIcons();
     const currentSession = selectedSession();
     if (
@@ -349,6 +368,7 @@ function renderAll() {
   renderMetrics();
   renderAccounts();
   renderSessions();
+  renderTaskboardWorkbench();
   renderSettings();
   drawIcons();
 }
@@ -609,7 +629,9 @@ function renderTaskboardStatus() {
     return;
   }
   const stateClass = taskboard.available ? "status-running" : taskboard.enabled ? "status-error" : "";
-  const stateText = taskboard.available ? "Taskboard 已连接" : taskboard.enabled ? "Taskboard 不可用" : "Taskboard 已停用";
+  const stateText = taskboard.available
+    ? taskboard.managed ? "内置 Taskboard 已运行" : "Taskboard 已连接"
+    : taskboard.enabled ? "内置 Taskboard 不可用" : "Taskboard 已停用";
   const mappings = Array.isArray(taskboard.projects) ? taskboard.projects : [];
   panel.innerHTML = `
     <div class="taskboard-connection">
@@ -626,6 +648,231 @@ function renderTaskboardStatus() {
           </span>
         </div>`).join("") : `<p class="taskboard-empty">添加 Codex 项目后会按工作目录自动映射。</p>`}
     </div>`;
+}
+
+async function loadTaskboardIssues(loadDetail = true) {
+  if (!state.taskboard?.available) {
+    state.taskboardIssues = [];
+    state.taskboardIssueDetail = null;
+    state.taskboardIssueError = state.taskboard?.error || (state.taskboard?.enabled ? "Taskboard 暂不可用" : "请先在设置中启用 Taskboard");
+    return;
+  }
+  try {
+    const result = await api("/api/taskboard/issues");
+    state.taskboardIssues = Array.isArray(result.issues) ? result.issues : [];
+    state.taskboardIssueError = "";
+    if (!state.taskboardIssues.some((issue) => issue.identifier === state.selectedTaskboardIssue)) {
+      state.selectedTaskboardIssue = state.taskboardIssues[0]?.identifier || "";
+      state.taskboardIssueDetail = null;
+    }
+    if (loadDetail && state.selectedTaskboardIssue) await loadTaskboardIssueDetail(state.selectedTaskboardIssue, false);
+  } catch (error) {
+    state.taskboardIssues = [];
+    state.taskboardIssueDetail = null;
+    state.taskboardIssueError = error.message || "无法读取 Taskboard 任务";
+  }
+}
+
+async function refreshTaskboardIssues(notify = false) {
+  const button = document.querySelector("#refreshTaskboardButton");
+  button.disabled = true;
+  try {
+    state.taskboard = await api("/api/taskboard");
+    await loadTaskboardIssues();
+    renderTaskboardStatus();
+    renderTaskboardWorkbench();
+    if (notify) toast("任务面板已刷新");
+  } finally {
+    button.disabled = false;
+    drawIcons();
+  }
+}
+
+async function loadTaskboardIssueDetail(identifier, render = true) {
+  state.selectedTaskboardIssue = identifier;
+  state.taskboardIssueDetail = null;
+  if (render) renderTaskboardWorkbench();
+  try {
+    state.taskboardIssueDetail = await api(`/api/taskboard/issues/${encodeURIComponent(identifier)}`);
+  } catch (error) {
+    state.taskboardIssueError = error.message || "无法读取任务详情";
+  }
+  if (render) {
+    renderTaskboardWorkbench();
+    drawIcons();
+  }
+}
+
+function renderTaskboardWorkbench() {
+  const issues = state.taskboardIssues;
+  const projectFilter = document.querySelector("#taskboardProjectFilter");
+  const currentProject = projectFilter.value;
+  const projects = [...new Map(issues.map((issue) => [issue.projectId, issue.taskboardProjectName])).entries()];
+  projectFilter.innerHTML = `<option value="">全部项目</option>${projects.map(([id, name]) => `<option value="${escapeAttr(id)}">${escapeHtml(name)}</option>`).join("")}`;
+  projectFilter.value = projects.some(([id]) => id === currentProject) ? currentProject : "";
+  const status = document.querySelector("#taskboardStatusFilter").value;
+  const query = document.querySelector("#taskboardSearchInput").value.trim().toLowerCase();
+  const visible = issues.filter((issue) => (!projectFilter.value || issue.projectId === projectFilter.value)
+    && (!status || issue.status === status)
+    && (!query || `${issue.identifier} ${issue.title}`.toLowerCase().includes(query)));
+  document.querySelector("#taskboardIssueCount").textContent = String(visible.length);
+  const metrics = [
+    ["全部", issues.length, "list-checks"],
+    ["处理中", issues.filter((issue) => issue.status === "in_progress").length, "loader-circle"],
+    ["阻塞", issues.filter((issue) => issue.status === "blocked").length, "circle-slash-2"],
+    ["待验收", issues.filter((issue) => issue.status === "in_review").length, "badge-check"]
+  ];
+  document.querySelector("#taskboardMetrics").innerHTML = metrics.map(([label, count, icon]) => `<div><dt><i data-lucide="${icon}"></i>${label}</dt><dd>${count}</dd></div>`).join("");
+  const openButton = document.querySelector("#openTaskboardButton");
+  if (state.taskboard?.url) openButton.href = state.taskboard.url;
+  if (state.taskboardIssueError && !issues.length) {
+    els.taskboardIssueList.innerHTML = taskboardEmpty("triangle-alert", "任务面板暂不可用", state.taskboardIssueError);
+  } else if (!visible.length) {
+    els.taskboardIssueList.innerHTML = taskboardEmpty("list-filter", issues.length ? "没有匹配的任务" : "还没有已映射任务", issues.length ? "调整项目、状态或搜索条件" : "先在 Taskboard 中创建与 Codex 项目工作目录一致的项目");
+  } else {
+    els.taskboardIssueList.innerHTML = visible.map((issue) => `<button class="taskboard-issue-row${issue.identifier === state.selectedTaskboardIssue ? " is-selected" : ""}" type="button" data-taskboard-issue="${escapeAttr(issue.identifier)}" aria-pressed="${issue.identifier === state.selectedTaskboardIssue}">
+      <span class="taskboard-issue-top"><strong>${escapeHtml(issue.identifier)}</strong><span class="taskboard-status status-${escapeAttr(issue.status)}">${taskboardStatusText(issue.status)}</span></span>
+      <span class="taskboard-issue-title">${escapeHtml(issue.title)}</span>
+      <span class="taskboard-issue-meta"><span>${escapeHtml(issue.taskboardProjectName)}</span><time>${relativeTime(issue.updatedAt)}</time></span>
+    </button>`).join("");
+  }
+  renderTaskboardDetail();
+}
+
+function isTaskboardEditing() {
+  return Boolean(
+    els.taskboardActionDialog?.open
+    || document.activeElement?.closest?.("#taskboardDetail")
+  );
+}
+
+function renderTaskboardDetail() {
+  const detail = state.taskboardIssueDetail;
+  const selected = state.taskboardIssues.find((issue) => issue.identifier === state.selectedTaskboardIssue);
+  if (!selected) {
+    els.taskboardDetail.innerHTML = taskboardEmpty("mouse-pointer-click", "选择一条任务", "查看详情、线程归属和状态操作");
+    return;
+  }
+  if (!detail || detail.issue.identifier !== selected.identifier) {
+    els.taskboardDetail.innerHTML = taskboardEmpty("loader-circle", "正在读取任务详情", selected.identifier);
+    return;
+  }
+  const issue = detail.issue;
+  const canManage = Boolean(issue.threadId);
+  els.taskboardDetail.innerHTML = `<header class="taskboard-detail-header">
+      <div><p class="eyebrow">${escapeHtml(issue.identifier)}</p><h2>${escapeHtml(issue.title)}</h2></div>
+      <span class="taskboard-status status-${escapeAttr(issue.status)}">${taskboardStatusText(issue.status)}</span>
+    </header>
+    <dl class="taskboard-detail-facts">
+      <div><dt>项目</dt><dd>${escapeHtml(issue.taskboardProjectName)}</dd></div>
+      <div><dt>优先级</dt><dd>${escapeHtml(taskboardPriorityText(issue.priority))}</dd></div>
+      <div><dt>Codex 线程</dt><dd><code title="${escapeAttr(issue.threadId || "")}">${escapeHtml(shortId(issue.threadId || "未绑定"))}</code></dd></div>
+      <div><dt>更新时间</dt><dd>${escapeHtml(messageTime(issue.updatedAt))}</dd></div>
+    </dl>
+    <section class="taskboard-description"><h3>任务说明</h3><div class="markdown-body">${renderMarkdown(issue.description || "暂无说明")}</div></section>
+    <section class="taskboard-comments"><div class="taskboard-detail-section-title"><h3>进展记录</h3><span>${detail.comments.length}</span></div>
+      <div class="taskboard-comment-list">${detail.comments.length ? detail.comments.map((comment) => `<article><div class="markdown-body">${renderMarkdown(comment.body)}</div><time>${escapeHtml(messageTime(comment.createdAt))}</time></article>`).join("") : `<p class="taskboard-no-comments">还没有进展记录。</p>`}</div>
+    </section>
+    ${canManage ? `<form class="taskboard-comment-form" id="taskboardCommentForm"><label><span>添加进展</span><textarea id="taskboardCommentInput" rows="3" maxlength="100000" required placeholder="记录验证结果、阻塞原因或交付证据"></textarea></label><button class="button button-secondary" type="submit"><i data-lucide="message-square-plus"></i><span>添加评论</span></button></form>` : `<p class="taskboard-thread-warning"><i data-lucide="link-2-off"></i><span>该任务尚未绑定 Codex 线程，请先在聊天中执行 <code>/task start ${escapeHtml(issue.identifier)}</code>。</span></p>`}
+    <footer class="taskboard-detail-actions">${canManage ? taskboardActionButtons(issue) : ""}</footer>`;
+}
+
+function taskboardActionButtons(issue) {
+  const actions = ({
+    todo: [["in_progress", "play", "开始处理", "primary"]],
+    in_progress: [["blocked", "circle-slash-2", "标记阻塞", "danger"], ["in_review", "badge-check", "提交验收", "primary"]],
+    blocked: [["in_progress", "rotate-ccw", "恢复处理", "primary"]],
+    in_review: [["in_progress", "undo-2", "退回处理", "secondary"], ["done", "check-check", "验收完成", "primary"]]
+  })[issue.status] || [];
+  return actions.map(([status, icon, label, kind]) => `<button class="button button-${kind}" type="button" data-taskboard-move="${status}" data-identifier="${escapeAttr(issue.identifier)}" data-version="${issue.version}"><i data-lucide="${icon}"></i><span>${label}</span></button>`).join("");
+}
+
+async function handleTaskboardIssueSelection(event) {
+  const button = event.target.closest("[data-taskboard-issue]");
+  if (!button || button.dataset.taskboardIssue === state.selectedTaskboardIssue) return;
+  await loadTaskboardIssueDetail(button.dataset.taskboardIssue);
+}
+
+function handleTaskboardDetailAction(event) {
+  const button = event.target.closest("[data-taskboard-move]");
+  if (!button) return;
+  openTaskboardActionDialog(button.dataset.identifier, button.dataset.taskboardMove, Number(button.dataset.version));
+}
+
+function openTaskboardActionDialog(identifier, status, version) {
+  const meta = ({
+    in_progress: { title: "进入处理中", copy: "确认由当前 Codex 线程继续处理这项任务。", label: "补充说明（可选）", hint: "退回处理时建议说明需要调整的内容。", required: false, submit: "确认处理" },
+    blocked: { title: "标记为阻塞", copy: "阻塞原因会写入进展记录，并触发已配置的项目通知。", label: "阻塞原因", hint: "说明依赖、权限或外部条件，以及解除阻塞所需动作。", required: true, submit: "确认阻塞" },
+    in_review: { title: "提交验收", copy: "交付证据会写入进展记录，状态变为待验收。", label: "交付与验证证据", hint: "请写明改动、测试结果和需要验收的关键点。", required: true, submit: "提交验收" },
+    done: { title: "验收完成", copy: "这是显式验收操作。确认后任务会标记完成，且不能从本后台自动撤销。", label: "验收意见（可选）", hint: "可记录验收范围、结果或后续事项。", required: false, submit: "确认验收并完成" }
+  })[status];
+  if (!meta) return;
+  document.querySelector("#taskboardActionIdentifier").value = identifier;
+  document.querySelector("#taskboardActionStatus").value = status;
+  document.querySelector("#taskboardActionVersion").value = String(version);
+  document.querySelector("#taskboardActionDialogTitle").textContent = meta.title;
+  document.querySelector("#taskboardActionCopy").textContent = meta.copy;
+  document.querySelector("#taskboardActionCommentLabel").textContent = meta.label;
+  document.querySelector("#taskboardActionHint").textContent = meta.hint;
+  document.querySelector("#taskboardActionComment").value = "";
+  document.querySelector("#taskboardActionComment").required = meta.required;
+  document.querySelector("#taskboardActionSubmit span").textContent = meta.submit;
+  els.taskboardActionDialog.showModal();
+  drawIcons();
+}
+
+async function submitTaskboardAction(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  const identifier = document.querySelector("#taskboardActionIdentifier").value;
+  const status = document.querySelector("#taskboardActionStatus").value;
+  const version = Number(document.querySelector("#taskboardActionVersion").value);
+  const comment = document.querySelector("#taskboardActionComment").value.trim();
+  try {
+    button.disabled = true;
+    await api(`/api/taskboard/issues/${encodeURIComponent(identifier)}/move`, {
+      method: "POST",
+      body: { status, version, ...(comment ? { comment } : {}) }
+    });
+    els.taskboardActionDialog.close();
+    await refreshTaskboardIssues(false);
+    toast(status === "done" ? "任务已验收完成" : "任务状态已更新");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function submitTaskboardComment(event) {
+  if (event.target.id !== "taskboardCommentForm") return;
+  event.preventDefault();
+  const button = event.submitter;
+  const input = document.querySelector("#taskboardCommentInput");
+  try {
+    button.disabled = true;
+    await api(`/api/taskboard/issues/${encodeURIComponent(state.selectedTaskboardIssue)}/comments`, {
+      method: "POST", body: { body: input.value.trim() }
+    });
+    await loadTaskboardIssueDetail(state.selectedTaskboardIssue);
+    toast("进展记录已添加");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function taskboardEmpty(icon, title, detail) {
+  return `<div class="taskboard-empty-state"><i data-lucide="${icon}"></i><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div>`;
+}
+
+function taskboardStatusText(status) {
+  return ({ backlog: "待规划", todo: "待处理", in_progress: "处理中", in_review: "待验收", blocked: "阻塞", done: "已完成", canceled: "已取消" })[status] || status;
+}
+
+function taskboardPriorityText(priority) {
+  return ({ urgent: "紧急", high: "高", medium: "中", low: "低", none: "未设置" })[priority] || priority;
 }
 
 function renderModelOptions() {
@@ -1768,7 +2015,7 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "taskboard", "settings"].includes(name) ? name : "accounts";
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const visible = panel.dataset.viewPanel === valid;
     panel.hidden = !visible;
@@ -1776,6 +2023,7 @@ function showView(name, updateHash = true) {
   });
   document.querySelectorAll(".tab[data-view]").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === valid));
   if (updateHash && location.hash !== `#${valid}`) history.replaceState(null, "", `#${valid}`);
+  if (valid === "taskboard" && updateHash) void refreshTaskboardIssues(false);
 }
 
 function closeDialog(id) {
