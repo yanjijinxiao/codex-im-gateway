@@ -1,20 +1,19 @@
-# Codex Taskboard 本地一键安装
+# 内置 Codex Taskboard 本地一键安装
 
-这份文档是本地安装、升级、验证和卸载的独立入口。目标是让 Codex 在拿到仓库路径后只执行一个命令，即可完成可复用的本地安装。
+Taskboard 已集成到 `codex-wx/packages/taskboard`。安装、构建和运行都从 `codex-wx` 根目录统一管理，不再从旧 `dashi-taskboard` 路径独立安装或启动。
 
 ## 安装结果
 
 一键安装会完成以下工作：
 
 1. 检查 Node.js 是否满足 `22.5+`；
-2. 仅在 `node_modules` 缺失或比 `package-lock.json` 旧时运行 `npm ci --ignore-scripts`；
-3. 仅在生产页面缺失或源码更新后运行生产构建；
+2. 复用根工作区的依赖和 npm 缓存；
+3. 同时构建 Bridge 与完整 Taskboard 页面；
 4. 注册 `~/.local/bin/taskctl`；
 5. 注册 `~/.codex/skills/manage-taskboard`；
-6. 使用临时 SQLite 数据库启动一次回环测试服务，并验证 `/health`；
-7. 不启动常驻进程，不修改 Codex 应用文件，不覆盖其他安装留下的文件或链接。
+6. 不启动常驻进程，不修改 Codex 应用文件，不覆盖同名普通文件。
 
-Taskboard 的正式数据仍保存在仓库的 `.data/` 中。安装验证使用系统临时目录，不接触正式数据库。
+Taskboard 正式数据保存在 `~/.codex-weixin/taskboard/`，不再使用源码目录内的 `.data/`。
 
 ## 前置条件
 
@@ -27,16 +26,16 @@ Taskboard 的正式数据仍保存在仓库的 `.data/` 中。安装验证使用
 
 ## 一键安装
 
-在仓库根目录执行：
+在 `codex-wx` 根目录执行：
 
 ```bash
 npm run install:local
 ```
 
-也可以完全绕过 npm script 名称，直接执行：
+也可以直接执行根安装器：
 
 ```bash
-node scripts/install-local.mjs
+node /Users/leishicheng/Documents/codex-wx/scripts/install-local.mjs
 ```
 
 重复执行是安全的：依赖、构建产物和正确的软链接会被复用。若目标位置已有普通文件、目录或指向其他项目的链接，安装器会停止并报告冲突，不会自动覆盖。
@@ -46,13 +45,13 @@ node scripts/install-local.mjs
 可以直接在 Codex 中发送：
 
 ```text
-请进入 /absolute/path/to/dashi-taskboard，先读取 docs/local-installation.md，执行 npm run install:local，并用 npm run install:check 验证。不要重复安装已经满足的 Node.js 或依赖，不要覆盖已有的不同目标文件。
+请进入 /Users/leishicheng/Documents/codex-wx，先读取 docs/taskboard-module.md，执行 npm run install:local，并用 npm run install:check 验证。不要访问或重新安装旧 dashi-taskboard 路径。
 ```
 
 如果仓库就在本机当前标准位置，则完整命令是：
 
 ```bash
-cd /Users/leishicheng/Documents/workspace/code/dashi-taskboard
+cd /Users/leishicheng/Documents/codex-wx
 npm run install:local
 ```
 
@@ -85,20 +84,20 @@ readlink ~/.codex/skills/manage-taskboard
 
 ## 启动方式
 
-### 只启动本地任务面板
+### 启动 Bridge 与内置任务面板
 
 ```bash
-CODEX_TASKBOARD_HOST=127.0.0.1 npm start
+node dist/server/index.js
 ```
 
-打开 <http://127.0.0.1:47823>。明确设置 `127.0.0.1` 可以避免把没有账号认证的本地看板暴露到局域网。
+Bridge 打开 <http://127.0.0.1:8787>，同一进程在 <http://127.0.0.1:47823> 提供完整看板。不要再启动第二个 Taskboard 服务。
 
 ### 启动 Codex 嵌入模式
 
 该方式会启动带调试端口的独立 Codex 窗口并保持注入器运行：
 
 ```bash
-CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
+node packages/taskboard/scripts/codex-injector.mjs --daemon --open --port 9231
 ```
 
 命令需要持续运行，使用结束后按 `Ctrl-C`。它不会修改 `ChatGPT.app` 或 `app.asar`。
@@ -118,7 +117,7 @@ CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
 
 ## 升级
 
-先保留现有 `.data/`，更新源码后重新运行同一个安装命令：
+先备份 `~/.codex-weixin/taskboard/taskboard.sqlite`，更新源码后重新运行同一个安装命令：
 
 ```bash
 git pull --ff-only
@@ -126,7 +125,7 @@ npm run install:local
 npm run install:check
 ```
 
-安装器不会删除或迁移 `.data/taskboard.sqlite` 和 `.data/attachments/`。涉及数据库结构升级时，仍应先备份 `.data/`，再按版本说明执行。
+安装器不会删除或迁移 `~/.codex-weixin/taskboard/`。涉及数据库结构升级时，应先备份该状态目录，再按版本说明执行。
 
 ## 卸载
 
@@ -139,7 +138,7 @@ readlink ~/.codex/skills/manage-taskboard
 
 确认它们都指向当前仓库后，再手动删除对应链接。不要在没有核对目标的情况下删除同名文件或目录。
 
-源码目录和 `.data/` 不会被自动删除。是否保留任务数据库应由用户明确决定。
+源码模块属于 `codex-wx` workspace，不应单独删除。是否保留 `~/.codex-weixin/taskboard/` 应由用户明确决定。
 
 ## 常见问题
 
@@ -168,6 +167,6 @@ curl http://127.0.0.1:47823/health
 ## 安全边界
 
 - 本地模式固定使用 `127.0.0.1`；
-- 不把 `.data/`、凭据或 Cloudflare 密钥提交到仓库；
+- 不把 `~/.codex-weixin/taskboard/`、凭据或 Cloudflare 密钥提交到仓库；
 - CDP 调试端口只应在运行可信本地代码时开启；
 - 当前仓库未声明明确的开源许可证，分发或商业集成前需先确认授权。

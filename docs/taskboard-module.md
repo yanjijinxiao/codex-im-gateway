@@ -34,7 +34,7 @@ Taskboard Issue 不会复制到 Bridge 的 JSON 状态中。数据库仍是唯�
 ## 从独立仓库迁移
 
 1. 停止独立 Taskboard 和 Bridge，确认 47823、8787 没有监听进程。
-2. 保留旧目录，不删除 `.data/`。
+2. 在确认迁移与备份前保留旧目录和 `.data/`。
 3. 用 SQLite 在线备份语义复制旧库：
 
 ```bash
@@ -51,7 +51,7 @@ sqlite3 ~/.codex-weixin/taskboard/taskboard.sqlite 'PRAGMA integrity_check;'
 
 ## 回滚
 
-停止 Bridge 后，将 Taskboard 数据目录切回旧 `.data/`，再从旧仓库启动独立服务即可。迁移过程不要求删除旧仓库或旧数据库；确认新模式稳定前应保留它们。
+当前机器的旧仓库已按用户要求移入 `~/.Trash/dashi-taskboard`。废纸篓尚未清空时可以恢复原目录；长期的数据回滚应使用 `~/.codex-weixin/taskboard/` 中带时间戳的 SQLite 备份。恢复数据库前先停止 Bridge，备份当前库，替换后执行 `PRAGMA integrity_check`，再恢复服务。不要重新安装或启动旧路径。
 
 ## 验证清单
 
