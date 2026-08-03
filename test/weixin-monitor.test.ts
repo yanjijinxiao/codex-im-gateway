@@ -163,3 +163,37 @@ test("skips duplicate message ids and persists the latest sync key", async (t) =
   assert.deepEqual(handled, ["duplicate"]);
   assert.deepEqual(syncKeys, ["sync-next", "sync-final"]);
 });
+
+test("keeps polling while a previous message waits for channel approval", async () => {
+  const controller = new AbortController();
+  const handled: string[] = [];
+  let polls = 0;
+  let finishFirst!: () => void;
+  const firstPending = new Promise<void>((resolve) => { finishFirst = resolve; });
+  const client = {
+    async getUpdates() {
+      polls += 1;
+      if (polls === 1) {
+        return { get_updates_buf: "sync-1", msgs: [{ message_id: "task", from_user_id: "alice", text: "run" }] };
+      }
+      if (polls === 2) {
+        return { get_updates_buf: "sync-2", msgs: [{ message_id: "approval", from_user_id: "alice", text: "/ok A1" }] };
+      }
+      controller.abort();
+      return { get_updates_buf: "sync-3", msgs: [] };
+    }
+  } as WeixinApiClient;
+
+  await monitorWeixin({
+    client,
+    signal: controller.signal,
+    pollIntervalMs: 0,
+    async onMessage(message) {
+      handled.push(message.id);
+      if (message.id === "task") await firstPending;
+      if (message.id === "approval") finishFirst();
+    }
+  });
+
+  assert.deepEqual(handled, ["task", "approval"]);
+});

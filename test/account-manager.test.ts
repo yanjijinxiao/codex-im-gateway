@@ -12,7 +12,7 @@ import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
 
-function setup(t: test.TestContext) {
+function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
@@ -68,7 +68,8 @@ function setup(t: test.TestContext) {
   };
   const manager = new AccountManager({
     paths,
-    configProvider: () => defaultConfig(root),
+    configProvider: () => ({ ...defaultConfig(root), taskboardEnabled: Boolean(options.taskboardClient) }),
+    taskboardClientFactory: () => options.taskboardClient as never,
     clientFactory: (account) => ({
       accountId: account.accountId,
       async sendText(input: { toUserId: string; text: string }) {
@@ -132,6 +133,108 @@ function setup(t: test.TestContext) {
     }
   };
 }
+
+test("notifies Taskboard review state once with the latest evidence", async (t) => {
+  let emit: ((event: object) => Promise<void> | void) | undefined;
+  const taskboardProject = { id: "tb-project", name: "Taskboard Project", workspacePath: "", issueCount: 1 };
+  const taskboardClient = {
+    baseUrl: "http://127.0.0.1:47823",
+    async subscribe(signal: AbortSignal, onEvent: typeof emit) {
+      emit = onEvent;
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    },
+    async listProjects() { return [taskboardProject]; },
+    async listComments() { return [{ body: "测试与构建均通过" }]; },
+    async projectForWorkspace() { return taskboardProject; },
+    async issueForThread() { return undefined; }
+  };
+  const { manager, root, sent } = setup(t, { taskboardClient });
+  taskboardProject.workspacePath = path.join(root, "review-project");
+  const project = manager.createProject("account-one", "Review Project", taskboardProject.workspacePath);
+  manager.setProjectNotifications("account-one", project.id, [{ accountId: "account-two", recipientId: "review-room", enabled: true }]);
+  await manager.startAll();
+  assert.ok(emit);
+  const issue = {
+    id: "task-one", identifier: "REVIEW-1", projectId: "tb-project", title: "Verify bridge",
+    description: "", status: "in_review", priority: "high", labels: [], threadId: "thread-one",
+    version: 4, createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  };
+  await emit?.({ type: "task.moved", task: issue });
+  await emit?.({ type: "task.moved", task: issue });
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]?.text ?? "", /Taskboard · 待验收/);
+  assert.match(sent[0]?.text ?? "", /REVIEW-1 · Verify bridge/);
+  assert.match(sent[0]?.text ?? "", /测试与构建均通过/);
+  await manager.stopAll();
+});
+
+test("exposes and manages only workspace-mapped Taskboard issues", async (t) => {
+  const comments: Array<{ body: string; threadId: string }> = [];
+  const moves: Array<{ taskId: string; status: string; version: number; threadId: string }> = [];
+  const taskboardProject = { id: "tb-project", name: "Bridge Delivery", workspacePath: "", issueCount: 1 };
+  const issue = {
+    id: "task-one", identifier: "BRIDGE-1", projectId: "tb-project", title: "Build workbench",
+    description: "Expose mapped issues", status: "in_progress", priority: "high", labels: ["codex"],
+    threadId: "thread-one", version: 7, createdAt: "2026-08-03T00:00:00.000Z",
+    updatedAt: "2026-08-03T01:00:00.000Z"
+  };
+  const taskboardClient = {
+    baseUrl: "http://127.0.0.1:47823",
+    async listProjects() { return [taskboardProject]; },
+    async listIssues() { return [issue]; },
+    async getIssue() { return issue; },
+    async listComments() { return [{ id: "comment-one", taskId: issue.id, body: "Current evidence", threadId: issue.threadId, createdAt: issue.createdAt, updatedAt: issue.updatedAt }]; },
+    async addComment(_taskId: string, body: string, threadId: string) {
+      comments.push({ body, threadId });
+      return { id: "comment-two", taskId: issue.id, body, threadId, createdAt: issue.updatedAt, updatedAt: issue.updatedAt };
+    },
+    async moveIssue(taskId: string, status: string, version: number, threadId: string) {
+      moves.push({ taskId, status, version, threadId });
+      return { ...issue, status, version: version + 1 };
+    }
+  };
+  const { manager, root } = setup(t, { taskboardClient });
+  taskboardProject.workspacePath = path.join(root, "bridge-project");
+  manager.createProject("account-one", "Bridge", taskboardProject.workspacePath);
+
+  const summaries = await manager.listTaskboardIssues();
+  const detail = await manager.getTaskboardIssue("BRIDGE-1");
+  await manager.commentTaskboardIssue("BRIDGE-1", "Admin evidence");
+  const moved = await manager.moveTaskboardIssue("BRIDGE-1", "in_review", 7, "Ready for acceptance");
+
+  assert.equal(summaries[0]?.identifier, "BRIDGE-1");
+  assert.equal(summaries[0]?.taskboardProjectName, "Bridge Delivery");
+  assert.equal(summaries[0]?.managedProjects[0]?.projectName, "Bridge");
+  assert.equal(detail.comments[0]?.body, "Current evidence");
+  assert.deepEqual(comments, [
+    { body: "Admin evidence", threadId: "thread-one" },
+    { body: "Ready for acceptance", threadId: "thread-one" }
+  ]);
+  assert.deepEqual(moves, [{ taskId: "task-one", status: "in_review", version: 7, threadId: "thread-one" }]);
+  assert.equal(moved.status, "in_review");
+});
+
+test("rejects Taskboard admin mutations without a Codex thread or valid transition", async (t) => {
+  let threaded = false;
+  const taskboardProject = { id: "tb-project", name: "Bridge Delivery", workspacePath: "", issueCount: 1 };
+  const issue = {
+    id: "task-one", identifier: "BRIDGE-1", projectId: "tb-project", title: "Build workbench",
+    description: "", status: "todo", priority: "high", labels: [], threadId: null, version: 1,
+    createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  };
+  const { manager, root } = setup(t, { taskboardClient: {
+    baseUrl: "http://127.0.0.1:47823",
+    async listProjects() { return [taskboardProject]; },
+    async getIssue() { return { ...issue, threadId: threaded ? "thread-one" : null }; }
+  } });
+  taskboardProject.workspacePath = path.join(root, "bridge-project");
+  manager.createProject("account-one", "Bridge", taskboardProject.workspacePath);
+
+  await assert.rejects(() => manager.commentTaskboardIssue("BRIDGE-1", "Evidence"), /Codex thread/i);
+  threaded = true;
+  await assert.rejects(() => manager.moveTaskboardIssue("BRIDGE-1", "done", 1), /transition/i);
+});
 
 test("isolates personal knowledge by WeChat account", (t) => {
   const { paths } = setup(t);

@@ -50,6 +50,13 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 - States: default, hover, selected, responding, disabled actions.
 - Accessibility: existing pressed states and action labels remain.
 
+### Taskboard Integration Panel
+
+- Structure: local-service enable switch, loopback URL, connection state, and one mapping row per managed Codex project.
+- States: connected, unavailable, disabled, mapped, unmapped.
+- Accessibility: connection meaning is expressed in text as well as color; paths remain selectable and horizontally wrap instead of clipping.
+- Security: the URL field accepts HTTP loopback origins only; remote Taskboard endpoints are outside this local-console contract.
+
 ## 6. Motion & Interaction
 
 Use the existing 160ms micro-interaction timing. Respect `prefers-reduced-motion`; no layout animation.

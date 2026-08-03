@@ -333,7 +333,7 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 .settings-form { border-top: 1px solid var(--ink); }
 .settings-group { padding: 26px 0 30px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 30px; }
 .settings-group h2 { font-size: 14px; }
-.settings-group > label, .field-grid, .settings-update { width: 100%; max-width: 720px; grid-column: 2; }
+.settings-group > label, .field-grid, .settings-update, .taskboard-settings { width: 100%; max-width: 720px; grid-column: 2; }
 .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 .settings-update { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .settings-update-version { min-width: 0; display: grid; gap: 4px; }
@@ -359,6 +359,20 @@ textarea { min-height: 110px; padding: 11px 12px; resize: vertical; line-height:
 input:hover, select:hover, textarea:hover { border-color: #8e9a93; }
 input:focus, select:focus, textarea:focus { border-color: var(--focus); outline: 3px solid color-mix(in srgb, var(--focus) 15%, transparent); }
 .form-actions { padding-top: 24px; display: flex; justify-content: end; }
+.taskboard-settings { display: grid; gap: 16px; }
+.taskboard-status-panel { border: 1px solid var(--line); border-radius: var(--radius); background: #f8faf8; }
+.taskboard-connection { min-height: 42px; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.taskboard-connection code { min-width: 0; overflow-wrap: anywhere; color: var(--ink-soft); font-size: 10px; }
+.taskboard-error { margin: 0; padding: 0 12px 10px; color: var(--red); font-size: 10px; line-height: 1.5; }
+.taskboard-mappings { border-top: 1px solid var(--line); }
+.taskboard-mapping { min-height: 52px; padding: 9px 12px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.taskboard-mapping + .taskboard-mapping { border-top: 1px solid var(--line); }
+.taskboard-mapping > span:first-child { min-width: 0; display: grid; gap: 3px; }
+.taskboard-mapping strong { font-size: 11px; }
+.taskboard-mapping small { overflow-wrap: anywhere; color: var(--ink-soft); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; }
+.taskboard-mapping-state { flex: 0 0 auto; color: var(--amber); font-size: 9px; font-weight: 800; }
+.taskboard-mapping-state.is-mapped { color: var(--green-dark); }
+.taskboard-empty { margin: 0; padding: 13px 12px; color: var(--ink-soft); font-size: 10px; }
 
 .modal { width: min(calc(100% - 32px), 480px); max-height: min(760px, calc(100vh - 32px)); padding: 0; border: 1px solid #c7cfca; border-radius: 8px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); }
 .modal::backdrop { background: rgb(15 22 19 / 46%); backdrop-filter: blur(3px); }
@@ -519,8 +533,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
   .composer-files { padding-left: 45px; }
   .composer-hint { margin-left: 45px; }
   .settings-group { grid-template-columns: 1fr; gap: 16px; }
-  .settings-group > label, .field-grid, .settings-update { grid-column: 1; }
+  .settings-group > label, .field-grid, .settings-update, .taskboard-settings { grid-column: 1; }
   .field-grid { grid-template-columns: 1fr; }
+  .taskboard-connection, .taskboard-mapping { align-items: flex-start; flex-direction: column; gap: 7px; }
   .qr-stage { min-height: 342px; padding-inline: 16px; }
   .qr-frame { width: min(280px, calc(100vw - 72px)); height: min(280px, calc(100vw - 72px)); }
 }

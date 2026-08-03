@@ -107,6 +107,71 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
   });
 });
 
+test("propagates the configured sandbox to an app-server turn", async (t) => {
+  // Given: a bridge configured to allow Codex full workspace access.
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000,
+    execSandbox: "danger-full-access"
+  });
+  t.after(() => runner.close());
+
+  // When: a message starts a turn through the app-server path used by channel streaming.
+  const result = await runner.run({
+    prompt: "verify-danger-full-access",
+    cwd: "/tmp/project",
+    threadId: "thread-existing"
+  });
+
+  // Then: the downstream app-server accepts the expected policy and completes the turn.
+  assert.equal(result.text, "reply:verify-danger-full-access");
+});
+
+test("routes command, file, and permission approvals to the active channel turn", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  for (const kind of ["command", "file", "permissions"] as const) {
+    const requests: Array<{ kind: string; command?: string; reason?: string }> = [];
+    const result = await runner.run({
+      prompt: `approval:${kind}`,
+      cwd: "/tmp/project",
+      threadId: `thread-approval-${kind}`,
+      onApproval: async (request) => {
+        requests.push(request);
+        return "accept";
+      }
+    });
+
+    assert.equal(result.text, `approval:${kind}:accept`);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.kind, kind);
+    assert.match(requests[0]?.reason ?? "", new RegExp(kind));
+    if (kind === "command") assert.equal(requests[0]?.command, "touch approved.txt");
+  }
+});
+
+test("declines an app-server approval when the channel rejects it", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "approval:command",
+    cwd: "/tmp/project",
+    threadId: "thread-approval-decline",
+    onApproval: async () => "decline"
+  });
+
+  assert.equal(result.text, "approval:command:decline");
+});
+
 test("interrupts the active V2 turn with both threadId and turnId", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

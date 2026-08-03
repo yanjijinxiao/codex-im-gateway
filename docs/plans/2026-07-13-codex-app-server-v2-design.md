@@ -14,7 +14,9 @@
 
 app-server 的每个请求都有超时，子进程退出或协议流关闭时会拒绝所有等待中的请求和 turn。`auto` 模式在首次消息和已有 thread 的后续消息中都允许回退到 `codex exec resume`，避免 app-server 临时不可用后会话彻底卡死。
 
-微信端目前没有审批交互界面，因此 app-server thread 使用 `approvalPolicy: "never"`：Codex 在既有沙箱权限内自动完成任务，不向无人处理的 RPC 审批请求等待。若仍收到服务端审批或输入请求，客户端安全地拒绝或取消，保证 turn 不会无限挂起。
+> 2026-08-04 更新：本段所述限制已由渠道审批功能取代。聊天端 app-server turn 现在使用 `approvalPolicy: "on-request"`，命令、文件和额外权限审批会按账号、发送者与 turn 路由，并支持 `/approve`、`/reject` 和超时自动拒绝。以下内容仅保留为最初设计记录。
+
+最初版本的微信端没有审批交互界面，因此 app-server thread 使用 `approvalPolicy: "never"`：Codex 在既有沙箱权限内自动完成任务，不向无人处理的 RPC 审批请求等待。若仍收到服务端审批或输入请求，客户端安全地拒绝或取消，保证 turn 不会无限挂起。
 
 ## 验证
 

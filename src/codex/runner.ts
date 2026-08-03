@@ -26,7 +26,8 @@ export class HybridCodexRunner {
   constructor(private readonly options: HybridCodexRunnerOptions) {
     this.appServer = new AppServerCodexRunner({
       codexBin: options.codexBin,
-      requestTimeoutMs: options.timeoutMs
+      requestTimeoutMs: options.timeoutMs,
+      sandbox: options.execSandbox
     });
     this.exec = new CodexExecRunner({
       codexBin: options.codexBin,
@@ -61,14 +62,14 @@ export class HybridCodexRunner {
   }
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
-    const requiresAppServerForStreaming = Boolean(input.onDelta || input.onProgress);
+    const requiresAppServerForStreaming = Boolean(input.onDelta || input.onProgress || input.onApproval);
     if (this.options.backend === "exec" && !requiresAppServerForStreaming) {
       return this.exec.run(input);
     }
     try {
       return await this.appServer.run(input);
     } catch (error) {
-      if (this.options.backend === "app-server") {
+      if (this.options.backend === "app-server" || input.onApproval) {
         throw error;
       }
       const fallback = await this.exec.run({

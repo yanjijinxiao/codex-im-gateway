@@ -6,6 +6,7 @@ const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
 let nextTurn = 1;
 const activeTurns = new Map();
+const pendingApprovals = new Map();
 let externalBusyReads = 0;
 
 function send(message) {
@@ -61,6 +62,36 @@ rl.on("line", (line) => {
 
   if (!initialized) {
     fail(message.id, "Not initialized");
+    return;
+  }
+
+  if (!message.method && pendingApprovals.has(message.id)) {
+    const approval = pendingApprovals.get(message.id);
+    pendingApprovals.delete(message.id);
+    const decision = approval.kind === "permissions"
+      ? (Object.keys(message.result?.permissions ?? {}).length ? "accept" : "decline")
+      : message.result?.decision;
+    const itemId = `item-${approval.turnId}`;
+    send({
+      method: "item/completed",
+      params: {
+        threadId: approval.threadId,
+        turnId: approval.turnId,
+        completedAtMs: Date.now(),
+        item: {
+          type: "agentMessage",
+          id: itemId,
+          text: `approval:${approval.kind}:${decision}`,
+          phase: "final_answer",
+          memoryCitation: null
+        }
+      }
+    });
+    send({
+      method: "turn/completed",
+      params: { threadId: approval.threadId, turn: completedTurn(approval.turnId, "completed") }
+    });
+    activeTurns.delete(approval.threadId);
     return;
   }
 
@@ -194,8 +225,48 @@ rl.on("line", (line) => {
       fail(message.id, "turn/start requires text input");
       return;
     }
+    const approvalKind = prompt.startsWith("approval:") ? prompt.slice("approval:".length) : undefined;
+    const expectedApprovalPolicy = approvalKind ? "on-request" : "never";
+    if (message.params?.approvalPolicy !== expectedApprovalPolicy) {
+      fail(message.id, `turn approvalPolicy must be ${expectedApprovalPolicy}`);
+      return;
+    }
+    if (prompt === "verify-danger-full-access"
+      && message.params?.sandboxPolicy?.type !== "dangerFullAccess") {
+      fail(message.id, "turn/start must propagate the configured danger-full-access sandbox");
+      return;
+    }
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+    if (["command", "file", "permissions"].includes(approvalKind)) {
+      const approvalId = `approval-${turnId}`;
+      pendingApprovals.set(approvalId, {
+        kind: approvalKind,
+        threadId: message.params.threadId,
+        turnId
+      });
+      const method = approvalKind === "command"
+        ? "item/commandExecution/requestApproval"
+        : approvalKind === "file"
+          ? "item/fileChange/requestApproval"
+          : "item/permissions/requestApproval";
+      send({
+        id: approvalId,
+        method,
+        params: {
+          threadId: message.params.threadId,
+          turnId,
+          itemId: `approval-item-${turnId}`,
+          startedAtMs: Date.now(),
+          cwd: "/tmp/project",
+          command: approvalKind === "command" ? "touch approved.txt" : null,
+          reason: `fixture ${approvalKind} approval`,
+          grantRoot: approvalKind === "file" ? "/tmp/project" : null,
+          permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined
+        }
+      });
+      return;
+    }
     if (prompt === "hold") {
       return;
     }

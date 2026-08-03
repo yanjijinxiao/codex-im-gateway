@@ -73,7 +73,12 @@ const configSchema = z.object({
   codexExecSandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable().optional(),
   model: z.string().optional(),
   effort: z.string().optional(),
-  streamReplies: z.boolean().optional()
+  streamReplies: z.boolean().optional(),
+  taskboardEnabled: z.boolean().optional(),
+  taskboardUrl: z.string().url().refine((value) => {
+    const url = new URL(value);
+    return url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  }, "Taskboard URL must use an HTTP loopback origin").optional()
 });
 const MAX_WEB_UPLOAD_FILES = 10;
 const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
@@ -236,6 +241,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   if (method === "GET" && url.pathname === "/api/projects") {
     sendJson(response, 200, { projects: context.accountManager.listProjects() });
+    return;
+  }
+  if (method === "GET" && url.pathname === "/api/taskboard") {
+    sendJson(response, 200, await context.accountManager.getTaskboardStatus());
     return;
   }
   if (method === "POST" && url.pathname === "/api/projects") {

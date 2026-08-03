@@ -40,7 +40,7 @@
 
 ### 3. Codex CLI 原生命令
 
-微信端支持 `/help`、`/status`、`/balance`、`/memory`、`/project`、`/sessions`、`/session`、`/new`、`/resume`、`/model`、`/effort`、`/stream`、`/prompt start`、`/prompt done` 和 `/stop`，可以管理项目、会话、个人知识库、模型、推理强度和过程进度，并查看当前 Codex 账号剩余用量。
+消息渠道支持 `/help`、`/status`、`/balance`、`/memory`、`/project`、`/task`、`/sessions`、`/session`、`/new`、`/resume`、`/model`、`/effort`、`/stream`、`/prompt start`、`/prompt done`、`/approve`、`/reject` 和 `/stop`，可以管理项目、Taskboard Issue、会话、个人知识库、模型、推理强度、过程进度与 Codex 运行审批，并查看当前 Codex 账号剩余用量。
 
 <p align="center">
   <img src="docs/images/screenshots/wechat-cli-commands.png" alt="在微信中使用 Codex CLI 原生命令" width="420" />
@@ -59,6 +59,8 @@
 一个服务可以并行运行多个个人微信、企业微信和飞书渠道。每个账号拥有独立的联系人授权、附件、会话、个人知识库和运行状态；移除个人微信账号时还可以选择保留历史，重新扫码后继续使用。
 
 管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人和飞书企业自建应用。企业微信与飞书使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
+
+聊天端任务需要运行命令、修改文件或申请额外权限时，审批请求会发回发起任务的同一账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝；10 分钟未回复会自动拒绝。审批编号按账号和联系人隔离，其他渠道或联系人不能代为处理。
 
 <p align="center">
   <img src="docs/images/screenshots/web-multi-account.png" alt="Codex Channel Bridge 多账号管理" width="100%" />
@@ -150,7 +152,13 @@ node dist/server/index.js
 - 每个项目可以独立开启任务结束通知，选择通知渠道和接收会话（或用户）ID；成功、失败和中断都会发送结果摘要。
 - 通知按钮为绿色并显示“通知已开启”时表示配置生效；任务数量表示当前正在运行的任务数，不是历史会话总数。
 
-## 微信内命令
+## Taskboard 联动
+
+“设置”页面默认连接本机 `http://127.0.0.1:47823`，按绝对工作目录把 Codex 项目映射到 Taskboard 项目。Taskboard 始终是 Issue 状态的唯一事实源，桥接服务不会把看板任务复制进自己的状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
+
+将 Taskboard 仓库中的 `skills/manage-taskboard` 复制或软链接到 `~/.codex/skills/manage-taskboard` 后，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+
+## 消息渠道内命令
 
 ```text
 /help            /h           查看命令
@@ -166,6 +174,15 @@ node dist/server/index.js
 /project P1      /p P1        切换已绑定项目
 /project rename P1|名称 /p rn P1|名称  重命名项目
 /project delete P1      /p d P1        移除没有运行任务的项目
+/task            /tb          查看当前项目未完成的 Taskboard Issue
+/task ISSUE编号              绑定并继续 Issue 对应的 Codex thread
+/task new 标题               创建、领取并开始处理新 Issue
+/task start ISSUE编号        领取并开始处理已有 Issue
+/task comment ISSUE编号 内容  添加带当前 threadId 的评论；可同时发送附件
+/task attach ISSUE编号       把当前消息附件上传到 Issue
+/task block ISSUE编号 原因   记录阻塞原因并标记阻塞
+/task review ISSUE编号       验证、记录证据并提交验收
+/task accept ISSUE编号       按验收门禁处理；只有用户确认后才可完成
 /sessions        /ss          查看当前项目最近活跃的 10 个会话
 /session R1      /s R1        绑定并继续当前项目的指定会话
 /new             /n           在当前项目新建并绑定 Codex 会话
@@ -178,6 +195,8 @@ node dist/server/index.js
 /stream <on|off|default>       开启、关闭过程进度，或恢复继承全局设置
 /prompt start    /pp s        开始缓冲多条微信消息
 /prompt done     /pp d        将缓冲内容作为一次 Codex turn 提交
+/approve A1      /ok A1       批准一次当前渠道收到的 Codex 审批
+/reject A1       /no A1       拒绝当前渠道收到的 Codex 审批
 /stop            /x           中断当前 Codex 任务
 ```
 
@@ -207,7 +226,7 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；如果 app-server 无法启动、握手或处理请求，会自动回退到 `codex exec` 或 `codex exec resume`。
 
-微信端目前没有 Codex 审批弹窗，因此 app-server 使用 `approvalPolicy: "never"`，只在现有 Codex sandbox 权限内执行，不会等待一个无法在微信中回答的本机审批请求。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
+聊天端发起的 app-server turn 使用 `approvalPolicy: "on-request"`。Codex 请求运行命令、修改文件或增加权限时，桥接服务会把请求路由到原账号、原联系人并等待 `/approve` 或 `/reject`；超时、发送失败或找不到对应任务时安全拒绝。带渠道审批的任务不会回退到无法交互审批的 `codex exec`。管理页保存的 `codexExecSandbox` 是兼容旧版本保留的字段名，现在会同时应用到 app-server 主路径和 exec 回退路径；选择“完整访问”时，新建及已绑定会话的后续回合都会以 `danger-full-access` 运行。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
 
 ## 模型和推理强度
 

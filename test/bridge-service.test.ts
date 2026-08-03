@@ -107,11 +107,11 @@ test("lists every built-in command and reports the current Codex account balance
   const help = replies.at(-1) ?? "";
   for (const command of [
     "/help", "/status", "/balance", "/memory", "/project", "/new", "/sessions", "/session", "/resume",
-    "/model", "/effort", "/stream", "/prompt start", "/prompt done", "/stop"
+    "/model", "/effort", "/stream", "/prompt start", "/prompt done", "/approve", "/reject", "/stop"
   ]) {
     assert.match(help, new RegExp(command.replace("/", "\\/")));
   }
-  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/b", "/ss", "/s", "/r", "/n", "/m", "/e", "/str", "/pp", "/x"]) {
+  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/b", "/ss", "/s", "/r", "/n", "/m", "/e", "/str", "/pp", "/ok", "/no", "/x"]) {
     assert.match(help, new RegExp(alias.replace("/", "\\/")));
   }
 
@@ -140,11 +140,179 @@ test("maps every documented short command to its canonical command", () => {
     e: "effort",
     str: "stream",
     pp: "prompt",
-    x: "stop"
+    ok: "approve",
+    no: "reject",
+    x: "stop",
+    tb: "task"
   };
   for (const [alias, command] of Object.entries(aliases)) {
     assert.deepEqual(parseCommand(`/${alias} argument`), { name: command, arg: "argument" });
   }
+});
+
+test("sends Codex approvals to the originating sender and accepts channel decisions", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("Approval project", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "Alice task", project.id);
+  stateStore.createSession("bob@im.wechat", project.workspace, "Bob task", project.id);
+  const replies: Array<{ toUserId: string; text: string }> = [];
+  let releaseApproval!: (decision: "accept" | "decline") => void;
+  const approvalSeen = new Promise<"accept" | "decline">((resolve) => { releaseApproval = resolve; });
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["alice@im.wechat", "bob@im.wechat"]
+    },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { toUserId: string; text: string }) {
+        replies.push(input);
+        return { messageId: `sent-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async run(input: { onApproval?: (request: Record<string, unknown>) => Promise<"accept" | "decline"> }) {
+        const decision = await input.onApproval?.({
+          kind: "command",
+          threadId: "thread-alice",
+          turnId: "turn-alice",
+          itemId: "item-alice",
+          command: "touch approved.txt",
+          cwd: tmpDir,
+          reason: "需要创建文件"
+        });
+        releaseApproval(decision ?? "decline");
+        return { raw: "", text: `审批结果：${decision}`, threadId: "thread-alice" };
+      },
+      async getRuntimeInfo() { return {}; },
+      async stop() {}
+    } as never
+  });
+
+  const runningTurn = service.handleMessage({
+    id: "run", senderId: "alice@im.wechat", contextToken: "alice-context", text: "创建文件", attachments: [], raw: {}
+  });
+  for (let attempt = 0; attempt < 20 && !replies.some((reply) => /Codex 审批 A1/.test(reply.text)); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.match(replies.find((reply) => reply.toUserId === "alice@im.wechat")?.text ?? "", /touch approved\.txt/);
+
+  await service.handleMessage({
+    id: "wrong-sender", senderId: "bob@im.wechat", text: "/ok A1", attachments: [], raw: {}
+  });
+  assert.match(replies.at(-1)?.text ?? "", /没有待审批/);
+
+  await service.handleMessage({
+    id: "approve", senderId: "alice@im.wechat", text: "/ok A1", attachments: [], raw: {}
+  });
+  assert.equal(await approvalSeen, "accept");
+  await runningTurn;
+  assert.match(replies.at(-2)?.text ?? "", /已批准.*A1/);
+  assert.match(replies.at(-1)?.text ?? "", /审批结果：accept/);
+});
+
+test("automatically declines unanswered channel approvals after the timeout", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-timeout-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("Approval project", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "Alice task", project.id);
+  const replies: string[] = [];
+  let decision: string | undefined;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    approvalTimeoutMs: 10,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: {
+      async run(input: { onApproval?: (request: Record<string, unknown>) => Promise<"accept" | "decline"> }) {
+        decision = await input.onApproval?.({
+          kind: "file", threadId: "thread-timeout", turnId: "turn-timeout", itemId: "item-timeout",
+          grantRoot: tmpDir, reason: "需要写入"
+        });
+        return { raw: "", text: "已继续", threadId: "thread-timeout" };
+      },
+      async getRuntimeInfo() { return {}; },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({
+    id: "run", senderId: "alice@im.wechat", text: "修改文件", attachments: [], raw: {}
+  });
+
+  assert.equal(decision, "decline");
+  assert.ok(replies.some((reply) => /审批 A1 已超时.*自动拒绝/.test(reply)));
+});
+
+test("lists and binds Taskboard issues to the active Codex session", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-taskboard-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("Project One", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "Taskboard task", project.id);
+  const replies: string[] = [];
+  const issue = {
+    id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration",
+    description: "", status: "in_progress", priority: "high", labels: ["codex"],
+    threadId: "thread-one", version: 3, createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  } as const;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    taskboard: {
+      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
+      async listIssues() { return [issue]; },
+      async getIssue() { return issue; }
+    } as never,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: { async stop() {} } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({ id, senderId: "alice@im.wechat", text, attachments: [], raw: {} });
+
+  await send("list", "/task");
+  assert.match(replies.at(-1) ?? "", /PROJECT-1.*Ship integration/);
+  await send("bind", "/task PROJECT-1");
+  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.threadId, "thread-one");
+  assert.match(replies.at(-1) ?? "", /已绑定.*PROJECT-1/);
+  await send("empty-attachment", "/task attach PROJECT-1");
+  assert.match(replies.at(-1) ?? "", /提供评论文字或附件/);
+});
+
+test("routes Taskboard workflow mutations through Codex and the manage-taskboard skill", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-taskboard-action-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("Project One", tmpDir);
+  stateStore.createSession("alice@im.wechat", project.workspace, "Taskboard task", project.id);
+  const prompts: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    taskboard: {
+      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
+      async getIssue() { return { id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration", description: "", status: "todo", priority: "high", labels: [], threadId: null, version: 1, createdAt: "", updatedAt: "" }; }
+    } as never,
+    weixin: { async sendTyping() {}, async sendText() { return { messageId: "sent" }; } } as never,
+    runner: {
+      async run(input: { prompt: string }) { prompts.push(input.prompt); return { raw: "", text: "已开始", threadId: "thread-new" }; },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({ id: "start", senderId: "alice@im.wechat", text: "/task start PROJECT-1", attachments: [], raw: {} });
+  assert.match(prompts[0] ?? "", /manage-taskboard Skill/);
+  assert.match(prompts[0] ?? "", /PROJECT-1/);
+  assert.match(prompts[0] ?? "", /开始处理/);
 });
 
 test("automatically learns and reuses account knowledge with user controls", async (t) => {

@@ -176,12 +176,12 @@
               </select>
             </label>
             <label>
-              <span>Exec 沙箱</span>
+              <span>Codex 文件权限</span>
               <select id="sandboxInput" name="codexExecSandbox">
                 <option value="">沿用 Codex 设置</option>
                 <option value="read-only">只读</option>
                 <option value="workspace-write">工作区可写</option>
-                <option value="danger-full-access">完整访问</option>
+                <option value="danger-full-access">完整访问（无文件限制）</option>
               </select>
             </label>
             <label>
@@ -205,6 +205,24 @@
                 <span aria-hidden="true"></span>
               </span>
             </label>
+          </div>
+        </div>
+        <div class="settings-group">
+          <h2>Taskboard</h2>
+          <div class="taskboard-settings">
+            <label class="toggle-field" for="taskboardEnabledInput">
+              <span>启用本地任务联动</span>
+              <span class="toggle-control">
+                <input id="taskboardEnabledInput" name="taskboardEnabled" type="checkbox">
+                <span aria-hidden="true"></span>
+              </span>
+            </label>
+            <label>
+              <span>本地 Taskboard 地址</span>
+              <input id="taskboardUrlInput" name="taskboardUrl" type="url" inputmode="url" autocomplete="off" placeholder="http://127.0.0.1:47823">
+              <small class="field-hint">仅允许 HTTP 回环地址，不会连接公网看板。</small>
+            </label>
+            <section class="taskboard-status-panel" id="taskboardStatusPanel" aria-live="polite"></section>
           </div>
         </div>
         <div class="settings-group">

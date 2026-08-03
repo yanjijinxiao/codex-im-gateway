@@ -48,6 +48,7 @@ import {
 import { WeixinApiClient } from "../weixin/api.js";
 import { monitorWeixin, type MonitorOptions } from "../weixin/monitor.js";
 import { inferMediaKind, sanitizeFileName } from "../weixin/media.js";
+import { TaskboardClient, type TaskboardEvent, type TaskboardIssue } from "../taskboard/client.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -87,6 +88,22 @@ export type AccountProjectTask = {
   source: "managed" | "codex";
   startedAt: string;
   updatedAt: string;
+};
+
+export type TaskboardIntegrationStatus = {
+  enabled: boolean;
+  available: boolean;
+  url: string;
+  error?: string;
+  projects: Array<{
+    accountId: string;
+    projectId: string;
+    projectName: string;
+    workspace: string;
+    taskboardProjectId?: string;
+    taskboardProjectName?: string;
+    issueCount?: number;
+  }>;
 };
 
 export type SessionChatResult = {
@@ -143,6 +160,7 @@ export type AccountManagerOptions = {
       onTaskChanged: (task: CodexSessionTask) => void;
     }
   ) => CodexSessionCompletionMonitor;
+  taskboardClientFactory?: (url: string) => TaskboardClient;
 };
 
 export class AccountManager {
@@ -157,8 +175,13 @@ export class AccountManager {
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
+  private readonly taskboardClientFactory: (url: string) => TaskboardClient;
+  private readonly recentTaskboardNotifications = new Map<string, number>();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
+  private taskboard?: TaskboardClient;
+  private taskboardController?: AbortController;
+  private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
@@ -178,6 +201,7 @@ export class AccountManager {
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
+    this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
   }
 
   async startAll(): Promise<void> {
@@ -185,6 +209,7 @@ export class AccountManager {
       .filter((account) => account.enabled)
       .map((account) => this.startAccount(account.accountId, false)));
     this.ensureCodexSessionMonitor();
+    this.startTaskboardMonitor();
   }
 
   async stopAll(): Promise<void> {
@@ -192,6 +217,12 @@ export class AccountManager {
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
     this.managedTurnCompletions.clear();
+    this.taskboardController?.abort();
+    await this.taskboardTask;
+    this.taskboardController = undefined;
+    this.taskboardTask = undefined;
+    this.taskboard = undefined;
+    this.recentTaskboardNotifications.clear();
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => this.stopAccount(account.accountId, false)));
@@ -203,8 +234,14 @@ export class AccountManager {
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => account.accountId);
     await Promise.all(running.map((accountId) => this.stopAccount(accountId, false)));
+    this.taskboardController?.abort();
+    await this.taskboardTask;
+    this.taskboardController = undefined;
+    this.taskboardTask = undefined;
+    this.taskboard = undefined;
     this.closeRunner();
     await Promise.all(running.map((accountId) => this.startAccount(accountId, false)));
+    this.startTaskboardMonitor();
   }
 
   async refreshAccount(accountId: string): Promise<AccountSummary> {
@@ -238,6 +275,7 @@ export class AccountManager {
       runner: this.runnerFor(config),
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
+      taskboard: this.taskboardFor(config),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
       onTurnCompleted: ({ sessionId, text, success, turnId }) => this.notifyProjectCompletion(
         account.accountId,
@@ -731,7 +769,7 @@ export class AccountManager {
     if (session.threadId && turnId) {
       this.managedTurnCompletions.add(taskRuntimeKey(session.threadId, turnId));
     }
-    await this.sendProjectCompletion(project, session.title, resultText, success);
+    await this.sendProjectCompletion(project, session.title, resultText, success, session.threadId);
   }
 
   private ensureCodexSessionMonitor(): void {
@@ -845,7 +883,8 @@ export class AccountManager {
           project,
           completion.taskTitle,
           completion.text,
-          completion.success
+          completion.success,
+          completion.sessionId
         ))
     ));
   }
@@ -854,14 +893,18 @@ export class AccountManager {
     project: ManagedProject,
     taskTitle: string,
     resultText: string,
-    success: boolean
+    success: boolean,
+    threadId?: string
   ): Promise<void> {
     const targets = (project.notifications ?? []).filter((target) => target.enabled);
     if (!targets.length) return;
+    const issue = threadId ? await this.issueForProjectThread(project, threadId) : undefined;
+    if (issue && this.wasRecentlyNotified(issue)) return;
     const excerpt = resultText.replace(/\s+/g, " ").trim().slice(0, 500);
     const text = [
       success ? "【Codex 任务已完成】" : "【Codex 任务执行失败】",
       `项目：${project.name}`,
+      ...(issue ? [`Issue：${issue.identifier} · ${formatTaskboardStatus(issue.status)}`] : []),
       `任务：${taskTitle.replace(/\s+/g, " ").trim().slice(0, 100) || "Codex 会话"}`,
       ...(excerpt ? [`${success ? "结果" : "错误"}：${excerpt}`] : [])
     ].join("\n");
@@ -883,6 +926,148 @@ export class AccountManager {
         }
       }
     });
+  }
+
+  async getTaskboardStatus(): Promise<TaskboardIntegrationStatus> {
+    const config = this.configProvider();
+    const managed = this.listProjects();
+    if (!config.taskboardEnabled) {
+      return { enabled: false, available: false, url: config.taskboardUrl, projects: managed.map(taskboardProjectBase) };
+    }
+    try {
+      const client = this.taskboardFor(config)!;
+      const projects = await client.listProjects();
+      return {
+        enabled: true,
+        available: true,
+        url: client.baseUrl,
+        projects: managed.map((project) => {
+          const match = projects.find((candidate) => candidate.workspacePath !== null
+            && canonicalWorkspace(candidate.workspacePath) === canonicalWorkspace(project.workspace));
+          return {
+            ...taskboardProjectBase(project),
+            ...(match ? {
+              taskboardProjectId: match.id,
+              taskboardProjectName: match.name,
+              issueCount: match.issueCount
+            } : {})
+          };
+        })
+      };
+    } catch (error) {
+      return {
+        enabled: true,
+        available: false,
+        url: config.taskboardUrl,
+        error: error instanceof Error ? error.message : String(error),
+        projects: managed.map(taskboardProjectBase)
+      };
+    }
+  }
+
+  private taskboardFor(config = this.configProvider()): TaskboardClient | undefined {
+    if (!config.taskboardEnabled) return undefined;
+    if (!this.taskboard || this.taskboard.baseUrl !== config.taskboardUrl.replace(/\/$/, "")) {
+      this.taskboard = this.taskboardClientFactory(config.taskboardUrl);
+    }
+    return this.taskboard;
+  }
+
+  private startTaskboardMonitor(): void {
+    const client = this.taskboardFor();
+    if (!client || this.taskboardTask) return;
+    const controller = new AbortController();
+    this.taskboardController = controller;
+    this.taskboardTask = this.runTaskboardMonitor(client, controller.signal).catch((error) => {
+      if (!controller.signal.aborted) {
+        console.error(`[codex-channel-bridge] Taskboard monitor stopped: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+  }
+
+  private async runTaskboardMonitor(client: TaskboardClient, signal: AbortSignal): Promise<void> {
+    let retryMs = 2_000;
+    while (!signal.aborted) {
+      try {
+        await client.subscribe(signal, (event) => this.handleTaskboardEvent(event));
+        retryMs = 2_000;
+      } catch (error) {
+        if (signal.aborted) return;
+        console.warn(`[codex-channel-bridge] Taskboard event stream unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await waitForAbortOrTimeout(signal, retryMs);
+      retryMs = Math.min(retryMs * 2, 30_000);
+    }
+  }
+
+  private async handleTaskboardEvent(event: TaskboardEvent): Promise<void> {
+    const issue = event.task;
+    if (!["task.updated", "task.moved"].includes(event.type)
+      || !issue
+      || !["blocked", "in_review", "done"].includes(issue.status)) return;
+    const key = taskboardNotificationKey(issue);
+    if (this.recentTaskboardNotifications.has(key)) return;
+    this.recentTaskboardNotifications.set(key, Date.now());
+    this.pruneTaskboardNotifications();
+    const taskboardProjects = await this.taskboard!.listProjects();
+    const taskboardProject = taskboardProjects.find((project) => project.id === issue.projectId);
+    if (!taskboardProject?.workspacePath) return;
+    const latestComment = (await this.taskboard!.listComments(issue.id)).at(-1)?.body;
+    const workspace = canonicalWorkspace(taskboardProject.workspacePath);
+    await Promise.all(listAccounts(this.options.paths).flatMap((account) => {
+      const store = this.storeFor(account.accountId);
+      return store.listProjects()
+        .filter((project) => canonicalWorkspace(project.workspace) === workspace)
+        .map((project) => this.sendTaskboardStatusNotification(project, issue, latestComment));
+    }));
+  }
+
+  private async sendTaskboardStatusNotification(
+    project: ManagedProject,
+    issue: TaskboardIssue,
+    latestComment?: string
+  ): Promise<void> {
+    const targets = (project.notifications ?? []).filter((target) => target.enabled);
+    if (!targets.length) return;
+    const excerpt = latestComment?.replace(/\s+/g, " ").trim().slice(0, 500);
+    const text = [
+      `【Taskboard · ${formatTaskboardStatus(issue.status)}】`,
+      `项目：${project.name}`,
+      `Issue：${issue.identifier} · ${issue.title}`,
+      ...(excerpt ? [`最新记录：${excerpt}`] : [])
+    ].join("\n");
+    await this.sendNotificationTargets(targets, text);
+  }
+
+  private async sendNotificationTargets(targets: ProjectNotificationTarget[], text: string): Promise<void> {
+    const results = await Promise.allSettled(targets.map(async (target) => {
+      const entry = this.entries.get(target.accountId);
+      if (!entry?.client || entry.status !== "running") throw new Error(`Notification channel is not running: ${target.accountId}`);
+      const contextToken = entry.store?.getContextToken(target.recipientId);
+      await entry.client.sendText({ toUserId: target.recipientId, text, ...(contextToken ? { contextToken } : {}) });
+    }));
+    for (const result of results) {
+      if (result.status === "rejected") console.error(`[codex-channel-bridge] Taskboard notification failed: ${String(result.reason)}`);
+    }
+  }
+
+  private async issueForProjectThread(project: ManagedProject, threadId: string): Promise<TaskboardIssue | undefined> {
+    try {
+      const taskboardProject = await this.taskboardFor()?.projectForWorkspace(project.workspace);
+      return taskboardProject ? await this.taskboard!.issueForThread(taskboardProject.id, threadId) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private wasRecentlyNotified(issue: TaskboardIssue): boolean {
+    const at = this.recentTaskboardNotifications.get(taskboardNotificationKey(issue));
+    return at !== undefined && Date.now() - at < 30_000;
+  }
+
+  private pruneTaskboardNotifications(): void {
+    const cutoff = Date.now() - 5 * 60_000;
+    for (const [key, at] of this.recentTaskboardNotifications) if (at < cutoff) this.recentTaskboardNotifications.delete(key);
   }
 
   private summary(account: ChannelAccount): AccountSummary {
@@ -971,6 +1156,47 @@ function sessionRuntimeKey(accountId: string, sessionId: string): string {
 
 function taskRuntimeKey(sessionId: string, turnId: string): string {
   return `${sessionId}\n${turnId}`;
+}
+
+function taskboardNotificationKey(issue: TaskboardIssue): string {
+  return `${issue.id}\n${issue.version}\n${issue.status}`;
+}
+
+function taskboardProjectBase(project: AccountProject): TaskboardIntegrationStatus["projects"][number] {
+  return {
+    accountId: project.accountId,
+    projectId: project.id,
+    projectName: project.name,
+    workspace: project.workspace
+  };
+}
+
+function formatTaskboardStatus(status: TaskboardIssue["status"]): string {
+  return ({
+    backlog: "待规划",
+    todo: "待处理",
+    in_progress: "处理中",
+    in_review: "待验收",
+    blocked: "阻塞",
+    done: "已完成",
+    canceled: "已取消"
+  } as Record<TaskboardIssue["status"], string>)[status];
+}
+
+function waitForAbortOrTimeout(signal: AbortSignal, timeoutMs: number): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const onAbort = () => {
+      finish();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function uniqueAccountId(paths: StatePaths, preferred: string): string {

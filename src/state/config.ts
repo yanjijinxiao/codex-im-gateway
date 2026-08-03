@@ -21,6 +21,8 @@ export type CodexWeixinConfig = {
   maxBufferItems: number;
   promptBufferTtlMs: number;
   maxInboundBytes: number;
+  taskboardEnabled: boolean;
+  taskboardUrl: string;
 };
 
 export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): CodexWeixinConfig {
@@ -33,7 +35,9 @@ export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): C
     streamReplies: true,
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
-    maxInboundBytes: MAX_INBOUND_BYTES
+    maxInboundBytes: MAX_INBOUND_BYTES,
+    taskboardEnabled: true,
+    taskboardUrl: "http://127.0.0.1:47823"
   };
 }
 
@@ -46,6 +50,10 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
     ...loaded,
     codexExecSandbox,
     streamReplies: typeof loaded.streamReplies === "boolean" ? loaded.streamReplies : base.streamReplies,
+    taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
+    taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
+      ? loaded.taskboardUrl.trim()
+      : base.taskboardUrl,
     maxInboundBytes: normalizeInboundBytes(loaded.maxInboundBytes, base.maxInboundBytes),
     allowedSenderIds: loaded.allowedSenderIds ?? base.allowedSenderIds,
     allowedWorkspaces: (loaded.allowedWorkspaces?.length ? loaded.allowedWorkspaces : base.allowedWorkspaces)

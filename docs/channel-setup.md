@@ -45,6 +45,17 @@
 
 服务会监听该项目下由聊天端、Web 和 Codex Desktop 发起的任务。任务成功、失败或中断时都会发送项目、任务和结果摘要。页面中的任务数量只表示当前正在运行的任务；完成后任务会从运行列表移除。
 
+### 运行审批
+
+从个人微信、企业微信或飞书发起的 Codex 任务需要运行命令、修改文件或申请额外权限时，审批请求会自动发送到发起任务的同一渠道账号和联系人。审批消息包含独立的 `A编号`、操作内容、工作目录和原因：
+
+- `/approve A1` 或 `/ok A1`：批准一次；
+- `/reject A1` 或 `/no A1`：拒绝；
+- 只有一个待审批请求时可以省略编号；
+- 10 分钟未回复、消息发送失败或任务已结束时自动拒绝。
+
+审批只对原账号和原联系人有效，不能从另一个微信账号、企业微信会话或飞书用户代为批准。审批能力依赖 Codex app-server；带审批的任务不会降级到非交互式 `codex exec`。
+
 ## English
 
 Add all channels from the Codex Channel Bridge **Accounts** page at `http://127.0.0.1:8787`. Credentials stay in the compatibility data directory `~/.codex-weixin/`; the management API never returns secrets or tokens to the browser.
@@ -70,3 +81,7 @@ Create a custom app, enable its bot, configure message events over long connecti
 ### Project task notifications
 
 Open a project's bell menu, enable completion notifications, select a channel, and enter the recorded conversation or user ID. A green bell and enabled badge confirm the setting. Tasks started from chat, Web, or Codex Desktop send a summary after success, failure, or interruption.
+
+### Runtime approvals
+
+When a task started from personal WeChat, Enterprise WeChat, or Feishu asks to run a command, change files, or obtain additional permissions, the request returns to that same channel account and sender. Use `/approve A1` or `/ok A1` to approve once, and `/reject A1` or `/no A1` to decline. The ID may be omitted when exactly one request is pending. Requests time out safely after ten minutes and are isolated from every other account and sender. This flow requires Codex app-server and does not fall back to non-interactive `codex exec`.

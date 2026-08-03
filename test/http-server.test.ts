@@ -58,6 +58,74 @@ test("account deletion passes the session-history retention choice", async (t) =
   ]);
 });
 
+test("exposes Taskboard health and workspace mappings", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-taskboard-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const expected = {
+    enabled: true,
+    available: true,
+    url: "http://127.0.0.1:47823",
+    projects: [{ accountId: "one", projectId: "project", projectName: "Project", workspace: root, taskboardProjectId: "tb", taskboardProjectName: "Taskboard", issueCount: 2 }]
+  };
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: { async getTaskboardStatus() { return expected; } } as never,
+    port: 0
+  });
+  t.after(() => server.close());
+
+  const response = await fetch(`${server.url}/api/taskboard`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), expected);
+});
+
+test("exposes Taskboard issue details and forwards protected management actions", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-taskboard-workbench-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: unknown[] = [];
+  const issue = { identifier: "BRIDGE-1", status: "in_progress", version: 4 };
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: {
+      async listTaskboardIssues() { return [issue]; },
+      async getTaskboardIssue(identifier: string) { return { issue, comments: [{ body: identifier }] }; },
+      async commentTaskboardIssue(identifier: string, body: string) {
+        calls.push({ identifier, body });
+        return { body };
+      },
+      async moveTaskboardIssue(identifier: string, status: string, version: number, comment?: string) {
+        calls.push({ identifier, status, version, comment });
+        return { ...issue, status, version: version + 1 };
+      }
+    } as never,
+    port: 0
+  });
+  t.after(() => server.close());
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Codex-Weixin-Token": server.requestToken,
+    Origin: server.url
+  };
+
+  const list = await fetch(`${server.url}/api/taskboard/issues`);
+  const detail = await fetch(`${server.url}/api/taskboard/issues/BRIDGE-1`);
+  const comment = await fetch(`${server.url}/api/taskboard/issues/BRIDGE-1/comments`, {
+    method: "POST", headers, body: JSON.stringify({ body: "Verified" })
+  });
+  const move = await fetch(`${server.url}/api/taskboard/issues/BRIDGE-1/move`, {
+    method: "POST", headers, body: JSON.stringify({ status: "in_review", version: 4, comment: "Ready" })
+  });
+
+  assert.deepEqual(await list.json(), { issues: [issue] });
+  assert.deepEqual(await detail.json(), { issue, comments: [{ body: "BRIDGE-1" }] });
+  assert.equal(comment.status, 201);
+  assert.equal(move.status, 200);
+  assert.deepEqual(calls, [
+    { identifier: "BRIDGE-1", body: "Verified" },
+    { identifier: "BRIDGE-1", status: "in_review", version: 4, comment: "Ready" }
+  ]);
+});
+
 test("channel and project notification APIs validate and forward configuration", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-channel-api-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

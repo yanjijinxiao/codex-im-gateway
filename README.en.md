@@ -34,7 +34,8 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 | ✅ | Browser QR connection | Shows waiting, scanned, connected, and expired QR states. | Pending: `docs/images/screenshots/wechat-qr-login.png` |
 | ✅ | Session management | Grouped account tabs, Markdown history, continued Codex threads, and create, rename, activate, reset, and delete actions. | [Web sessions](docs/images/screenshots/web-session-management.png) |
 | ✅ | Web text and attachments | Send text with up to 10 files (100 MiB total), with media playback, preview, and download in history. | Pending: `docs/images/screenshots/web-attachments.png` |
-| ✅ | WeChat private-chat control | Supports regular messages plus `/help`, `/status`, `/balance`, `/memory`, `/project`, `/sessions`, `/session`, `/new`, `/resume`, `/model`, `/effort`, `/prompt start`, `/prompt done`, and `/stop`. | Pending: `docs/images/screenshots/wechat-chat.png` |
+| ✅ | Channel chat control | Supports regular messages plus project, session, knowledge, model, progress, approval, and interruption commands across personal WeChat, Enterprise WeChat, and Feishu. | Pending: `docs/images/screenshots/wechat-chat.png` |
+| ✅ | Channel approvals | Command, file-change, and additional-permission approvals return to the originating account and sender with isolated approve/reject commands and a safe timeout. | Pending: `docs/images/screenshots/wechat-approval.png` |
 | ✅ | Per-account personal knowledge | Each WeChat account automatically learns reusable preferences, skills, knowledge, and workflows, then injects relevant entries into later WeChat and Web turns without sharing across accounts. | Pending: `docs/images/screenshots/wechat-memory.png` |
 | ✅ | WeChat media input | Accepts transcribed voice, images, audio, video, and files up to 100 MiB each, with a direct notice when the limit is exceeded. | Pending: `docs/images/screenshots/wechat-media-input.png` |
 | ✅ | File delivery to WeChat | Codex can return local images, videos, and files as native WeChat messages. | Pending: `docs/images/screenshots/wechat-media-output.png` |
@@ -86,6 +87,8 @@ Select **Add Channel** in the Web console:
 
 Enterprise WeChat and Feishu use official long-connection SDKs, so the local service needs no public domain or callback URL. See [Message channel and task notification setup](./docs/channel-setup.md) for complete steps and official console links. Credentials stay under `~/.codex-weixin/` and are never returned by the management API.
 
+When a chat-started task needs permission to run a command, change files, or gain additional access, the request returns to the same channel account and sender. Reply with `/approve A1` (`/ok A1`) to approve once or `/reject A1` (`/no A1`) to decline. Unanswered requests are declined after ten minutes, and another sender or account cannot act on the request.
+
 ## First personal WeChat connection
 
 1. Open Settings and confirm the default and allowed Codex workspaces.
@@ -118,7 +121,7 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
 - A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
-## WeChat commands
+## Message-channel commands
 
 ```text
 /help            /h           Show commands
@@ -146,6 +149,8 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 /stream <on|off|default>       Enable, disable, or restore global process progress
 /prompt start    /pp s        Buffer multiple WeChat messages
 /prompt done     /pp d        Submit the buffer as one Codex turn
+/approve A1      /ok A1       Approve one Codex request received in this channel
+/reject A1       /no A1       Decline a Codex request received in this channel
 /stop            /x           Interrupt the current Codex task
 ```
 
@@ -175,7 +180,7 @@ Only absolute local paths are accepted. Native outbound types are `image`, `vide
 
 The default `codexBackend` is `auto`. On the first Codex message, the service starts one persistent `codex app-server --stdio` process and uses the current `initialize`, `thread/*`, and `turn/*` protocol. New and resumed conversations prefer app-server; startup, handshake, or request failures automatically fall back to `codex exec` or `codex exec resume`.
 
-WeChat does not currently expose Codex approval prompts, so app-server uses `approvalPolicy: "never"` and operates only within the configured Codex sandbox instead of waiting for an approval that cannot be answered in WeChat. The management page can still pin the backend to `app-server` or `exec` for diagnostics.
+Chat-started app-server turns use `approvalPolicy: "on-request"`. Command, file-change, and additional-permission requests are routed back to the originating account and sender and wait for `/approve` or `/reject`; timeout, delivery failure, or a missing owning turn safely declines the request. Turns with channel approval enabled do not fall back to non-interactive `codex exec`. The management page can still pin the backend to `app-server` or `exec` for diagnostics.
 
 ## Models and reasoning effort
 

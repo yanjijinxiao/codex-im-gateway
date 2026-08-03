@@ -9,6 +9,7 @@ const state = {
   codex: null,
   codexRuntime: null,
   codexModels: [],
+  taskboard: null,
   loginPoll: null,
   selectedSessionKey: "",
   sessionMessages: [],
@@ -129,7 +130,10 @@ function bindEvents() {
 
 async function bootstrap() {
   try {
-    const data = await api("/api/bootstrap", { token: false });
+    const [data, taskboard] = await Promise.all([
+      api("/api/bootstrap", { token: false }),
+      api("/api/taskboard", { token: false })
+    ]);
     state.requestToken = data.requestToken;
     state.version = data.version || "";
     state.accounts = data.accounts;
@@ -139,6 +143,7 @@ async function bootstrap() {
     state.codex = data.codex;
     state.codexRuntime = data.codexRuntime;
     state.codexModels = data.codexModels || [];
+    state.taskboard = taskboard;
     renderAll();
     showView(location.hash.slice(1) || "accounts", false);
     window.setInterval(() => void refreshData(false), 5000);
@@ -305,17 +310,20 @@ function delay(ms) {
 async function refreshData(notify) {
   try {
     const previousSession = selectedSession();
-    const [accounts, projects, sessions] = await Promise.all([
+    const [accounts, projects, sessions, taskboard] = await Promise.all([
       api("/api/accounts"),
       api("/api/projects"),
-      api("/api/sessions")
+      api("/api/sessions"),
+      api("/api/taskboard")
     ]);
     state.accounts = accounts.accounts;
     state.projects = projects.projects;
     state.sessions = sessions.sessions;
+    state.taskboard = taskboard;
     renderMetrics();
     renderAccounts();
     renderSessions();
+    renderTaskboardStatus();
     drawIcons();
     const currentSession = selectedSession();
     if (
@@ -584,9 +592,40 @@ function renderSettings() {
   document.querySelector("#backendInput").value = state.config.codexBackend || "auto";
   document.querySelector("#sandboxInput").value = state.config.codexExecSandbox || "";
   document.querySelector("#streamRepliesInput").checked = Boolean(state.config.streamReplies);
+  document.querySelector("#taskboardEnabledInput").checked = Boolean(state.config.taskboardEnabled);
+  document.querySelector("#taskboardUrlInput").value = state.config.taskboardUrl || "http://127.0.0.1:47823";
   renderModelOptions();
   document.querySelector("#effectiveModelValue").textContent = state.codexRuntime?.model || state.config.model || "Codex 默认";
   document.querySelector("#effectiveEffortValue").textContent = state.codexRuntime?.effort || state.config.effort || "Codex 默认";
+  renderTaskboardStatus();
+}
+
+function renderTaskboardStatus() {
+  const panel = document.querySelector("#taskboardStatusPanel");
+  if (!panel) return;
+  const taskboard = state.taskboard;
+  if (!taskboard) {
+    panel.innerHTML = `<div class="taskboard-connection"><span class="status-label">正在检查连接</span></div>`;
+    return;
+  }
+  const stateClass = taskboard.available ? "status-running" : taskboard.enabled ? "status-error" : "";
+  const stateText = taskboard.available ? "Taskboard 已连接" : taskboard.enabled ? "Taskboard 不可用" : "Taskboard 已停用";
+  const mappings = Array.isArray(taskboard.projects) ? taskboard.projects : [];
+  panel.innerHTML = `
+    <div class="taskboard-connection">
+      <span class="status-label ${stateClass}">${stateText}</span>
+      <code>${escapeHtml(taskboard.url || "")}</code>
+    </div>
+    ${taskboard.error ? `<p class="taskboard-error">${escapeHtml(taskboard.error)}</p>` : ""}
+    <div class="taskboard-mappings">
+      ${mappings.length ? mappings.map((mapping) => `
+        <div class="taskboard-mapping">
+          <span><strong>${escapeHtml(mapping.projectName)}</strong><small>${escapeHtml(mapping.workspace)}</small></span>
+          <span class="taskboard-mapping-state ${mapping.taskboardProjectId ? "is-mapped" : ""}">
+            ${mapping.taskboardProjectId ? `${escapeHtml(mapping.taskboardProjectName)} · ${Number(mapping.issueCount || 0)} Issues` : "未映射"}
+          </span>
+        </div>`).join("") : `<p class="taskboard-empty">添加 Codex 项目后会按工作目录自动映射。</p>`}
+    </div>`;
 }
 
 function renderModelOptions() {
@@ -1710,12 +1749,15 @@ async function saveSettings(event) {
         codexExecSandbox: document.querySelector("#sandboxInput").value || null,
         model: document.querySelector("#modelInput").value.trim(),
         effort: document.querySelector("#effortInput").value.trim(),
-        streamReplies: document.querySelector("#streamRepliesInput").checked
+        streamReplies: document.querySelector("#streamRepliesInput").checked,
+        taskboardEnabled: document.querySelector("#taskboardEnabledInput").checked,
+        taskboardUrl: document.querySelector("#taskboardUrlInput").value.trim()
       }
     });
     state.config = result.config;
     state.codexRuntime = result.codexRuntime;
     state.codexModels = result.codexModels || state.codexModels;
+    state.taskboard = await api("/api/taskboard");
     renderAll();
     toast("设置已保存");
   } catch (error) {

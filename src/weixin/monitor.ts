@@ -73,19 +73,20 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
         console.log(`[codex-channel-bridge] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
         continue;
       }
-      try {
-        console.log(`[codex-channel-bridge] handling message ${normalized.id} from ${normalized.senderId}`);
-        await options.onMessage(normalized);
-        console.log(`[codex-channel-bridge] handled message ${normalized.id} from ${normalized.senderId}`);
-      } catch (error) {
-        console.error(`[codex-channel-bridge] message handling failed for ${normalized.senderId}: ${errorDetail(error)}`);
+      const message = normalized;
+      console.log(`[codex-channel-bridge] handling message ${message.id} from ${message.senderId}`);
+      void options.onMessage(message).then(() => {
+        console.log(`[codex-channel-bridge] handled message ${message.id} from ${message.senderId}`);
+      }).catch(async (error) => {
+        console.error(`[codex-channel-bridge] message handling failed for ${message.senderId}: ${errorDetail(error)}`);
         try {
-          await options.onMessageError?.(error, normalized);
+          await options.onMessageError?.(error, message);
         } catch (reportError) {
-          console.error(`[codex-channel-bridge] failed to report message error for ${normalized.senderId}: ${errorDetail(reportError)}`);
+          console.error(`[codex-channel-bridge] failed to report message error for ${message.senderId}: ${errorDetail(reportError)}`);
         }
-      }
+      });
     }
+    await Promise.resolve();
     if (!messages.length) {
       await delay(pollIntervalMs, options.signal);
     }

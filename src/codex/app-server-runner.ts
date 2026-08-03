@@ -3,10 +3,18 @@ import readline from "node:readline";
 
 import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
 import { parseAccountRateLimits, type CodexAccountBalance } from "./account-balance.js";
+import {
+  appServerApprovalResult,
+  isAppServerApprovalMethod,
+  parseAppServerApproval,
+  type CodexApprovalHandler
+} from "./approval.js";
+import type { CodexExecSandbox } from "./sandbox.js";
 
 export type AppServerRunnerOptions = {
   codexBin?: string;
   requestTimeoutMs?: number;
+  sandbox?: CodexExecSandbox;
 };
 
 export type CodexRunnerInput = {
@@ -18,6 +26,7 @@ export type CodexRunnerInput = {
   effort?: string;
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
+  onApproval?: CodexApprovalHandler;
 };
 
 export type CodexHistoryMessage = {
@@ -79,6 +88,11 @@ type QueuedTurnEvent = {
   text: string;
 };
 
+type AppServerSandboxPolicy =
+  | { readonly type: "dangerFullAccess" }
+  | { readonly type: "readOnly" }
+  | { readonly type: "workspaceWrite" };
+
 type WireMessage = {
   id?: JsonRpcId;
   method?: string;
@@ -101,6 +115,7 @@ export class AppServerCodexRunner {
   private stderr = "";
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly activeTurns = new Map<string, string>();
+  private readonly approvalHandlersByThread = new Map<string, CodexApprovalHandler>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
   private readonly turnEvents = new Map<string, string[]>();
   private readonly turnTexts = new Map<string, string>();
@@ -140,22 +155,33 @@ export class AppServerCodexRunner {
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
       cwd: input.cwd,
-      approvalPolicy: "never",
+      approvalPolicy: input.onApproval ? "on-request" : "never",
+      sandboxPolicy: appServerSandboxPolicy(this.options.sandbox),
       model: input.model,
       effort: input.effort
     });
     let turnResponse: Record<string, unknown>;
+    if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
     try {
       turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
     } catch (error) {
-      if (!input.threadId || !isThreadBusyError(error)) throw error;
+      if (!input.threadId || !isThreadBusyError(error)) {
+        this.approvalHandlersByThread.delete(threadId);
+        throw error;
+      }
       await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
       await this.waitForThreadIdle(input.threadId);
-      turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+      try {
+        turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+      } catch (retryError) {
+        this.approvalHandlersByThread.delete(threadId);
+        throw retryError;
+      }
     }
     const turn = turnResponse.turn as Record<string, unknown> | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
     if (!turnId) {
+      this.approvalHandlersByThread.delete(threadId);
       throw new Error("Codex app-server did not return a turn id");
     }
 
@@ -464,6 +490,7 @@ export class AppServerCodexRunner {
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
     this.activeTurns.delete(threadId);
+    this.approvalHandlersByThread.delete(threadId);
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
@@ -578,11 +605,34 @@ export class AppServerCodexRunner {
 
   private handleServerRequest(message: WireMessage): void {
     const id = message.id as JsonRpcId;
-    switch (message.method) {
-      case "item/commandExecution/requestApproval":
-      case "item/fileChange/requestApproval":
-        this.send({ id, result: { decision: "decline" } });
+    if (isAppServerApprovalMethod(message.method)) {
+      const method = message.method;
+      const request = parseAppServerApproval(method, message.params ?? {});
+      const handler = request ? this.approvalHandlersByThread.get(request.threadId) : undefined;
+      if (!request || !handler) {
+        const fallback = request ?? {
+          kind: "command" as const,
+          threadId: "",
+          turnId: "",
+          itemId: ""
+        };
+        this.send({ id, result: appServerApprovalResult(method, fallback, "decline") });
         return;
+      }
+      void Promise.resolve(handler(request))
+        .then((decision) => {
+          this.send({ id, result: appServerApprovalResult(method, request, decision) });
+        })
+        .catch(() => {
+          try {
+            this.send({ id, result: appServerApprovalResult(method, request, "decline") });
+          } catch {
+            // The turn or transport already ended; there is nothing left to approve.
+          }
+        });
+      return;
+    }
+    switch (message.method) {
       case "execCommandApproval":
       case "applyPatchApproval":
         this.send({ id, result: { decision: "denied" } });
@@ -592,9 +642,6 @@ export class AppServerCodexRunner {
         return;
       case "mcpServer/elicitation/request":
         this.send({ id, result: { action: "cancel", content: null, _meta: null } });
-        return;
-      case "item/permissions/requestApproval":
-        this.send({ id, result: { permissions: {}, scope: "turn" } });
         return;
       case "item/tool/call":
         this.send({
@@ -643,6 +690,7 @@ export class AppServerCodexRunner {
       waiter.reject(error);
     }
     this.activeTurns.clear();
+    this.approvalHandlersByThread.clear();
     this.turnEvents.clear();
     this.turnTexts.clear();
     this.completedTurns.clear();
@@ -651,6 +699,19 @@ export class AppServerCodexRunner {
     this.itemPhasesByTurn.clear();
     this.runtimeInfoByThread.clear();
     this.modelOptions = undefined;
+  }
+}
+
+function appServerSandboxPolicy(sandbox: CodexExecSandbox | undefined): AppServerSandboxPolicy | undefined {
+  switch (sandbox) {
+    case undefined:
+      return undefined;
+    case "read-only":
+      return { type: "readOnly" };
+    case "workspace-write":
+      return { type: "workspaceWrite" };
+    case "danger-full-access":
+      return { type: "dangerFullAccess" };
   }
 }
 
