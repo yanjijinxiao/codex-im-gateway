@@ -507,6 +507,7 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
   .metrics { width: 100%; grid-template-columns: 1fr 1fr; }
   .workspace-metric { grid-column: 1 / -1; max-width: none; }
   .view { padding: 30px 0 56px; }
+  .taskboard-view { width: 100%; margin: 0; padding: 0; }
   h1 { font-size: 25px; }
   .section-heading { align-items: center; }
   .heading-actions { justify-content: flex-end; flex-wrap: wrap; }
