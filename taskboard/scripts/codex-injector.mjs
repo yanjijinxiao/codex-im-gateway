@@ -58,7 +58,7 @@ function parseArgs(argv) {
     startupToken: null,
     daemon: false,
     screenshot: null,
-    appPath: "/Applications/ChatGPT.app",
+    appPath: "ChatGPT",
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -198,6 +198,7 @@ function launchCodex(appPath, port) {
       "--args",
       `--remote-debugging-port=${port}`,
       `--remote-allow-origins=http://127.0.0.1:${port}`,
+      "--disable-features=LocalNetworkAccessChecks",
     ],
     { stdio: "ignore" },
   );
@@ -409,6 +410,7 @@ async function waitForResidentInjectorReady(port, pid, startupToken, expectedSou
             expression: `({
               token: window[${JSON.stringify(hostStartupTokenName)}],
               taskboardEntryMounted: Boolean(document.getElementById("codex-taskboard-entry")),
+              channelEntryMounted: Boolean(document.getElementById("codex-channel-bridge-entry")),
               sourceHash: window.__codexTaskboardInjection__?.sourceHash || null
             })`,
             returnByValue: true,
@@ -416,6 +418,7 @@ async function waitForResidentInjectorReady(port, pid, startupToken, expectedSou
           if (
             (startupToken === null || readiness.result.value?.token === startupToken)
             && readiness.result.value.taskboardEntryMounted
+            && readiness.result.value.channelEntryMounted
             && readiness.result.value.sourceHash === expectedSourceHash
           ) return;
         } finally {
@@ -983,6 +986,7 @@ async function readInjectionStatus(cdp) {
       sourceHash: window.__codexTaskboardInjection__?.sourceHash || null,
       scriptIdentifier: window[${JSON.stringify(injectionScriptIdentifierName)}] || null,
       entryMounted: Boolean(document.getElementById("codex-taskboard-entry")),
+      channelEntryMounted: Boolean(document.getElementById("codex-channel-bridge-entry")),
       pageMounted: Boolean(document.getElementById("codex-taskboard-page")),
       pageVisible: document.getElementById("codex-taskboard-page")?.hidden === false,
       frameUrl: document.getElementById("codex-taskboard-frame")?.src || null
@@ -1000,6 +1004,7 @@ async function waitForInjectionStatus(cdp, shouldOpen, expectedSourceHash, timeo
     && (
       status.sourceHash !== expectedSourceHash
       || !status.entryMounted
+      || !status.channelEntryMounted
       || (shouldOpen && (!status.pageVisible || !status.frameUrl))
     )
   ) {

@@ -87,6 +87,8 @@ Select **Add Channel** in the Web console:
 
 Enterprise WeChat and Feishu use official long-connection SDKs, so the local service needs no public domain or callback URL. See [Message channel and task notification setup](./docs/channel-setup.md) for complete steps and official console links. Credentials stay under `~/.codex-weixin/` and are never returned by the management API.
 
+Each channel also has an optional Webhook under the pencil **Channel Settings** action. When configured, every successfully received or sent channel message is mirrored once as a JSON POST; no request is made when it is left unconfigured. The management API exposes only the configured status and never returns the potentially secret-bearing URL. See [Webhook mirroring](./docs/channel-setup.md#webhook-mirroring) for the event format.
+
 When a chat-started task needs permission to run a command, change files, or gain additional access, the request returns to the same channel account and sender. Reply with `/approve A1` (`/ok A1`) to approve once or `/reject A1` (`/no A1`) to decline. Unanswered requests are declined after ten minutes, and another sender or account cannot act on the request.
 
 ## First personal WeChat connection
@@ -125,9 +127,13 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 
 Taskboard is fully embedded in this repository under the `taskboard/` workspace, including the local service, React management UI, `taskctl` CLI, Codex Skill, Cloud/injection scripts, and tests. Running `npm install` and `npm run build` at the repository root installs and builds both the bridge and Taskboard without an external Taskboard repository or Git submodule.
 
+The management header includes a Taskboard tab that switches the current main area to the configured loopback Taskboard without opening another window. Switching back to Channels, Sessions, or Settings restores the corresponding Bridge view.
+
 The Settings page connects to `http://127.0.0.1:47823` by default and maps Codex projects to Taskboard projects by absolute workspace path. Taskboard remains the single source of truth for issue state; the bridge does not copy board issues into its own state files. The configured `manage-taskboard` Skill and `taskctl` command point directly to this repository's `taskboard/` workspace.
 
 Useful commands: `npm run taskboard:start` starts the local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
+
+Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --launch --watch` adds two native-looking peer navigation entries below Plugins. **Taskboard** and **Channel Configuration** switch the same Codex main workspace between the local board and the Codex Channel Bridge management page at `http://127.0.0.1:8787/`; neither opens a separate browser side panel. Current Codex Chromium builds enforce Local Network Access checks for loopback iframes, so the launcher supplies `--disable-features=LocalNetworkAccessChecks`; an already-running Dock-launched process without a debugging port cannot be injected in place.
 
 ## Message-channel commands
 

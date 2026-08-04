@@ -1,11 +1,13 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.8";
+  const VERSION = "0.7.0";
   const SOURCE_HASH = window.__CODEX_TASKBOARD_SOURCE_HASH__;
   const SENTINEL_KEY = "__codexTaskboardInjection__";
   const DEFAULT_TASKBOARD_URL = "http://127.0.0.1:47823/?host=codex";
+  const DEFAULT_CHANNEL_BRIDGE_URL = "http://127.0.0.1:8787/";
   const ENTRY_ID = "codex-taskboard-entry";
+  const CHANNEL_ENTRY_ID = "codex-channel-bridge-entry";
   const PAGE_ID = "codex-taskboard-page";
   const FRAME_ID = "codex-taskboard-frame";
   const DRAG_REGION_ID = "codex-taskboard-drag-region";
@@ -25,6 +27,8 @@
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
+  const TASKBOARD_VIEW = "taskboard";
+  const CHANNEL_VIEW = "channel";
   const PLUGIN_LABELS = ["插件", "plugins"];
   const NATIVE_PAGE_LABELS = [
     "新建任务",
@@ -52,6 +56,7 @@
   } catch (_) {}
 
   let entry = null;
+  let channelEntry = null;
   let page = null;
   let frame = null;
   let dragRegion = null;
@@ -72,6 +77,7 @@
   let pendingThreadCreation = null;
   let lastNativeThreadId = "";
   let active = false;
+  let activeView = null;
   let destroyed = false;
 
   function normalizedLabel(value) {
@@ -98,6 +104,24 @@
     }
   }
 
+  function resolveChannelBridgeUrl() {
+    const configured = typeof window.__CODEX_CHANNEL_BRIDGE_URL__ === "string"
+      ? window.__CODEX_CHANNEL_BRIDGE_URL__.trim()
+      : "";
+    try {
+      const url = new URL(configured || DEFAULT_CHANNEL_BRIDGE_URL);
+      if (
+        (url.protocol !== "http:" && url.protocol !== "https:")
+        || (url.hostname !== "127.0.0.1" && url.hostname !== "localhost")
+      ) {
+        throw new Error("Unsupported Codex Channel Bridge URL");
+      }
+      return url;
+    } catch (_) {
+      return new URL(DEFAULT_CHANNEL_BRIDGE_URL);
+    }
+  }
+
   function isLocalTaskboardOrigin(origin) {
     try {
       const { protocol, hostname } = new URL(origin);
@@ -114,11 +138,13 @@
     style.id = STYLE_ID;
     style.setAttribute(OWNED_ATTRIBUTE, "true");
     style.textContent = `
-      #${ENTRY_ID}[aria-current="page"] {
+      #${ENTRY_ID}[aria-current="page"],
+      #${CHANNEL_ENTRY_ID}[aria-current="page"] {
         background: var(--color-token-list-hover-background, color-mix(in srgb, currentColor 8%, transparent));
         color: var(--color-token-foreground, inherit);
       }
-      #${ENTRY_ID}:focus-visible {
+      #${ENTRY_ID}:focus-visible,
+      #${CHANNEL_ENTRY_ID}:focus-visible {
         outline: 2px solid var(--color-token-border, Highlight);
         outline-offset: 2px;
       }
@@ -139,7 +165,7 @@
       }
       #${PAGE_ID} {
         position: absolute;
-        top: 0;
+        top: var(--codex-taskboard-top-offset, 46px);
         right: 0;
         bottom: 0;
         left: 0;
@@ -233,7 +259,7 @@
     return Array.from(group?.children || []).filter((child) => child.tagName === "BUTTON").at(-1) || null;
   }
 
-  function replaceEntryIcon(button) {
+  function replaceEntryIcon(button, kind) {
     const icon = button.querySelector("svg");
     if (!icon) return;
     icon.setAttribute("viewBox", "0 0 24 24");
@@ -242,45 +268,51 @@
     icon.setAttribute("stroke-width", "1.8");
     icon.setAttribute("stroke-linecap", "round");
     icon.setAttribute("stroke-linejoin", "round");
-    icon.innerHTML = `
-      <rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect>
-      <path d="M9 4v16M14.5 8h2.5M14.5 12h2.5M14.5 16h2.5"></path>
-    `;
+    icon.innerHTML = kind === "taskboard"
+      ? `
+        <rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect>
+        <path d="M9 4v16M14.5 8h2.5M14.5 12h2.5M14.5 16h2.5"></path>
+      `
+      : `
+        <path d="M12 3.5a2.2 2.2 0 0 1 2.1 1.55l.23.75a7 7 0 0 1 1.18.68l.77-.18a2.2 2.2 0 0 1 2.45 1.16l.8 1.38a2.2 2.2 0 0 1-.35 2.68l-.55.57c.03.22.04.45.04.68 0 .23-.01.46-.04.68l.55.57a2.2 2.2 0 0 1 .35 2.68l-.8 1.38a2.2 2.2 0 0 1-2.45 1.16l-.77-.18a7 7 0 0 1-1.18.68l-.23.75A2.2 2.2 0 0 1 12 21.5h-1.6a2.2 2.2 0 0 1-2.1-1.55l-.23-.75a7 7 0 0 1-1.18-.68l-.77.18a2.2 2.2 0 0 1-2.45-1.16l-.8-1.38a2.2 2.2 0 0 1 .35-2.68l.55-.57a5 5 0 0 1 0-1.36l-.55-.57a2.2 2.2 0 0 1-.35-2.68l.8-1.38A2.2 2.2 0 0 1 6.12 6.3l.77.18a7 7 0 0 1 1.18-.68l.23-.75a2.2 2.2 0 0 1 2.1-1.55H12Z"></path>
+        <circle cx="11.2" cy="12.5" r="2.7"></circle>
+      `;
   }
 
-  function createEntry(reference) {
+  function createEntry(reference, { id, labelText, ariaLabel, iconKind, onClick }) {
     const button = reference.cloneNode(true);
-    button.id = ENTRY_ID;
+    button.id = id;
     button.type = "button";
     button.removeAttribute("disabled");
     button.removeAttribute("aria-expanded");
     button.removeAttribute("aria-controls");
     button.removeAttribute("aria-describedby");
     button.removeAttribute("data-state");
-    button.setAttribute("aria-label", "打开任务面板");
-    button.setAttribute("title", "任务面板");
+    button.setAttribute("aria-label", ariaLabel);
+    button.setAttribute("title", labelText);
     button.setAttribute(OWNED_ATTRIBUTE, "true");
     button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
     const label = button.querySelector(".text-fade-truncate")
       || Array.from(button.querySelectorAll("span")).find((node) => buttonMatches(node, PLUGIN_LABELS));
-    if (label) label.textContent = "任务面板";
-    else button.textContent = "任务面板";
-    replaceEntryIcon(button);
+    if (label) label.textContent = labelText;
+    else button.textContent = labelText;
+    replaceEntryIcon(button, iconKind);
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openTaskboard();
+      onClick();
     });
     return button;
   }
 
   function syncEntryState() {
-    if (!entry) return;
-    if (active && entry.getAttribute("aria-current") !== "page") {
-      entry.setAttribute("aria-current", "page");
-    } else if (!active && entry.hasAttribute("aria-current")) {
-      entry.removeAttribute("aria-current");
-    }
+    if (!entry || !channelEntry) return;
+    const taskboardActive = active && activeView === TASKBOARD_VIEW;
+    const channelActive = active && activeView === CHANNEL_VIEW;
+    if (taskboardActive) entry.setAttribute("aria-current", "page");
+    else entry.removeAttribute("aria-current");
+    if (channelActive) channelEntry.setAttribute("aria-current", "page");
+    else channelEntry.removeAttribute("aria-current");
   }
 
   function ensureEntry() {
@@ -288,9 +320,32 @@
     installStyles();
     const reference = findReferenceButton();
     if (!reference?.parentElement) return;
-    if (!entry) entry = createEntry(reference);
+    if (!entry) {
+      entry = createEntry(reference, {
+        id: ENTRY_ID,
+        labelText: "任务面板",
+        ariaLabel: "切换到任务面板",
+        iconKind: "taskboard",
+        onClick: openTaskboard,
+      });
+    }
+    if (!channelEntry) {
+      channelEntry = createEntry(reference, {
+        id: CHANNEL_ENTRY_ID,
+        labelText: "渠道配置",
+        ariaLabel: "切换到渠道配置",
+        iconKind: "channel",
+        onClick: openChannelConfig,
+      });
+    }
     if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
       reference.after(entry);
+    }
+    if (
+      channelEntry.parentElement !== reference.parentElement
+      || channelEntry.previousElementSibling !== entry
+    ) {
+      entry.after(channelEntry);
     }
     syncEntryState();
   }
@@ -320,11 +375,25 @@
     return { frameHost, surface };
   }
 
+  function pageTopOffset(surface) {
+    const header = document.querySelector("main > header");
+    const headerRect = header?.getBoundingClientRect();
+    const surfaceRect = surface.getBoundingClientRect();
+    if (!headerRect || !Number.isFinite(headerRect.bottom) || !Number.isFinite(surfaceRect.top)) {
+      return 46;
+    }
+    return Math.max(0, Math.ceil(headerRect.bottom - surfaceRect.top));
+  }
+
   function muteNativeSelection() {
     if (!active) return;
     document.querySelectorAll('aside nav[role="navigation"] [aria-current]')
       .forEach((node) => {
-        if (node === entry || node.closest(`#${ENTRY_ID}`)) return;
+        if (
+          node === entry
+          || node === channelEntry
+          || node.closest(`#${ENTRY_ID}, #${CHANNEL_ENTRY_ID}`)
+        ) return;
         if (!mutedNativeSelections.has(node)) {
           mutedNativeSelections.set(node, node.getAttribute("aria-current"));
         }
@@ -556,7 +625,7 @@
   }
 
   function postHostContext() {
-    if (!frame) return;
+    if (!frame || activeView !== TASKBOARD_VIEW) return;
     const liveContext = readHostContext();
     const payload = hostContextSnapshot
       ? {
@@ -793,7 +862,7 @@
         resolve();
       });
       frameReadyWaiters.clear();
-      if (active) showFrame();
+      if (active && activeView === TASKBOARD_VIEW) showFrame();
       postHostContext();
       return;
     }
@@ -881,9 +950,9 @@
     return section;
   }
 
-  function showLoading() {
+  function showLoading(message = "正在启动任务面板…") {
     if (!status) return;
-    status.replaceChildren(document.createTextNode("正在启动任务面板…"));
+    status.replaceChildren(document.createTextNode(message));
     status.hidden = false;
     if (frame) frame.hidden = true;
   }
@@ -896,7 +965,7 @@
     }
   }
 
-  function showLoadError(message) {
+  function showLoadError(message, retryAction = openTaskboard) {
     if (!status) return;
     const content = document.createElement("div");
     const text = document.createElement("div");
@@ -904,7 +973,7 @@
     const retry = document.createElement("button");
     retry.type = "button";
     retry.textContent = "重新启动";
-    retry.addEventListener("click", openTaskboard, { once: true });
+    retry.addEventListener("click", retryAction, { once: true });
     content.append(text, retry);
     status.replaceChildren(content);
     status.hidden = false;
@@ -960,20 +1029,72 @@
     page.appendChild(nextFrame);
   }
 
+  function frameMatchesChannelBridgeUrl(channelUrl) {
+    if (!frame) return false;
+    try {
+      const loadedUrl = new URL(frame.getAttribute("src") || frame.src);
+      loadedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      const expectedUrl = new URL(channelUrl.href);
+      expectedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      return loadedUrl.href === expectedUrl.href;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function loadChannelBridgeFrame(generation, cacheBust = false) {
+    cancelFrameReadyWaiters(new Error("渠道配置正在重新加载"));
+    frame?.remove();
+    frame = null;
+    frameReady = false;
+    if (dragRegion) dragRegion.hidden = true;
+    if (noDragLeft) noDragLeft.hidden = true;
+    if (noDragRight) noDragRight.hidden = true;
+
+    const channelUrl = resolveChannelBridgeUrl();
+    if (cacheBust) {
+      channelUrl.searchParams.set(FRAME_REFRESH_PARAM, Date.now().toString(36));
+    }
+    frameOrigin = channelUrl.origin;
+    const nextFrame = document.createElement("iframe");
+    nextFrame.id = FRAME_ID;
+    nextFrame.hidden = true;
+    nextFrame.src = channelUrl.href;
+    nextFrame.title = "渠道配置";
+    nextFrame.referrerPolicy = "no-referrer";
+    nextFrame.addEventListener("load", () => {
+      if (
+        frame !== nextFrame
+        || !active
+        || activeView !== CHANNEL_VIEW
+        || generation !== openGeneration
+      ) return;
+      frameReady = true;
+      showFrame();
+    }, { once: true });
+    frame = nextFrame;
+    page.appendChild(nextFrame);
+  }
+
   function reloadFrame() {
     if (!frame) return false;
     const generation = ++openGeneration;
+    if (activeView === CHANNEL_VIEW) {
+      showLoading("正在启动渠道配置…");
+      loadChannelBridgeFrame(generation, true);
+      return true;
+    }
     if (active) showLoading();
     loadTaskboardFrame(true);
     if (active) {
-      void waitForFrameReady()
+      waitForFrameReady()
         .then(() => {
-          if (!active || generation !== openGeneration) return;
+          if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
           showFrame();
           postHostContext();
         })
         .catch((error) => {
-          if (!active || generation !== openGeneration) return;
+          if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
           showLoadError(error.message);
         });
     }
@@ -1080,18 +1201,18 @@
         requestHostEnsure(taskboardUrl),
         captureHostContext(),
       ]);
-      if (!active || generation !== openGeneration) return;
+      if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
       hostContextSnapshot = context;
       if (!frameReady || result.restarted || !frameMatchesTaskboardUrl(taskboardUrl)) {
         showLoading();
         loadTaskboardFrame();
         await waitForFrameReady();
       }
-      if (!active || generation !== openGeneration) return;
+      if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
       showFrame();
       postHostContext();
     } catch (error) {
-      if (!active || generation !== openGeneration) return;
+      if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
       const bindingAvailable = hasLiveHostBinding();
       showLoadError(bindingAvailable
         ? error.message
@@ -1117,6 +1238,7 @@
       restoreNativeContent();
       surface.appendChild(page);
     }
+    page.style.setProperty("--codex-taskboard-top-offset", `${pageTopOffset(surface)}px`);
     surface.setAttribute(HOST_ATTRIBUTE, "true");
     Array.from(surface.children).forEach((child) => {
       if (child !== page && child.getAttribute(OWNED_ATTRIBUTE) !== "true") {
@@ -1125,6 +1247,7 @@
     });
     hideNativeHeader();
     muteNativeSelection();
+    page.setAttribute("aria-label", activeView === CHANNEL_VIEW ? "渠道配置" : "任务面板");
     page.hidden = false;
     document.documentElement.setAttribute("data-codex-taskboard-open", "true");
   }
@@ -1133,6 +1256,7 @@
     if (!active && page?.hidden !== false) return;
     openGeneration += 1;
     active = false;
+    activeView = null;
     if (page) page.hidden = true;
     restoreNativeContent();
     restoreNativeSelection();
@@ -1151,15 +1275,47 @@
     }
     const generation = ++openGeneration;
     active = true;
+    activeView = TASKBOARD_VIEW;
     ensureEntry();
     mountActivePage();
     syncEntryState();
-    void prepareTaskboard(generation);
+    prepareTaskboard(generation).catch((error) => {
+      if (!active || activeView !== TASKBOARD_VIEW || generation !== openGeneration) return;
+      showLoadError(error instanceof Error ? error.message : "任务面板启动失败");
+    });
+  }
+
+  function openChannelConfig() {
+    if (destroyed) return;
+    if (!active) {
+      lastFocusedElement = document.activeElement;
+      hostContextSnapshot = null;
+    }
+    const generation = ++openGeneration;
+    active = true;
+    activeView = CHANNEL_VIEW;
+    updateDragRegion(null);
+    ensureEntry();
+    mountActivePage();
+    syncEntryState();
+
+    const channelUrl = resolveChannelBridgeUrl();
+    if (frameReady && frame?.isConnected && frameMatchesChannelBridgeUrl(channelUrl)) {
+      showFrame();
+      return;
+    }
+    showLoading("正在启动渠道配置…");
+    loadChannelBridgeFrame(generation);
   }
 
   function isNativePageNavigation(target) {
     const clickable = target?.closest?.("button,a,[role='button'],[data-app-action-sidebar-thread-id]");
-    if (!clickable || clickable === entry || clickable.closest(`#${ENTRY_ID}`)) return false;
+    if (
+      !clickable
+      || clickable === entry
+      || clickable === channelEntry
+      || clickable.closest(`#${ENTRY_ID}, #${CHANNEL_ENTRY_ID}`)
+    ) return false;
     if (!clickable.closest("aside nav[role='navigation']")) return false;
     if (clickable.hasAttribute("data-app-action-sidebar-section-toggle")) return false;
     if (buttonMatches(clickable, NATIVE_PAGE_LABELS)) return true;
@@ -1237,6 +1393,7 @@
     closeTaskboard(false);
     document.querySelectorAll(`[${OWNED_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     entry = null;
+    channelEntry = null;
     page = null;
     frame = null;
     dragRegion = null;
@@ -1257,6 +1414,7 @@
     refresh,
     reloadFrame,
     open: openTaskboard,
+    openChannelConfig,
     close: closeTaskboard,
     destroy,
     hostResponse: onHostResponse,

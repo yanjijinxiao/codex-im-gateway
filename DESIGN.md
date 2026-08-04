@@ -44,6 +44,19 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 - Accessibility: every project action names its target project; full project names and paths remain available through visible text or `title`.
 - Layout: rows wrap to a vertical action stack on narrow screens without horizontal scrolling.
 
+### Channel Settings Dialog
+
+- Structure: local display name, optional Webhook URL replacement field, current Webhook status, explicit clear switch, and cancel/save actions.
+- States: not configured, configured, replacing, clearing, validation error, submitting.
+- Accessibility: the dialog title and close action name the channel settings task; the URL input uses native URL semantics; configured state is expressed in text rather than color alone.
+- Security: Webhook URLs may contain signing secrets, so account list responses expose only `webhookConfigured`; the saved URL is never rendered back into the browser or written to logs.
+
+### Webhook Status Row
+
+- Structure: a third channel-identifier row labeled `Webhook`, with concise `已配置` or `未配置` text.
+- States: configured and not configured.
+- Layout: reuse the existing identifier grid without introducing a new badge or card style.
+
 ### Session Row
 
 - Structure: active marker, task title, activity time, context preview, actions.
@@ -56,6 +69,23 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 - States: connected, unavailable, disabled, mapped, unmapped.
 - Accessibility: connection meaning is expressed in text as well as color; paths remain selectable and horizontally wrap instead of clipping.
 - Security: the URL field accepts HTTP loopback origins only; remote Taskboard endpoints are outside this local-console contract.
+
+### Taskboard Management View
+
+- Structure: a fourth peer tab named “任务面板” in the existing management-view navigation and a full-width Taskboard frame in the main content region.
+- Behavior: selecting the tab replaces the Bridge status and content surfaces in place; it does not open another window or sidebar. The frame uses the configured loopback Taskboard URL and is loaded on first selection.
+- States: default, hover, focus-visible, active, Taskboard loading, and Taskboard unavailable.
+- Accessibility: the tab uses the existing keyboard-reachable tab primitive and the frame has a concise Chinese title.
+- Security: the frame policy permits HTTP loopback hosts only; arbitrary remote frame origins remain blocked.
+
+### Codex Sidebar Integration Entries
+
+- Structure: two native-looking rows placed immediately after Codex's Plugins row: “任务面板” first and “渠道配置” second.
+- Behavior: the two rows are peer navigation entries. “任务面板” and “渠道配置” switch the same embedded main-workspace surface between Taskboard and the loopback Codex Channel Bridge page; selecting the current row keeps the current page instead of opening another surface.
+- Layout: the shared embedded surface begins below Codex's measured native titlebar and fills the remaining project workspace; standalone Taskboard and Channel Bridge pages retain their own full-page layout.
+- States: default, hover, focus-visible, and active. Exactly one integration row claims the current-page state while its embedded surface is visible.
+- Accessibility: each row has a distinct icon, visible text, and an action-specific accessible name.
+- Security: the channel entry resolves only to an HTTP(S) loopback URL and never carries credentials in its label or DOM text. Channel Bridge permits the exact `app://-` Codex frame ancestor while ordinary web ancestors remain blocked; mutation-origin checks remain unchanged.
 
 ## 6. Motion & Interaction
 

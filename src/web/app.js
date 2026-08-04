@@ -94,7 +94,15 @@ function bindEvents() {
   els.sessionModelInput.addEventListener("change", () => void handleSessionModelChange());
   els.sessionEffortInput.addEventListener("change", () => void saveSessionRuntimeSettings());
   els.sessionStreamInput.addEventListener("change", () => void saveSessionRuntimeSettings());
-  document.querySelector("#accountForm").addEventListener("submit", (event) => void saveAccountRemark(event));
+  document.querySelector("#accountForm").addEventListener("submit", (event) => saveAccountSettings(event).catch((error) => setAccountFormError(String(error))));
+  document.querySelector("#accountWebhookInput").addEventListener("input", (event) => {
+    if (event.target.value.trim()) document.querySelector("#clearAccountWebhookInput").checked = false;
+    setAccountFormError("");
+  });
+  document.querySelector("#clearAccountWebhookInput").addEventListener("change", (event) => {
+    if (event.target.checked) document.querySelector("#accountWebhookInput").value = "";
+    setAccountFormError("");
+  });
   document.querySelector("#removeAccountForm").addEventListener("submit", (event) => void removeAccount(event));
   document.querySelector("#sessionForm").addEventListener("submit", (event) => void saveSession(event));
   document.querySelector("#projectForm").addEventListener("submit", (event) => void saveProject(event));
@@ -406,7 +414,7 @@ function renderAccounts() {
         <div class="account-stat"><span>状态</span><strong class="status-label status-${escapeAttr(account.status)}">${statusText(account.status)}</strong></div>
         <div class="account-stat"><span>会话</span><strong>${account.sessionCount}</strong></div>
         <div class="account-actions">
-          <button class="icon-button" type="button" data-account-action="rename" data-account-id="${escapeAttr(account.accountId)}" title="修改账号备注" aria-label="修改账号备注"><i data-lucide="pencil"></i></button>
+          <button class="icon-button" type="button" data-account-action="settings" data-account-id="${escapeAttr(account.accountId)}" title="渠道设置" aria-label="配置${escapeAttr(accountDisplayName(account.accountId))}的 Webhook 和备注"><i data-lucide="pencil"></i></button>
           <button class="icon-button" type="button" data-account-action="${account.status === "running" ? "stop" : "start"}" data-account-id="${escapeAttr(account.accountId)}" title="${account.status === "running" ? "停止账号" : "启动账号"}" aria-label="${account.status === "running" ? "停止账号" : "启动账号"}"><i data-lucide="${account.status === "running" ? "pause" : "play"}"></i></button>
           <button class="icon-button is-danger" type="button" data-account-action="remove" data-account-id="${escapeAttr(account.accountId)}" title="移除账号" aria-label="移除账号"><i data-lucide="trash-2"></i></button>
         </div>
@@ -697,8 +705,8 @@ async function handleAccountAction(event) {
   if (action === "add") return openChannelDialog();
   const accountId = button.dataset.accountId;
   const account = state.accounts.find((item) => item.accountId === accountId);
-  if (action === "rename") {
-    if (account) openAccountRemarkDialog(account);
+  if (action === "settings") {
+    if (account) openAccountSettingsDialog(account);
     return;
   }
   if (action === "remove") {
@@ -726,9 +734,17 @@ async function handleAccountAction(event) {
   }
 }
 
-function openAccountRemarkDialog(account) {
+function openAccountSettingsDialog(account) {
   document.querySelector("#editingRemarkAccountId").value = account.accountId;
   document.querySelector("#accountRemarkInput").value = account.displayName || "";
+  document.querySelector("#accountWebhookInput").value = "";
+  document.querySelector("#clearAccountWebhookInput").checked = false;
+  setAccountFormError("");
+  document.querySelector("#clearAccountWebhookField").hidden = !account.webhookConfigured;
+  document.querySelector("#accountWebhookHint").textContent = account.webhookConfigured
+    ? "当前已配置。填写新地址将替换；留空则保持不变。"
+    : "配置后，该渠道的每条收发消息都会额外推送一次。";
+  document.querySelector("#accountDialogTitle").textContent = `${accountDisplayName(account.accountId)} · 渠道设置`;
   els.accountDialog.showModal();
   document.querySelector("#accountRemarkInput").select();
 }
@@ -765,25 +781,44 @@ async function removeAccount(event) {
   }
 }
 
-async function saveAccountRemark(event) {
+async function saveAccountSettings(event) {
   event.preventDefault();
   const button = event.submitter;
   const accountId = document.querySelector("#editingRemarkAccountId").value;
   const displayName = document.querySelector("#accountRemarkInput").value.trim();
+  const webhookUrl = document.querySelector("#accountWebhookInput").value.trim();
+  const clearWebhook = document.querySelector("#clearAccountWebhookInput").checked;
+  const body = { displayName };
+  if (webhookUrl) body.webhookUrl = webhookUrl;
+  else if (clearWebhook) body.webhookUrl = null;
+  setAccountFormError("");
   try {
     button.disabled = true;
     await api(`/api/accounts/${encodeURIComponent(accountId)}`, {
       method: "PATCH",
-      body: { displayName }
+      body
     });
     els.accountDialog.close();
     await refreshData(false);
-    toast(displayName ? "账号备注已保存" : "账号备注已清除");
+    toast("渠道设置已保存");
   } catch (error) {
-    toast(error.message, true);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const webhookInvalid = /Webhook URL|webhookUrl|Invalid url/i.test(rawMessage);
+    setAccountFormError(
+      webhookInvalid ? "Webhook 地址无效，请使用 http:// 或 https:// 开头的完整地址。" : rawMessage,
+      webhookInvalid
+    );
+    if (webhookInvalid) document.querySelector("#accountWebhookInput").focus();
   } finally {
     button.disabled = false;
   }
+}
+
+function setAccountFormError(message, webhookInvalid = false) {
+  const error = document.querySelector("#accountFormError");
+  error.textContent = message;
+  error.hidden = !message;
+  document.querySelector("#accountWebhookInput").setAttribute("aria-invalid", webhookInvalid ? "true" : "false");
 }
 
 async function handleSessionAction(event) {
@@ -1768,13 +1803,31 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "taskboard", "settings"].includes(name) ? name : "accounts";
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const visible = panel.dataset.viewPanel === valid;
     panel.hidden = !visible;
     panel.classList.toggle("is-visible", visible);
   });
-  document.querySelectorAll(".tab[data-view]").forEach((tab) => tab.classList.toggle("is-active", tab.dataset.view === valid));
+  document.querySelectorAll(".tab[data-view]").forEach((tab) => {
+    const active = tab.dataset.view === valid;
+    tab.classList.toggle("is-active", active);
+    if (active) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
+  });
+  document.body.dataset.activeView = valid;
+  document.querySelector("#serviceStatusBand").hidden = valid === "taskboard";
+  if (valid === "taskboard") {
+    const taskboardFrame = document.querySelector("#taskboardFrame");
+    const taskboardUrl = state.taskboard?.url || state.config?.taskboardUrl;
+    if (taskboardUrl && URL.canParse(taskboardUrl)) {
+      const frameUrl = new URL(taskboardUrl);
+      if (taskboardFrame.dataset.source !== frameUrl.href) {
+        taskboardFrame.src = frameUrl.href;
+        taskboardFrame.dataset.source = frameUrl.href;
+      }
+    }
+  }
   if (updateHash && location.hash !== `#${valid}`) history.replaceState(null, "", `#${valid}`);
 }
 
@@ -1857,13 +1910,14 @@ function channelInfo(channel) {
 
 function renderChannelIdentifiers(account) {
   const channel = account.channel || "weixin";
+  const webhook = `<div><dt>Webhook</dt><dd><code>${account.webhookConfigured ? "已配置" : "未配置"}</code></dd></div>`;
   if (channel === "wecom") {
-    return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>`;
+    return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
   }
   if (channel === "feishu") {
-    return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div><div><dt>最近 Chat ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>`;
+    return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div><div><dt>最近 Chat ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
   }
-  return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>`;
+  return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>${webhook}`;
 }
 
 function statusText(status) {

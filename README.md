@@ -118,6 +118,8 @@ node dist/server/index.js
 
 企业微信和飞书都使用官方长连接 SDK，本机无需公网域名或回调地址。完整步骤、后台入口和接收 ID 获取方法见 [消息渠道与任务通知配置](./docs/channel-setup.md)。渠道凭据只保存在 `~/.codex-weixin/`，不会通过管理 API 返回浏览器。
 
+每个渠道都可以在铅笔按钮打开的“渠道设置”中单独配置可选 Webhook。配置后，该渠道每条成功收取或发出的消息都会额外 POST 一次标准 JSON 事件；未配置时不会发起请求。管理 API 只返回是否已配置，不会把可能包含签名密钥的 Webhook 地址返回浏览器。事件格式见 [Webhook 镜像](./docs/channel-setup.md#webhook-镜像)。
+
 ## 第一次接入个人微信
 
 1. 打开管理页，在“设置”中确认 Codex 默认工作目录和允许的工作目录。
@@ -158,9 +160,13 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 “设置”页面默认连接本机 `http://127.0.0.1:47823`，按绝对工作目录把 Codex 项目映射到 Taskboard 项目。Taskboard 始终是 Issue 状态的唯一事实源，桥接服务不会把看板任务复制进自己的状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
 
+管理页顶部提供“任务面板”入口，点击后会在当前主区域切换并展示已配置的本机 Taskboard，不会另开窗口；切回“消息渠道”“会话”或“设置”会恢复对应 Bridge 页面。
+
 将当前仓库的 `taskboard/skills/manage-taskboard` 软链接到 `~/.codex/skills/manage-taskboard`，并将 `taskboard/cli/taskctl.mjs` 暴露为 `taskctl` 后，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
 
 常用命令：`npm run taskboard:start` 启动本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
+
+以 `taskboard/scripts/codex-injector.mjs --launch --watch` 启动正常 Codex 后，原生侧边栏会在“插件”下增加“任务面板”和“渠道配置”两个入口。两者是同级导航：点击后在同一个 Codex 主工作区内分别切换本机 Taskboard 和 `http://127.0.0.1:8787/` 的 Codex Channel Bridge 管理页，不会另开浏览器侧栏。当前 Codex 使用的 Chromium 会检查本机网络 iframe，因此必须由该启动器添加 `--disable-features=LocalNetworkAccessChecks`；直接从 Dock 启动且没有调试端口的既有进程无法在运行中补注入。
 
 ## 消息渠道内命令
 
