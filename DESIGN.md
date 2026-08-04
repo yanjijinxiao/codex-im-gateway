@@ -46,9 +46,9 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 
 ### Channel Settings Dialog
 
-- Structure: local display name, optional Webhook URL replacement field, current Webhook status, explicit clear switch, and cancel/save actions.
+- Structure: local display name, Webhook notification-platform selector, optional Webhook URL replacement field, provider-specific URL guidance, current Webhook status, explicit clear switch, and cancel/save actions.
 - States: not configured, configured, replacing, clearing, validation error, submitting.
-- Accessibility: the dialog title and close action name the channel settings task; the URL input uses native URL semantics; configured state is expressed in text rather than color alone.
+- Accessibility: the dialog title and close action name the channel settings task; the platform uses a native select, the URL input uses native URL semantics, and configured state is expressed in text rather than color alone.
 - Security: Webhook URLs may contain signing secrets, so account list responses expose only `webhookConfigured`; the saved URL is never rendered back into the browser or written to logs.
 
 ### Webhook Status Row

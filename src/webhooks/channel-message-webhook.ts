@@ -1,4 +1,5 @@
 import type { ChannelKind } from "../weixin/accounts.js";
+import { resolveWebhookProvider, type WebhookProvider } from "./webhook-provider.js";
 
 export type ChannelMessageAttachment = {
   readonly kind: "image" | "file" | "video" | "audio";
@@ -27,6 +28,7 @@ type ChannelMessageWebhookOptions = {
   readonly accountId: string;
   readonly channel: ChannelKind;
   readonly webhookUrl?: string;
+  readonly webhookProvider?: WebhookProvider;
   readonly fetch?: typeof fetch;
   readonly now?: () => Date;
 };
@@ -47,15 +49,6 @@ class ChannelMessageWebhookBusinessError extends Error {
   }
 }
 
-function isWeComIncomingWebhook(webhookUrl: string): boolean {
-  try {
-    const url = new URL(webhookUrl);
-    return url.hostname === "qyapi.weixin.qq.com" && url.pathname === "/cgi-bin/webhook/send";
-  } catch {
-    return false;
-  }
-}
-
 function truncateUtf8(value: string, maximumBytes: number): string {
   const encoded = new TextEncoder().encode(value);
   if (encoded.byteLength <= maximumBytes) return value;
@@ -70,7 +63,7 @@ function truncateUtf8(value: string, maximumBytes: number): string {
   return "";
 }
 
-function createWeComIncomingWebhookPayload(channel: ChannelKind, message: ChannelMessage): object {
+function createNotificationText(channel: ChannelKind, message: ChannelMessage): string {
   const counterparty = message.direction === "inbound"
     ? `发送者: ${message.senderId}`
     : `接收者: ${message.recipientId}`;
@@ -83,27 +76,47 @@ function createWeComIncomingWebhookPayload(channel: ChannelKind, message: Channe
       ? [`附件: ${message.attachments.map((attachment) => attachment.label).join(", ")}`]
       : [])
   ];
-  return {
-    msgtype: "text",
-    text: {
-      content: truncateUtf8(lines.join("\n"), 2_048)
-    }
-  };
+  return lines.join("\n");
+}
+
+function truncateCharacters(value: string, maximumCharacters: number): string {
+  return Array.from(value).slice(0, maximumCharacters).join("");
+}
+
+function createProviderPayload(provider: Exclude<WebhookProvider, "generic">, text: string): object {
+  if (provider === "wecom") {
+    return { msgtype: "text", text: { content: truncateUtf8(text, 2_048) } };
+  }
+  if (provider === "feishu") {
+    return { msg_type: "text", content: { text: truncateUtf8(text, 20_000) } };
+  }
+  if (provider === "dingtalk") {
+    return {
+      msgtype: "text",
+      text: { content: truncateUtf8(text, 20_000) },
+      at: { isAtAll: false }
+    };
+  }
+  if (provider === "slack") return { text: truncateCharacters(text, 4_000) };
+  return { content: truncateCharacters(text, 2_000) };
 }
 
 export class ChannelMessageWebhook {
   private webhookUrl: string | undefined;
+  private webhookProvider: WebhookProvider | undefined;
   private readonly fetch: typeof fetch;
   private readonly now: () => Date;
 
   constructor(private readonly options: ChannelMessageWebhookOptions) {
     this.webhookUrl = options.webhookUrl;
+    this.webhookProvider = options.webhookProvider;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.now = options.now ?? (() => new Date());
   }
 
-  configure(webhookUrl?: string): void {
+  configure(webhookUrl?: string, webhookProvider?: WebhookProvider): void {
     this.webhookUrl = webhookUrl;
+    this.webhookProvider = webhookProvider;
   }
 
   publish(message: ChannelMessage): void {
@@ -119,11 +132,11 @@ export class ChannelMessageWebhook {
       },
       message
     } as const;
-    const weComIncomingWebhook = isWeComIncomingWebhook(webhookUrl);
-    const payload = weComIncomingWebhook
-      ? createWeComIncomingWebhookPayload(this.options.channel, message)
-      : genericPayload;
-    this.deliver(webhookUrl, payload, weComIncomingWebhook).catch((error: unknown) => {
+    const provider = resolveWebhookProvider(this.webhookProvider, webhookUrl);
+    const payload = provider === "generic"
+      ? genericPayload
+      : createProviderPayload(provider, createNotificationText(this.options.channel, message));
+    this.deliver(webhookUrl, payload, provider).catch((error: unknown) => {
       console.warn("[codex-channel-bridge] webhook delivery failed", {
         accountId: this.options.accountId,
         direction: message.direction,
@@ -132,7 +145,7 @@ export class ChannelMessageWebhook {
     });
   }
 
-  private async deliver(webhookUrl: string, payload: object, weComIncomingWebhook: boolean): Promise<void> {
+  private async deliver(webhookUrl: string, payload: object, provider: WebhookProvider): Promise<void> {
     const response = await this.fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -140,9 +153,34 @@ export class ChannelMessageWebhook {
       signal: AbortSignal.timeout(5_000)
     });
     if (!response.ok) throw new ChannelMessageWebhookDeliveryError(response.status);
-    if (!weComIncomingWebhook) return;
-    const result: unknown = await response.json();
-    if (!result || typeof result !== "object" || !("errcode" in result) || typeof result.errcode !== "number") {
+    if (provider === "generic" || provider === "slack" || provider === "discord") return;
+    let result: unknown;
+    try {
+      result = await response.json();
+    } catch {
+      throw new ChannelMessageWebhookBusinessError(-1, "invalid response");
+    }
+    if (!result || typeof result !== "object") {
+      throw new ChannelMessageWebhookBusinessError(-1, "invalid response");
+    }
+    if (provider === "feishu") {
+      const code = "code" in result && typeof result.code === "number"
+        ? result.code
+        : "StatusCode" in result && typeof result.StatusCode === "number"
+          ? result.StatusCode
+          : undefined;
+      if (code === undefined) throw new ChannelMessageWebhookBusinessError(-1, "invalid response");
+      if (code !== 0) {
+        const message = "msg" in result && typeof result.msg === "string"
+          ? result.msg
+          : "StatusMessage" in result && typeof result.StatusMessage === "string"
+            ? result.StatusMessage
+            : "unknown error";
+        throw new ChannelMessageWebhookBusinessError(code, message);
+      }
+      return;
+    }
+    if (!("errcode" in result) || typeof result.errcode !== "number") {
       throw new ChannelMessageWebhookBusinessError(-1, "invalid response");
     }
     if (result.errcode !== 0) {

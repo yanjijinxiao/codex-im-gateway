@@ -382,6 +382,18 @@
           <small class="field-hint">备注只保存在本机；清空后恢复默认名称。</small>
         </label>
         <label>
+          <span>通知平台</span>
+          <select id="accountWebhookProviderInput" aria-describedby="accountWebhookProviderHint">
+            <option value="generic">通用 JSON</option>
+            <option value="wecom">企业微信机器人</option>
+            <option value="feishu">飞书 / Lark 机器人</option>
+            <option value="dingtalk">钉钉机器人</option>
+            <option value="slack">Slack Incoming Webhook</option>
+            <option value="discord">Discord Webhook</option>
+          </select>
+          <small class="field-hint" id="accountWebhookProviderHint">发送标准 channel.message JSON，适合自建服务。</small>
+        </label>
+        <label>
           <span>Webhook 地址（可选）</span>
           <input id="accountWebhookInput" type="url" maxlength="2048" autocomplete="url" placeholder="https://example.com/webhooks/messages" aria-describedby="accountWebhookHint accountFormError" aria-invalid="false">
           <small class="field-hint" id="accountWebhookHint">配置后，该渠道的每条收发消息都会额外推送一次。</small>

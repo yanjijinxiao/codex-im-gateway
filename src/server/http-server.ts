@@ -17,6 +17,7 @@ import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
 import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
+import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
@@ -25,7 +26,8 @@ const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
 }, "Invalid Webhook URL: HTTP or HTTPS required");
 const accountSettingsSchema = z.object({
   displayName: z.string().max(40),
-  webhookUrl: webhookUrlSchema.nullable().optional()
+  webhookUrl: webhookUrlSchema.nullable().optional(),
+  webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional()
 });
 const accountDeleteSchema = z.object({
   retainHistory: z.boolean().optional()

@@ -350,6 +350,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.match(pageHtml, /id="removeAccountDialog"/);
   assert.match(pageHtml, /data-view="accounts" aria-current="page"/);
   assert.match(pageHtml, /id="accountDialog" aria-labelledby="accountDialogTitle"/);
+  assert.match(pageHtml, /id="accountWebhookProviderInput"/);
   assert.match(pageHtml, /重新扫码后恢复/);
   const appResponse = await fetch(`${server.url}/app.js`);
   const appSource = await appResponse.text();
@@ -412,6 +413,17 @@ test("local API redacts credentials and protects mutations", async (t) => {
     error: "Invalid Webhook URL: HTTP or HTTPS required"
   });
 
+  const invalidWebhookProvider = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({ displayName: "工作微信", webhookProvider: "unknown" })
+  });
+  assert.equal(invalidWebhookProvider.status, 400);
+
   const renamed = await fetch(`${server.url}/api/accounts/account-one`, {
     method: "PATCH",
     headers: {
@@ -421,23 +433,26 @@ test("local API redacts credentials and protects mutations", async (t) => {
     },
     body: JSON.stringify({
       displayName: "工作微信",
-      webhookUrl: "https://hooks.example.test/channel?token=secret"
+      webhookUrl: "https://hooks.example.test/channel?token=secret",
+      webhookProvider: "dingtalk"
     })
   });
   assert.equal(renamed.status, 200);
   const renamedAccount = (await renamed.json() as {
-    account: { displayName: string; webhookConfigured: boolean; webhookUrl?: string };
+    account: { displayName: string; webhookConfigured: boolean; webhookProvider: string; webhookUrl?: string };
   }).account;
   assert.equal(renamedAccount.displayName, "工作微信");
   assert.equal(renamedAccount.webhookConfigured, true);
+  assert.equal(renamedAccount.webhookProvider, "dingtalk");
   assert.equal(renamedAccount.webhookUrl, undefined);
 
   const accountsResponse = await fetch(`${server.url}/api/accounts`);
   const accounts = await accountsResponse.json() as {
-    accounts: Array<{ displayName?: string; webhookConfigured: boolean; webhookUrl?: string }>;
+    accounts: Array<{ displayName?: string; webhookConfigured: boolean; webhookProvider: string; webhookUrl?: string }>;
   };
   assert.equal(accounts.accounts[0].displayName, "工作微信");
   assert.equal(accounts.accounts[0].webhookConfigured, true);
+  assert.equal(accounts.accounts[0].webhookProvider, "dingtalk");
   assert.equal(accounts.accounts[0].webhookUrl, undefined);
 
   const clearedWebhook = await fetch(`${server.url}/api/accounts/account-one`, {

@@ -532,13 +532,16 @@ test("persists channel settings without exposing the webhook URL", (t) => {
 
   const configured = manager.updateAccount("account-one", {
     displayName: "  工作微信  ",
-    webhookUrl: "https://hooks.example.test/channel?token=secret"
+    webhookUrl: "https://hooks.example.test/channel?token=secret",
+    webhookProvider: "feishu"
   });
   assert.equal(configured.displayName, "工作微信");
   assert.equal(configured.webhookConfigured, true);
+  assert.equal(configured.webhookProvider, "feishu");
   assert.equal("webhookUrl" in configured, false);
   assert.equal(loadAccount(paths, "account-one").displayName, "工作微信");
   assert.equal(loadAccount(paths, "account-one").webhookUrl, "https://hooks.example.test/channel?token=secret");
+  assert.equal(loadAccount(paths, "account-one").webhookProvider, "feishu");
 
   const renamed = manager.updateAccount("account-one", { displayName: "工作渠道" });
   assert.equal(renamed.displayName, "工作渠道");
@@ -552,6 +555,7 @@ test("persists channel settings without exposing the webhook URL", (t) => {
   const cleared = manager.updateAccount("account-one", { displayName: "   ", webhookUrl: null });
   assert.equal(cleared.displayName, undefined);
   assert.equal(cleared.webhookConfigured, false);
+  assert.equal(cleared.webhookProvider, "feishu");
   assert.equal(loadAccount(paths, "account-one").displayName, undefined);
   assert.equal(loadAccount(paths, "account-one").webhookUrl, undefined);
 });

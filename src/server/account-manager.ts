@@ -292,7 +292,8 @@ export class AccountManager {
     const webhook = new ChannelMessageWebhook({
       accountId: account.accountId,
       channel,
-      ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {})
+      ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {}),
+      ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
     const adapter = channel === "weixin" ? undefined : this.channelFactory(account as WeComAccount | FeishuAccount);
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
@@ -402,7 +403,7 @@ export class AccountManager {
       throw new Error("Account display name must be 40 characters or fewer");
     }
     const account = setAccountSettings(this.options.paths, accountId, { ...patch, displayName });
-    this.entries.get(account.accountId)?.webhook?.configure(account.webhookUrl);
+    this.entries.get(account.accountId)?.webhook?.configure(account.webhookUrl, account.webhookProvider);
     return this.summary(account);
   }
 

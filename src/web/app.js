@@ -29,6 +29,38 @@ const MAX_CHAT_FILES = 10;
 const MAX_CHAT_FILE_BYTES = 100 * 1024 * 1024;
 const DISMISSED_UPDATE_KEY = "codex-channel-bridge.dismissed-update";
 const UPDATE_RECONNECT_TIMEOUT_MS = 90 * 1000;
+const WEBHOOK_PROVIDER_PRESENTATION = {
+  generic: {
+    label: "通用 JSON",
+    placeholder: "https://example.com/webhooks/messages",
+    hint: "发送标准 channel.message JSON，适合自建服务。"
+  },
+  wecom: {
+    label: "企业微信机器人",
+    placeholder: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...",
+    hint: "按企业微信群机器人的 text 消息格式发送。"
+  },
+  feishu: {
+    label: "飞书 / Lark 机器人",
+    placeholder: "https://open.feishu.cn/open-apis/bot/v2/hook/...",
+    hint: "按飞书或 Lark 自定义机器人的 text 消息格式发送。"
+  },
+  dingtalk: {
+    label: "钉钉机器人",
+    placeholder: "https://oapi.dingtalk.com/robot/send?access_token=...",
+    hint: "按钉钉群机器人的 text 消息格式发送。"
+  },
+  slack: {
+    label: "Slack Incoming Webhook",
+    placeholder: "https://hooks.slack.com/services/...",
+    hint: "按 Slack Incoming Webhook 的 text 消息格式发送。"
+  },
+  discord: {
+    label: "Discord Webhook",
+    placeholder: "https://discord.com/api/webhooks/...",
+    hint: "按 Discord Webhook 的 content 消息格式发送。"
+  }
+};
 let streamingRenderFrame = 0;
 
 const els = {};
@@ -95,6 +127,10 @@ function bindEvents() {
   els.sessionEffortInput.addEventListener("change", () => void saveSessionRuntimeSettings());
   els.sessionStreamInput.addEventListener("change", () => void saveSessionRuntimeSettings());
   document.querySelector("#accountForm").addEventListener("submit", (event) => saveAccountSettings(event).catch((error) => setAccountFormError(String(error))));
+  document.querySelector("#accountWebhookProviderInput").addEventListener("change", () => {
+    updateAccountWebhookProviderPresentation();
+    setAccountFormError("");
+  });
   document.querySelector("#accountWebhookInput").addEventListener("input", (event) => {
     if (event.target.value.trim()) document.querySelector("#clearAccountWebhookInput").checked = false;
     setAccountFormError("");
@@ -738,6 +774,8 @@ function openAccountSettingsDialog(account) {
   document.querySelector("#editingRemarkAccountId").value = account.accountId;
   document.querySelector("#accountRemarkInput").value = account.displayName || "";
   document.querySelector("#accountWebhookInput").value = "";
+  document.querySelector("#accountWebhookProviderInput").value = account.webhookProvider || "generic";
+  updateAccountWebhookProviderPresentation();
   document.querySelector("#clearAccountWebhookInput").checked = false;
   setAccountFormError("");
   document.querySelector("#clearAccountWebhookField").hidden = !account.webhookConfigured;
@@ -787,8 +825,9 @@ async function saveAccountSettings(event) {
   const accountId = document.querySelector("#editingRemarkAccountId").value;
   const displayName = document.querySelector("#accountRemarkInput").value.trim();
   const webhookUrl = document.querySelector("#accountWebhookInput").value.trim();
+  const webhookProvider = document.querySelector("#accountWebhookProviderInput").value;
   const clearWebhook = document.querySelector("#clearAccountWebhookInput").checked;
-  const body = { displayName };
+  const body = { displayName, webhookProvider };
   if (webhookUrl) body.webhookUrl = webhookUrl;
   else if (clearWebhook) body.webhookUrl = null;
   setAccountFormError("");
@@ -805,13 +844,20 @@ async function saveAccountSettings(event) {
     const rawMessage = error instanceof Error ? error.message : String(error);
     const webhookInvalid = /Webhook URL|webhookUrl|Invalid url/i.test(rawMessage);
     setAccountFormError(
-      webhookInvalid ? "Webhook 地址无效，请使用 http:// 或 https:// 开头的完整地址。" : rawMessage,
+      webhookInvalid ? "Webhook 地址无效。请以 http:// 或 https:// 开头。" : rawMessage,
       webhookInvalid
     );
     if (webhookInvalid) document.querySelector("#accountWebhookInput").focus();
   } finally {
     button.disabled = false;
   }
+}
+
+function updateAccountWebhookProviderPresentation() {
+  const provider = document.querySelector("#accountWebhookProviderInput").value;
+  const presentation = WEBHOOK_PROVIDER_PRESENTATION[provider] || WEBHOOK_PROVIDER_PRESENTATION.generic;
+  document.querySelector("#accountWebhookInput").placeholder = presentation.placeholder;
+  document.querySelector("#accountWebhookProviderHint").textContent = presentation.hint;
 }
 
 function setAccountFormError(message, webhookInvalid = false) {
@@ -1910,7 +1956,9 @@ function channelInfo(channel) {
 
 function renderChannelIdentifiers(account) {
   const channel = account.channel || "weixin";
-  const webhook = `<div><dt>Webhook</dt><dd><code>${account.webhookConfigured ? "已配置" : "未配置"}</code></dd></div>`;
+  const provider = WEBHOOK_PROVIDER_PRESENTATION[account.webhookProvider] || WEBHOOK_PROVIDER_PRESENTATION.generic;
+  const webhookStatus = account.webhookConfigured ? `已配置 · ${provider.label}` : "未配置";
+  const webhook = `<div><dt>Webhook</dt><dd><code>${escapeHtml(webhookStatus)}</code></dd></div>`;
   if (channel === "wecom") {
     return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
   }

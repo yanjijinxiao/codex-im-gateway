@@ -47,9 +47,20 @@
 
 ### Webhook 镜像
 
-每个渠道账号都可以点击铅笔按钮打开“渠道设置”，配置一个独立的 HTTP 或 HTTPS Webhook。配置后，每条成功收取或发出的渠道消息都会额外发送一次 `POST`；清除配置后立即停止推送。Webhook 请求最多等待 5 秒、不会重试，失败只记录本机警告，不阻塞原渠道的收发消息。
+每个渠道账号都可以点击铅笔按钮打开“渠道设置”，选择通知平台并配置一个独立的 HTTP 或 HTTPS Webhook。配置后，每条成功收取或发出的渠道消息都会额外发送一次 `POST`；清除配置后立即停止推送。Webhook 请求最多等待 5 秒、不会重试，失败只记录本机警告，不阻塞原渠道的收发消息。
 
-管理 API 和页面只显示“已配置”或“未配置”，不会回显可能包含签名密钥的完整地址。请求使用 `Content-Type: application/json`，消息附件只包含类型和文件名，不包含渠道 Token、上下文 Token 或原始加密附件字段：
+可选平台包括：
+
+- **通用 JSON**：发送下方完整的 `channel.message` 事件，适合自建服务；
+- **企业微信机器人**：发送 `msgtype: "text"`；
+- **飞书 / Lark 机器人**：发送 `msg_type: "text"`；
+- **钉钉机器人**：发送 `msgtype: "text"`；
+- **Slack Incoming Webhook**：发送 `text`；
+- **Discord Webhook**：发送 `content`。
+
+旧配置没有保存平台类型时，会根据企业微信、飞书/Lark、钉钉、Slack 或 Discord 的官方 Webhook 域名自动识别；无法识别的地址继续使用通用 JSON。
+
+管理 API 和页面只显示配置状态和平台类型，不会回显可能包含签名密钥的完整地址。所有请求使用 `Content-Type: application/json`。通用 JSON 的消息附件只包含类型和文件名，不包含渠道 Token、上下文 Token 或原始加密附件字段：
 
 ```json
 {
@@ -108,9 +119,9 @@ Open a project's bell menu, enable completion notifications, select a channel, a
 
 ### Webhook mirroring
 
-Open a channel's pencil **Channel Settings** action to configure an independent HTTP or HTTPS Webhook. Every successfully received or sent channel message is then mirrored once as a JSON `POST`; clearing the setting stops delivery immediately. Requests time out after five seconds and are not retried. Delivery failures produce a local warning but never block the original channel message.
+Open a channel's pencil **Channel Settings** action, select Generic JSON, Enterprise WeChat, Feishu/Lark, DingTalk, Slack, or Discord, then configure an independent HTTP or HTTPS Webhook. Every successfully received or sent channel message is mirrored once using the selected provider's JSON shape; clearing the setting stops delivery immediately. Requests time out after five seconds and are not retried. Delivery failures produce a local warning but never block the original channel message.
 
-The console and management API expose only whether a Webhook is configured, never the potentially secret-bearing URL. Payloads use the `channel.message` schema shown in the Chinese section above. Inbound messages contain `senderId`; outbound messages contain `recipientId`. Attachments include only `kind` and `label`, without channel tokens, context tokens, or raw encrypted attachment fields.
+The console and management API expose only the configured status and provider, never the potentially secret-bearing URL. Generic payloads use the `channel.message` schema shown in the Chinese section above. Inbound messages contain `senderId`; outbound messages contain `recipientId`. Attachments include only `kind` and `label`, without channel tokens, context tokens, or raw encrypted attachment fields. Legacy settings without a provider are auto-detected from known official Webhook hosts and otherwise remain Generic JSON.
 
 ### Runtime approvals
 
