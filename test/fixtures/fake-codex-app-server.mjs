@@ -270,7 +270,7 @@ rl.on("line", (line) => {
     if (prompt === "hold") {
       return;
     }
-    setTimeout(() => {
+    const sendProgress = () => {
       const progressItemId = `progress-${turnId}`;
       send({
         method: "item/started",
@@ -293,6 +293,8 @@ rl.on("line", (line) => {
           item: { type: "agentMessage", id: progressItemId, text: `working:${prompt}`, phase: "commentary", memoryCitation: null }
         }
       });
+    };
+    const sendFinal = () => {
       const itemId = `item-${turnId}`;
       send({
         method: "item/started",
@@ -322,7 +324,16 @@ rl.on("line", (line) => {
         params: { threadId: message.params.threadId, turn: completedTurn(turnId, "completed") }
       });
       activeTurns.delete(message.params.threadId);
-    }, prompt.startsWith("slow:") ? 75 : 5);
+    };
+    if (prompt === "sliding-timeout") {
+      setTimeout(sendProgress, 30);
+      setTimeout(sendFinal, 65);
+    } else {
+      setTimeout(() => {
+        sendProgress();
+        sendFinal();
+      }, prompt.startsWith("slow:") ? 75 : 5);
+    }
     return;
   }
 
