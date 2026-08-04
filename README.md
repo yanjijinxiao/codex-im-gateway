@@ -108,6 +108,34 @@ node dist/server/index.js
 
 这里的 npm 只用于按锁文件安装依赖和执行构建，不发布本服务。也可以执行 `npm run install:local` 一次完成 Bridge、内置 Taskboard、`taskctl` 和 `manage-taskboard` Skill 的本机准备。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)，Taskboard 的安装、数据迁移和回滚见 [内置 Taskboard 模块指南](./docs/taskboard-module.md)。
 
+## 一键集成到 Codex
+
+完成上面的本机构建并启动 Bridge 后，在仓库根目录运行：
+
+```bash
+npm run taskboard:codex
+```
+
+这个命令会用所需的本机调试参数启动 Codex，并一次性在原生侧边栏“插件”下增加两个同级入口：
+
+- **渠道配置（消息渠道）**：打开 Codex Channel Bridge 管理页，可添加个人微信、企业微信和飞书。
+- **任务面板**：打开内置 Taskboard，继续使用当前项目和 Codex 会话上下文。
+
+两个入口共用 Codex 主工作区，不会额外打开浏览器侧栏。注入器负责保持入口有效，因此使用期间请保持该命令所在的终端运行；以后启动集成版 Codex 仍运行同一条命令即可。
+
+如果 Codex 已经从 Dock 或 Finder 启动且侧边栏只显示旧的“任务面板”，请先完全退出 Codex，并停止旧的注入器终端，再从**当前仓库根目录**重新运行上述命令。直接启动的既有 Codex 进程无法在运行中补加调试端口，这也是只出现一个旧入口时最常见的原因。
+
+首次安装可以按以下顺序完成构建、服务启动和 Codex 集成：
+
+```bash
+npm run install:local
+node dist/server/index.js
+# 另开一个终端，在同一仓库目录运行
+npm run taskboard:codex
+```
+
+成功后，侧边栏应同时看到“渠道配置”和“任务面板”。Bridge 管理页为 [http://127.0.0.1:8787](http://127.0.0.1:8787)，Taskboard 为 [http://127.0.0.1:47823](http://127.0.0.1:47823)。
+
 ## 添加消息渠道
 
 管理页点击“添加渠道”后，可以选择：

@@ -77,6 +77,34 @@ node dist/server/index.js
 
 Here npm only installs locked dependencies and runs the build; it does not install or start this service. Node.js starts the service directly and opens [http://127.0.0.1:8787](http://127.0.0.1:8787). See the [local run guide](./docs/local-run.md) for update, start, and stop instructions.
 
+## One-command Codex integration
+
+After building locally and starting the Bridge as described above, run this command from the repository root:
+
+```bash
+npm run taskboard:codex
+```
+
+It launches Codex with the required local debugging flags and adds two peer entries below Plugins in the native sidebar:
+
+- **Channel Configuration (Message Channels)** opens the Codex Channel Bridge console for Personal WeChat, Enterprise WeChat, and Feishu.
+- **Taskboard** opens the embedded board while retaining the current Codex project and conversation context.
+
+Both entries use the Codex main workspace instead of opening a separate browser side panel. Keep the command's terminal running while using the integration, because the injector keeps the entries attached. Use the same command whenever you want to launch the integrated Codex window again.
+
+If Codex was launched from the Dock or Finder and the sidebar shows only an older Taskboard entry, quit Codex completely, stop the old injector terminal, and rerun the command from the **current repository root**. An already-running Codex process cannot gain a debugging port after launch, which is the usual cause of a stale single-entry sidebar.
+
+For a first-time setup, use this sequence to build, start the Bridge, and integrate Codex:
+
+```bash
+npm run install:local
+node dist/server/index.js
+# In another terminal, from the same repository:
+npm run taskboard:codex
+```
+
+After a successful launch, both Channel Configuration and Taskboard should be visible. The Bridge console is at [http://127.0.0.1:8787](http://127.0.0.1:8787), and Taskboard is at [http://127.0.0.1:47823](http://127.0.0.1:47823).
+
 ## Add a message channel
 
 Select **Add Channel** in the Web console:
