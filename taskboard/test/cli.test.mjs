@@ -92,10 +92,10 @@ test("project create sends id, name, and an absolute workspace path", async () =
   assert.equal(requestBody.workspacePath.endsWith("/docs"), true);
 });
 
-test("issue list serializes project, status, and thread filters", async () => {
+test("issue list serializes project and status filters", async () => {
   let requestedUrl;
   const result = await run(
-    ["issue", "list", "--project", "local", "--status", "todo", "--thread-id", "thread-current"],
+    ["issue", "list", "--project", "local", "--status", "todo"],
     async (url) => {
       requestedUrl = url;
       return response({ tasks: [] });
@@ -105,7 +105,6 @@ test("issue list serializes project, status, and thread filters", async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(requestedUrl.searchParams.get("projectId"), "local");
   assert.equal(requestedUrl.searchParams.get("status"), "todo");
-  assert.equal(requestedUrl.searchParams.get("threadId"), "thread-current");
 });
 
 test("issue commands accept in-review, blocked, and canceled statuses", async () => {

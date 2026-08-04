@@ -81,16 +81,6 @@ test("attach reconciles the renderer against a hashed current injection source",
   assert.match(source, /expectedSourceHash/);
 });
 
-test("the initial Codex navigation preserves CSP bypass for the Taskboard iframe", () => {
-  const injectTargetSource = source.slice(
-    source.indexOf("async function injectTarget"),
-    source.indexOf("async function injectAll"),
-  );
-  assert.match(injectTargetSource, /Page\.setBypassCSP/);
-  assert.match(injectTargetSource, /cdp\.send\("Page\.navigate", \{ url: target\.url \}\)/);
-  assert.doesNotMatch(injectTargetSource, /cdp\.send\("Page\.reload"\)/);
-});
-
 test("the injector ignores auxiliary Codex windows", () => {
   assert.match(source, /!target\.url\?\.includes\("initialRoute=%2Fglobal-dictation"\)/);
 });

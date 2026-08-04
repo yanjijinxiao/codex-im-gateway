@@ -20,8 +20,6 @@
     "taskctl": "./cli/taskctl.mjs"
   },
   "scripts": {
-    "install:local": "node scripts/install-local.mjs",
-    "install:check": "node scripts/install-local.mjs --check",
     "codex": "node scripts/codex-injector.mjs --launch --watch --open",
     "codex:inject": "node scripts/codex-injector.mjs --watch",
     "codex:daemon": "node scripts/codex-injector.mjs --daemon --open",
@@ -45,20 +43,20 @@
     "check": "npm run typecheck && npm run build && npm test"
   },
   "dependencies": {
-    "@lobehub/icons-static-svg": "^1.94.0",
-    "@xyflow/react": "^12.11.2",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "@lobehub/icons-static-svg": "1.94.0",
+    "@xyflow/react": "12.11.2",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.3",
-    "miniflare": "^4.20260722.0",
-    "typescript": "^7.0.2",
-    "vite": "^8.1.5",
-    "wrangler": "^4.114.0"
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "miniflare": "4.20260722.0",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "wrangler": "4.114.0"
   }
 }

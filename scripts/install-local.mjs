@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(path.dirname(scriptPath), "..");
-const taskboardRoot = path.join(projectRoot, "packages", "taskboard");
+const taskboardRoot = path.join(projectRoot, "taskboard");
 
 function parseOptions(argv) {
   const options = { check: false, skipDependencies: false, skipBuild: false };

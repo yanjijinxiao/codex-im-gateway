@@ -154,11 +154,13 @@ node dist/server/index.js
 
 ## Taskboard 联动
 
-Taskboard 已内置为 `packages/taskboard/` workspace 模块。Bridge 启动时会一并启动 `http://127.0.0.1:47823`，并按绝对工作目录把 Codex 项目映射到 Taskboard 项目；退出或重启时也会统一关闭。Taskboard 始终是 Issue 状态的唯一事实源，数据保存在 `~/.codex-weixin/taskboard/`，不会复制进 Bridge 的 JSON 状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
+Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本机服务、React 管理页面、`taskctl` CLI、Codex Skill、Cloud/注入脚本和测试。Bridge 启动时会一并启动 `http://127.0.0.1:47823`，退出或重启时统一关闭；数据保存在 `~/.codex-weixin/taskboard/`。根目录执行 `npm install` 和 `npm run build` 会同时安装并构建桥接服务与 Taskboard，不依赖外部仓库或 Git 子模块。
 
-管理后台的“任务面板”会汇总所有已映射项目的状态数量，并提供项目、状态和关键词筛选。选中 Issue 后可查看说明、优先级、Codex threadId 和进展评论，也可添加评论及执行开始处理、阻塞、恢复、提交验收、退回和验收完成。没有真实 Codex threadId 的 Issue 只能查看；阻塞和提交验收必须填写证据；“验收完成”只在待验收状态出现，并要求在独立确认窗口中显式验收。完整的关系、附件和规划仍在 Taskboard 原生页面处理。
+“设置”页和管理后台的“任务面板”按绝对工作目录映射 Codex 与 Taskboard 项目。Taskboard 始终是 Issue 状态的唯一事实源，桥接服务不会复制看板任务到自己的状态文件。任务面板支持筛选、详情、评论和受控状态流转；没有真实 Codex threadId 的 Issue 只能查看，阻塞和提交验收必须填写证据，完成必须显式验收。为了保持本地安全边界，配置只接受 HTTP 回环地址。
 
-执行 `npm run install:local` 后，内置模块的 `manage-taskboard` Skill 和 `taskctl` 会链接到用户目录，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+执行 `npm run install:local` 后，`taskboard/skills/manage-taskboard` 和 `taskboard/cli/taskctl.mjs` 会链接到用户目录，聊天端可通过 `/task` 查询和推进工作流。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+
+常用命令：`npm run taskboard:start` 启动独立本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
 
 ## 消息渠道内命令
 

@@ -16,6 +16,7 @@ import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, Sess
 import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
 import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
+import { handleTaskboardHttp } from "./taskboard-http.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const accountDisplayNameSchema = z.object({
@@ -79,14 +80,6 @@ const configSchema = z.object({
     const url = new URL(value);
     return url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
   }, "Taskboard URL must use an HTTP loopback origin").optional()
-});
-const taskboardCommentSchema = z.object({
-  body: z.string().trim().min(1).max(100_000)
-});
-const taskboardMoveSchema = z.object({
-  status: z.enum(["backlog", "todo", "in_progress", "in_review", "blocked", "done", "canceled"]),
-  version: z.number().int().nonnegative(),
-  comment: z.string().trim().min(1).max(100_000).optional()
 });
 const MAX_WEB_UPLOAD_FILES = 10;
 const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
@@ -251,40 +244,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { projects: context.accountManager.listProjects() });
     return;
   }
-  if (method === "GET" && url.pathname === "/api/taskboard") {
-    sendJson(response, 200, await context.accountManager.getTaskboardStatus());
-    return;
-  }
-  if (method === "GET" && url.pathname === "/api/taskboard/issues") {
-    sendJson(response, 200, { issues: await context.accountManager.listTaskboardIssues() });
-    return;
-  }
-  const taskboardCommentMatch = matchPath(url.pathname, "/api/taskboard/issues/:identifier/comments");
-  if (method === "POST" && taskboardCommentMatch) {
-    const body = taskboardCommentSchema.parse(await readJsonBody(request));
-    sendJson(response, 201, {
-      comment: await context.accountManager.commentTaskboardIssue(taskboardCommentMatch.identifier, body.body)
-    });
-    return;
-  }
-  const taskboardMoveMatch = matchPath(url.pathname, "/api/taskboard/issues/:identifier/move");
-  if (method === "POST" && taskboardMoveMatch) {
-    const body = taskboardMoveSchema.parse(await readJsonBody(request));
-    sendJson(response, 200, {
-      issue: await context.accountManager.moveTaskboardIssue(
-        taskboardMoveMatch.identifier,
-        body.status,
-        body.version,
-        body.comment
-      )
-    });
-    return;
-  }
-  const taskboardIssueMatch = matchPath(url.pathname, "/api/taskboard/issues/:identifier");
-  if (method === "GET" && taskboardIssueMatch) {
-    sendJson(response, 200, await context.accountManager.getTaskboardIssue(taskboardIssueMatch.identifier));
-    return;
-  }
+  if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;
   if (method === "POST" && url.pathname === "/api/projects") {
     const body = projectCreateSchema.parse(await readJsonBody(request));
     const workspace = path.resolve(body.workspace);
@@ -697,7 +657,7 @@ function errorStatus(message: string): number {
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;
   if (/unable to verify|timed out/i.test(message)) return 503;
-  return /required|invalid|allowed|empty|too large|too many|exceed/i.test(message) ? 400 : 500;
+  return /required|invalid|allowed|empty|too large|too many|exceed|transition/i.test(message) ? 400 : 500;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {

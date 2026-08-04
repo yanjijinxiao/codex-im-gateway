@@ -34,7 +34,7 @@ Every successful command writes one JSON object with `schemaVersion` to stdout. 
 ## Read issues
 
 ```bash
-taskctl issue list [--project PROJECT_ID] [--status STATUS] [--thread-id ID] [--json]
+taskctl issue list [--project PROJECT_ID] [--status STATUS] [--json]
 taskctl issue get ID [--json]
 ```
 

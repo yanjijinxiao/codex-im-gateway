@@ -6,5 +6,6 @@ output/
 .omo/
 .env
 .codex-weixin/
+taskboard/.data/
 *.log
 *.tsbuildinfo

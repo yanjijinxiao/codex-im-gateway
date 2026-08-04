@@ -58,9 +58,13 @@ import {
   type TaskboardComment,
   type TaskboardEvent,
   type TaskboardIssue,
-  type TaskboardProject,
   type TaskboardStatus
 } from "../taskboard/client.js";
+import {
+  TaskboardWorkbench,
+  type TaskboardIssueDetail,
+  type TaskboardIssueSummary
+} from "../taskboard/workbench.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -117,21 +121,6 @@ export type TaskboardIntegrationStatus = {
     taskboardProjectName?: string;
     issueCount?: number;
   }>;
-};
-
-export type TaskboardIssueSummary = TaskboardIssue & {
-  taskboardProjectName: string;
-  workspace: string;
-  managedProjects: Array<{
-    accountId: string;
-    projectId: string;
-    projectName: string;
-  }>;
-};
-
-export type TaskboardIssueDetail = {
-  issue: TaskboardIssueSummary;
-  comments: TaskboardComment[];
 };
 
 export type SessionChatResult = {
@@ -210,6 +199,7 @@ export class AccountManager {
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
+  private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
@@ -239,6 +229,10 @@ export class AccountManager {
     this.codexDesktopApprovalMonitorFactory = options.codexDesktopApprovalMonitorFactory
       ?? ((handlers) => new CodexDesktopApprovalMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
+    this.taskboardWorkbench = new TaskboardWorkbench({
+      client: () => this.taskboardFor(),
+      projects: () => this.listProjects().map(taskboardProjectBase)
+    });
   }
 
   async startAll(): Promise<void> {
@@ -1077,29 +1071,15 @@ export class AccountManager {
   }
 
   async listTaskboardIssues(): Promise<TaskboardIssueSummary[]> {
-    const client = this.requireTaskboard();
-    const contexts = this.mappedTaskboardProjects(await client.listProjects());
-    const batches = await Promise.all(contexts.map(async (context) => ({
-      context,
-      issues: await client.listIssues({ projectId: context.taskboardProject.id })
-    })));
-    return batches.flatMap(({ context, issues }) => issues.map((issue) =>
-      taskboardIssueSummary(issue, context.taskboardProject, context.managedProjects)
-    )).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    return this.taskboardWorkbench.listIssues();
   }
 
   async getTaskboardIssue(identifier: string): Promise<TaskboardIssueDetail> {
-    const { client, issue, taskboardProject, managedProjects } = await this.taskboardIssueContext(identifier);
-    return {
-      issue: taskboardIssueSummary(issue, taskboardProject, managedProjects),
-      comments: await client.listComments(issue.id)
-    };
+    return this.taskboardWorkbench.getIssue(identifier);
   }
 
   async commentTaskboardIssue(identifier: string, body: string): Promise<TaskboardComment> {
-    const { client, issue } = await this.taskboardIssueContext(identifier);
-    const threadId = requireTaskboardThread(issue);
-    return client.addComment(issue.id, body.trim(), threadId);
+    return this.taskboardWorkbench.commentIssue(identifier, body);
   }
 
   async moveTaskboardIssue(
@@ -1108,53 +1088,7 @@ export class AccountManager {
     version: number,
     comment?: string
   ): Promise<TaskboardIssue> {
-    const { client, issue } = await this.taskboardIssueContext(identifier);
-    const threadId = requireTaskboardThread(issue);
-    if (issue.version !== version) {
-      throw new Error(`Taskboard issue version changed: expected ${version}, current ${issue.version}`);
-    }
-    if (!taskboardTransitions(issue.status).includes(status)) {
-      throw new Error(`Invalid Taskboard transition: ${issue.status} -> ${status}`);
-    }
-    const note = comment?.trim();
-    if (["blocked", "in_review"].includes(status) && !note) {
-      throw new Error(`Taskboard transition to ${status} requires a comment`);
-    }
-    if (note) await client.addComment(issue.id, note, threadId);
-    return client.moveIssue(issue.id, status, version, threadId);
-  }
-
-  private requireTaskboard(): TaskboardClient {
-    const client = this.taskboardFor();
-    if (!client) throw new Error("Taskboard integration is disabled");
-    return client;
-  }
-
-  private mappedTaskboardProjects(projects: TaskboardProject[]): Array<{
-    taskboardProject: TaskboardProject;
-    managedProjects: AccountProject[];
-  }> {
-    const managed = this.listProjects();
-    return projects.flatMap((taskboardProject) => {
-      if (!taskboardProject.workspacePath) return [];
-      const workspace = canonicalWorkspace(taskboardProject.workspacePath);
-      const managedProjects = managed.filter((project) => canonicalWorkspace(project.workspace) === workspace);
-      return managedProjects.length ? [{ taskboardProject, managedProjects }] : [];
-    });
-  }
-
-  private async taskboardIssueContext(identifier: string): Promise<{
-    client: TaskboardClient;
-    issue: TaskboardIssue;
-    taskboardProject: TaskboardProject;
-    managedProjects: AccountProject[];
-  }> {
-    const client = this.requireTaskboard();
-    const [issue, projects] = await Promise.all([client.getIssue(identifier), client.listProjects()]);
-    const context = this.mappedTaskboardProjects(projects)
-      .find((candidate) => candidate.taskboardProject.id === issue.projectId);
-    if (!context) throw new Error(`Taskboard issue is outside managed workspaces: ${identifier}`);
-    return { client, issue, ...context };
+    return this.taskboardWorkbench.moveIssue(identifier, status, version, comment);
   }
 
   private taskboardFor(config = this.configProvider()): TaskboardClient | undefined {
@@ -1361,40 +1295,6 @@ function taskboardProjectBase(project: AccountProject): TaskboardIntegrationStat
     projectName: project.name,
     workspace: project.workspace
   };
-}
-
-function taskboardIssueSummary(
-  issue: TaskboardIssue,
-  project: TaskboardProject,
-  managedProjects: AccountProject[]
-): TaskboardIssueSummary {
-  return {
-    ...issue,
-    taskboardProjectName: project.name,
-    workspace: project.workspacePath ?? "",
-    managedProjects: managedProjects.map((managed) => ({
-      accountId: managed.accountId,
-      projectId: managed.id,
-      projectName: managed.name
-    }))
-  };
-}
-
-function requireTaskboardThread(issue: TaskboardIssue): string {
-  if (!issue.threadId) throw new Error(`Taskboard issue has no Codex thread: ${issue.identifier}`);
-  return issue.threadId;
-}
-
-function taskboardTransitions(status: TaskboardStatus): readonly TaskboardStatus[] {
-  return ({
-    backlog: [],
-    todo: ["in_progress"],
-    in_progress: ["blocked", "in_review"],
-    in_review: ["in_progress", "done"],
-    blocked: ["in_progress"],
-    done: [],
-    canceled: []
-  } as const)[status];
 }
 
 function formatTaskboardStatus(status: TaskboardIssue["status"]): string {

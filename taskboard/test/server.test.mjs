@@ -1413,34 +1413,6 @@ test("all task statuses are accepted, filtered, and listed in workflow order", a
   }
 });
 
-test("task listing can resolve the durable issue linked to a Codex thread", async () => {
-  // Given: two issues in one project attributed to different Codex threads.
-  const baseUrl = await startServer();
-  const first = await request(baseUrl, "/api/tasks", {
-    method: "POST",
-    body: {
-      projectId: "local",
-      title: "First linked issue",
-      threadId: "thread-first",
-    },
-  });
-  await request(baseUrl, "/api/tasks", {
-    method: "POST",
-    body: {
-      projectId: "local",
-      title: "Second linked issue",
-      threadId: "thread-second",
-    },
-  });
-
-  // When: a bridge asks for the issue attributed to the first thread.
-  const result = await request(baseUrl, "/api/tasks?threadId=thread-first");
-
-  // Then: only the matching durable issue is returned.
-  assert.equal(result.response.status, 200);
-  assert.deepEqual(result.body.tasks.map((task) => task.id), [first.body.task.id]);
-});
-
 test("task and comment mutations keep content-specific conversation attribution", async () => {
   const baseUrl = await startServer();
   const createResult = await request(baseUrl, "/api/tasks", {

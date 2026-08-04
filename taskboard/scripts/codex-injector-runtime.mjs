@@ -147,7 +147,7 @@ export async function restartResidentInjector(port, handlers) {
   for (const pid of previousPids) await handlers.stopResident(pid);
   const startupToken = handlers.createStartupToken();
   const started = handlers.startResident(port, startupToken);
-  await handlers.waitUntilReady(port, started.pid, startupToken);
+  await handlers.waitUntilReady(port, started.pid, started.started ? startupToken : null);
   return {
     previousPids,
     pid: started.pid,

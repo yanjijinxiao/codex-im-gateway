@@ -414,7 +414,7 @@ async function waitForResidentInjectorReady(port, pid, startupToken, expectedSou
             returnByValue: true,
           });
           if (
-            readiness.result.value?.token === startupToken
+            (startupToken === null || readiness.result.value?.token === startupToken)
             && readiness.result.value.taskboardEntryMounted
             && readiness.result.value.sourceHash === expectedSourceHash
           ) return;
@@ -1057,6 +1057,13 @@ async function injectTarget(
     if (keepAlive) await installTaskboardHostBinding(cdp, supervisor);
     if (keepAlive && attachExisting) {
       const currentStatus = await readInjectionStatus(cdp);
+      const attachingFreshRenderer = !currentStatus.sourceHash;
+      if (attachingFreshRenderer) {
+        await Promise.all([
+          cdp.waitFor("Page.loadEventFired", 60_000),
+          cdp.send("Page.reload"),
+        ]);
+      }
       const reconciled = await reconcileInjectionRuntime({
         currentStatus,
         source,
@@ -1077,11 +1084,18 @@ async function injectTarget(
         publishInjectionScriptIdentifier(cdp, reconciled.scriptIdentifier)
       ));
       await publishHostHeartbeat(cdp, startupToken);
+      if (attachingFreshRenderer && shouldOpen) {
+        await cdp.send("Runtime.evaluate", {
+          expression: "window.__codexTaskboardInjection__?.open()",
+          returnByValue: true,
+        });
+      }
+      const shouldRemainOpen = reconciled.shouldRemainOpen || (attachingFreshRenderer && shouldOpen);
       const status = await waitForInjectionStatus(
         cdp,
-        reconciled.shouldRemainOpen,
+        shouldRemainOpen,
         sourceHash,
-        15_000,
+        attachingFreshRenderer ? 60_000 : 15_000,
       );
       const frameLoaded = status.frameUrl
         ? await waitForFrame(cdp, status.frameUrl, 15_000)
@@ -1096,9 +1110,9 @@ async function injectTarget(
     cdp.on("Page.loadEventFired", () => (
       publishInjectionScriptIdentifier(cdp, scriptIdentifier)
     ));
-    const navigated = cdp.waitFor("Page.loadEventFired", 15_000);
-    await cdp.send("Page.navigate", { url: target.url });
-    await navigated;
+    const reloaded = cdp.waitFor("Page.loadEventFired", 15_000);
+    await cdp.send("Page.reload");
+    await reloaded;
     await evaluateInjectionSource(cdp, source);
     await publishInjectionScriptIdentifier(cdp, scriptIdentifier);
     if (keepAlive) await publishHostHeartbeat(cdp, startupToken);

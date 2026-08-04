@@ -75,6 +75,7 @@ type TurnWaiter = {
   resolve: (value: CodexRunResult) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  refresh: () => void;
 };
 
 type TurnStream = {
@@ -513,13 +514,22 @@ export class AppServerCodexRunner {
 
     const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const expire = () => {
         this.turnWaiters.delete(key);
         const error = new Error(`app-server turn timed out after ${timeoutMs}ms`);
         reject(error);
         this.failTransport(error, true);
-      }, timeoutMs);
-      this.turnWaiters.set(key, { resolve, reject, timer });
+      };
+      const waiter: TurnWaiter = {
+        resolve,
+        reject,
+        timer: setTimeout(expire, timeoutMs),
+        refresh: () => {
+          clearTimeout(waiter.timer);
+          waiter.timer = setTimeout(expire, timeoutMs);
+        }
+      };
+      this.turnWaiters.set(key, waiter);
     });
   }
 
@@ -597,6 +607,7 @@ export class AppServerCodexRunner {
     if (!callback) return;
     stream.chain = stream.chain
       .then(() => callback(event.text))
+      .then(() => this.turnWaiters.get(key)?.refresh())
       .then(() => undefined)
       .catch((error) => {
         console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);

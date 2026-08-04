@@ -123,9 +123,11 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 
 ## Taskboard integration
 
-Settings connects to the local `http://127.0.0.1:47823` service and maps Codex projects by canonical workspace path. Taskboard remains the only source of truth for issue state; the bridge does not copy issues into its own runtime state, and only HTTP loopback origins are accepted.
+Taskboard is fully embedded in this repository under the `taskboard/` workspace, including the local service, React management UI, `taskctl` CLI, Codex Skill, Cloud/injection scripts, and tests. The bridge starts `http://127.0.0.1:47823` with the main service and closes it during shutdown or restart; data is stored under `~/.codex-weixin/taskboard/`. Running `npm install` and `npm run build` at the repository root installs and builds both the bridge and Taskboard without an external repository or Git submodule.
 
-The Taskboard page summarizes mapped issues and supports project, status, and text filters. Its detail pane exposes the description, priority, Codex thread attribution, and progress comments. Issues with a real Codex thread can be commented on and moved through the guarded workflow: start, block, resume, submit for review, return to progress, and explicitly accept as done. Blocking and review require evidence, and completion is available only from review through a dedicated acceptance confirmation. Relations, attachments, and planning remain in the full Taskboard UI.
+The Settings and Taskboard pages map Codex projects by canonical workspace path. Taskboard remains the only source of truth for issue state; the bridge does not copy issues into its state files. The management page supports filtering, details, comments, and guarded workflow transitions. Issues without a real Codex thread are read-only, blocking and review require evidence, and completion requires explicit acceptance. Only HTTP loopback origins are accepted.
+
+Running `npm run install:local` links `taskboard/skills/manage-taskboard` and `taskboard/cli/taskctl.mjs` into the user environment. Useful commands: `npm run taskboard:start` starts a standalone local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
 
 ## Message-channel commands
 

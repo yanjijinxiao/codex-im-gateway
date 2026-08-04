@@ -6,16 +6,6 @@ A local-first issue board that runs in a browser and can be embedded in Codex th
 
 - Node.js 22.5 or newer
 
-## One-command local installation
-
-For a Codex-ready local installation, including the production build, `taskctl`, and the bundled `manage-taskboard` Skill, follow the independent [local installation guide](docs/local-installation.md):
-
-```bash
-npm run install:local
-```
-
-The installer is idempotent: it reuses current dependencies and existing correct links, and refuses to overwrite a file or link owned by another installation. Verify an existing installation without changing it with `npm run install:check`.
-
 ## Run locally
 
 ```bash

@@ -107,6 +107,28 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
   });
 });
 
+test("keeps an active channel turn alive from its latest progress reply", async (t) => {
+  // Given: a turn whose progress arrives before the timeout and final answer arrives after the original deadline.
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 200
+  });
+  t.after(() => runner.close());
+
+  const progress: string[] = [];
+
+  // When: the originating channel receives progress during the active turn.
+  const result = await runner.run({
+    prompt: "sliding-timeout",
+    cwd: "/tmp/project",
+    onProgress: (message) => progress.push(message)
+  });
+
+  // Then: the timeout is measured from that reply and the final answer completes.
+  assert.deepEqual(progress, ["working:sliding-timeout"]);
+  assert.equal(result.text, "reply:sliding-timeout");
+});
+
 test("propagates the configured sandbox to an app-server turn", async (t) => {
   // Given: a bridge configured to allow Codex full workspace access.
   const runner = new HybridCodexRunner({
