@@ -339,6 +339,8 @@ test("local API redacts credentials and protects mutations", async (t) => {
 
   const pageResponse = await fetch(server.url);
   const pageHtml = await pageResponse.text();
+  assert.equal(pageResponse.headers.get("x-frame-options"), null);
+  assert.match(pageResponse.headers.get("content-security-policy") ?? "", /frame-ancestors app:\/\/-/);
   assert.match(pageHtml, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml">/);
   assert.match(
     pageHtml,
@@ -346,7 +348,14 @@ test("local API redacts credentials and protects mutations", async (t) => {
   );
   assert.match(pageHtml, /id="updateCheckButton"/);
   assert.match(pageHtml, /id="removeAccountDialog"/);
+  assert.match(pageHtml, /data-view="accounts" aria-current="page"/);
+  assert.match(pageHtml, /id="accountDialog" aria-labelledby="accountDialogTitle"/);
+  assert.match(pageHtml, /id="accountWebhookProviderInput"/);
   assert.match(pageHtml, /重新扫码后恢复/);
+  const appResponse = await fetch(`${server.url}/app.js`);
+  const appSource = await appResponse.text();
+  assert.match(appSource, /tab\.setAttribute\("aria-current", "page"\)/);
+  assert.match(appSource, /tab\.removeAttribute\("aria-current"\)/);
   const faviconResponse = await fetch(`${server.url}/favicon.svg`);
   assert.equal(faviconResponse.status, 200);
   assert.match(faviconResponse.headers.get("content-type") ?? "", /^image\/svg\+xml/);
@@ -390,6 +399,31 @@ test("local API redacts credentials and protects mutations", async (t) => {
   });
   assert.equal(unauthorizedRename.status, 403);
 
+  const invalidWebhook = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({ displayName: "工作微信", webhookUrl: "ftp://hooks.example.test/channel" })
+  });
+  assert.equal(invalidWebhook.status, 400);
+  assert.deepEqual(await invalidWebhook.json(), {
+    error: "Invalid Webhook URL: HTTP or HTTPS required"
+  });
+
+  const invalidWebhookProvider = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({ displayName: "工作微信", webhookProvider: "unknown" })
+  });
+  assert.equal(invalidWebhookProvider.status, 400);
+
   const renamed = await fetch(`${server.url}/api/accounts/account-one`, {
     method: "PATCH",
     headers: {
@@ -397,14 +431,44 @@ test("local API redacts credentials and protects mutations", async (t) => {
       "X-Codex-Weixin-Token": bootstrap.requestToken,
       Origin: server.url
     },
-    body: JSON.stringify({ displayName: "工作微信" })
+    body: JSON.stringify({
+      displayName: "工作微信",
+      webhookUrl: "https://hooks.example.test/channel?token=secret",
+      webhookProvider: "dingtalk"
+    })
   });
   assert.equal(renamed.status, 200);
-  assert.equal((await renamed.json() as { account: { displayName: string } }).account.displayName, "工作微信");
+  const renamedAccount = (await renamed.json() as {
+    account: { displayName: string; webhookConfigured: boolean; webhookProvider: string; webhookUrl?: string };
+  }).account;
+  assert.equal(renamedAccount.displayName, "工作微信");
+  assert.equal(renamedAccount.webhookConfigured, true);
+  assert.equal(renamedAccount.webhookProvider, "dingtalk");
+  assert.equal(renamedAccount.webhookUrl, undefined);
 
   const accountsResponse = await fetch(`${server.url}/api/accounts`);
-  const accounts = await accountsResponse.json() as { accounts: Array<{ displayName?: string }> };
+  const accounts = await accountsResponse.json() as {
+    accounts: Array<{ displayName?: string; webhookConfigured: boolean; webhookProvider: string; webhookUrl?: string }>;
+  };
   assert.equal(accounts.accounts[0].displayName, "工作微信");
+  assert.equal(accounts.accounts[0].webhookConfigured, true);
+  assert.equal(accounts.accounts[0].webhookProvider, "dingtalk");
+  assert.equal(accounts.accounts[0].webhookUrl, undefined);
+
+  const clearedWebhook = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({ displayName: "工作微信", webhookUrl: null })
+  });
+  assert.equal(clearedWebhook.status, 200);
+  const clearedAccount = (await clearedWebhook.json() as {
+    account: { webhookConfigured: boolean };
+  }).account;
+  assert.equal(clearedAccount.webhookConfigured, false);
 
   const unauthorized = await fetch(`${server.url}/api/sessions`, {
     method: "POST",

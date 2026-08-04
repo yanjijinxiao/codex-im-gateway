@@ -140,6 +140,42 @@ export function findResidentInjectorPids({
   return residents;
 }
 
+export function findUndebuggableCodexPids(processList) {
+  const mainExecutable = /^(?:.*\/)?(?:ChatGPT|Codex)\.app\/Contents\/MacOS\/(?:ChatGPT|Codex)(?:\s|$)/;
+  const processes = [];
+
+  for (const line of processList.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const command = match[2];
+    if (!mainExecutable.test(command) || /(?:^|\s)--remote-debugging-port(?:=|\s)/.test(command)) continue;
+    processes.push(pid);
+  }
+  return processes;
+}
+
+export async function adoptNormalCodexLaunch({ deferredPids = [] }, handlers) {
+  const deferred = new Set(deferredPids);
+  while (true) {
+    if (await handlers.isCdpReachable()) return { launched: false, process: null };
+    const candidates = handlers.findUndebuggablePids();
+    if (candidates.some((pid) => deferred.has(pid))) {
+      await handlers.waitForNextCheck();
+      continue;
+    }
+    deferred.clear();
+    if (candidates.length === 0) {
+      await handlers.waitForNextCheck();
+      continue;
+    }
+    for (const pid of candidates) await handlers.stopProcess(pid);
+    const process = handlers.launch();
+    await handlers.waitForCdp();
+    return { launched: true, process };
+  }
+}
+
 export async function restartResidentInjector(port, handlers) {
   const previousPids = handlers.findResidents(port);
   if (previousPids.length === 0) return { previousPids: [], pid: null, restarted: false };

@@ -19,6 +19,7 @@ import {
 import { WeixinApiClient, isStaleContextError, type FetchLike } from "../weixin/api.js";
 import { downloadInboundAttachments, InboundMediaTooLargeError, sendLocalMediaFile } from "../weixin/media.js";
 import type { NormalizedWeixinMessage } from "../weixin/messages.js";
+import type { OutboundChannelMessage } from "../webhooks/channel-message-webhook.js";
 import type { PromptBufferItem } from "./prompt-buffer.js";
 import { formatAccountBalance, type CodexAccountBalance } from "../codex/account-balance.js";
 import type { ChannelTextClient } from "../channels/types.js";
@@ -54,6 +55,7 @@ export type BridgeServiceOptions = {
     success: boolean;
     turnId?: string;
   }) => Promise<void> | void;
+  onOutboundMessage?: (message: OutboundChannelMessage) => void;
 };
 
 export class BridgeService {
@@ -843,7 +845,7 @@ export class BridgeService {
       return;
     }
     try {
-      await sendLocalMediaFile({
+      const sent = await sendLocalMediaFile({
         client: this.options.weixin as ChannelTextClient & Pick<
           WeixinApiClient,
           "getUploadUrl" | "sendFileMessage" | "sendImageMessage" | "sendVideoMessage"
@@ -852,6 +854,13 @@ export class BridgeService {
         contextToken: this.options.stateStore.getContextToken(senderId),
         filePath: action.path,
         kind: action.type
+      });
+      this.options.onOutboundMessage?.({
+        direction: "outbound",
+        id: sent.messageId,
+        recipientId: senderId,
+        text: "",
+        attachments: [{ kind: sent.kind, label: path.basename(action.path) }]
       });
     } catch (error) {
       await this.reply(senderId, `[codex-channel-bridge] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
@@ -944,7 +953,14 @@ export class BridgeService {
     const contextToken = this.options.stateStore.getContextToken(senderId);
     try {
       console.log(`[codex-channel-bridge] sending reply to ${senderId}; text=${text.length} chars`);
-      await this.options.weixin.sendText({ toUserId: senderId, text, contextToken });
+      const sent = await this.options.weixin.sendText({ toUserId: senderId, text, contextToken });
+      this.options.onOutboundMessage?.({
+        direction: "outbound",
+        id: sent.messageId,
+        recipientId: senderId,
+        text,
+        attachments: []
+      });
       console.log(`[codex-channel-bridge] sent reply to ${senderId}`);
     } catch (error) {
       if (isStaleContextError(error)) {

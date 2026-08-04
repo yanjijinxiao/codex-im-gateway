@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,6 +13,7 @@ import { defaultConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
+import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
 function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
@@ -29,6 +31,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
     });
   }
   const starts: string[] = [];
+  const inboundHandlers = new Map<string, (message: NormalizedWeixinMessage) => Promise<void>>();
   const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
   const runs: Array<Record<string, unknown>> = [];
   let runtimeInfo: { model?: string; effort?: string; provider?: string } = {
@@ -106,8 +109,10 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
         input.stateStore.setPairedSenderIds(input.stateStore.listPairedSenderIds().filter((id) => id !== senderId));
       }
     }) as never,
-    monitor: async ({ client, signal }) => {
-      starts.push((client as never as { accountId: string }).accountId);
+    monitor: async ({ client, signal, onMessage }) => {
+      const accountId = (client as never as { accountId: string }).accountId;
+      starts.push(accountId);
+      inboundHandlers.set(accountId, onMessage);
       await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
     },
     runnerFactory: () => runner as never,
@@ -133,6 +138,11 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
     runs,
     history,
     sent,
+    async emitInbound(accountId: string, message: NormalizedWeixinMessage) {
+      const handler = inboundHandlers.get(accountId);
+      assert.ok(handler, `Inbound handler is not running for ${accountId}`);
+      await handler(message);
+    },
     async emitCodexCompletion(completion: CodexSessionCompletion) {
       assert.ok(externalCompletionHandler, "Codex session monitor should be active");
       await externalCompletionHandler(completion);
@@ -310,8 +320,23 @@ test("adds redacted enterprise channels and stops them cleanly", async (t) => {
   await manager.stopAccount(feishu.accountId, false);
 });
 
-test("notifies the configured channel when a project Web task ends", async (t) => {
+test("notifies the configured channel and mirrors the outbound message to its webhook", { timeout: 2_000 }, async (t) => {
+  const received = Promise.withResolvers<unknown>();
+  const webhookServer = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    received.resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(204).end();
+  });
+  await new Promise<void>((resolve) => webhookServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve, reject) => webhookServer.close((error) => error ? reject(error) : resolve())));
+  const address = webhookServer.address();
+  assert.ok(address && typeof address !== "string");
   const { manager, root, sent } = setup(t);
+  manager.updateAccount("account-two", {
+    displayName: "",
+    webhookUrl: `http://127.0.0.1:${address.port}/events`
+  });
   await manager.startAll();
   const project = manager.createProject("account-one", "发布项目", path.join(root, "release"));
   const session = manager.createSession("account-one", "alice@im.wechat", undefined, "发布检查", project.id);
@@ -328,6 +353,21 @@ test("notifies the configured channel when a project Web task ends", async (t) =
     toUserId: "release-room",
     text: "【Codex 任务已完成】\n项目：发布项目\n任务：发布检查\n结果：Web reply"
   }]);
+  const payload = await received.promise as { occurredAt: string } & Record<string, unknown>;
+  assert.match(payload.occurredAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...payload, occurredAt: undefined }, {
+    schemaVersion: 1,
+    event: "channel.message",
+    occurredAt: undefined,
+    account: { id: "account-two", channel: "weixin" },
+    message: {
+      direction: "outbound",
+      id: "sent",
+      recipientId: "release-room",
+      text: sent[0].text,
+      attachments: []
+    }
+  });
   await manager.stopAll();
 });
 
@@ -568,26 +608,92 @@ test("rejects projects outside the configured workspace allowlist", (t) => {
   );
 });
 
-test("persists and clears a local account display name", (t) => {
+test("persists channel settings without exposing the webhook URL", (t) => {
   const { manager, paths } = setup(t);
 
-  const renamed = manager.renameAccount("account-one", "  工作微信  ");
-  assert.equal(renamed.displayName, "工作微信");
+  const configured = manager.updateAccount("account-one", {
+    displayName: "  工作微信  ",
+    webhookUrl: "https://hooks.example.test/channel?token=secret",
+    webhookProvider: "feishu"
+  });
+  assert.equal(configured.displayName, "工作微信");
+  assert.equal(configured.webhookConfigured, true);
+  assert.equal(configured.webhookProvider, "feishu");
+  assert.equal("webhookUrl" in configured, false);
   assert.equal(loadAccount(paths, "account-one").displayName, "工作微信");
+  assert.equal(loadAccount(paths, "account-one").webhookUrl, "https://hooks.example.test/channel?token=secret");
+  assert.equal(loadAccount(paths, "account-one").webhookProvider, "feishu");
+
+  const renamed = manager.updateAccount("account-one", { displayName: "工作渠道" });
+  assert.equal(renamed.displayName, "工作渠道");
+  assert.equal(loadAccount(paths, "account-one").webhookUrl, "https://hooks.example.test/channel?token=secret");
 
   assert.throws(
-    () => manager.renameAccount("account-one", "a".repeat(41)),
+    () => manager.updateAccount("account-one", { displayName: "a".repeat(41) }),
     /40 characters or fewer/
   );
 
-  const cleared = manager.renameAccount("account-one", "   ");
+  const cleared = manager.updateAccount("account-one", { displayName: "   ", webhookUrl: null });
   assert.equal(cleared.displayName, undefined);
+  assert.equal(cleared.webhookConfigured, false);
+  assert.equal(cleared.webhookProvider, "feishu");
   assert.equal(loadAccount(paths, "account-one").displayName, undefined);
+  assert.equal(loadAccount(paths, "account-one").webhookUrl, undefined);
+});
+
+test("mirrors each inbound channel message to its configured webhook", { timeout: 2_000 }, async (t) => {
+  const received = Promise.withResolvers<{ headers: http.IncomingHttpHeaders; body: unknown }>();
+  const webhookServer = http.createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    received.resolve({
+      headers: request.headers,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8"))
+    });
+    response.writeHead(204).end();
+  });
+  await new Promise<void>((resolve) => webhookServer.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>((resolve, reject) => webhookServer.close((error) => error ? reject(error) : resolve())));
+  const address = webhookServer.address();
+  assert.ok(address && typeof address !== "string");
+  const { manager, emitInbound } = setup(t);
+  manager.updateAccount("account-one", {
+    displayName: "",
+    webhookUrl: `http://127.0.0.1:${address.port}/events`
+  });
+  await manager.startAccount("account-one");
+
+  await emitInbound("account-one", {
+    id: "message-1",
+    senderId: "alice",
+    text: "检查发布状态",
+    attachments: [{ kind: "image", label: "proof.png", item: { aes_key: "must-not-leak" } }],
+    raw: { message_id: "message-1", from_user_id: "alice", context_token: "must-not-leak" }
+  });
+
+  const delivery = await received.promise;
+  assert.equal(delivery.headers["content-type"], "application/json");
+  const payload = delivery.body as { occurredAt: string } & Record<string, unknown>;
+  assert.match(payload.occurredAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...payload, occurredAt: undefined }, {
+    schemaVersion: 1,
+    event: "channel.message",
+    occurredAt: undefined,
+    account: { id: "account-one", channel: "weixin" },
+    message: {
+      direction: "inbound",
+      id: "message-1",
+      senderId: "alice",
+      text: "检查发布状态",
+      attachments: [{ kind: "image", label: "proof.png" }]
+    }
+  });
+  await manager.stopAll();
 });
 
 test("optionally retains account sessions when removing a WeChat account", async (t) => {
   const { manager, paths, root } = setup(t);
-  manager.renameAccount("account-one", "张三");
+  manager.updateAccount("account-one", { displayName: "张三" });
   manager.allowSender("account-one", "alice@im.wechat");
   manager.createSession("account-one", "alice@im.wechat", root, "历史会话");
   const retainedStatePath = accountStatePaths(paths, "account-one").statePath;

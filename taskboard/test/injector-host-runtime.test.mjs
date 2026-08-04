@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import * as injectorRuntime from "../scripts/codex-injector-runtime.mjs";
 import {
   findResidentInjectorPids,
   handleHostBindingPayload,
@@ -157,6 +158,59 @@ test("resident discovery accepts this repository's absolute and relative launch 
     defaultPort: 9229,
     cwdForPid: (pid) => cwdByPid.get(pid) ?? null,
   }), [102, 105]);
+});
+
+test("a Dock-launched Codex process without a CDP port is selected for adoption", () => {
+  assert.equal(
+    typeof injectorRuntime.findUndebuggableCodexPids,
+    "function",
+    "the resident injector must classify a normal Codex launch before it can restart it with CDP",
+  );
+  const processList = [
+    "101 /Users/test/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    "102 /Users/test/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9231",
+    "103 /Users/test/Applications/ChatGPT.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=renderer",
+    "104 /Applications/Codex.app/Contents/MacOS/Codex --some-existing-flag",
+    "105 node scripts/codex-injector.mjs --app-path /Users/test/Applications/ChatGPT.app",
+  ].join("\n");
+
+  assert.deepEqual(injectorRuntime.findUndebuggableCodexPids(processList), [101, 104]);
+});
+
+test("resident adoption waits for the current Codex window and relaunches the next Dock opening with CDP", async () => {
+  assert.equal(
+    typeof injectorRuntime.adoptNormalCodexLaunch,
+    "function",
+    "the resident injector must wait safely for the current window before adopting the next normal launch",
+  );
+  const calls = [];
+  const processSnapshots = [[101], [101], [], [202]];
+  const launchedProcess = { pid: 303 };
+
+  const result = await injectorRuntime.adoptNormalCodexLaunch(
+    { deferredPids: [101] },
+    {
+      isCdpReachable: async () => false,
+      findUndebuggablePids: () => processSnapshots.shift() ?? [202],
+      waitForNextCheck: async () => calls.push(["wait"]),
+      stopProcess: async (pid) => calls.push(["stop", pid]),
+      launch: () => {
+        calls.push(["launch"]);
+        return launchedProcess;
+      },
+      waitForCdp: async () => calls.push(["ready"]),
+    },
+  );
+
+  assert.deepEqual(result, { launched: true, process: launchedProcess });
+  assert.deepEqual(calls, [
+    ["wait"],
+    ["wait"],
+    ["wait"],
+    ["stop", 202],
+    ["launch"],
+    ["ready"],
+  ]);
 });
 
 test("refresh stops every stale resident before starting one token-verified replacement", async () => {

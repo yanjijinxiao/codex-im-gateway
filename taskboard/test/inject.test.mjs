@@ -12,7 +12,7 @@ const webApp = await readFile(new URL("../web/src/App.tsx", import.meta.url), "u
 
 test("injection is an idempotent IIFE guarded by its current source hash", () => {
   assert.match(source, /^\(\(\) => \{/);
-  assert.match(source, /const VERSION = "0\.6\.8"/);
+  assert.match(source, /const VERSION = "0\.7\.0"/);
   assert.match(source, /const SOURCE_HASH = window\.__CODEX_TASKBOARD_SOURCE_HASH__/);
   assert.match(source, /const SENTINEL_KEY = "__codexTaskboardInjection__"/);
   assert.match(source, /previous\?\.sourceHash === SOURCE_HASH/);
@@ -28,7 +28,18 @@ test("embedded page uses the local taskboard URL and supports a runtime override
   assert.match(source, /frameOrigin = taskboardUrl\.origin/);
 });
 
-test("entry clones the native Plugins row and the page covers the complete Codex workspace", () => {
+test("Taskboard and Channel Configuration switch one main-workspace surface", () => {
+  assert.match(source, /ariaLabel: "切换到任务面板"/);
+  assert.match(source, /ariaLabel: "切换到渠道配置"/);
+  assert.match(source, /activeView = TASKBOARD_VIEW/);
+  assert.match(source, /activeView = CHANNEL_VIEW/);
+  assert.match(source, /page\.setAttribute\("aria-label", activeView === CHANNEL_VIEW \? "渠道配置" : "任务面板"\)/);
+  assert.match(source, /frameReady && frame\?\.isConnected && frameMatchesChannelBridgeUrl\(channelUrl\)/);
+  assert.match(source, /frameReady[\s\S]*frame\?\.isConnected[\s\S]*frameMatchesTaskboardUrl\(taskboardUrl\)/);
+  assert.doesNotMatch(source, /window\.open\(/);
+});
+
+test("entry clones the native Plugins row and the page fills the Codex workspace below its titlebar", () => {
   assert.match(source, /const PLUGIN_LABELS = \["插件", "plugins"\]/);
   assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
   assert.match(source, /return directButtons\.length >= 3/);
@@ -37,8 +48,10 @@ test("entry clones the native Plugins row and the page covers the complete Codex
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
   assert.match(source, /const surface = viewport\?\.parentElement/);
   assert.match(source, /surface\.appendChild\(page\)/);
-  assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: 0;/);
-  assert.doesNotMatch(source, /--codex-taskboard-top-offset/);
+  assert.match(source, /#\$\{PAGE_ID\} \{[\s\S]*?top: var\(--codex-taskboard-top-offset, 46px\);/);
+  assert.match(source, /function pageTopOffset\(surface\)/);
+  assert.match(source, /headerRect\.bottom - surfaceRect\.top/);
+  assert.match(source, /page\.style\.setProperty\("--codex-taskboard-top-offset", `\$\{pageTopOffset\(surface\)\}px`\)/);
   assert.match(source, /child\.setAttribute\(HIDDEN_ATTRIBUTE, "true"\)/);
   assert.match(source, /page\.hidden = false/);
   assert.doesNotMatch(source, /codex-taskboard-overlay/);
@@ -56,8 +69,8 @@ test("opening Taskboard suppresses native selection and contextual header until 
   assert.doesNotMatch(source, /setTimeout\(\(\) => closeTaskboard\(false\), 0\)/);
 });
 
-test("the embedded header fills the native titlebar without clipping or a full-page no-drag region", () => {
-  assert.match(source, /top: 0;/);
+test("the embedded header stays below the native titlebar without clipping or a full-page no-drag region", () => {
+  assert.match(source, /top: var\(--codex-taskboard-top-offset, 46px\);/);
   assert.match(source, /z-index: 31 !important/);
   assert.doesNotMatch(source, /headerRightInset/);
   assert.doesNotMatch(source, /NATIVE_HEADER_RIGHT_INSET/);
@@ -86,6 +99,11 @@ test("only the empty embedded header spacer is draggable", () => {
     webStyles,
     /\.app-shell\.embedded \.workspace-header \.header-actions,[\s\S]*?-webkit-app-region: no-drag;/,
   );
+  const openChannelSource = source.slice(
+    source.indexOf("function openChannelConfig"),
+    source.indexOf("\n\n  function isNativePageNavigation"),
+  );
+  assert.match(openChannelSource, /activeView = CHANNEL_VIEW;\s*updateDragRegion\(null\);/);
 });
 
 test("the embedded header clears the macOS window controls when the Codex sidebar is collapsed", () => {
@@ -189,6 +207,8 @@ test("complete App automation payloads cross the injected forwarder into the cur
     workspacePath: "/tmp/local-project",
     skillPath: "/tmp/manage-taskboard/SKILL.md",
     automationId: "automation-1",
+    enabledByUser: true,
+    quotaAware: true,
     intervalMinutes: 10,
     model: "gpt-5.6-sol",
     reasoningEffort: "ultra",

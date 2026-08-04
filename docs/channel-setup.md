@@ -45,6 +45,41 @@
 
 服务会监听该项目下由聊天端、Web 和 Codex Desktop 发起的任务。任务成功、失败或中断时都会发送项目、任务和结果摘要。页面中的任务数量只表示当前正在运行的任务；完成后任务会从运行列表移除。
 
+### Webhook 镜像
+
+每个渠道账号都可以点击铅笔按钮打开“渠道设置”，选择通知平台并配置一个独立的 HTTP 或 HTTPS Webhook。配置后，每条成功收取或发出的渠道消息都会额外发送一次 `POST`；清除配置后立即停止推送。Webhook 请求最多等待 5 秒、不会重试，失败只记录本机警告，不阻塞原渠道的收发消息。
+
+可选平台包括：
+
+- **通用 JSON**：发送下方完整的 `channel.message` 事件，适合自建服务；
+- **企业微信机器人**：发送 `msgtype: "text"`；
+- **飞书 / Lark 机器人**：发送 `msg_type: "text"`；
+- **钉钉机器人**：发送 `msgtype: "text"`；
+- **Slack Incoming Webhook**：发送 `text`；
+- **Discord Webhook**：发送 `content`。
+
+旧配置没有保存平台类型时，会根据企业微信、飞书/Lark、钉钉、Slack 或 Discord 的官方 Webhook 域名自动识别；无法识别的地址继续使用通用 JSON。
+
+管理 API 和页面只显示配置状态和平台类型，不会回显可能包含签名密钥的完整地址。所有请求使用 `Content-Type: application/json`。通用 JSON 的消息附件只包含类型和文件名，不包含渠道 Token、上下文 Token 或原始加密附件字段：
+
+```json
+{
+  "schemaVersion": 1,
+  "event": "channel.message",
+  "occurredAt": "2026-08-04T12:00:00.000Z",
+  "account": { "id": "account-one", "channel": "weixin" },
+  "message": {
+    "direction": "inbound",
+    "id": "message-id",
+    "senderId": "sender-id",
+    "text": "消息内容",
+    "attachments": [{ "kind": "image", "label": "photo.png" }]
+  }
+}
+```
+
+出站消息使用 `direction: "outbound"` 和 `recipientId`。`channel` 的值为 `weixin`、`wecom` 或 `feishu`。
+
 ### 运行审批
 
 从个人微信、企业微信或飞书发起的 Codex 任务需要运行命令、修改文件或申请额外权限时，审批请求会自动发送到发起任务的同一渠道账号和联系人。审批消息包含独立的 `A编号`、操作内容、工作目录和原因：
@@ -81,6 +116,12 @@ Create a custom app, enable its bot, configure message events over long connecti
 ### Project task notifications
 
 Open a project's bell menu, enable completion notifications, select a channel, and enter the recorded conversation or user ID. A green bell and enabled badge confirm the setting. Tasks started from chat, Web, or Codex Desktop send a summary after success, failure, or interruption.
+
+### Webhook mirroring
+
+Open a channel's pencil **Channel Settings** action, select Generic JSON, Enterprise WeChat, Feishu/Lark, DingTalk, Slack, or Discord, then configure an independent HTTP or HTTPS Webhook. Every successfully received or sent channel message is mirrored once using the selected provider's JSON shape; clearing the setting stops delivery immediately. Requests time out after five seconds and are not retried. Delivery failures produce a local warning but never block the original channel message.
+
+The console and management API expose only the configured status and provider, never the potentially secret-bearing URL. Generic payloads use the `channel.message` schema shown in the Chinese section above. Inbound messages contain `senderId`; outbound messages contain `recipientId`. Attachments include only `kind` and `label`, without channel tokens, context tokens, or raw encrypted attachment fields. Legacy settings without a provider are auto-detected from known official Webhook hosts and otherwise remain Generic JSON.
 
 ### Runtime approvals
 

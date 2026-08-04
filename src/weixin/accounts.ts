@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { ensureDir, readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { StatePaths } from "../state/paths.js";
+import { resolveWebhookProvider, type WebhookProvider } from "../webhooks/webhook-provider.js";
 
 export type WeixinAccount = {
   channel?: "weixin";
@@ -13,6 +14,8 @@ export type WeixinAccount = {
   cdnBaseUrl: string;
   userId?: string;
   displayName?: string;
+  webhookUrl?: string;
+  webhookProvider?: WebhookProvider;
   savedAt: string;
   enabled: boolean;
 };
@@ -23,6 +26,8 @@ export type WeComAccount = {
   botId: string;
   secret: string;
   displayName?: string;
+  webhookUrl?: string;
+  webhookProvider?: WebhookProvider;
   savedAt: string;
   enabled: boolean;
 };
@@ -33,6 +38,8 @@ export type FeishuAccount = {
   appId: string;
   appSecret: string;
   displayName?: string;
+  webhookUrl?: string;
+  webhookProvider?: WebhookProvider;
   savedAt: string;
   enabled: boolean;
 };
@@ -98,6 +105,8 @@ export function saveScannedAccount(
     botId,
     userId: scanned.userId ?? previous.userId,
     ...(previous.displayName ? { displayName: previous.displayName } : {}),
+    ...(existing?.webhookUrl ? { webhookUrl: existing.webhookUrl } : {}),
+    ...(existing?.webhookProvider ? { webhookProvider: existing.webhookProvider } : {}),
     enabled: true
   } : { ...scanned, botId };
   saveAccount(paths, account);
@@ -167,15 +176,27 @@ export function setAccountEnabled(paths: StatePaths, accountId: string, enabled:
   return updated;
 }
 
-export function setAccountDisplayName(paths: StatePaths, accountId: string, displayName: string): ChannelAccount {
+export type AccountSettingsPatch = {
+  displayName: string;
+  webhookUrl?: string | null;
+  webhookProvider?: WebhookProvider;
+};
+
+export function setAccountSettings(paths: StatePaths, accountId: string, patch: AccountSettingsPatch): ChannelAccount {
   const account = loadAccount(paths, accountId);
   const updated: ChannelAccount = { ...account };
-  const normalized = displayName.trim();
-  if (normalized) {
-    updated.displayName = normalized;
+  const displayName = patch.displayName.trim();
+  if (displayName) {
+    updated.displayName = displayName;
   } else {
     delete updated.displayName;
   }
+  if (patch.webhookUrl !== undefined) {
+    const webhookUrl = patch.webhookUrl?.trim();
+    if (webhookUrl) updated.webhookUrl = webhookUrl;
+    else delete updated.webhookUrl;
+  }
+  if (patch.webhookProvider !== undefined) updated.webhookProvider = patch.webhookProvider;
   saveAccount(paths, updated);
   return updated;
 }
@@ -186,23 +207,46 @@ export function deleteAccount(paths: StatePaths, accountId: string): void {
 }
 
 export type PublicChannelAccount =
-  | (Omit<WeixinAccount, "token"> & { channel: "weixin" })
-  | Omit<WeComAccount, "secret">
-  | Omit<FeishuAccount, "appSecret">;
+  | (Omit<WeixinAccount, "token" | "webhookUrl"> & {
+      channel: "weixin";
+      webhookConfigured: boolean;
+      webhookProvider: WebhookProvider;
+    })
+  | (Omit<WeComAccount, "secret" | "webhookUrl"> & {
+      webhookConfigured: boolean;
+      webhookProvider: WebhookProvider;
+    })
+  | (Omit<FeishuAccount, "appSecret" | "webhookUrl"> & {
+      webhookConfigured: boolean;
+      webhookProvider: WebhookProvider;
+    });
 
 export type PublicWeixinAccount = PublicChannelAccount;
 
 export function publicAccount(account: ChannelAccount): PublicChannelAccount {
   if (accountChannel(account) === "wecom") {
-    const { secret: _secret, ...safe } = account as WeComAccount;
-    return safe;
+    const { secret: _secret, webhookUrl, ...safe } = account as WeComAccount;
+    return {
+      ...safe,
+      webhookProvider: resolveWebhookProvider(account.webhookProvider, webhookUrl),
+      webhookConfigured: Boolean(webhookUrl)
+    };
   }
   if (accountChannel(account) === "feishu") {
-    const { appSecret: _appSecret, ...safe } = account as FeishuAccount;
-    return safe;
+    const { appSecret: _appSecret, webhookUrl, ...safe } = account as FeishuAccount;
+    return {
+      ...safe,
+      webhookProvider: resolveWebhookProvider(account.webhookProvider, webhookUrl),
+      webhookConfigured: Boolean(webhookUrl)
+    };
   }
-  const { token: _token, ...safe } = account as WeixinAccount;
-  return { ...safe, channel: "weixin" };
+  const { token: _token, webhookUrl, ...safe } = account as WeixinAccount;
+  return {
+    ...safe,
+    channel: "weixin",
+    webhookProvider: resolveWebhookProvider(account.webhookProvider, webhookUrl),
+    webhookConfigured: Boolean(webhookUrl)
+  };
 }
 
 export function loadAccount(paths: StatePaths, accountId?: string): ChannelAccount {

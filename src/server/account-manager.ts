@@ -41,10 +41,11 @@ import {
   publicAccount,
   retainAccountHistory,
   saveAccount,
-  setAccountDisplayName,
+  setAccountSettings,
   setAccountEnabled,
   normalizeAccountId,
   type ChannelAccount,
+  type AccountSettingsPatch,
   type FeishuAccount,
   type PublicWeixinAccount,
   type WeComAccount,
@@ -65,6 +66,7 @@ import {
   type TaskboardIssueDetail,
   type TaskboardIssueSummary
 } from "../taskboard/workbench.js";
+import { ChannelMessageWebhook } from "../webhooks/channel-message-webhook.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -160,7 +162,14 @@ type RuntimeEntry = {
   service?: BridgeService;
   store?: RuntimeStateStore;
   client?: ChannelTextClient;
+  webhook?: ChannelMessageWebhook;
   error?: string;
+};
+
+type DirectChannelText = {
+  readonly recipientId: string;
+  readonly text: string;
+  readonly contextToken?: string;
 };
 
 export type AccountManagerOptions = {
@@ -298,6 +307,12 @@ export class AccountManager {
     const statePaths = accountStatePaths(this.options.paths, account.accountId);
     const store = new RuntimeStateStore(statePaths);
     const channel = accountChannel(account);
+    const webhook = new ChannelMessageWebhook({
+      accountId: account.accountId,
+      channel,
+      ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {}),
+      ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
+    });
     const adapter = channel === "weixin" ? undefined : this.channelFactory(account as WeComAccount | FeishuAccount);
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
     const config = this.configProvider();
@@ -310,6 +325,7 @@ export class AccountManager {
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
       taskboard: this.taskboardFor(config),
+      onOutboundMessage: (message) => webhook.publish(message),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
       onTurnCompleted: ({ sessionId, text, success, turnId }) => this.notifyProjectCompletion(
         account.accountId,
@@ -319,17 +335,24 @@ export class AccountManager {
         turnId
       )
     });
-    const entry: RuntimeEntry = { status: "starting", controller, service, store, client };
+    const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
 
     entry.status = "running";
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      webhook.publish({
+        direction: "inbound",
+        id: message.id,
+        senderId: message.senderId,
+        text: message.text,
+        attachments: message.attachments.map(({ kind, label }) => ({ kind, label }))
+      });
       if (channel !== "weixin") service.allowSender(message.senderId);
       await service.handleMessage(message);
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
-      await client.sendText({
-        toUserId: message.senderId,
+      await this.sendChannelText(entry, {
+        recipientId: message.senderId,
         text: userFacingMessageHandlingError(error),
         contextToken: store.getContextToken(message.senderId)
       });
@@ -392,12 +415,14 @@ export class AccountManager {
     this.entries.delete(account.accountId);
   }
 
-  renameAccount(accountId: string, displayName: string): AccountSummary {
-    const normalized = displayName.trim();
-    if (normalized.length > 40) {
+  updateAccount(accountId: string, patch: AccountSettingsPatch): AccountSummary {
+    const displayName = patch.displayName.trim();
+    if (displayName.length > 40) {
       throw new Error("Account display name must be 40 characters or fewer");
     }
-    return this.summary(setAccountDisplayName(this.options.paths, accountId, normalized));
+    const account = setAccountSettings(this.options.paths, accountId, { ...patch, displayName });
+    this.entries.get(account.accountId)?.webhook?.configure(account.webhookUrl, account.webhookProvider);
+    return this.summary(account);
   }
 
   addChannelAccount(input:
@@ -1017,8 +1042,8 @@ export class AccountManager {
         throw new Error(`Notification channel is not running: ${target.accountId}`);
       }
       const contextToken = entry.store?.getContextToken(target.recipientId);
-      await entry.client.sendText({
-        toUserId: target.recipientId,
+      await this.sendChannelText(entry, {
+        recipientId: target.recipientId,
         text,
         ...(contextToken ? { contextToken } : {})
       });
@@ -1170,7 +1195,11 @@ export class AccountManager {
       const entry = this.entries.get(target.accountId);
       if (!entry?.client || entry.status !== "running") throw new Error(`Notification channel is not running: ${target.accountId}`);
       const contextToken = entry.store?.getContextToken(target.recipientId);
-      await entry.client.sendText({ toUserId: target.recipientId, text, ...(contextToken ? { contextToken } : {}) });
+      await this.sendChannelText(entry, {
+        recipientId: target.recipientId,
+        text,
+        ...(contextToken ? { contextToken } : {})
+      });
     }));
     for (const result of results) {
       if (result.status === "rejected") console.error(`[codex-channel-bridge] Taskboard notification failed: ${String(result.reason)}`);
@@ -1207,6 +1236,22 @@ export class AccountManager {
       lastActiveSenderId: store.getLastActiveSenderId(),
       sessionCount: store.listSessions().length
     };
+  }
+
+  private async sendChannelText(entry: RuntimeEntry, message: DirectChannelText): Promise<void> {
+    if (!entry.client) throw new Error("Notification channel client is not available");
+    const sent = await entry.client.sendText({
+      toUserId: message.recipientId,
+      text: message.text,
+      ...(message.contextToken ? { contextToken: message.contextToken } : {})
+    });
+    entry.webhook?.publish({
+      direction: "outbound",
+      id: sent.messageId,
+      recipientId: message.recipientId,
+      text: message.text,
+      attachments: []
+    });
   }
 }
 

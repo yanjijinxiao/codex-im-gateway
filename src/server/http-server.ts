@@ -17,10 +17,17 @@ import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
 import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
+import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
-const accountDisplayNameSchema = z.object({
-  displayName: z.string().max(40)
+const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
+  const protocol = new URL(value).protocol;
+  return protocol === "http:" || protocol === "https:";
+}, "Invalid Webhook URL: HTTP or HTTPS required");
+const accountSettingsSchema = z.object({
+  displayName: z.string().max(40),
+  webhookUrl: webhookUrlSchema.nullable().optional(),
+  webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional()
 });
 const accountDeleteSchema = z.object({
   retainHistory: z.boolean().optional()
@@ -125,7 +132,7 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
       updateService,
       port: actualPort
     }).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = requestErrorMessage(error);
       sendJson(response, errorStatus(message), { error: message });
     });
   });
@@ -311,9 +318,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   const accountMatch = matchPath(url.pathname, "/api/accounts/:accountId");
   if (method === "PATCH" && accountMatch) {
-    const body = accountDisplayNameSchema.parse(await readJsonBody(request));
+    const body = accountSettingsSchema.parse(await readJsonBody(request));
     sendJson(response, 200, {
-      account: context.accountManager.renameAccount(accountMatch.accountId, body.displayName)
+      account: context.accountManager.updateAccount(accountMatch.accountId, body)
     });
     return;
   }
@@ -539,9 +546,8 @@ function serveStatic(response: ServerResponse, pathname: string): void {
 function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
-  response.setHeader("X-Frame-Options", "DENY");
   response.setHeader("Referrer-Policy", "no-referrer");
-  response.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'");
+  response.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src http://127.0.0.1:* http://localhost:*; frame-ancestors app://-");
 }
 
 function isAllowedHost(host: string | undefined, port: number): boolean {
@@ -658,6 +664,11 @@ function errorStatus(message: string): number {
   if (/already in progress|no newer/i.test(message)) return 409;
   if (/unable to verify|timed out/i.test(message)) return 503;
   return /required|invalid|allowed|empty|too large|too many|exceed|transition/i.test(message) ? 400 : 500;
+}
+
+function requestErrorMessage(error: unknown): string {
+  if (error instanceof z.ZodError) return error.issues[0]?.message ?? "Invalid request";
+  return error instanceof Error ? error.message : String(error);
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {

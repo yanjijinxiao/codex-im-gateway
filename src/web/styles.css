@@ -73,6 +73,12 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 
 main { min-height: calc(100vh - 151px); }
 .view { width: min(calc(100% - 40px), var(--content)); margin: 0 auto; padding: 44px 0 80px; }
+.taskboard-view { width: 100%; margin: 0; padding: 0; }
+.taskboard-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--surface); }
+body[data-active-view="taskboard"] { height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
+body[data-active-view="taskboard"] .app-header { flex: 0 0 auto; }
+body[data-active-view="taskboard"] main { min-height: 0; flex: 1 1 auto; display: flex; }
+body[data-active-view="taskboard"] .taskboard-view { min-height: 0; flex: 1 1 auto; }
 .section-heading { min-height: 54px; margin-bottom: 24px; display: flex; align-items: end; justify-content: space-between; gap: 20px; }
 .heading-actions { display: flex; align-items: center; gap: 8px; }
 .eyebrow { margin: 0 0 5px; color: var(--green-dark); font-size: 10px; font-weight: 800; letter-spacing: .12em; }
@@ -486,6 +492,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
 .spinner { width: 30px; height: 30px; border: 3px solid var(--surface-muted); border-top-color: var(--green); border-radius: 50%; animation: spin .8s linear infinite; }
 .form-stack { display: grid; gap: 18px; }
 .form-stack > [hidden] { display: none !important; }
+.form-error { margin: -3px 0 0; padding: 9px 11px; border: 1px solid #efc5c3; border-radius: var(--radius); color: var(--red); background: var(--red-soft); font-size: 10px; font-weight: 650; line-height: 1.5; }
+input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61 / 16%); }
 .channel-modal { width: min(calc(100% - 32px), 620px); overflow: hidden; }
 .channel-modal > form { max-height: min(760px, calc(100vh - 32px)); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
 .channel-modal .modal-body { overflow-y: auto; }
@@ -558,6 +566,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
   .metrics { width: 100%; grid-template-columns: 1fr 1fr; }
   .workspace-metric { grid-column: 1 / -1; max-width: none; }
   .view { padding: 30px 0 56px; }
+  .taskboard-view { width: 100%; margin: 0; padding: 0; }
   h1 { font-size: 25px; }
   .section-heading { align-items: center; }
   .heading-actions { justify-content: flex-end; flex-wrap: wrap; }

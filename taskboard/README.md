@@ -64,7 +64,8 @@ Keep the existing Codex window open. From the Taskboard repository, start a seco
 ```bash
 open -n -a /Applications/ChatGPT.app --args \
   --remote-debugging-port=9231 \
-  --remote-allow-origins=http://127.0.0.1:9231
+  --remote-allow-origins=http://127.0.0.1:9231 \
+  --disable-features=LocalNetworkAccessChecks
 ```
 
 After the new Codex window appears, run the injector in another terminal:
@@ -84,9 +85,19 @@ Quit every running Codex window, then run:
 CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
 ```
 
-This starts the local Taskboard service when needed, launches the official macOS Codex app with a loopback-only CDP port, injects a native-looking Taskboard entry after Plugins, and keeps watching both the service and replacement renderers. Opening Taskboard asks this launcher to health-check the fixed local service, restart it when needed, and rebuild a failed iframe. Keep this command running while using the embedded panel. The launcher does not modify `ChatGPT.app` or its `app.asar`.
+This starts the local Taskboard service when needed, launches the official macOS Codex app with a loopback-only CDP port, injects native-looking “任务面板” and “渠道配置” entries after Plugins, and keeps watching both the service and replacement renderers. The two entries switch one embedded Codex main-workspace surface between Taskboard and the loopback Codex Channel Bridge page at <http://127.0.0.1:8787/>; the channel page does not open in a browser side panel. Opening Taskboard asks this launcher to health-check the fixed local service, restart it when needed, and rebuild a failed iframe. Keep this command running while using the embedded panel. The launcher does not modify `ChatGPT.app` or its `app.asar`.
 
-Codex 26.715.52143 ships a renderer CSP that blocks arbitrary HTTP iframes. The launcher therefore enables CDP CSP bypass, reloads that renderer once, installs the document-start script, and waits until the Taskboard OOPIF is actually loaded. CDP is unauthenticated to other processes on the same machine, so only run trusted local code while the launcher is active.
+Current Codex builds enforce both renderer CSP and Local Network Access checks for HTTP loopback iframes. The launcher enables CDP CSP bypass and disables that browser feature for the launched Codex process, reloads the renderer once, installs the document-start script, and waits until the Taskboard OOPIF is actually loaded. CDP is unauthenticated to other processes on the same machine, so only run trusted local code while the launcher is active.
+
+For a background service that also handles later Dock/Finder launches, keep the resident injector running with `--adopt-normal-launch`. When installing it while Codex is already open, add `--defer-existing` so the current window is not interrupted; after that window exits, the next normal Codex launch is briefly restarted with the required CDP and Local Network Access flags, then injected:
+
+```bash
+node scripts/codex-injector.mjs --watch --port 9231 \
+  --attach-existing --adopt-normal-launch --defer-existing \
+  --app-path /Applications/ChatGPT.app
+```
+
+The resident process must remain running. This is a controlled relaunch rather than in-place injection because Chromium cannot add a remote-debugging port to an already-running process.
 
 To inject into a Codex instance that was already launched with CDP by another method, run:
 
@@ -96,7 +107,7 @@ npm run codex:inject -- --port 9229 --open
 
 This command also stays resident so the injected tab can restart Taskboard after a service exit. Stop it with `Ctrl-C`.
 
-The script adds a Taskboard entry to the Codex sidebar and renders the iframe across Codex's complete main workspace, including the contextual titlebar area so Taskboard's own header does not leave an empty strip. That full rectangular header is placed above Electron's draggable layer and marked `no-drag`; because the native contextual actions are suppressed while Taskboard is active, its own actions use their normal edge padding without an artificial right-side gap. The native sidebar stays mounted, while the previous page selection and contextual header are temporarily suppressed; choosing another Codex page restores them.
+The script adds Taskboard and Channel Configuration entries to the Codex sidebar and renders their shared iframe below Codex's measured native titlebar, filling the remaining project workspace. The native sidebar stays mounted, while the previous page selection and contextual header are temporarily suppressed; choosing another Codex page restores them. Switching from Taskboard to Channel Configuration also clears Taskboard's Electron drag regions before the Channel Bridge becomes interactive.
 
 “在对话中打开” selects the corresponding native Codex project when one is available and opens an unsent native composer with `$manage-taskboard ISSUE-ID`. A conversation is attributed only after it actually processes the issue: `taskctl` reads Codex's `CODEX_THREAD_ID` and records that ID on the issue or comment mutation. Recorded IDs are clickable through Codex's native route bridge. Each issue can bind either one Git branch or one worktree; the options are scanned from the selected Codex project's repository instead of being typed by hand. The integration uses Codex's existing project, composer, and route markers; it does not patch React, replace `fetch`, load private chunks, or edit Codex data files.
 

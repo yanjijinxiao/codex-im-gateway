@@ -30,15 +30,6 @@
     "bridge"
   ],
   "type": "module",
-  "workspaces": [
-    "taskboard"
-  ],
-  "overrides": {
-    "@types/react": "19.2.17",
-    "@types/react-dom": "19.2.3",
-    "react": "19.2.7",
-    "react-dom": "19.2.7"
-  },
   "scripts": {
     "install:local": "node scripts/install-local.mjs",
     "install:check": "node scripts/install-local.mjs --check",

@@ -124,6 +124,44 @@ test("lists every built-in command and reports the current Codex account balance
   assert.match(replies.at(-1) ?? "", /Credits：12\.34/);
 });
 
+test("reports each successfully sent text message for webhook mirroring", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-outbound-webhook-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const outbound: unknown[] = [];
+  let sentText = "";
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore: new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state"))),
+    weixin: {
+      async sendText(input: { text: string }) {
+        sentText = input.text;
+        return { messageId: "outbound-1" };
+      }
+    },
+    runner: { async stop() {} } as never,
+    onOutboundMessage: (message) => outbound.push(message)
+  });
+
+  await service.handleMessage({
+    id: "help-1",
+    senderId: "alice@im.wechat",
+    text: "/help",
+    attachments: [],
+    raw: {}
+  });
+
+  assert.equal(outbound.length, 1);
+  const message = outbound[0] as { text: string } & Record<string, unknown>;
+  assert.equal(message.text, sentText);
+  assert.deepEqual({ ...message, text: undefined }, {
+    direction: "outbound",
+    id: "outbound-1",
+    recipientId: "alice@im.wechat",
+    text: undefined,
+    attachments: []
+  });
+});
+
 test("maps every documented short command to its canonical command", () => {
   const aliases: Record<string, string> = {
     h: "help",
@@ -401,6 +439,7 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   };
   const textReplies: string[] = [];
   const imageMessages: Array<Record<string, unknown>> = [];
+  const outbound: Array<Record<string, unknown>> = [];
   const weixin = {
     async sendTyping() {},
     async sendText(input: { text: string }) {
@@ -431,6 +470,7 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
     config,
     stateStore,
     weixin,
+    onOutboundMessage: (message) => outbound.push(message),
     runner: {
       async run() {
         return {
@@ -463,6 +503,15 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   assert.equal(textReplies.some((reply) => reply.includes("[codex-channel-bridge] File send requested")), false);
   assert.equal(textReplies.some((reply) => reply.includes(markdownPath)), false);
   assert.equal(textReplies.join("\n").includes("如果图片没有直接显示"), false);
+  assert.deepEqual(outbound.find((message) => (
+    Array.isArray(message.attachments) && message.attachments.length > 0
+  )), {
+    direction: "outbound",
+    id: "image-message",
+    recipientId: "alice@im.wechat",
+    text: "",
+    attachments: [{ kind: "image", label: "generated_image_latest.png" }]
+  });
 });
 
 test("sends local markdown videos as native WeChat video messages", async (t) => {
