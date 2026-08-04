@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 
 import { AccessController } from "./access.js";
@@ -730,11 +731,30 @@ export class BridgeService {
       return items;
     }
     try {
+      const rootDir = this.options.inboundDir ?? path.join(this.options.config.defaultCwd, ".codex-weixin-inbound");
+      const remoteAttachments = [];
+      for (const attachment of attachments) {
+        if (!attachment.path) {
+          remoteAttachments.push(attachment);
+          continue;
+        }
+        const localPath = path.resolve(attachment.path);
+        const relativePath = path.relative(path.resolve(rootDir), localPath);
+        if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+          throw new Error("inbound attachment path is outside its account directory");
+        }
+        const size = fs.statSync(localPath).size;
+        if (size > this.options.config.maxInboundBytes) {
+          throw new InboundMediaTooLargeError(this.options.config.maxInboundBytes, size);
+        }
+        items.push({ kind: attachment.kind, path: localPath, label: attachment.label });
+      }
+      if (!remoteAttachments.length) return items;
       const downloaded = await downloadInboundAttachments({
-        rootDir: this.options.inboundDir ?? path.join(this.options.config.defaultCwd, ".codex-weixin-inbound"),
+        rootDir,
         senderId: message.senderId,
         messageId: message.id,
-        attachments,
+        attachments: remoteAttachments,
         maxBytes: this.options.config.maxInboundBytes,
         fetch: this.options.mediaFetch
       });
@@ -749,7 +769,7 @@ export class BridgeService {
       if (error instanceof InboundMediaTooLargeError) throw error;
       items.push({
         kind: "text",
-        text: `[WeChat attachment download failed: ${error instanceof Error ? error.message : String(error)}]`
+        text: `[Attachment download failed: ${error instanceof Error ? error.message : String(error)}]`
       });
     }
     return items;
@@ -840,21 +860,26 @@ export class BridgeService {
   }
 
   private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }): Promise<void> {
-    if (!isWeixinMediaClient(this.options.weixin, action.type)) {
-      await this.reply(senderId, `当前渠道暂不支持直接发送 ${action.type} 文件：${path.basename(action.path)}`);
-      return;
-    }
     try {
-      const sent = await sendLocalMediaFile({
-        client: this.options.weixin as ChannelTextClient & Pick<
-          WeixinApiClient,
-          "getUploadUrl" | "sendFileMessage" | "sendImageMessage" | "sendVideoMessage"
-        >,
-        toUserId: senderId,
-        contextToken: this.options.stateStore.getContextToken(senderId),
-        filePath: action.path,
-        kind: action.type
-      });
+      let sent: { messageId: string; kind: "image" | "file" | "video" };
+      if (action.type === "image" && this.options.weixin.sendImage) {
+        const result = await this.options.weixin.sendImage({ toUserId: senderId, path: action.path });
+        sent = { ...result, kind: "image" };
+      } else if (isWeixinMediaClient(this.options.weixin, action.type)) {
+        sent = await sendLocalMediaFile({
+          client: this.options.weixin as ChannelTextClient & Pick<
+            WeixinApiClient,
+            "getUploadUrl" | "sendFileMessage" | "sendImageMessage" | "sendVideoMessage"
+          >,
+          toUserId: senderId,
+          contextToken: this.options.stateStore.getContextToken(senderId),
+          filePath: action.path,
+          kind: action.type
+        });
+      } else {
+        await this.reply(senderId, `当前渠道暂不支持直接发送 ${action.type} 文件：${path.basename(action.path)}`);
+        return;
+      }
       this.options.onOutboundMessage?.({
         direction: "outbound",
         id: sent.messageId,

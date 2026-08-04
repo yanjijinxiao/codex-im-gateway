@@ -176,7 +176,7 @@ export type AccountManagerOptions = {
   paths: StatePaths;
   configProvider?: () => CodexWeixinConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
-  channelFactory?: (account: WeComAccount | FeishuAccount) => ChannelAdapter;
+  channelFactory?: (account: WeComAccount | FeishuAccount, options: { inboundDir: string }) => ChannelAdapter;
   bridgeFactory?: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   monitor?: (options: MonitorOptions) => Promise<void>;
   runnerFactory?: (config: CodexWeixinConfig) => HybridCodexRunner;
@@ -200,7 +200,7 @@ export class AccountManager {
   private readonly configProvider: () => CodexWeixinConfig;
   private readonly clientFactory: (account: WeixinAccount) => WeixinApiClient;
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
-  private readonly channelFactory: (account: WeComAccount | FeishuAccount) => ChannelAdapter;
+  private readonly channelFactory: NonNullable<AccountManagerOptions["channelFactory"]>;
   private readonly monitor: (options: MonitorOptions) => Promise<void>;
   private readonly runnerFactory: (config: CodexWeixinConfig) => HybridCodexRunner;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
@@ -224,9 +224,9 @@ export class AccountManager {
       token: account.token
     }));
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
-    this.channelFactory = options.channelFactory ?? ((account) => account.channel === "wecom"
+    this.channelFactory = options.channelFactory ?? ((account, adapterOptions) => account.channel === "wecom"
       ? new WeComChannelAdapter(account)
-      : new FeishuChannelAdapter(account));
+      : new FeishuChannelAdapter(account, { inboundDir: adapterOptions.inboundDir }));
     this.monitor = options.monitor ?? monitorWeixin;
     this.runnerFactory = options.runnerFactory ?? ((config) => new HybridCodexRunner({
       backend: config.codexBackend,
@@ -313,7 +313,10 @@ export class AccountManager {
       ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {}),
       ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
-    const adapter = channel === "weixin" ? undefined : this.channelFactory(account as WeComAccount | FeishuAccount);
+    const adapter = channel === "weixin" ? undefined : this.channelFactory(
+      account as WeComAccount | FeishuAccount,
+      { inboundDir: statePaths.inboundDir }
+    );
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
     const config = this.configProvider();
     const service = this.bridgeFactory({

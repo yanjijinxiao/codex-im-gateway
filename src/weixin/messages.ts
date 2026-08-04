@@ -11,6 +11,7 @@ export type WeixinInboundAttachment = {
   kind: "image" | "file" | "video" | "audio";
   label: string;
   item: Record<string, unknown>;
+  path?: string;
 };
 
 export type NormalizedWeixinMessage = {

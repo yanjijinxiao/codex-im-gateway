@@ -2,6 +2,7 @@ import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 
 export type ChannelTextClient = {
   sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
+  sendImage?(input: { toUserId: string; path: string }): Promise<{ messageId: string }>;
   sendTyping?(input: { toUserId: string; contextToken?: string; typing?: boolean }): Promise<void>;
 };
 
