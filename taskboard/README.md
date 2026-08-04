@@ -89,6 +89,16 @@ This starts the local Taskboard service when needed, launches the official macOS
 
 Current Codex builds enforce both renderer CSP and Local Network Access checks for HTTP loopback iframes. The launcher enables CDP CSP bypass and disables that browser feature for the launched Codex process, reloads the renderer once, installs the document-start script, and waits until the Taskboard OOPIF is actually loaded. CDP is unauthenticated to other processes on the same machine, so only run trusted local code while the launcher is active.
 
+For a background service that also handles later Dock/Finder launches, keep the resident injector running with `--adopt-normal-launch`. When installing it while Codex is already open, add `--defer-existing` so the current window is not interrupted; after that window exits, the next normal Codex launch is briefly restarted with the required CDP and Local Network Access flags, then injected:
+
+```bash
+node scripts/codex-injector.mjs --watch --port 9231 \
+  --attach-existing --adopt-normal-launch --defer-existing \
+  --app-path /Applications/ChatGPT.app
+```
+
+The resident process must remain running. This is a controlled relaunch rather than in-place injection because Chromium cannot add a remote-debugging port to an already-running process.
+
 To inject into a Codex instance that was already launched with CDP by another method, run:
 
 ```bash

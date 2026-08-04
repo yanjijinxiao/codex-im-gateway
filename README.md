@@ -166,7 +166,7 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 常用命令：`npm run taskboard:start` 启动本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
 
-以 `taskboard/scripts/codex-injector.mjs --launch --watch` 启动正常 Codex 后，原生侧边栏会在“插件”下增加“任务面板”和“渠道配置”两个入口。两者是同级导航：点击后在同一个 Codex 主工作区内分别切换本机 Taskboard 和 `http://127.0.0.1:8787/` 的 Codex Channel Bridge 管理页，不会另开浏览器侧栏。当前 Codex 使用的 Chromium 会检查本机网络 iframe，因此必须由该启动器添加 `--disable-features=LocalNetworkAccessChecks`；直接从 Dock 启动且没有调试端口的既有进程无法在运行中补注入。
+以 `taskboard/scripts/codex-injector.mjs --launch --watch` 启动正常 Codex 后，原生侧边栏会在“插件”下增加“任务面板”和“渠道配置”两个入口。两者是同级导航：点击后在同一个 Codex 主工作区内分别切换本机 Taskboard 和 `http://127.0.0.1:8787/` 的 Codex Channel Bridge 管理页，不会另开浏览器侧栏。当前 Codex 使用的 Chromium 会检查本机网络 iframe，因此必须由该启动器添加 `--disable-features=LocalNetworkAccessChecks`；直接从 Dock 启动且没有调试端口的既有进程无法在运行中补注入。常驻后台时可增加 `--adopt-normal-launch`；若安装时 Codex 已打开，再增加 `--defer-existing`，注入器会保留当前窗口，并在它退出后的下一次正常启动时短暂重启 Codex、补齐所需参数并完成注入。
 
 ## 消息渠道内命令
 

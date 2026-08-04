@@ -12,6 +12,8 @@ import {
   reconcileTaskboardAutomation,
 } from "../shared/taskboard-automation.mjs";
 import {
+  adoptNormalCodexLaunch,
+  findUndebuggableCodexPids,
   findResidentInjectorPids,
   handleHostBindingPayload,
   reconcileInjectionRuntime,
@@ -55,6 +57,8 @@ function parseArgs(argv) {
     refresh: false,
     refreshIfRunning: false,
     attachExisting: false,
+    adoptNormalLaunch: false,
+    deferExisting: false,
     startupToken: null,
     daemon: false,
     screenshot: null,
@@ -69,6 +73,8 @@ function parseArgs(argv) {
     else if (arg === "--refresh") options.refresh = true;
     else if (arg === "--refresh-if-running") options.refreshIfRunning = true;
     else if (arg === "--attach-existing") options.attachExisting = true;
+    else if (arg === "--adopt-normal-launch") options.adoptNormalLaunch = true;
+    else if (arg === "--defer-existing") options.deferExisting = true;
     else if (arg === "--startup-token") {
       options.startupToken = argv[++index];
       if (!/^[a-z0-9-]{1,100}$/i.test(options.startupToken || "")) {
@@ -87,6 +93,12 @@ function parseArgs(argv) {
 
   if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535) {
     throw new Error("--port must be an integer between 1 and 65535");
+  }
+  if (options.adoptNormalLaunch && !options.watch) {
+    throw new Error("--adopt-normal-launch requires --watch");
+  }
+  if (options.deferExisting && !options.adoptNormalLaunch) {
+    throw new Error("--defer-existing requires --adopt-normal-launch");
   }
   return options;
 }
@@ -186,6 +198,33 @@ function createTaskboardSupervisor({ detached }) {
 
 function codexIsRunning() {
   return spawnSync("/usr/bin/pgrep", ["-x", "ChatGPT"], { stdio: "ignore" }).status === 0;
+}
+
+function undebuggableCodexPids() {
+  const processes = spawnSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return processes.status === 0 ? findUndebuggableCodexPids(processes.stdout) : [];
+}
+
+async function stopCodexProcess(pid) {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (error?.code === "ESRCH") return;
+    throw error;
+  }
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out stopping normal Codex process ${pid}`);
 }
 
 function launchCodex(appPath, port) {
@@ -306,9 +345,18 @@ async function codexTargets(port) {
     (target) =>
       target.type === "page" &&
       target.webSocketDebuggerUrl &&
-      !target.url?.includes("initialRoute=%2Fglobal-dictation") &&
+      !target.url?.includes("initialRoute=") &&
       (target.url?.startsWith("app://") || target.title === "Codex"),
   );
+}
+
+async function waitForCodexRendererTarget(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await codexTargets(port)).length > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Timed out waiting for the main Codex renderer target");
 }
 
 function codexDebuggingPorts(preferredPort) {
@@ -1014,6 +1062,23 @@ async function waitForInjectionStatus(cdp, shouldOpen, expectedSourceHash, timeo
   return status;
 }
 
+async function waitForRendererDocument(cdp, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const evaluation = await cdp.send("Runtime.evaluate", {
+      expression: `({
+        locationProtocol: window.location.protocol,
+        readyState: document.readyState
+      })`,
+      returnByValue: true,
+    });
+    const documentState = evaluation.result.value;
+    if (documentState.locationProtocol === "app:" && documentState.readyState === "complete") return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Timed out waiting for the initial Codex renderer document");
+}
+
 async function evaluateInjectionSource(cdp, source) {
   const evaluation = await cdp.send("Runtime.evaluate", {
     expression: source,
@@ -1061,13 +1126,16 @@ async function injectTarget(
     await cdp.send("Runtime.enable");
     if (keepAlive) await installTaskboardHostBinding(cdp, supervisor);
     if (keepAlive && attachExisting) {
-      const currentStatus = await readInjectionStatus(cdp);
+      let currentStatus = await readInjectionStatus(cdp);
       const attachingFreshRenderer = !currentStatus.sourceHash;
       if (attachingFreshRenderer) {
-        await Promise.all([
-          cdp.waitFor("Page.loadEventFired", 60_000),
-          cdp.send("Page.reload"),
-        ]);
+        // The reload applies the CSP bypass, but it must wait for Codex's initial load to finish.
+        // Reloading earlier aborts that load and opens Codex's native startup-error dialog.
+        await waitForRendererDocument(cdp, 60_000);
+        const reloaded = cdp.waitFor("Page.loadEventFired", 60_000);
+        await cdp.send("Page.reload");
+        await reloaded;
+        currentStatus = await readInjectionStatus(cdp);
       }
       const reconciled = await reconcileInjectionRuntime({
         currentStatus,
@@ -1260,9 +1328,26 @@ async function main() {
 
   let codexProcess = null;
   const supervisor = createTaskboardSupervisor({ detached: !options.watch });
+  const adoptNormalLaunch = (deferredPids = []) => adoptNormalCodexLaunch(
+    { deferredPids },
+    {
+      isCdpReachable: () => isReachable(cdpVersionUrl),
+      findUndebuggablePids: undebuggableCodexPids,
+      waitForNextCheck: () => new Promise((resolve) => setTimeout(resolve, 500)),
+      stopProcess: stopCodexProcess,
+      launch: () => launchCodex(options.appPath, options.port),
+      waitForCdp: () => waitUntilReachable(cdpVersionUrl, 30_000),
+    },
+  );
 
   try {
-    const cdpReachable = await isReachable(cdpVersionUrl);
+    let cdpReachable = await isReachable(cdpVersionUrl);
+    if (!cdpReachable && options.adoptNormalLaunch) {
+      const deferredPids = options.deferExisting ? undebuggableCodexPids() : [];
+      const adoption = await adoptNormalLaunch(deferredPids);
+      codexProcess = adoption.process;
+      cdpReachable = true;
+    }
     if (!cdpReachable) {
       if (!options.launch) {
         throw new Error(`Codex CDP is not listening on 127.0.0.1:${options.port}`);
@@ -1281,6 +1366,7 @@ async function main() {
       await waitUntilReachable(cdpVersionUrl, 30_000);
     }
 
+    await waitForCodexRendererTarget(options.port, 30_000);
     const { source, sourceHash } = await currentInjectionSource();
     const injectedTargets = new Map();
     const firstResults = await injectAll(
@@ -1337,6 +1423,13 @@ async function main() {
         );
         if (results.length > 0) console.log(JSON.stringify({ injected: results }, null, 2));
       } catch (error) {
+        if (options.adoptNormalLaunch && !(await isReachable(cdpVersionUrl))) {
+          injectedTargets.forEach((connection) => connection.close());
+          injectedTargets.clear();
+          const adoption = await adoptNormalLaunch();
+          codexProcess = adoption.process;
+          continue;
+        }
         if (codexProcess && codexProcess.exitCode !== null) break;
         console.error(`Waiting for Codex renderer: ${error.message}`);
       }

@@ -69,6 +69,29 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
 });
 
+test("the resident injector can adopt the next normal Codex launch without interrupting the current window", () => {
+  assert.match(source, /--adopt-normal-launch/);
+  assert.match(source, /--defer-existing/);
+  assert.match(source, /adoptNormalCodexLaunch/);
+  assert.match(source, /findUndebuggableCodexPids/);
+  assert.match(source, /injectedTargets\.clear\(\)/);
+});
+
+test("a freshly adopted renderer waits for its first document before the CSP bypass reload", () => {
+  const attachBranchStart = source.indexOf("if (keepAlive && attachExisting)");
+  const attachBranchEnd = source.indexOf("const scriptIdentifier =", attachBranchStart);
+  const attachBranch = source.slice(attachBranchStart, attachBranchEnd);
+  const waitIndex = attachBranch.indexOf("await waitForRendererDocument(cdp, 60_000)");
+  const reloadIndex = attachBranch.indexOf('await cdp.send("Page.reload")');
+
+  assert.notEqual(waitIndex, -1);
+  assert.notEqual(reloadIndex, -1);
+  assert.ok(waitIndex < reloadIndex);
+  assert.match(attachBranch, /const reloaded = cdp\.waitFor\("Page\.loadEventFired", 60_000\)/);
+  assert.match(attachBranch, /await reloaded/);
+  assert.match(source, /documentState\.readyState === "complete"/);
+});
+
 test("attach reconciles the renderer against a hashed current injection source", () => {
   assert.match(source, /createHash\("sha256"\)/);
   assert.match(source, /__CODEX_TASKBOARD_SOURCE_HASH__/);
@@ -82,7 +105,15 @@ test("attach reconciles the renderer against a hashed current injection source",
 });
 
 test("the injector ignores auxiliary Codex windows", () => {
-  assert.match(source, /!target\.url\?\.includes\("initialRoute=%2Fglobal-dictation"\)/);
+  assert.match(source, /!target\.url\?\.includes\("initialRoute="\)/);
+});
+
+test("initial injection waits for the main Codex renderer after browser CDP is ready", () => {
+  const waitIndex = source.indexOf("await waitForCodexRendererTarget(options.port, 30_000)");
+  const injectionIndex = source.indexOf("const firstResults = await injectAll(");
+
+  assert.notEqual(waitIndex, -1);
+  assert.ok(waitIndex < injectionIndex);
 });
 
 test("a completed web build refreshes an already-open Codex iframe", () => {
