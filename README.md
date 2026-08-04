@@ -154,9 +154,13 @@ node dist/server/index.js
 
 ## Taskboard 联动
 
+Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本机服务、React 管理页面、`taskctl` CLI、Codex Skill、Cloud/注入脚本和测试。根目录执行 `npm install` 和 `npm run build` 会同时安装并构建桥接服务与 Taskboard，不依赖外部 Taskboard 仓库或 Git 子模块。
+
 “设置”页面默认连接本机 `http://127.0.0.1:47823`，按绝对工作目录把 Codex 项目映射到 Taskboard 项目。Taskboard 始终是 Issue 状态的唯一事实源，桥接服务不会把看板任务复制进自己的状态文件。为了保持本地安全边界，配置只接受 HTTP 回环地址。
 
-将 Taskboard 仓库中的 `skills/manage-taskboard` 复制或软链接到 `~/.codex/skills/manage-taskboard` 后，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+将当前仓库的 `taskboard/skills/manage-taskboard` 软链接到 `~/.codex/skills/manage-taskboard`，并将 `taskboard/cli/taskctl.mjs` 暴露为 `taskctl` 后，聊天端可以通过 `/task` 查询和推进工作流。领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+
+常用命令：`npm run taskboard:start` 启动本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
 
 ## 消息渠道内命令
 

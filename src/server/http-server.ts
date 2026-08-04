@@ -16,6 +16,7 @@ import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, Sess
 import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
 import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
+import { handleTaskboardHttp } from "./taskboard-http.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const accountDisplayNameSchema = z.object({
@@ -243,10 +244,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { projects: context.accountManager.listProjects() });
     return;
   }
-  if (method === "GET" && url.pathname === "/api/taskboard") {
-    sendJson(response, 200, await context.accountManager.getTaskboardStatus());
-    return;
-  }
+  if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;
   if (method === "POST" && url.pathname === "/api/projects") {
     const body = projectCreateSchema.parse(await readJsonBody(request));
     const workspace = path.resolve(body.workspace);
@@ -659,7 +657,7 @@ function errorStatus(message: string): number {
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;
   if (/unable to verify|timed out/i.test(message)) return 503;
-  return /required|invalid|allowed|empty|too large|too many|exceed/i.test(message) ? 400 : 500;
+  return /required|invalid|allowed|empty|too large|too many|exceed|transition/i.test(message) ? 400 : 500;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {

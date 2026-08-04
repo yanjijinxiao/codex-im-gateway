@@ -121,6 +121,14 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
 - A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
+## Taskboard integration
+
+Taskboard is fully embedded in this repository under the `taskboard/` workspace, including the local service, React management UI, `taskctl` CLI, Codex Skill, Cloud/injection scripts, and tests. Running `npm install` and `npm run build` at the repository root installs and builds both the bridge and Taskboard without an external Taskboard repository or Git submodule.
+
+The Settings page connects to `http://127.0.0.1:47823` by default and maps Codex projects to Taskboard projects by absolute workspace path. Taskboard remains the single source of truth for issue state; the bridge does not copy board issues into its own state files. The configured `manage-taskboard` Skill and `taskctl` command point directly to this repository's `taskboard/` workspace.
+
+Useful commands: `npm run taskboard:start` starts the local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
+
 ## Message-channel commands
 
 ```text

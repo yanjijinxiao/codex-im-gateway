@@ -48,7 +48,18 @@ import {
 import { WeixinApiClient } from "../weixin/api.js";
 import { monitorWeixin, type MonitorOptions } from "../weixin/monitor.js";
 import { inferMediaKind, sanitizeFileName } from "../weixin/media.js";
-import { TaskboardClient, type TaskboardEvent, type TaskboardIssue } from "../taskboard/client.js";
+import {
+  TaskboardClient,
+  type TaskboardComment,
+  type TaskboardEvent,
+  type TaskboardIssue,
+  type TaskboardStatus
+} from "../taskboard/client.js";
+import {
+  TaskboardWorkbench,
+  type TaskboardIssueDetail,
+  type TaskboardIssueSummary
+} from "../taskboard/workbench.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -176,6 +187,7 @@ export class AccountManager {
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
+  private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
@@ -202,6 +214,10 @@ export class AccountManager {
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
+    this.taskboardWorkbench = new TaskboardWorkbench({
+      client: () => this.taskboardFor(),
+      projects: () => this.listProjects().map(taskboardProjectBase)
+    });
   }
 
   async startAll(): Promise<void> {
@@ -963,6 +979,27 @@ export class AccountManager {
         projects: managed.map(taskboardProjectBase)
       };
     }
+  }
+
+  async listTaskboardIssues(): Promise<TaskboardIssueSummary[]> {
+    return this.taskboardWorkbench.listIssues();
+  }
+
+  async getTaskboardIssue(identifier: string): Promise<TaskboardIssueDetail> {
+    return this.taskboardWorkbench.getIssue(identifier);
+  }
+
+  async commentTaskboardIssue(identifier: string, body: string): Promise<TaskboardComment> {
+    return this.taskboardWorkbench.commentIssue(identifier, body);
+  }
+
+  async moveTaskboardIssue(
+    identifier: string,
+    status: TaskboardStatus,
+    version: number,
+    comment?: string
+  ): Promise<TaskboardIssue> {
+    return this.taskboardWorkbench.moveIssue(identifier, status, version, comment);
   }
 
   private taskboardFor(config = this.configProvider()): TaskboardClient | undefined {
