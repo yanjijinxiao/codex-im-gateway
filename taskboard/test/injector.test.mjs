@@ -13,11 +13,48 @@ const packageJson = JSON.parse(
 
 test("the resident injector supervises the fixed local Taskboard service", () => {
   assert.match(source, /function createTaskboardSupervisor/);
-  assert.match(source, /await isReachable\(taskboardHealthUrl\)/);
+  assert.match(source, /await isReachable\(taskboardHealthUrl, taskboardHealthTimeoutMs\)/);
   assert.match(source, /ensureInFlight/);
-  assert.match(source, /await supervisor\.ensure\(\)/);
+  assert.match(source, /await supervisor\.ensure\(\{ force: true \}\)/);
   assert.match(source, /it will be restarted automatically/);
-  assert.match(source, /AbortSignal\.timeout\(1_500\)/);
+  assert.match(source, /AbortSignal\.timeout\(timeoutMs\)/);
+});
+
+test("the resident injector lets a busy Taskboard health endpoint answer before restarting it", () => {
+  assert.match(source, /const taskboardHealthTimeoutMs = 5_000/);
+  assert.match(source, /async function isReachable\(url, timeoutMs = 1_500\)/);
+  assert.match(source, /AbortSignal\.timeout\(timeoutMs\)/);
+  assert.match(source, /isReachable\(taskboardHealthUrl, taskboardHealthTimeoutMs\)/);
+});
+
+test("the supervisor does not start a competing server when the Taskboard port is occupied", () => {
+  const ensureStart = source.indexOf("  async function ensure({ force = false } = {})");
+  const ensureEnd = source.indexOf("\n\n  function stop()", ensureStart);
+  const ensureSource = source.slice(ensureStart, ensureEnd);
+  const occupiedPortCheck = ensureSource.indexOf("await isPortListening(taskboardOrigin)");
+  const serverStart = ensureSource.indexOf("startTaskboard({ detached })");
+
+  assert.notEqual(ensureStart, -1);
+  assert.notEqual(ensureEnd, -1);
+  assert.match(source, /function isPortListening\(origin, timeoutMs = 500\)/);
+  assert.notEqual(occupiedPortCheck, -1);
+  assert.notEqual(serverStart, -1);
+  assert.ok(occupiedPortCheck < serverStart);
+  assert.match(ensureSource, /owns its port but did not answer \/health/);
+});
+
+test("a slow Taskboard recovery cannot block resident host heartbeats", () => {
+  const loopStart = source.indexOf("    let serviceEnsurePending = false;");
+  const loopEnd = source.indexOf("    supervisor.stop();", loopStart);
+
+  assert.notEqual(loopStart, -1);
+  assert.notEqual(loopEnd, -1);
+  const loopSource = source.slice(loopStart, loopEnd);
+  assert.match(loopSource, /let serviceEnsurePending = false/);
+  assert.match(loopSource, /supervisor\.ensure\(\)\s*\.catch/);
+  assert.match(loopSource, /\.finally\(\(\) => \{\s*serviceEnsurePending = false;/);
+  assert.doesNotMatch(loopSource, /await supervisor\.ensure\(\)/);
+  assert.match(loopSource, /await publishHostHeartbeat/);
 });
 
 test("the CDP bridge accepts only service ensure and native Skill composer prefill actions", () => {
@@ -75,6 +112,20 @@ test("the resident injector can adopt the next normal Codex launch without inter
   assert.match(source, /adoptNormalCodexLaunch/);
   assert.match(source, /findUndebuggableCodexPids/);
   assert.match(source, /injectedTargets\.clear\(\)/);
+});
+
+test("a stalled CDP request retires its connection instead of freezing resident heartbeats", () => {
+  const sendStart = source.indexOf("  send(method, params = {})");
+  const sendEnd = source.indexOf("\n  waitFor(method, timeoutMs)", sendStart);
+  const sendSource = source.slice(sendStart, sendEnd);
+
+  assert.notEqual(sendStart, -1);
+  assert.notEqual(sendEnd, -1);
+  assert.match(sendSource, /const timeout = setTimeout/);
+  assert.match(sendSource, /this\.pending\.delete\(id\)/);
+  assert.match(sendSource, /this\.close\(\)/);
+  assert.match(sendSource, /Timed out waiting for CDP response/);
+  assert.match(sendSource, /clearTimeout\(timeout\)/);
 });
 
 test("a freshly adopted renderer waits for its first document before the CSP bypass reload", () => {

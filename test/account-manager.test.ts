@@ -15,7 +15,7 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
-function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) {
+function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
@@ -33,6 +33,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
   const starts: string[] = [];
   const inboundHandlers = new Map<string, (message: NormalizedWeixinMessage) => Promise<void>>();
   const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
+  const sentCards: Array<{ accountId: string; toUserId: string; card: { identifier: string; latestComment?: string; actions: readonly { label: string }[] } }> = [];
   const runs: Array<Record<string, unknown>> = [];
   let runtimeInfo: { model?: string; effort?: string; provider?: string } = {
     model: "runtime-model",
@@ -49,6 +50,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
     { id: "assistant-1", role: "assistant" as const, text: "历史回答" }
   ];
   const runner = {
+    async warmUp() {},
     async run(input: Record<string, unknown>) {
       runs.push(input);
       if (runHandler) return runHandler(input);
@@ -82,7 +84,13 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
       async sendText(input: { toUserId: string; text: string }) {
         sent.push({ accountId: account.accountId, ...input });
         return { messageId: "sent" };
-      }
+      },
+      ...(options.taskCards ? {
+        async sendTaskCard(input: { toUserId: string; card: typeof sentCards[number]["card"] }) {
+          sentCards.push({ accountId: account.accountId, ...input });
+          return { messageId: "sent-card" };
+        }
+      } : {})
     }) as never,
     channelFactory: (account) => ({
       client: {
@@ -138,6 +146,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
     runs,
     history,
     sent,
+    sentCards,
     async emitInbound(accountId: string, message: NormalizedWeixinMessage) {
       const handler = inboundHandlers.get(accountId);
       assert.ok(handler, `Inbound handler is not running for ${accountId}`);
@@ -166,7 +175,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object } = {}) 
   };
 }
 
-test("notifies Taskboard review state once with the latest evidence", async (t) => {
+test("notifies Taskboard review state once as an actionable card with the latest evidence", async (t) => {
   let emit: ((event: object) => Promise<void> | void) | undefined;
   const taskboardProject = { id: "tb-project", name: "Taskboard Project", workspacePath: "", issueCount: 1 };
   const taskboardClient = {
@@ -180,7 +189,7 @@ test("notifies Taskboard review state once with the latest evidence", async (t) 
     async projectForWorkspace() { return taskboardProject; },
     async issueForThread() { return undefined; }
   };
-  const { manager, root, sent } = setup(t, { taskboardClient });
+  const { manager, root, sent, sentCards } = setup(t, { taskboardClient, taskCards: true });
   taskboardProject.workspacePath = path.join(root, "review-project");
   const project = manager.createProject("account-one", "Review Project", taskboardProject.workspacePath);
   manager.setProjectNotifications("account-one", project.id, [{ accountId: "account-two", recipientId: "review-room", enabled: true }]);
@@ -194,10 +203,11 @@ test("notifies Taskboard review state once with the latest evidence", async (t) 
   await emit?.({ type: "task.moved", task: issue });
   await emit?.({ type: "task.moved", task: issue });
 
-  assert.equal(sent.length, 1);
-  assert.match(sent[0]?.text ?? "", /Taskboard · 待验收/);
-  assert.match(sent[0]?.text ?? "", /REVIEW-1 · Verify bridge/);
-  assert.match(sent[0]?.text ?? "", /测试与构建均通过/);
+  assert.equal(sent.length, 0);
+  assert.equal(sentCards.length, 1);
+  assert.equal(sentCards[0]?.card.identifier, "REVIEW-1");
+  assert.equal(sentCards[0]?.card.latestComment, "测试与构建均通过");
+  assert.deepEqual(sentCards[0]?.card.actions.map((action) => action.label), ["查看详情", "通过", "退回"]);
   await manager.stopAll();
 });
 

@@ -27,6 +27,9 @@ export type CodexRunnerInput = {
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
   onApproval?: CodexApprovalHandler;
+  ephemeral?: boolean;
+  outputSchema?: Record<string, unknown>;
+  sandbox?: CodexExecSandbox;
 };
 
 export type CodexHistoryMessage = {
@@ -140,6 +143,7 @@ export class AppServerCodexRunner {
       input.threadId ? "thread/resume" : "thread/start",
       compactObject({
         ...(input.threadId ? { threadId: input.threadId } : {}),
+        ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
         cwd: input.cwd,
         model: input.model,
         approvalPolicy: "never"
@@ -157,9 +161,10 @@ export class AppServerCodexRunner {
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
       cwd: input.cwd,
       approvalPolicy: input.onApproval ? "on-request" : "never",
-      sandboxPolicy: appServerSandboxPolicy(this.options.sandbox),
+      sandboxPolicy: appServerSandboxPolicy(input.sandbox ?? this.options.sandbox),
       model: input.model,
-      effort: input.effort
+      effort: input.effort,
+      outputSchema: input.outputSchema
     });
     let turnResponse: Record<string, unknown>;
     if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
@@ -339,7 +344,7 @@ export class AppServerCodexRunner {
           experimentalApi: false,
           requestAttestation: false
         }
-      }, Math.min(this.options.requestTimeoutMs ?? 600_000, 15_000));
+      }, Math.min(this.options.requestTimeoutMs ?? 600_000, 60_000));
       this.notify("initialized", {});
       this.initialized = true;
     } catch (error) {
@@ -365,9 +370,10 @@ export class AppServerCodexRunner {
       try {
         this.send({ id, method, params });
       } catch (error) {
+        const normalizedError = error instanceof Error ? error : new Error(String(error));
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(error);
+        reject(normalizedError);
       }
     });
   }
@@ -630,15 +636,17 @@ export class AppServerCodexRunner {
         this.send({ id, result: appServerApprovalResult(method, fallback, "decline") });
         return;
       }
-      void Promise.resolve(handler(request))
+      Promise.resolve(handler(request))
         .then((decision) => {
           this.send({ id, result: appServerApprovalResult(method, request, decision) });
         })
-        .catch(() => {
+        .catch((error) => {
           try {
             this.send({ id, result: appServerApprovalResult(method, request, "decline") });
-          } catch {
-            // The turn or transport already ended; there is nothing left to approve.
+          } catch (sendError) {
+            const approvalError = error instanceof Error ? error.message : String(error);
+            const transportError = sendError instanceof Error ? sendError.message : String(sendError);
+            console.warn(`Codex approval failed (${approvalError}) and decline could not be sent: ${transportError}`);
           }
         });
       return;

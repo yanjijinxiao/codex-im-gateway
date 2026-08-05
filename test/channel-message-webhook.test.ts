@@ -33,7 +33,7 @@ test("does not request a webhook when the channel has no webhook configured", ()
   assert.equal(requestCount, 1);
 });
 
-test("adapts channel events for an Enterprise WeChat incoming webhook", async () => {
+test("omits the sender when adapting inbound events for an Enterprise WeChat webhook", async () => {
   let requestBody: unknown;
   const webhook = new ChannelMessageWebhook({
     accountId: "account-one",
@@ -60,7 +60,6 @@ test("adapts channel events for an Enterprise WeChat incoming webhook", async ()
       content: [
         "[Codex Channel Bridge] 收到消息",
         "渠道: feishu",
-        "发送者: alice",
         "内容: hello",
         "附件: photo.png"
       ].join("\n")
@@ -69,7 +68,7 @@ test("adapts channel events for an Enterprise WeChat incoming webhook", async ()
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("adapts channel events for each selectable webhook provider", async () => {
+test("omits the recipient when adapting outbound events for each selectable webhook provider", async () => {
   const message = {
     direction: "outbound" as const,
     id: "message-2",
@@ -80,7 +79,6 @@ test("adapts channel events for each selectable webhook provider", async () => {
   const expectedText = [
     "[Codex Channel Bridge] 发出消息",
     "渠道: weixin",
-    "接收者: bob",
     "内容: build passed",
     "附件: report.txt"
   ].join("\n");
@@ -152,7 +150,6 @@ test("auto-detects known webhook providers for saved configurations without a pr
       text: [
         "[Codex Channel Bridge] 收到消息",
         "渠道: weixin",
-        "发送者: alice",
         "内容: hello"
       ].join("\n")
     }

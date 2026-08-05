@@ -64,13 +64,9 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 }
 
 function createNotificationText(channel: ChannelKind, message: ChannelMessage): string {
-  const counterparty = message.direction === "inbound"
-    ? `发送者: ${message.senderId}`
-    : `接收者: ${message.recipientId}`;
   const lines = [
     `[Codex Channel Bridge] ${message.direction === "inbound" ? "收到" : "发出"}消息`,
     `渠道: ${channel}`,
-    counterparty,
     ...(message.text ? [`内容: ${message.text}`] : []),
     ...(message.attachments.length
       ? [`附件: ${message.attachments.map((attachment) => attachment.label).join(", ")}`]

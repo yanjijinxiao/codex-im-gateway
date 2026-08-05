@@ -8,6 +8,7 @@ let nextTurn = 1;
 const activeTurns = new Map();
 const pendingApprovals = new Map();
 let externalBusyReads = 0;
+let ephemeralThreadStarted = false;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -100,6 +101,7 @@ rl.on("line", (line) => {
       fail(message.id, "approvalPolicy must be never");
       return;
     }
+    ephemeralThreadStarted = message.params?.ephemeral === true;
     respond(message.id, {
       thread: { id: "thread-new" },
       model: message.params.model ?? "configured-model",
@@ -234,6 +236,13 @@ rl.on("line", (line) => {
     if (prompt === "verify-danger-full-access"
       && message.params?.sandboxPolicy?.type !== "dangerFullAccess") {
       fail(message.id, "turn/start must propagate the configured danger-full-access sandbox");
+      return;
+    }
+    if (prompt === "classify-intent"
+      && (!ephemeralThreadStarted
+        || message.params?.sandboxPolicy?.type !== "readOnly"
+        || message.params?.outputSchema?.properties?.intent?.type !== "string")) {
+      fail(message.id, "intent classification must use an ephemeral read-only thread with output schema");
       return;
     }
     activeTurns.set(message.params.threadId, turnId);

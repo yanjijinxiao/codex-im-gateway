@@ -18,6 +18,14 @@ export type HybridCodexRunnerOptions = {
   timeoutMs?: number;
 };
 
+export type EphemeralCodexRunnerInput = {
+  readonly prompt: string;
+  readonly cwd: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly outputSchema?: Record<string, unknown>;
+};
+
 export class HybridCodexRunner {
   private readonly appServer: AppServerCodexRunner;
   private readonly exec: CodexExecRunner;
@@ -89,6 +97,18 @@ export class HybridCodexRunner {
       this.appServer.stop(threadId),
       this.exec.stop(threadId)
     ]);
+  }
+
+  runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult> {
+    return this.appServer.run({
+      ...input,
+      ephemeral: true,
+      sandbox: "read-only"
+    });
+  }
+
+  async warmUp(cwd: string): Promise<void> {
+    await this.appServer.getRuntimeInfo(cwd);
   }
 
   async getHistory(threadId: string): Promise<CodexHistoryMessage[]> {

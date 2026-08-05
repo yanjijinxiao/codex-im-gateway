@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { BridgeService } from "../src/bridge/service.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu.js";
+import { createTaskCard } from "../src/channels/task-card.js";
 import { defaultConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
@@ -62,6 +63,82 @@ test("Feishu uploads a local image and sends its image key to the target chat", 
       msg_type: "image",
       content: JSON.stringify({ image_key: "img_test" })
     }
+  }]);
+});
+
+test("Feishu sends an interactive Taskboard card and routes its button callback as a canonical command", async () => {
+  let dispatcher: { handles: Map<string, (event: unknown) => unknown> } | undefined;
+  const messages: Array<Record<string, unknown>> = [];
+  const inbound: Array<{ id: string; senderId: string; text: string }> = [];
+  const adapter = new FeishuChannelAdapter({
+    channel: "feishu",
+    accountId: "feishu-test",
+    appId: "cli_test",
+    appSecret: "secret",
+    savedAt: new Date().toISOString(),
+    enabled: true
+  }, {
+    apiClient: {
+      im: {
+        v1: {
+          image: { async create() { return { image_key: "unused" }; } },
+          message: {
+            async create(input: Record<string, unknown>) {
+              messages.push(input);
+              return { data: { message_id: "card-message" } };
+            }
+          },
+          messageResource: { async get() { throw new Error("not used"); } }
+        }
+      }
+    },
+    wsClient: {
+      async start(input) { dispatcher = input.eventDispatcher; },
+      close() {}
+    }
+  });
+  const issue = {
+    id: "task-one", identifier: "BRIDGE-1", projectId: "bridge", title: "完成渠道二期",
+    description: "", status: "in_review", priority: "high", labels: [], threadId: "thread-one",
+    version: 3, createdAt: "2026-08-05T00:00:00.000Z", updatedAt: "2026-08-05T01:00:00.000Z"
+  } as const;
+
+  const sent = await adapter.sendTaskCard({ toUserId: "oc_test", card: createTaskCard("Bridge", issue) });
+  assert.equal(sent.messageId, "card-message");
+  assert.equal((messages[0].data as { msg_type?: string }).msg_type, "interactive");
+  const content = JSON.parse((messages[0].data as { content: string }).content) as {
+    elements: Array<{ tag: string; actions?: Array<{ value?: unknown }> }>;
+  };
+  const actionElement = content.elements.find((element) => element.tag === "action");
+  assert.deepEqual(actionElement?.actions?.map((action) => action.value), [
+    { version: 1, command: "task", arg: "detail BRIDGE-1" },
+    { version: 1, command: "task", arg: "accept BRIDGE-1" },
+    { version: 1, command: "task", arg: "return BRIDGE-1" }
+  ]);
+
+  const controller = new AbortController();
+  const monitor = adapter.monitor({
+    signal: controller.signal,
+    async onMessage(message) {
+      inbound.push({ id: message.id, senderId: message.senderId, text: message.text });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(dispatcher);
+  await dispatcher.handles.get("card.action.trigger")?.({
+    token: "callback-token",
+    context: { open_message_id: "card-message", open_chat_id: "oc_test" },
+    operator: { open_id: "ou_operator" },
+    action: { tag: "button", value: { version: 1, command: "task", arg: "accept BRIDGE-1" } }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await monitor;
+
+  assert.deepEqual(inbound, [{
+    id: "feishu-card:callback-token",
+    senderId: "oc_test",
+    text: "/task accept BRIDGE-1"
   }]);
 });
 

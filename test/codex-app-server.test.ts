@@ -150,6 +150,28 @@ test("propagates the configured sandbox to an app-server turn", async (t) => {
   assert.equal(result.text, "reply:verify-danger-full-access");
 });
 
+test("runs AI classification on a persistent ephemeral app-server thread", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000,
+    execSandbox: "danger-full-access"
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.runEphemeral({
+    prompt: "classify-intent",
+    cwd: "/tmp",
+    outputSchema: {
+      type: "object",
+      properties: { intent: { type: "string" } },
+      required: ["intent"]
+    }
+  });
+
+  assert.equal(result.text, "reply:classify-intent");
+});
+
 test("routes command, file, and permission approvals to the active channel turn", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

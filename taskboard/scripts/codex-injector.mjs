@@ -3,6 +3,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -28,6 +29,7 @@ const injectionPath = path.join(projectRoot, "inject", "codex-taskboard.user.js"
 const automationPoliciesPath = path.join(projectRoot, ".data", "codex-automation-policies.json");
 const taskboardOrigin = `http://127.0.0.1:${resolvePort()}`;
 const taskboardHealthUrl = `${taskboardOrigin}/health`;
+const taskboardHealthTimeoutMs = 5_000;
 const taskboardPageUrl = `${taskboardOrigin}/?host=codex`;
 const hostBindingName = "__codexTaskboardHostV1";
 const hostHeartbeatName = "__codexTaskboardHostHeartbeatV1";
@@ -109,13 +111,30 @@ async function fetchJson(url) {
   return response.json();
 }
 
-async function isReachable(url) {
+async function isReachable(url, timeoutMs = 1_500) {
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(1_500) });
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     return response.ok;
   } catch {
     return false;
   }
+}
+
+function isPortListening(origin, timeoutMs = 500) {
+  const url = new URL(origin);
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+    let settled = false;
+    const finish = (listening) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+    socket.setTimeout(timeoutMs, () => finish(false));
+  });
 }
 
 async function waitUntilReachable(url, timeoutMs) {
@@ -142,10 +161,13 @@ function createTaskboardSupervisor({ detached }) {
   let stopping = false;
 
   async function ensure({ force = false } = {}) {
-    if (await isReachable(taskboardHealthUrl)) {
+    if (await isReachable(taskboardHealthUrl, taskboardHealthTimeoutMs)) {
       return { status: "ok", restarted: false };
     }
     if (ensureInFlight) return ensureInFlight;
+    if (await isPortListening(taskboardOrigin)) {
+      throw new Error("Taskboard service owns its port but did not answer /health");
+    }
     if (!force && Date.now() < retryAfter) {
       throw new Error("Taskboard restart is waiting before its next attempt");
     }
@@ -298,8 +320,31 @@ class CdpConnection {
   send(method, params = {}) {
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      // Renderer replacement can strand a CDP response while the WebSocket stays open.
+      // Retire the connection so the watch loop can attach a fresh one.
+      const timeout = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (!pending) return;
+        this.pending.delete(id);
+        pending.reject(new Error(`Timed out waiting for CDP response to ${method}`));
+        this.close();
+      }, 15_000);
+      const settle = (callback) => (value) => {
+        clearTimeout(timeout);
+        callback(value);
+      };
+      this.pending.set(id, {
+        resolve: settle(resolve),
+        reject: settle(reject),
+      });
+      try {
+        this.socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        const pending = this.pending.get(id);
+        this.pending.delete(id);
+        pending?.reject(error);
+        this.close();
+      }
     });
   }
 
@@ -335,6 +380,8 @@ class CdpConnection {
   }
 
   close() {
+    if (this.closed) return;
+    this.closed = true;
     this.socket.close();
   }
 }
@@ -1396,12 +1443,19 @@ async function main() {
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
 
+    let serviceEnsurePending = false;
     while (true) {
       await new Promise((resolve) => setTimeout(resolve, 2_000));
-      try {
-        await supervisor.ensure();
-      } catch (error) {
-        console.error(`Waiting for Taskboard service: ${error.message}`);
+      // Startup is service-gated above; recurring recovery must not block the host heartbeat.
+      if (!serviceEnsurePending) {
+        serviceEnsurePending = true;
+        supervisor.ensure()
+          .catch((error) => {
+            console.error(`Waiting for Taskboard service: ${error.message}`);
+          })
+          .finally(() => {
+            serviceEnsurePending = false;
+          });
       }
       for (const connection of injectedTargets.values()) {
         try {

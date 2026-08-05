@@ -74,7 +74,7 @@ async function main(): Promise<void> {
 
   console.log(`codex-channel-bridge is running at ${server.url}`);
   console.log(`State directory: ${paths.root}`);
-  if (taskboard) console.log(`Embedded Taskboard is running at ${taskboard.url}`);
+  if (taskboard) console.log(`Taskboard is available at ${taskboard.url}`);
   if ((process.env.CODEX_CHANNEL_BRIDGE_OPEN ?? process.env.CODEX_WEIXIN_OPEN) !== "0") {
     void open(server.url).catch((error: unknown) => {
       console.warn(`Unable to open the browser automatically: ${error instanceof Error ? error.message : String(error)}`);

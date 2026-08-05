@@ -7,6 +7,16 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import type { FeishuAccount } from "../weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import { feishuActionCard } from "./feishu-action-card.js";
+import { feishuTaskCard } from "./feishu-task-card.js";
+import {
+  type ChannelTaskCard
+} from "./task-card.js";
+import {
+  formatChannelActionCommand,
+  parseChannelActionValue,
+  type ChannelActionCard
+} from "./action-card.js";
 
 type FeishuAdapterOptions = {
   readonly apiClient?: {
@@ -65,27 +75,74 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
   }
 
+  async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<{ messageId: string }> {
+    const result = await this.apiClient.im.v1.message.create({
+      params: { receive_id_type: recipientType(input.toUserId) },
+      data: {
+        receive_id: input.toUserId,
+        msg_type: "interactive",
+        content: JSON.stringify(feishuActionCard(input.card))
+      }
+    });
+    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+  }
+
+  async sendTaskCard(input: { toUserId: string; card: ChannelTaskCard }): Promise<{ messageId: string }> {
+    const result = await this.apiClient.im.v1.message.create({
+      params: { receive_id_type: recipientType(input.toUserId) },
+      data: {
+        receive_id: input.toUserId,
+        msg_type: "interactive",
+        content: JSON.stringify(feishuTaskCard(input.card))
+      }
+    });
+    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+  }
+
   async monitor(options: ChannelMonitorOptions): Promise<void> {
     const dispatcher = new Lark.EventDispatcher({}).register({
-      "im.message.receive_v1": (event) => {
+      "im.message.receive_v1": async (event) => {
         if (event.message.message_type !== "text" && event.message.message_type !== "image") return;
         const pendingMessage: NormalizedWeixinMessage = {
           id: event.message.message_id,
           senderId: event.message.chat_id,
           text: "",
           attachments: [],
-          raw: event as unknown as NormalizedWeixinMessage["raw"]
+          raw: { channel: "feishu", event }
         };
         if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
-        void this.normalizeMessage(pendingMessage, event.message.message_type, event.message.content)
-          .then(options.onMessage)
-          .catch(async (error) => {
-            try {
-              await options.onMessageError?.(error, pendingMessage);
-            } catch (reportError) {
-              console.error(`[codex-channel-bridge] failed to report Feishu message error: ${errorDetail(reportError)}`);
-            }
-          });
+        try {
+          await options.onMessage(await this.normalizeMessage(
+            pendingMessage,
+            event.message.message_type,
+            event.message.content
+          ));
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          await reportMessageError(options, error, pendingMessage);
+        }
+      },
+      "card.action.trigger": async (rawEvent: Lark.RawCardActionEvent) => {
+        const event = Lark.normalizeCardAction(rawEvent, { includeRaw: true });
+        const action = parseChannelActionValue(event?.action.value);
+        if (!event || !action) return;
+        const token = typeof rawEvent.token === "string" && rawEvent.token.trim()
+          ? rawEvent.token.trim()
+          : cardActionIdentity(event);
+        const pendingMessage: NormalizedWeixinMessage = {
+          id: `feishu-card:${token}`,
+          senderId: event.chatId,
+          text: formatChannelActionCommand(action),
+          attachments: [],
+          raw: { channel: "feishu", event: rawEvent }
+        };
+        if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
+        try {
+          await options.onMessage(pendingMessage);
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          await reportMessageError(options, error, pendingMessage);
+        }
       }
     });
     const started = this.wsClient.start({ eventDispatcher: dispatcher });
@@ -114,6 +171,27 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
       ...message,
       attachments: [{ kind: "image", label: path.basename(targetPath), item: {}, path: targetPath }]
     };
+  }
+}
+
+function cardActionIdentity(event: Lark.CardActionEvent): string {
+  const value = JSON.stringify(event.action.value ?? "");
+  return crypto.createHash("sha256")
+    .update(`${event.messageId}\n${event.operator.openId}\n${value}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+async function reportMessageError(
+  options: ChannelMonitorOptions,
+  error: Error,
+  message: NormalizedWeixinMessage
+): Promise<void> {
+  try {
+    await options.onMessageError?.(error, message);
+  } catch (reportError) {
+    if (!(reportError instanceof Error)) throw reportError;
+    console.error(`[codex-channel-bridge] failed to report Feishu message error: ${errorDetail(reportError)}`);
   }
 }
 

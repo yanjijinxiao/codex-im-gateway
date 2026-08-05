@@ -3,12 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { parseActionBlocks } from "../bridge/actions.js";
+import { createCodexChannelIntentResolver } from "../bridge/ai-channel-intent.js";
 import { buildPrompt, buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
 import { FeishuChannelAdapter } from "../channels/feishu.js";
 import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
+import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
 import { WeComChannelAdapter } from "../channels/wecom.js";
 import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
@@ -319,12 +321,18 @@ export class AccountManager {
     );
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
     const config = this.configProvider();
+    const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       config,
       stateStore: store,
       weixin: client,
       inboundDir: statePaths.inboundDir,
-      runner: this.runnerFor(config),
+      runner,
+      intentResolver: createCodexChannelIntentResolver({
+        runner,
+        cwd: this.options.paths.root,
+        ...(config.model ? { model: config.model } : {})
+      }),
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
       taskboard: this.taskboardFor(config),
@@ -406,7 +414,8 @@ export class AccountManager {
       retainAccountHistory(this.options.paths, account as WeixinAccount);
     } else if (accountChannel(account) === "weixin" && (account as WeixinAccount).userId) {
       const weixin = account as WeixinAccount;
-      forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId: weixin.userId! });
+      const userId = weixin.userId;
+      if (userId) forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId });
     }
     deleteAccount(this.options.paths, accountId);
     if (!retainHistory) {
@@ -807,8 +816,15 @@ export class AccountManager {
   }
 
   private runnerFor(config = this.configProvider()): HybridCodexRunner {
-    this.runner ??= this.runnerFactory(config);
-    return this.runner;
+    if (this.runner) return this.runner;
+    const runner = this.runnerFactory(config);
+    this.runner = runner;
+    runner.warmUp(this.options.paths.root).catch((error: unknown) => {
+      console.warn("[codex-channel-bridge] Codex app-server warm-up failed", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+    return runner;
   }
 
   private closeRunner(): void {
@@ -906,7 +922,8 @@ export class AccountManager {
       console.warn(`[codex-channel-bridge] no running notification channel for approval in project ${project.name}`);
       return undefined;
     }
-    return this.entries.get(target.accountId)!.service!.requestApproval(target.recipientId, request);
+    const entry = this.entries.get(target.accountId);
+    return entry?.service?.requestApproval(target.recipientId, request);
   }
 
   private projectForExternalThread(threadId: string, workspace?: string): ManagedProject | undefined {
@@ -1030,7 +1047,7 @@ export class AccountManager {
     const targets = (project.notifications ?? []).filter((target) => target.enabled);
     if (!targets.length) return;
     const issue = threadId ? await this.issueForProjectThread(project, threadId) : undefined;
-    if (issue && this.wasRecentlyNotified(issue)) return;
+    if (success && issue && this.wasRecentlyNotified(issue)) return;
     const excerpt = resultText.replace(/\s+/g, " ").trim().slice(0, 500);
     const text = [
       success ? "【Codex 任务已完成】" : "【Codex 任务执行失败】",
@@ -1039,24 +1056,12 @@ export class AccountManager {
       `任务：${taskTitle.replace(/\s+/g, " ").trim().slice(0, 100) || "Codex 会话"}`,
       ...(excerpt ? [`${success ? "结果" : "错误"}：${excerpt}`] : [])
     ].join("\n");
-    await Promise.allSettled(targets.map(async (target) => {
-      const entry = this.entries.get(target.accountId);
-      if (!entry?.client || entry.status !== "running") {
-        throw new Error(`Notification channel is not running: ${target.accountId}`);
-      }
-      const contextToken = entry.store?.getContextToken(target.recipientId);
-      await this.sendChannelText(entry, {
-        recipientId: target.recipientId,
-        text,
-        ...(contextToken ? { contextToken } : {})
-      });
-    })).then((results) => {
-      for (const result of results) {
-        if (result.status === "rejected") {
-          console.error(`[codex-channel-bridge] project completion notification failed: ${String(result.reason)}`);
-        }
-      }
-    });
+    const card = issue ? createTaskCard(project.name, issue, {
+      title: success ? "Codex 任务已完成" : "Codex 任务执行失败",
+      note: excerpt ? `${success ? "结果" : "错误"}：${excerpt}` : undefined,
+      template: success ? "green" : "red"
+    }) : undefined;
+    await this.sendNotificationTargets(targets, text, card);
   }
 
   async getTaskboardStatus(): Promise<TaskboardIntegrationStatus> {
@@ -1066,7 +1071,10 @@ export class AccountManager {
       return { enabled: false, managed: true, available: false, url: config.taskboardUrl, projects: managed.map(taskboardProjectBase) };
     }
     try {
-      const client = this.taskboardFor(config)!;
+      const client = this.taskboardFor(config);
+      if (!client) {
+        return { enabled: true, managed: true, available: false, url: config.taskboardUrl, projects: managed.map(taskboardProjectBase) };
+      }
       const projects = await client.listProjects();
       return {
         enabled: true,
@@ -1163,10 +1171,12 @@ export class AccountManager {
     if (this.recentTaskboardNotifications.has(key)) return;
     this.recentTaskboardNotifications.set(key, Date.now());
     this.pruneTaskboardNotifications();
-    const taskboardProjects = await this.taskboard!.listProjects();
+    const taskboard = this.taskboard;
+    if (!taskboard) return;
+    const taskboardProjects = await taskboard.listProjects();
     const taskboardProject = taskboardProjects.find((project) => project.id === issue.projectId);
     if (!taskboardProject?.workspacePath) return;
-    const latestComment = (await this.taskboard!.listComments(issue.id)).at(-1)?.body;
+    const latestComment = (await taskboard.listComments(issue.id)).at(-1)?.body;
     const workspace = canonicalWorkspace(taskboardProject.workspacePath);
     await Promise.all(listAccounts(this.options.paths).flatMap((account) => {
       const store = this.storeFor(account.accountId);
@@ -1190,30 +1200,42 @@ export class AccountManager {
       `Issue：${issue.identifier} · ${issue.title}`,
       ...(excerpt ? [`最新记录：${excerpt}`] : [])
     ].join("\n");
-    await this.sendNotificationTargets(targets, text);
+    await this.sendNotificationTargets(targets, text, createTaskCard(project.name, issue, {
+      latestComment: excerpt
+    }));
   }
 
-  private async sendNotificationTargets(targets: ProjectNotificationTarget[], text: string): Promise<void> {
+  private async sendNotificationTargets(
+    targets: ProjectNotificationTarget[],
+    text: string,
+    card?: ChannelTaskCard
+  ): Promise<void> {
     const results = await Promise.allSettled(targets.map(async (target) => {
       const entry = this.entries.get(target.accountId);
       if (!entry?.client || entry.status !== "running") throw new Error(`Notification channel is not running: ${target.accountId}`);
       const contextToken = entry.store?.getContextToken(target.recipientId);
-      await this.sendChannelText(entry, {
+      const message = {
         recipientId: target.recipientId,
         text,
         ...(contextToken ? { contextToken } : {})
-      });
+      };
+      if (card && entry.client.sendTaskCard) await this.sendChannelTaskCard(entry, message, card);
+      else await this.sendChannelText(entry, message);
     }));
     for (const result of results) {
-      if (result.status === "rejected") console.error(`[codex-channel-bridge] Taskboard notification failed: ${String(result.reason)}`);
+      if (result.status === "rejected") console.error(`[codex-channel-bridge] channel notification failed: ${String(result.reason)}`);
     }
   }
 
   private async issueForProjectThread(project: ManagedProject, threadId: string): Promise<TaskboardIssue | undefined> {
     try {
-      const taskboardProject = await this.taskboardFor()?.projectForWorkspace(project.workspace);
-      return taskboardProject ? await this.taskboard!.issueForThread(taskboardProject.id, threadId) : undefined;
-    } catch {
+      const taskboard = this.taskboardFor();
+      const taskboardProject = await taskboard?.projectForWorkspace(project.workspace);
+      return taskboard && taskboardProject
+        ? await taskboard.issueForThread(taskboardProject.id, threadId)
+        : undefined;
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
       return undefined;
     }
   }
@@ -1256,6 +1278,22 @@ export class AccountManager {
       attachments: []
     });
   }
+
+  private async sendChannelTaskCard(
+    entry: RuntimeEntry,
+    message: DirectChannelText,
+    card: ChannelTaskCard
+  ): Promise<void> {
+    if (!entry.client?.sendTaskCard) throw new Error("Notification channel card capability is not available");
+    const sent = await entry.client.sendTaskCard({ toUserId: message.recipientId, card });
+    entry.webhook?.publish({
+      direction: "outbound",
+      id: sent.messageId,
+      recipientId: message.recipientId,
+      text: message.text,
+      attachments: []
+    });
+  }
 }
 
 function requireSession(store: RuntimeStateStore, sessionId: string): ManagedSession {
@@ -1284,7 +1322,8 @@ function sessionAttachment(
     const stat = fs.statSync(action.path);
     available = stat.isFile();
     if (available) size = stat.size;
-  } catch {
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
     // Keep historical attachments visible even after their local file is moved.
   }
   return {

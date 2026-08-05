@@ -38,9 +38,9 @@
   <img src="docs/images/screenshots/wechat-voice-command.png" alt="通过微信语音向 Codex 下达指令" width="420" />
 </p>
 
-### 3. Codex CLI 原生命令
+### 3. 自然语言工作台与底层命令
 
-消息渠道支持 `/help`、`/status`、`/balance`、`/memory`、`/project`、`/task`、`/sessions`、`/session`、`/new`、`/resume`、`/model`、`/effort`、`/stream`、`/prompt start`、`/prompt done`、`/approve`、`/reject` 和 `/stop`，可以管理项目、Taskboard Issue、会话、个人知识库、模型、推理强度、过程进度与 Codex 运行审批，并查看当前 Codex 账号剩余用量。
+消息渠道默认使用自然语言工作台，可以直接发送“查看任务”“切换到 codex-weixin”“新任务：补充飞书卡片”“记录：测试通过”“提交验收”“通过”或“退回：缺少运行态验证”。普通消息会先由 AI 做语义识别，而不是匹配固定关键词；只有高置信度且通过结构化校验、动作白名单和参数校验的工作台意图，才会映射为 `/project`、`/task` 等稳定命令。低置信度、识别失败或普通项目讨论会继续交给 Codex 自然对话。斜杠命令保留为可审计、可脚本化、绕过语义识别的底层能力。完整命令还可以管理会话、个人知识库、模型、推理强度、过程进度与 Codex 运行审批，并查看当前 Codex 账号剩余用量。
 
 <p align="center">
   <img src="docs/images/screenshots/wechat-cli-commands.png" alt="在微信中使用 Codex CLI 原生命令" width="420" />
@@ -170,7 +170,7 @@ npm run taskboard:codex
 - “切换”决定该联系人下一条微信消息继续哪个 Codex thread。
 - “重置”清空本服务记录的 thread，下一条消息创建新上下文。
 - “删除”只删除本服务中的会话记录，不删除 Codex 自身保存的历史文件。
-- 微信中的 `/sessions` 会列出当前项目最近活跃的 10 个桥接或 Codex Desktop 会话、最近内容摘要和时间，并为每项生成 `R1`、`R2` 这类独立编号；发送 `/session R1` 会把真实 Codex thread 绑定到当前项目并继续对话，旧 `/resume` 命令仍兼容。
+- 微信中的 `/sessions` 会列出当前项目最近活跃的 10 个桥接或 Codex Desktop 会话、最近内容摘要和时间，并为每项生成 `R1`、`R2` 这类独立编号；发送 `/session R1` 会把真实 Codex thread 绑定到当前项目并继续对话。
 - 微信中的 `/new` 会立即在当前项目创建并绑定新的受管会话。
 - 同一个 Codex thread 在微信、企业微信、飞书、Web 或 Codex Desktop 中已有任务运行时，后续消息会按顺序排队并显示等待进度；前一条成功、失败、中断或超时后都会释放队列和“处理中”状态，不会并发覆盖同一会话。
 
@@ -198,6 +198,8 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 ## 消息渠道内命令
 
+自然语言是默认入口：AI 以当前项目、可用项目和当前 Issue 上下文做语义识别，再把通过结构化白名单校验的意图映射到同一工作流；不依赖固定关键词，也不会直接执行模型自由生成的命令。低置信度或无法确定的消息按普通 Codex 对话处理。斜杠命令是确定性、可脚本化且不经过 AI 识别的底层能力。Taskboard 是状态唯一事实源：聊天只维护当前项目和当前 Issue 上下文；“记录”以及阻塞、验收等里程碑会写回 Issue，普通讨论仍留在 Codex thread。飞书会把 Taskboard Issue 显示为交互卡片，并按状态提供“开始处理”“查看详情”“提交验收”“通过”“退回”等按钮；按钮回调也执行下列同一组命令。
+
 ```text
 /help            /h           查看命令
 /status          /st          查看当前会话、工作目录、thread、backend、实际模型和推理强度
@@ -210,21 +212,24 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 /project add     /p a         查看可从 Codex 历史添加的项目
 /project add C1  /p a C1      按 C 编号添加 Codex 历史项目
 /project P1      /p P1        切换已绑定项目
+/project switch 完整项目名    按名称切换已绑定项目
 /project rename P1|名称 /p rn P1|名称  重命名项目
 /project delete P1      /p d P1        移除没有运行任务的项目
 /task            /tb          查看当前项目未完成的 Taskboard Issue
 /task ISSUE编号              绑定并继续 Issue 对应的 Codex thread
 /task new 标题               创建、领取并开始处理新 Issue
+/task todo 标题              创建待办，但不开始处理
 /task start ISSUE编号        领取并开始处理已有 Issue
+/task detail ISSUE编号       查看 Issue 状态、说明、最新记录和可用操作
 /task comment ISSUE编号 内容  添加带当前 threadId 的评论；可同时发送附件
 /task attach ISSUE编号       把当前消息附件上传到 Issue
 /task block ISSUE编号 原因   记录阻塞原因并标记阻塞
 /task review ISSUE编号       验证、记录证据并提交验收
 /task accept ISSUE编号       按验收门禁处理；只有用户确认后才可完成
+/task return ISSUE编号 原因  从待验收退回处理中并记录原因
 /sessions        /ss          查看当前项目最近活跃的 10 个会话
 /session R1      /s R1        绑定并继续当前项目的指定会话
 /new             /n           在当前项目新建并绑定 Codex 会话
-/resume R1       /r R1        兼容旧版会话查看与切换命令
 /model           /m           查看当前模型和可用模型
 /model <序号|模型 ID|default>  切换当前会话模型，或恢复继承设置
 /effort          /e           查看当前模型支持的推理强度

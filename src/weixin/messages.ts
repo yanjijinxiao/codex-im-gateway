@@ -1,4 +1,5 @@
 export type WeixinRawMessage = {
+  [key: string]: unknown;
   message_id?: string | number;
   from_user_id?: string;
   sender?: string;

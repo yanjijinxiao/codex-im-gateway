@@ -1,6 +1,7 @@
 import type { AddressInfo } from "node:net";
 
 import { createTaskboardServer } from "codex-taskboard/server";
+import { TaskboardClient } from "./client.js";
 
 export type EmbeddedTaskboard = {
   url: string;
@@ -21,6 +22,8 @@ export async function startEmbeddedTaskboard(options: {
   dataDirectory: string;
   port: number;
 }): Promise<EmbeddedTaskboard> {
+  const existing = await reuseHealthyTaskboard(options.port);
+  if (existing) return existing;
   const taskboard = createTaskboardServer({ dataDirectory: options.dataDirectory });
   try {
     const address = await taskboard.listen({ host: "127.0.0.1", port: options.port });
@@ -37,10 +40,24 @@ export async function startEmbeddedTaskboard(options: {
     };
   } catch (cause) {
     await taskboard.close().catch(() => undefined);
+    const raced = await reuseHealthyTaskboard(options.port);
+    if (raced) return raced;
     throw new EmbeddedTaskboardStartError(
       `Unable to start the embedded Taskboard on port ${options.port}`,
       cause
     );
+  }
+}
+
+async function reuseHealthyTaskboard(port: number): Promise<EmbeddedTaskboard | undefined> {
+  if (port === 0) return undefined;
+  const url = `http://127.0.0.1:${port}`;
+  try {
+    await new TaskboardClient({ baseUrl: url, timeoutMs: 1_500 }).health();
+    return { url, close: () => Promise.resolve() };
+  } catch (error) {
+    if (error instanceof Error) return undefined;
+    throw error;
   }
 }
 

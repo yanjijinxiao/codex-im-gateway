@@ -4,8 +4,15 @@ import path from "node:path";
 import { AccessController } from "./access.js";
 import { ChannelApprovalController } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
+import type { ChannelCommand, FriendlyChannelIntent } from "./channel-intent.js";
+import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
+import {
+  conciseButtonLabel,
+  createCommandSelectionCard,
+  createMainMenuCard
+} from "./interaction-cards.js";
 import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { HybridCodexRunner } from "../codex/runner.js";
@@ -24,7 +31,13 @@ import type { OutboundChannelMessage } from "../webhooks/channel-message-webhook
 import type { PromptBufferItem } from "./prompt-buffer.js";
 import { formatAccountBalance, type CodexAccountBalance } from "../codex/account-balance.js";
 import type { ChannelTextClient } from "../channels/types.js";
-import type { TaskboardClient, TaskboardIssue, TaskboardProject, TaskboardStatus } from "../taskboard/client.js";
+import {
+  createChoiceCard,
+  type ChannelActionCard,
+  type ChannelChoice
+} from "../channels/action-card.js";
+import { createTaskCard, formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
+import type { TaskboardClient, TaskboardIssue, TaskboardProject } from "../taskboard/client.js";
 
 const RECENT_PROJECT_SESSION_LIMIT = 10;
 
@@ -47,6 +60,7 @@ export type BridgeServiceOptions = {
   inboundDir?: string;
   mediaFetch?: FetchLike;
   taskboard?: TaskboardClient;
+  intentResolver?: ChannelIntentResolver;
   approvalTimeoutMs?: number;
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
   onTurnCompleted?: (result: {
@@ -75,7 +89,9 @@ export class BridgeService {
       ttlMs: options.config.promptBufferTtlMs
     });
     this.approvals = new ChannelApprovalController(
-      (senderId, text) => this.reply(senderId, text),
+      (senderId, notice) => notice.card
+        ? this.replyActionCard(senderId, notice.card)
+        : this.reply(senderId, notice.text),
       options.approvalTimeoutMs
     );
     this.runner = options.runner ?? new HybridCodexRunner({
@@ -97,15 +113,26 @@ export class BridgeService {
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
 
-    const command = parseCommand(message.text);
-    const canRunWithoutProject = command && [
-      "help", "h", "balance", "memory", "knowledge", "project", "projects", "bind", "approve", "reject"
+    const slashCommand = parseCommand(message.text);
+    const friendlyIntent = slashCommand
+      ? undefined
+      : await this.resolveFriendlyChannelIntent(message.senderId, message.text);
+    if (friendlyIntent?.kind === "clarification") {
+      await this.reply(message.senderId, friendlyIntent.text);
+      return;
+    }
+    const command = slashCommand ?? (friendlyIntent?.kind === "command" ? friendlyIntent.command : undefined);
+    const canRunWithoutProject = command && ![
+      "status", "task", "new", "session", "sessions", "model", "effort", "stream", "prompt", "stop"
     ].includes(command.name);
     if (!canRunWithoutProject && !this.ensureBoundProjectSession(message.senderId)) {
-      await this.reply(
-        message.senderId,
-        "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。"
-      );
+      const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
+      await this.replyActionCard(message.senderId, createChoiceCard({
+        title: "先添加一个 Codex 项目",
+        body: "还没有绑定项目。点击下方按钮，从 Codex 历史项目中选择。",
+        fallbackText,
+        choices: [{ label: "选择历史项目", command: "project", arg: "add", style: "primary" }]
+      }));
       return;
     }
     if (command) {
@@ -120,18 +147,51 @@ export class BridgeService {
       for (const item of items) {
         this.buffers.append(message.senderId, item);
       }
-      await this.reply(message.senderId, "Buffered. Send /prompt done when ready.");
+      await this.replyActionCard(message.senderId, createChoiceCard({
+        title: "消息已加入合并区",
+        body: "可以继续发送内容；准备好后点击“提交合并消息”。",
+        fallbackText: "Buffered. Send /prompt done when ready.",
+        choices: [{ label: "提交合并消息", command: "prompt", arg: "done", style: "primary" }]
+      }));
       return;
     }
 
     await this.runCodexTurn(message, "", items);
   }
 
-  private async handleCommand(message: NormalizedWeixinMessage, command: { name: string; arg: string }): Promise<void> {
+  private async resolveFriendlyChannelIntent(
+    senderId: string,
+    text: string
+  ): Promise<FriendlyChannelIntent | undefined> {
+    const resolver = this.options.intentResolver;
+    if (!resolver || !text.trim()) return undefined;
+    const projects = this.options.stateStore.listProjects();
+    const activeSession = this.options.stateStore.getActiveSession(senderId);
+    const currentProjectName = activeSession?.projectId
+      ? projects.find((project) => project.id === activeSession.projectId)?.name
+      : undefined;
+    try {
+      return await resolver.resolve({
+        text,
+        ...(currentProjectName ? { currentProjectName } : {}),
+        projectNames: projects.map((project) => project.name)
+      });
+    } catch (error) {
+      if (error instanceof Error) {
+        console.warn("[codex-channel-bridge] AI intent classification unavailable; using ordinary chat", {
+          error: error.message
+        });
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async handleCommand(message: NormalizedWeixinMessage, command: ChannelCommand): Promise<void> {
     switch (command.name) {
       case "help":
       case "h":
-        await this.reply(message.senderId, helpText());
+        await this.replyActionCard(message.senderId, createMainMenuCard(helpText()));
         return;
       case "status":
       case "where":
@@ -144,12 +204,6 @@ export class BridgeService {
       case "knowledge":
         await this.handleMemoryCommand(message.senderId, command.arg);
         return;
-      case "bind":
-        await this.reply(
-          message.senderId,
-          "手工路径绑定已停用。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。"
-        );
-        return;
       case "project":
       case "projects":
         await this.handleProjectCommand(message.senderId, command.arg);
@@ -159,9 +213,27 @@ export class BridgeService {
         return;
       case "new":
         {
-          const activeSession = this.options.stateStore.getActiveSession(message.senderId)!;
+          const activeSession = this.options.stateStore.getActiveSession(message.senderId);
+          if (!activeSession) {
+            await this.replyActionCard(message.senderId, createChoiceCard({
+              title: "先选择项目",
+              body: "新会话需要归属到一个 Codex 项目。",
+              fallbackText: "请先选择一个项目，再新建会话。",
+              choices: [{ label: "选择项目", command: "project", arg: "list", style: "primary" }]
+            }));
+            return;
+          }
           const project = this.options.stateStore.listProjects()
-            .find((candidate) => candidate.id === activeSession.projectId)!;
+            .find((candidate) => candidate.id === activeSession.projectId);
+          if (!project) {
+            await this.replyActionCard(message.senderId, createChoiceCard({
+              title: "项目已不存在",
+              body: "当前会话关联的项目已被移除，请重新选择。",
+              fallbackText: "当前会话的项目已不存在，请重新选择项目。",
+              choices: [{ label: "重新选择项目", command: "project", arg: "list", style: "primary" }]
+            }));
+            return;
+          }
           const session = this.options.stateStore.createSession(
             message.senderId,
             project.workspace,
@@ -174,10 +246,9 @@ export class BridgeService {
           );
         }
         return;
-      case "resume":
       case "session":
       case "sessions":
-        await this.handleResumeCommand(message.senderId, command.arg);
+        await this.handleSessionCommand(message.senderId, command.arg);
         return;
       case "model":
         await this.handleModelCommand(message.senderId, command.arg);
@@ -203,7 +274,9 @@ export class BridgeService {
         await this.reply(message.senderId, "Stop signal sent.");
         return;
       default:
-        await this.reply(message.senderId, `Unknown command: /${command.name}. Send /help.`);
+        await this.replyActionCard(message.senderId, createMainMenuCard(
+          `未知命令：/${command.name}。发送 /help 查看可用命令。`
+        ));
     }
   }
 
@@ -231,43 +304,98 @@ export class BridgeService {
     if (!input || input.toLowerCase() === "list") {
       const issues = await taskboard.listIssues({ projectId: context.taskboardProject.id });
       const active = issues.filter((issue) => !["done", "canceled"].includes(issue.status));
-      await this.reply(message.senderId, active.length ? [
+      if (!active.length) {
+        await this.reply(message.senderId, `Taskboard · ${context.taskboardProject.name}\n当前没有未完成 Issue。`);
+        return;
+      }
+      if (this.options.weixin.sendTaskCard) {
+        for (const issue of active) {
+          await this.replyTaskCard(message.senderId, createTaskCard(context.managedProject.name, issue));
+        }
+        return;
+      }
+      await this.reply(message.senderId, [
         `Taskboard · ${context.taskboardProject.name}`,
         ...active.map((issue) => `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}`),
         "发送 /task ISSUE编号 绑定；/task start ISSUE编号 开始处理。"
-      ].join("\n") : `Taskboard · ${context.taskboardProject.name}\n当前没有未完成 Issue。`);
+      ].join("\n"));
       return;
     }
 
     const [rawAction, rawIdentifier, ...rest] = input.split(/\s+/);
     const action = rawAction.toLowerCase();
-    if (action === "new") {
+    if (action === "new" || action === "todo") {
       const title = [rawIdentifier, ...rest].filter(Boolean).join(" ").trim();
       if (!title) {
-        await this.reply(message.senderId, "用法：/task new Issue 标题");
+        await this.reply(message.senderId, `用法：/task ${action} Issue 标题`);
+        return;
+      }
+      const issue = await taskboard.createIssue({
+        projectId: context.taskboardProject.id,
+        title,
+        status: "todo",
+        priority: "none",
+        labels: []
+      });
+      if (action === "todo") {
+        await this.replyTaskCard(message.senderId, createTaskCard(
+          context.managedProject.name,
+          issue,
+          { note: "已记入待办，尚未开始处理。" }
+        ));
         return;
       }
       const managedProject = context.managedProject;
       this.options.stateStore.createSession(message.senderId, managedProject.workspace, title, managedProject.id);
       await this.runCodexTurn(message, taskboardSkillPrompt(
-        `在 Taskboard 项目 ${context.taskboardProject.id} 中创建标题为“${title}”的 Issue，并领取后开始处理。`
+        `领取并开始处理刚创建的 ${issue.identifier}；将当前 Codex thread 绑定到该 Issue。`
       ));
       return;
     }
 
-    if (["start", "block", "review", "accept", "comment", "attach"].includes(action)) {
+    if (["start", "block", "review", "accept", "return", "comment", "attach", "detail"].includes(action)) {
       if (!rawIdentifier) {
-        await this.reply(message.senderId, `用法：/task ${action} ISSUE编号${action === "comment" ? " 评论内容" : ""}`);
+        const fallbackText = `用法：/task ${action} ISSUE编号${action === "comment" ? " 评论内容" : ""}`;
+        await this.replyActionCard(message.senderId, createChoiceCard({
+          title: "先选择 Taskboard Issue",
+          body: action === "comment" ? "请选择 Issue；评论内容仍可直接用自然语言补充。" : "请选择要操作的 Issue。",
+          fallbackText,
+          choices: [{ label: "查看 Issue", command: "task", arg: "list", style: "primary" }]
+        }));
         return;
       }
-      const issue = await this.resolveTaskboardIssue(context.taskboardProject, rawIdentifier, message.senderId);
+      const issue = await this.resolveTaskboardIssueTarget(context, rawIdentifier, message.senderId);
       if (!issue) return;
-      if (issue.threadId) this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
+      if (action === "detail") {
+        const latestComment = (await taskboard.listComments(issue.id)).at(-1)?.body;
+        await this.replyTaskCard(message.senderId, createTaskCard(
+          context.managedProject.name,
+          issue,
+          { latestComment }
+        ));
+        return;
+      }
+      if (issue.threadId) {
+        this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
+      } else if (action === "start") {
+        this.options.stateStore.createSession(
+          message.senderId,
+          context.managedProject.workspace,
+          issue.title,
+          context.managedProject.id
+        );
+      }
       if (action === "comment" || action === "attach") {
         const body = action === "comment" ? rest.join(" ").trim() : "";
         const threadId = issue.threadId ?? this.options.stateStore.getActiveSession(message.senderId)?.threadId;
         if (!threadId) {
-          await this.reply(message.senderId, `Issue ${issue.identifier} 尚未关联 Codex 任务，请先发送 /task start ${issue.identifier}。`);
+          const fallbackText = `Issue ${issue.identifier} 尚未关联 Codex 任务，请先发送 /task start ${issue.identifier}。`;
+          await this.replyActionCard(message.senderId, createChoiceCard({
+            title: `${issue.identifier} 尚未开始`,
+            body: "先领取并开始处理，之后即可添加评论或附件。",
+            fallbackText,
+            choices: [{ label: "开始处理", command: "task", arg: `start ${issue.identifier}`, style: "primary" }]
+          }));
           return;
         }
         if (action === "comment" && body) await taskboard.addComment(issue.id, body, threadId);
@@ -283,13 +411,20 @@ export class BridgeService {
         return;
       }
       const detail = rest.join(" ").trim();
-      const instruction = {
-        start: `领取并开始处理 ${issue.identifier}。`,
-        block: `将 ${issue.identifier} 标记为阻塞，并记录阻塞原因：${detail || "原因待补充"}。`,
-        review: `完成 ${issue.identifier} 的检查与证据记录，然后提交验收。${detail ? ` 补充：${detail}` : ""}`,
-        accept: `验收 ${issue.identifier}；只有完成门禁满足时才标记完成，否则明确记录未通过原因。${detail ? ` 补充：${detail}` : ""}`
-      }[action];
-      await this.runCodexTurn(message, taskboardSkillPrompt(instruction!));
+      if (action === "block" && !detail) {
+        await this.reply(message.senderId, `请补充 ${issue.identifier} 的阻塞原因，例如：/task block ${issue.identifier} 等待接口权限。`);
+        return;
+      }
+      if (action === "return" && !detail) {
+        await this.reply(message.senderId, `请补充 ${issue.identifier} 的退回原因，例如：/task return ${issue.identifier} 缺少运行态验证。`);
+        return;
+      }
+      const instruction = taskboardWorkflowInstruction(action, issue, detail);
+      if (!instruction) {
+        await this.reply(message.senderId, `不支持的 Taskboard 操作：${action}`);
+        return;
+      }
+      await this.runCodexTurn(message, taskboardSkillPrompt(instruction));
       return;
     }
 
@@ -299,8 +434,42 @@ export class BridgeService {
       this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
       await this.reply(message.senderId, `已绑定 ${issue.identifier} · ${issue.title}\n状态：${formatTaskboardStatus(issue.status)}\n下一条消息会在对应 Codex 任务中继续。`);
     } else {
-      await this.reply(message.senderId, `${issue.identifier} 尚未关联 Codex 任务。发送 /task start ${issue.identifier} 领取并开始处理。`);
+      const fallbackText = `${issue.identifier} 尚未关联 Codex 任务。发送 /task start ${issue.identifier} 领取并开始处理。`;
+      await this.replyActionCard(message.senderId, createChoiceCard({
+        title: `${issue.identifier} 尚未开始`,
+        body: issue.title,
+        fallbackText,
+        choices: [{ label: "领取并开始", command: "task", arg: `start ${issue.identifier}`, style: "primary" }]
+      }));
     }
+  }
+
+  private async resolveTaskboardIssueTarget(
+    context: { session: ManagedSession; taskboardProject: TaskboardProject },
+    identifier: string,
+    senderId: string
+  ): Promise<TaskboardIssue | undefined> {
+    if (identifier.toLowerCase() !== "current") {
+      return this.resolveTaskboardIssue(context.taskboardProject, identifier, senderId);
+    }
+    if (!context.session.threadId) {
+      await this.reply(senderId, "当前会话尚未绑定 Taskboard Issue，请明确提供 ISSUE 编号。");
+      return undefined;
+    }
+    const taskboard = this.options.taskboard;
+    if (!taskboard) {
+      await this.reply(senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
+      return undefined;
+    }
+    const issue = await taskboard.issueForThread(
+      context.taskboardProject.id,
+      context.session.threadId
+    );
+    if (!issue) {
+      await this.reply(senderId, "当前 Codex 会话没有对应的 Taskboard Issue，请明确提供 ISSUE 编号。");
+      return undefined;
+    }
+    return issue;
   }
 
   private async taskboardContext(senderId: string): Promise<{
@@ -327,7 +496,12 @@ export class BridgeService {
     senderId: string
   ): Promise<TaskboardIssue | undefined> {
     try {
-      const issue = await this.options.taskboard!.getIssue(identifier);
+      const taskboard = this.options.taskboard;
+      if (!taskboard) {
+        await this.reply(senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
+        return undefined;
+      }
+      const issue = await taskboard.getIssue(identifier);
       if (issue.projectId !== project.id) {
         await this.reply(senderId, `${issue.identifier} 不属于当前 Taskboard 项目“${project.name}”。`);
         return undefined;
@@ -356,13 +530,23 @@ export class BridgeService {
           await this.reply(senderId, "没有可添加的 Codex 历史项目。请先在 Codex 中打开项目并创建任务。");
           return;
         }
-        await this.reply(senderId, [
+        const fallbackText = [
           "从 Codex 历史项目中选择：",
           ...candidates.map((item, index) =>
             `[C${index + 1}] ${item.name}（${item.sessionCount} 个会话）\n${item.workspace}`
           ),
           "发送 /project add C编号 添加，例如：/project add C1"
-        ].join("\n"));
+        ].join("\n");
+        await this.replyActionCard(senderId, createCommandSelectionCard({
+          title: "添加 Codex 项目",
+          body: candidates.map((item) => `**${item.name}** · ${item.sessionCount} 个会话\n${item.workspace}`).join("\n\n"),
+          command: "project",
+          choices: candidates.map((item, index) => ({
+            label: conciseButtonLabel(item.name),
+            arg: `add C${index + 1}`
+          })),
+          fallbackText
+        }));
         return;
       }
       const project = this.options.stateStore.createProject(candidate.name, candidate.workspace);
@@ -401,39 +585,94 @@ export class BridgeService {
     }
     if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "l") {
       const activeProjectId = this.options.stateStore.getActiveSession(senderId)?.projectId;
-      const lines = projects.length
+      const fallbackText = (projects.length
         ? ["已绑定的 Codex 项目：", ...projects.map((project, index) =>
           `[P${index + 1}] ${project.id === activeProjectId ? "【当前】" : ""}${project.name}\n   ${project.workspace}`
         ), "", "发送 /project P1 切换项目。"]
-        : ["还没有绑定 Codex 项目。", "发送 /project add 查看可从 Codex 历史添加的项目。"];
-      await this.reply(senderId, lines.join("\n"));
+        : ["还没有绑定 Codex 项目。", "发送 /project add 查看可从 Codex 历史添加的项目。"]).join("\n");
+      if (!projects.length) {
+        await this.replyActionCard(senderId, createChoiceCard({
+          title: "选择 Codex 项目",
+          body: "还没有绑定项目，可以从 Codex 历史记录中添加。",
+          fallbackText,
+          choices: [{ label: "添加历史项目", command: "project", arg: "add", style: "primary" }]
+        }));
+        return;
+      }
+      await this.replyActionCard(senderId, createCommandSelectionCard({
+        title: "选择 Codex 项目",
+        body: projects.map((project) => `${project.id === activeProjectId ? `**当前 · ${project.name}**` : `**${project.name}**`}\n${project.workspace}`).join("\n\n"),
+        command: "project",
+        choices: projects.map((project, index) => ({
+          label: conciseButtonLabel(project.name),
+          arg: `P${index + 1}`,
+          active: project.id === activeProjectId
+        })),
+        fallbackText
+      }));
       return;
     }
-    const match = /^p([1-9]\d*)$/i.exec(input);
-    const project = match ? projects[Number(match[1]) - 1] : undefined;
+    const requestedProject = /^(?:switch)\s+(.+)$/i.exec(input)?.[1]?.trim() ?? input;
+    const match = /^p([1-9]\d*)$/i.exec(requestedProject);
+    const nameMatches = match ? [] : projects.filter((candidate) => (
+      candidate.name.localeCompare(requestedProject, undefined, { sensitivity: "accent" }) === 0
+    ));
+    if (nameMatches.length > 1) {
+      const fallbackText = "有多个同名项目，请发送 /project 查看列表，再用 P 编号切换。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "需要选择具体项目",
+        body: "找到多个同名项目，请从完整项目列表中选择。",
+        fallbackText,
+        choices: [{ label: "查看项目列表", command: "project", arg: "list", style: "primary" }]
+      }));
+      return;
+    }
+    const project = match ? projects[Number(match[1]) - 1] : nameMatches[0];
     if (!project) {
-      await this.reply(senderId, "没有这个项目编号。发送 /project 查看项目列表。");
+      const fallbackText = "没有找到这个项目。发送 /project 查看项目列表，可用 P 编号或完整项目名切换。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "没有找到项目",
+        body: `未找到“${requestedProject}”，可以重新选择。`,
+        fallbackText,
+        choices: [{ label: "查看项目列表", command: "project", arg: "list", style: "primary" }]
+      }));
       return;
     }
     const existing = this.recentProjectSessionChoices(senderId, project)[0];
     const session = existing
       ? this.bindProjectSessionChoice(senderId, project, existing)
       : this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
-    await this.reply(senderId, [
+    const fallbackText = [
       `已切换 Codex 项目：${project.name}`,
       project.workspace,
       existing ? `已绑定最近活跃会话：${session.title}` : `项目暂无会话，已新建并绑定：${session.title}`,
       "发送 /sessions 查看当前项目最近 10 个会话，或发送 /new 新建会话。"
-    ].join("\n"));
+    ].join("\n");
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: `已切换到 ${conciseButtonLabel(project.name, 28)}`,
+      template: "green",
+      body: `${project.workspace}\n\n${existing ? `已绑定最近活跃会话：${session.title}` : `已新建并绑定会话：${session.title}`}`,
+      fallbackText,
+      choices: [
+        { label: "选择会话", command: "sessions", arg: "", style: "primary" },
+        { label: "新建会话", command: "new", arg: "" }
+      ]
+    }));
   }
 
-  private async handleResumeCommand(senderId: string, arg: string): Promise<void> {
+  private async handleSessionCommand(senderId: string, arg: string): Promise<void> {
     const activeSession = this.options.stateStore.getActiveSession(senderId);
     const project = activeSession?.projectId
       ? this.options.stateStore.listProjects().find((candidate) => candidate.id === activeSession.projectId)
       : undefined;
     if (!activeSession || !project) {
-      await this.reply(senderId, "请先发送 /project P编号 切换到一个项目。");
+      const fallbackText = "请先发送 /project P编号 切换到一个项目。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "先选择项目",
+        body: "会话属于具体项目，请先选择一个 Codex 项目。",
+        fallbackText,
+        choices: [{ label: "选择项目", command: "project", arg: "list", style: "primary" }]
+      }));
       return;
     }
     const sessions = this.recentProjectSessionChoices(senderId, project);
@@ -448,24 +687,58 @@ export class BridgeService {
           `   最近内容：${previews[index]}（${formatSessionTime(session.updatedAt)}）`
         );
       }
-      lines.push("", "发送 /session R1 绑定并继续对应会话；/resume R1 仍然可用。发送 /new 可在当前项目新建会话。");
-      for (const chunk of chunkText(lines.join("\n"))) {
-        await this.reply(senderId, chunk);
-      }
+      lines.push("", "发送 /session R1 绑定并继续对应会话。发送 /new 可在当前项目新建会话。");
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "选择会话",
+        body: sessions.length
+          ? sessions.map((session, index) => [
+            session.managed?.id === activeId ? `**当前 · ${session.title}**` : `**${session.title}**`,
+            `${previews[index]}（${formatSessionTime(session.updatedAt)}）`
+          ].join("\n")).join("\n\n")
+          : `项目“${project.name}”还没有可恢复的会话。`,
+        fallbackText: lines.join("\n"),
+        choices: [
+          ...sessions.map((session, index): ChannelChoice => ({
+            label: conciseButtonLabel(session.title),
+            command: "session",
+            arg: `R${index + 1}`,
+            style: session.managed?.id === activeId ? "primary" : "default"
+          })),
+          { label: "新建会话", command: "new", arg: "", style: sessions.length ? "default" : "primary" }
+        ]
+      }));
       return;
     }
     if (/^\d+$/.test(input)) {
-      await this.reply(senderId, "请使用列表中 R 开头的切换编号，例如 /resume R1；不要使用会话名称里的数字。");
+      const fallbackText = "请使用列表中 R 开头的切换编号，例如 /session R1；不要使用会话名称里的数字。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "请选择会话",
+        body: "数字可能与会话名称混淆，请直接从会话列表选择。",
+        fallbackText,
+        choices: [{ label: "打开会话列表", command: "sessions", arg: "", style: "primary" }]
+      }));
       return;
     }
     const match = /^r([1-9]\d*)$/i.exec(input);
     if (!match) {
-      await this.reply(senderId, "用法：/sessions 查看列表，或 /session R<编号> 绑定会话，例如 /session R1。");
+      const fallbackText = "用法：/sessions 查看列表，或 /session R<编号> 绑定会话，例如 /session R1。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "请选择会话",
+        body: "可以从最近活跃的会话中直接选择。",
+        fallbackText,
+        choices: [{ label: "打开会话列表", command: "sessions", arg: "", style: "primary" }]
+      }));
       return;
     }
     const selected = sessions[Number(match[1]) - 1];
     if (!selected) {
-      await this.reply(senderId, "没有这个切换编号。发送 /resume 查看可用的 R 编号。");
+      const fallbackText = "没有这个切换编号。发送 /sessions 查看可用的 R 编号。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "会话不存在",
+        body: "这个会话编号已失效，请重新选择。",
+        fallbackText,
+        choices: [{ label: "重新选择会话", command: "sessions", arg: "", style: "primary" }]
+      }));
       return;
     }
     const preview = await this.projectSessionChoicePreview(selected);
@@ -520,7 +793,7 @@ export class BridgeService {
     }
     const preview = choice.candidate ? codexSessionCandidatePreview(choice.candidate) : undefined;
     if (preview) this.options.stateStore.setSessionPromptPreview(session.id, preview);
-    return this.options.stateStore.getSession(session.id)!;
+    return this.options.stateStore.getSession(session.id) ?? session;
   }
 
   private async projectSessionChoicePreview(choice: ProjectSessionChoice): Promise<string> {
@@ -563,7 +836,16 @@ export class BridgeService {
       await this.runCodexTurn({ id: "buffer", senderId, text: "", attachments: [], raw: {} }, "", flushed.items);
       return;
     }
-    await this.reply(senderId, "Usage: /prompt start or /prompt done");
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: "消息合并",
+      body: this.buffers.isActive(senderId)
+        ? "消息合并已开启。可以继续发送内容，完成后点击提交。"
+        : "开启后，可以连续发送多条文字或附件，再一次性提交给 Codex。",
+      fallbackText: "Usage: /prompt start or /prompt done",
+      choices: this.buffers.isActive(senderId)
+        ? [{ label: "提交合并消息", command: "prompt", arg: "done", style: "primary" }]
+        : [{ label: "开始合并消息", command: "prompt", arg: "start", style: "primary" }]
+    }));
   }
 
   private async handleModelCommand(senderId: string, arg: string): Promise<void> {
@@ -581,7 +863,20 @@ export class BridgeService {
       } else {
         lines.push("", "暂时无法读取模型列表。仍可发送 /model <完整模型 ID> 切换。", "/model default 恢复继承设置。");
       }
-      await this.reply(senderId, lines.join("\n"));
+      await this.replyActionCard(senderId, createCommandSelectionCard({
+        title: "选择模型",
+        body: models.length
+          ? models.map((model) => `${model.model === runtime.model ? `**当前 · ${model.displayName}**` : `**${model.displayName}**`}\n${model.model}`).join("\n\n")
+          : `当前模型：${runtime.model ?? "Codex 默认"}\n\n模型列表暂时不可用。`,
+        command: "model",
+        choices: models.map((model, index) => ({
+          label: conciseButtonLabel(model.displayName),
+          arg: String(index + 1),
+          active: model.model === runtime.model
+        })),
+        includeDefault: true,
+        fallbackText: lines.join("\n")
+      }));
       return;
     }
     if (input.toLowerCase() === "default") {
@@ -593,7 +888,13 @@ export class BridgeService {
 
     const selected = selectModel(models, input);
     if (!selected && (models.length || !isPlausibleModelId(input))) {
-      await this.reply(senderId, "模型不存在。发送 /model 查看可用模型，或使用 /model default 恢复继承设置。");
+      const fallbackText = "模型不存在。发送 /model 查看可用模型，或使用 /model default 恢复继承设置。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "模型不存在",
+        body: `没有找到“${input}”，请重新选择模型。`,
+        fallbackText,
+        choices: [{ label: "重新选择模型", command: "model", arg: "", style: "primary" }]
+      }));
       return;
     }
     const currentRuntime = await this.effectiveRuntime(senderId);
@@ -621,7 +922,7 @@ export class BridgeService {
     const input = arg.trim();
     if (!input) {
       const session = this.options.stateStore.getActiveSession(senderId);
-      await this.reply(senderId, [
+      const fallbackText = [
         `当前推理强度：${formatEffort(runtime.effort)}${session?.effort ? "（本会话）" : "（继承 Web/Codex 设置）"}`,
         `当前模型：${runtime.model ?? "Codex 默认"}`,
         "",
@@ -629,7 +930,22 @@ export class BridgeService {
         ...efforts.map((effort, index) => `${index + 1}. ${formatEffort(effort)}`),
         "",
         "发送 /effort <序号或英文值> 切换；/effort default 恢复继承设置。"
-      ].join("\n"));
+      ].join("\n");
+      await this.replyActionCard(senderId, createCommandSelectionCard({
+        title: "选择推理强度",
+        body: `当前模型：${runtime.model ?? "Codex 默认"}\n\n${efforts.map((effort) => effort === runtime.effort
+          ? `**当前 · ${formatEffort(effort)}**`
+          : formatEffort(effort)
+        ).join("\n")}`,
+        command: "effort",
+        choices: efforts.map((effort, index) => ({
+          label: conciseButtonLabel(formatEffort(effort)),
+          arg: String(index + 1),
+          active: effort === runtime.effort
+        })),
+        includeDefault: true,
+        fallbackText
+      }));
       return;
     }
     if (input.toLowerCase() === "default") {
@@ -640,7 +956,13 @@ export class BridgeService {
     }
     const effort = selectEffort(efforts, input);
     if (!effort) {
-      await this.reply(senderId, "该模型不支持这个推理强度。发送 /effort 查看可用选项。");
+      const fallbackText = "该模型不支持这个推理强度。发送 /effort 查看可用选项。";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "推理强度不可用",
+        body: "当前模型不支持这个推理强度，请重新选择。",
+        fallbackText,
+        choices: [{ label: "重新选择", command: "effort", arg: "", style: "primary" }]
+      }));
       return;
     }
     this.options.stateStore.setEffortOverride(senderId, effort);
@@ -654,7 +976,18 @@ export class BridgeService {
     if (!input) {
       const effective = session?.streamReplies ?? inherited;
       const source = typeof session?.streamReplies === "boolean" ? "本会话设置" : "继承全局";
-      await this.reply(senderId, `当前过程进度：${effective ? "开启" : "关闭"}（${source}）\n发送 /stream on、/stream off 或 /stream default 切换。`);
+      const fallbackText = `当前过程进度：${effective ? "开启" : "关闭"}（${source}）\n发送 /stream on、/stream off 或 /stream default 切换。`;
+      await this.replyActionCard(senderId, createCommandSelectionCard({
+        title: "过程进度",
+        body: `当前状态：**${effective ? "开启" : "关闭"}**（${source}）`,
+        command: "stream",
+        choices: [
+          { label: "开启", arg: "on", active: effective },
+          { label: "关闭", arg: "off", active: !effective }
+        ],
+        includeDefault: true,
+        fallbackText
+      }));
       return;
     }
     if (input === "default") {
@@ -663,7 +996,15 @@ export class BridgeService {
       return;
     }
     if (input !== "on" && input !== "off") {
-      await this.reply(senderId, "用法：/stream on、/stream off 或 /stream default");
+      const fallbackText = "用法：/stream on、/stream off 或 /stream default";
+      await this.replyActionCard(senderId, createCommandSelectionCard({
+        title: "过程进度",
+        body: "请选择本会话是否显示执行过程。",
+        command: "stream",
+        choices: [{ label: "开启", arg: "on" }, { label: "关闭", arg: "off" }],
+        includeDefault: true,
+        fallbackText
+      }));
       return;
     }
     const enabled = input === "on";
@@ -686,7 +1027,23 @@ export class BridgeService {
       return;
     }
     if (normalized === "clear" || normalized === "c") {
-      await this.reply(senderId, "这会清空此微信账号的全部个人知识。确认请发送 /memory clear confirm");
+      const fallbackText = "这会清空此微信账号的全部个人知识。确认请发送 /memory clear confirm";
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "确认清空个人知识库",
+        template: "red",
+        body: "此操作会删除当前账号沉淀的全部偏好、技巧、知识点和流程。",
+        fallbackText,
+        choices: [
+          {
+            label: "确认清空",
+            command: "memory",
+            arg: "clear confirm",
+            style: "danger",
+            confirm: "确认清空全部个人知识？"
+          },
+          { label: "返回知识库", command: "memory", arg: "" }
+        ]
+      }));
       return;
     }
     const entries = this.options.stateStore.listKnowledge();
@@ -694,7 +1051,12 @@ export class BridgeService {
     if (forgetMatch) {
       const entry = entries[Number(forgetMatch[1]) - 1];
       if (!entry) {
-        await this.reply(senderId, "没有这个知识编号。发送 /memory 查看当前知识库。");
+        await this.replyActionCard(senderId, createChoiceCard({
+          title: "知识条目不存在",
+          body: "该条目可能已经被删除，请刷新知识库。",
+          fallbackText: "没有这个知识编号。发送 /memory 查看当前知识库。",
+          choices: [{ label: "刷新知识库", command: "memory", arg: "", style: "primary" }]
+        }));
         return;
       }
       this.options.stateStore.deleteKnowledge(entry.id);
@@ -702,23 +1064,68 @@ export class BridgeService {
       return;
     }
     if (input) {
-      await this.reply(senderId, "用法：/memory、/memory on、/memory off、/memory forget K编号、/memory clear");
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "个人知识库",
+        body: "请选择要进行的知识库操作。",
+        fallbackText: "用法：/memory、/memory on、/memory off、/memory forget K编号、/memory clear",
+        choices: [{ label: "查看知识库", command: "memory", arg: "", style: "primary" }]
+      }));
       return;
     }
-    const status = this.options.stateStore.isKnowledgeEnabled() ? "开启" : "关闭";
+    const knowledgeEnabled = this.options.stateStore.isKnowledgeEnabled();
+    const status = knowledgeEnabled ? "开启" : "关闭";
     if (!entries.length) {
-      await this.reply(senderId, `个人知识库（自动沉淀：${status}）\n暂无内容。后续对话会自动提炼可复用的偏好、技巧、知识点和流程。`);
+      const fallbackText = `个人知识库（自动沉淀：${status}）\n暂无内容。后续对话会自动提炼可复用的偏好、技巧、知识点和流程。`;
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "个人知识库",
+        body: `自动沉淀：**${status}**\n\n暂无内容。后续对话会自动提炼可复用信息。`,
+        fallbackText,
+        choices: [{
+          label: knowledgeEnabled ? "关闭自动沉淀" : "开启自动沉淀",
+          command: "memory",
+          arg: knowledgeEnabled ? "off" : "on",
+          style: "primary"
+        }]
+      }));
       return;
     }
     const projectNames = new Map(this.options.stateStore.listProjects().map((project) => [project.id, project.name]));
-    await this.reply(senderId, [
+    const visibleEntries = entries.slice(0, 20);
+    const fallbackText = [
       `个人知识库（自动沉淀：${status}，共 ${entries.length} 条）`,
-      ...entries.slice(0, 20).map((entry, index) =>
+      ...visibleEntries.map((entry, index) =>
         `[K${index + 1}] ${formatKnowledgeKind(entry.kind)} · ${entry.scope === "project" ? `项目：${projectNames.get(entry.projectId ?? "") ?? "已移除项目"}` : "账号"}\n${entry.title}：${entry.content}`
       ),
       "",
       "删除单条：/memory forget K编号"
-    ].join("\n"));
+    ].join("\n");
+    const choices: ChannelChoice[] = [{
+      label: knowledgeEnabled ? "关闭自动沉淀" : "开启自动沉淀",
+      command: "memory",
+      arg: knowledgeEnabled ? "off" : "on",
+      style: "primary"
+    }];
+    choices.push(...visibleEntries.map((entry, index): ChannelChoice => ({
+      label: conciseButtonLabel(`删除 K${index + 1} · ${entry.title}`),
+      command: "memory",
+      arg: `forget K${index + 1}`,
+      style: "danger",
+      confirm: `确认删除“${entry.title}”？`
+    })));
+    choices.push({
+      label: "清空全部",
+      command: "memory",
+      arg: "clear",
+      style: "danger"
+    });
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: "个人知识库",
+      body: `自动沉淀：**${status}** · 共 ${entries.length} 条\n\n${visibleEntries.map((entry, index) =>
+        `**K${index + 1} · ${entry.title}**\n${entry.content}`
+      ).join("\n\n")}`,
+      fallbackText,
+      choices
+    }));
   }
 
   private async promptItemsFromMessage(message: NormalizedWeixinMessage): Promise<PromptBufferItem[]> {
@@ -924,18 +1331,33 @@ export class BridgeService {
   private async statusText(senderId: string): Promise<string> {
     const session = this.options.stateStore.getActiveSession(senderId);
     const workspace = session?.workspace ?? this.options.config.defaultCwd;
+    const project = session?.projectId
+      ? this.options.stateStore.listProjects().find((candidate) => candidate.id === session.projectId)
+      : undefined;
+    let issue: TaskboardIssue | undefined;
+    if (project && session?.threadId && this.options.taskboard) {
+      try {
+        const taskboardProject = await this.options.taskboard.projectForWorkspace(project.workspace);
+        issue = taskboardProject
+          ? await this.options.taskboard.issueForThread(taskboardProject.id, session.threadId)
+          : undefined;
+      } catch (error) {
+        console.warn(`Taskboard context unavailable for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const runtime = await this.effectiveRuntime(senderId);
     return [
-      "codex-channel-bridge status",
-      `sender: ${senderId}`,
-      `session: ${session?.title ?? "(new)"}`,
-      `workspace: ${workspace}`,
-      `thread: ${session?.threadId || "(new)"}`,
-      `backend: ${this.options.config.codexBackend}`,
-      `exec sandbox: ${this.options.config.codexExecSandbox ?? "(Codex default)"}`,
+      "当前工作上下文",
+      `项目：${project?.name ?? "尚未选择"}`,
+      `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
+      `会话：${session?.title ?? "新会话"}`,
+      `工作目录：${workspace}`,
+      `thread：${session?.threadId || "尚未创建"}`,
+      `backend：${this.options.config.codexBackend}`,
+      `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
       `model: ${runtime.model ?? "(Codex default)"}`,
       `effort: ${runtime.effort ?? "(Codex default)"}`,
-      `stream replies: ${(session?.streamReplies ?? this.options.config.streamReplies) ? "on" : "off"}${typeof session?.streamReplies === "boolean" ? " (session)" : " (global)"}`
+      `过程回复：${(session?.streamReplies ?? this.options.config.streamReplies) ? "开启" : "关闭"}${typeof session?.streamReplies === "boolean" ? "（当前会话）" : "（全局）"}`
     ].join("\n");
   }
 
@@ -996,6 +1418,54 @@ export class BridgeService {
     }
   }
 
+  private async replyActionCard(senderId: string, card: ChannelActionCard): Promise<void> {
+    if (!this.options.weixin.sendActionCard) {
+      for (const text of chunkText(card.fallbackText)) {
+        await this.reply(senderId, text);
+      }
+      return;
+    }
+    try {
+      console.log(`[codex-channel-bridge] sending action card "${card.title}" to ${senderId}`);
+      const sent = await this.options.weixin.sendActionCard({ toUserId: senderId, card });
+      this.options.onOutboundMessage?.({
+        direction: "outbound",
+        id: sent.messageId,
+        recipientId: senderId,
+        text: card.fallbackText,
+        attachments: []
+      });
+      console.log(`[codex-channel-bridge] sent action card "${card.title}" to ${senderId}`);
+    } catch (error) {
+      console.warn(`Action card delivery failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
+      for (const text of chunkText(card.fallbackText)) {
+        await this.reply(senderId, text);
+      }
+    }
+  }
+
+  private async replyTaskCard(senderId: string, card: ChannelTaskCard): Promise<void> {
+    if (!this.options.weixin.sendTaskCard) {
+      await this.reply(senderId, card.fallbackText);
+      return;
+    }
+    try {
+      console.log(`[codex-channel-bridge] sending Taskboard card ${card.identifier} to ${senderId}`);
+      const sent = await this.options.weixin.sendTaskCard({ toUserId: senderId, card });
+      this.options.onOutboundMessage?.({
+        direction: "outbound",
+        id: sent.messageId,
+        recipientId: senderId,
+        text: card.fallbackText,
+        attachments: []
+      });
+      console.log(`[codex-channel-bridge] sent Taskboard card ${card.identifier} to ${senderId}`);
+    } catch (error) {
+      console.warn(`Taskboard card delivery failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
+      await this.reply(senderId, card.fallbackText);
+    }
+  }
+
   allowSender(senderId: string): void {
     this.access.allow(senderId);
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
@@ -1025,7 +1495,7 @@ function isWeixinMediaClient(client: ChannelTextClient, kind: "image" | "file" |
         : "sendFileMessage"] === "function";
 }
 
-export function parseCommand(text: string): { name: string; arg: string } | undefined {
+export function parseCommand(text: string): ChannelCommand | undefined {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) {
     return undefined;
@@ -1042,11 +1512,9 @@ const COMMAND_ALIASES: Readonly<Record<string, string>> = {
   bal: "balance",
   knowledge: "memory",
   mem: "memory",
-  b: "bind",
   projects: "project",
   p: "project",
   n: "new",
-  r: "resume",
   ss: "sessions",
   s: "session",
   m: "model",
@@ -1061,7 +1529,7 @@ const COMMAND_ALIASES: Readonly<Record<string, string>> = {
 
 function helpText(): string {
   return [
-    "Codex 微信内置命令：",
+    "Codex 渠道工作台（也可直接说“查看任务”“新任务：…”“提交验收”）：",
     "/help（/h）- 获取全部内置命令",
     "/status（/st）- 查看当前任务、项目、模型和运行状态",
     "/balance（/bal）- 查看当前 Codex 账号剩余用量",
@@ -1072,11 +1540,9 @@ function helpText(): string {
     "/project delete（/p d）P1 - 移除没有任务的项目",
     "/task（/tb）- 查看当前项目的 Taskboard Issue",
     "/task ISSUE编号 - 绑定并继续对应 Codex 任务",
-    "/task new|start|comment|attach|block|review|accept - 操作 Taskboard 工作流",
-    "/bind（/b）- 旧版手工路径绑定（已停用）",
+    "/task new|todo|start|detail|comment|attach|block|review|accept|return - 操作 Taskboard 工作流",
     "/sessions（/ss）- 查看当前项目最近活跃的 10 个会话",
     "/session（/s）R编号 - 绑定会话并在其中继续对话",
-    "/resume（/r）[R编号] - 会话查看与切换兼容命令",
     "/new（/n）- 在当前项目新建并绑定会话",
     "/model（/m）[编号|模型ID|default] - 查看或切换当前任务模型",
     "/effort（/e）[编号|级别|default] - 查看或切换推理强度",
@@ -1093,16 +1559,21 @@ function taskboardSkillPrompt(instruction: string): string {
   return `使用 manage-taskboard Skill 完成以下操作。遵守其线程归属、状态迁移、评论证据和验收门禁；Taskboard 是任务状态唯一事实源。\n\n${instruction}`;
 }
 
-function formatTaskboardStatus(status: TaskboardStatus): string {
-  return ({
-    backlog: "待规划",
-    todo: "待处理",
-    in_progress: "处理中",
-    in_review: "待验收",
-    blocked: "阻塞",
-    done: "已完成",
-    canceled: "已取消"
-  } as Record<TaskboardStatus, string>)[status];
+function taskboardWorkflowInstruction(action: string, issue: TaskboardIssue, detail: string): string | undefined {
+  switch (action) {
+    case "start":
+      return `领取并开始处理 ${issue.identifier}。`;
+    case "block":
+      return `将 ${issue.identifier} 标记为阻塞，并记录阻塞原因：${detail}。`;
+    case "review":
+      return `完成 ${issue.identifier} 的检查与证据记录，然后提交验收。${detail ? ` 补充：${detail}` : ""}`;
+    case "accept":
+      return `用户已明确确认验收 ${issue.identifier}；只有完成门禁满足时才标记完成，否则明确记录未通过原因。${detail ? ` 补充：${detail}` : ""}`;
+    case "return":
+      return `将待验收的 ${issue.identifier} 退回处理中，并记录退回原因：${detail}。`;
+    default:
+      return undefined;
+  }
 }
 
 function formatKnowledgeKind(kind: "preference" | "skill" | "knowledge" | "workflow"): string {

@@ -6,6 +6,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { BridgeService, parseCommand } from "../src/bridge/service.js";
+import type { ChannelIntentResolverInput } from "../src/bridge/ai-channel-intent.js";
+import type { FriendlyChannelIntent } from "../src/bridge/channel-intent.js";
 import { buildPrompt } from "../src/bridge/format.js";
 import { defaultConfig, MAX_INBOUND_BYTES } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
@@ -106,14 +108,15 @@ test("lists every built-in command and reports the current Codex account balance
   await send("help", "/help");
   const help = replies.at(-1) ?? "";
   for (const command of [
-    "/help", "/status", "/balance", "/memory", "/project", "/new", "/sessions", "/session", "/resume",
+    "/help", "/status", "/balance", "/memory", "/project", "/task", "/new", "/sessions", "/session",
     "/model", "/effort", "/stream", "/prompt start", "/prompt done", "/approve", "/reject", "/stop"
   ]) {
     assert.match(help, new RegExp(command.replace("/", "\\/")));
   }
-  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/b", "/ss", "/s", "/r", "/n", "/m", "/e", "/str", "/pp", "/ok", "/no", "/x"]) {
+  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/tb", "/ss", "/s", "/n", "/m", "/e", "/str", "/pp", "/ok", "/no", "/x"]) {
     assert.match(help, new RegExp(alias.replace("/", "\\/")));
   }
+  assert.doesNotMatch(help, /\/bind|\/resume|\/b\b|\/r\b/);
 
   await send("balance", "/balance");
   assert.equal(stateStore.listProjects().length, 0);
@@ -169,10 +172,8 @@ test("maps every documented short command to its canonical command", () => {
     bal: "balance",
     mem: "memory",
     p: "project",
-    b: "bind",
     ss: "sessions",
     s: "session",
-    r: "resume",
     n: "new",
     m: "model",
     e: "effort",
@@ -186,6 +187,8 @@ test("maps every documented short command to its canonical command", () => {
   for (const [alias, command] of Object.entries(aliases)) {
     assert.deepEqual(parseCommand(`/${alias} argument`), { name: command, arg: "argument" });
   }
+  assert.deepEqual(parseCommand("/bind /tmp/project"), { name: "bind", arg: "/tmp/project" });
+  assert.deepEqual(parseCommand("/resume R1"), { name: "resume", arg: "R1" });
 });
 
 test("sends Codex approvals to the originating sender and accepts channel decisions", async (t) => {
@@ -351,6 +354,113 @@ test("routes Taskboard workflow mutations through Codex and the manage-taskboard
   assert.match(prompts[0] ?? "", /manage-taskboard Skill/);
   assert.match(prompts[0] ?? "", /PROJECT-1/);
   assert.match(prompts[0] ?? "", /开始处理/);
+});
+
+test("uses friendly Chinese workbench intents with direct Taskboard creation, current-issue context, and cards", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-friendly-taskboard-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("Project One", tmpDir);
+  const session = stateStore.createSession("alice@im.wechat", project.workspace, "Taskboard task", project.id);
+  stateStore.setSessionThread(session.id, "thread-one");
+  const prompts: string[] = [];
+  const comments: string[] = [];
+  const cards: Array<{ identifier: string; projectName: string }> = [];
+  const replies: string[] = [];
+  const createdTitles: string[] = [];
+  const classifiedContexts: ChannelIntentResolverInput[] = [];
+  const resolvedIntents = new Map<string, FriendlyChannelIntent>([
+    ["把现在手头在忙的事情给我捋一遍", { kind: "command", command: { name: "task", arg: "list" } }],
+    ["记到待办：补充操作文档", { kind: "command", command: { name: "task", arg: "todo 补充操作文档" } }],
+    ["新任务：完成飞书按钮回调", { kind: "command", command: { name: "task", arg: "new 完成飞书按钮回调" } }],
+    ["记录：测试和构建均通过", { kind: "command", command: { name: "task", arg: "comment current 测试和构建均通过" } }],
+    ["退回：缺少飞书真机点击验证", { kind: "command", command: { name: "task", arg: "return current 缺少飞书真机点击验证" } }],
+    ["查看当前项目", { kind: "command", command: { name: "status", arg: "" } }]
+  ]);
+  const issue = {
+    id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration",
+    description: "Finish phase two", status: "in_review", priority: "high", labels: ["codex"],
+    threadId: "thread-one", version: 3, createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  } as const;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    taskboard: {
+      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
+      async listIssues() { return [issue]; },
+      async getIssue(identifier: string) {
+        if (identifier === "PROJECT-1") return issue;
+        throw new Error("not found");
+      },
+      async issueForThread() { return issue; },
+      async listComments() { return [{ body: "All checks passed" }]; },
+      async addComment(_id: string, body: string) { comments.push(body); return { body }; },
+      async createIssue(input: { title: string }) {
+        createdTitles.push(input.title);
+        return { ...issue, id: "task-two", identifier: "PROJECT-2", title: input.title, status: "todo", threadId: null, version: 1 };
+      }
+    } as never,
+    weixin: {
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; },
+      async sendTaskCard(input) {
+        cards.push({ identifier: input.card.identifier, projectName: input.card.projectName });
+        return { messageId: `card-${cards.length}` };
+      }
+    },
+    intentResolver: {
+      async resolve(input) {
+        classifiedContexts.push(input);
+        const intent = resolvedIntents.get(input.text);
+        assert.ok(intent);
+        return intent;
+      }
+    },
+    runner: {
+      async run(input: { prompt: string; threadId?: string }) {
+        prompts.push(input.prompt);
+        return { raw: "", text: "已处理", threadId: input.threadId ?? "thread-one" };
+      },
+      async getRuntimeInfo() { return { model: "gpt-test", effort: "high" }; },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id, senderId: "alice@im.wechat", text, attachments: [], raw: {}
+  });
+
+  await send("list", "把现在手头在忙的事情给我捋一遍");
+  assert.deepEqual(cards.at(-1), { identifier: "PROJECT-1", projectName: "Project One" });
+  assert.deepEqual(classifiedContexts[0], {
+    text: "把现在手头在忙的事情给我捋一遍",
+    currentProjectName: "Project One",
+    projectNames: ["Project One"]
+  });
+  assert.equal(prompts.length, 0);
+
+  await send("todo", "记到待办：补充操作文档");
+  assert.deepEqual(createdTitles, ["补充操作文档"]);
+  assert.equal(prompts.length, 0);
+  assert.equal(cards.at(-1)?.identifier, "PROJECT-2");
+
+  await send("new", "新任务：完成飞书按钮回调");
+  assert.deepEqual(createdTitles, ["补充操作文档", "完成飞书按钮回调"]);
+  assert.match(prompts.at(-1) ?? "", /领取并开始处理刚创建的 PROJECT-2/);
+
+  await send("comment", "记录：测试和构建均通过");
+  assert.deepEqual(comments, ["测试和构建均通过"]);
+
+  await send("return", "退回：缺少飞书真机点击验证");
+  assert.match(prompts.at(-1) ?? "", /退回处理中/);
+  assert.match(prompts.at(-1) ?? "", /缺少飞书真机点击验证/);
+
+  await send("status", "查看当前项目");
+  assert.match(replies.at(-1) ?? "", /项目：Project One/);
+  assert.match(replies.at(-1) ?? "", /任务：PROJECT-1 · 待验收 · Ship integration/);
+
+  const classificationCount = classifiedContexts.length;
+  await send("slash-list", "/task list");
+  assert.equal(classifiedContexts.length, classificationCount);
+  assert.deepEqual(cards.at(-1), { identifier: "PROJECT-1", projectName: "Project One" });
 });
 
 test("automatically learns and reuses account knowledge with user controls", async (t) => {
@@ -817,7 +927,7 @@ test("lists resumable sessions with unambiguous R codes and switches by code", a
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
   assert.match(replies.at(-1) ?? "", /R 开头的切换编号/);
 
-  await send("resume-invalid", "/resume R99");
+  await send("resume-invalid", "/session R99");
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
   assert.match(replies.at(-1) ?? "", /没有这个切换编号/);
 
@@ -840,7 +950,9 @@ test("lists only the ten most recent sessions in the current project", async (t)
   );
   const other = stateStore.createProject("其他项目", path.join(tmpDir, "other"));
   stateStore.createSession("alice@im.wechat", other.workspace, "其他项目会话", other.id);
-  stateStore.activateSession(sessions.at(-1)!.id);
+  const latestSession = sessions.at(-1);
+  assert.ok(latestSession);
+  stateStore.activateSession(latestSession.id);
   const replies: string[] = [];
   const service = new BridgeService({
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
@@ -980,16 +1092,18 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
   assert.match(replies.at(-1) ?? "", /已绑定的 Codex 项目/);
   assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区`));
 
-  // Legacy manual workspace binding cannot bypass the Codex candidate list.
+  // Removed legacy channel commands are not retained as compatibility aliases.
   const manualWorkspace = path.join(tmpDir, "manual-path");
   await sendWithProjects("manual-bind", `/bind ${manualWorkspace}`);
-  assert.match(replies.at(-1) ?? "", /手工路径绑定已停用/);
+  assert.match(replies.at(-1) ?? "", /未知命令：\/bind/);
   assert.equal(stateStore.listProjects().some((project) => project.workspace === manualWorkspace), false);
 
   await sendWithProjects("project-rename", `/p rn P${projectNumber}|嘉兴AI社区`);
   assert.match(replies.at(-1) ?? "", /已重命名 Codex 项目/);
   await sendWithProjects("project-switch", `/p P${projectNumber}`);
   assert.match(replies.at(-1) ?? "", /项目暂无会话，已新建并绑定/);
+  await sendWithProjects("legacy-resume", "/resume R1");
+  assert.match(replies.at(-1) ?? "", /未知命令：\/resume/);
 
   // Then the active Codex task is pinned to that project workspace
   assert.equal(stateStore.getWorkspace("alice@im.wechat"), workspace);

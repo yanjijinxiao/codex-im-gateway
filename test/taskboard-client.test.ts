@@ -122,6 +122,35 @@ test("moves an issue with optimistic versioning and Codex attribution", async ()
   });
 });
 
+test("creates a Taskboard todo through the bounded local API payload", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const task = {
+    id: "task-two", identifier: "PROJECT-2", projectId: "project-one", title: "Document channel cards",
+    description: "", status: "todo", priority: "none", labels: [], threadId: null,
+    version: 1, createdAt: "2026-08-05T00:00:00.000Z", updatedAt: "2026-08-05T00:00:00.000Z"
+  };
+  const client = new TaskboardClient({
+    baseUrl: "http://127.0.0.1:47823",
+    fetch: async (input, init) => {
+      calls.push({ url: String(input), init });
+      return Response.json({ task }, { status: 201 });
+    }
+  });
+
+  const created = await client.createIssue({ projectId: "project-one", title: task.title });
+
+  assert.equal(created.identifier, "PROJECT-2");
+  assert.equal(calls[0]?.init?.method, "POST");
+  assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), {
+    projectId: "project-one",
+    title: "Document channel cards",
+    description: "",
+    status: "todo",
+    priority: "none",
+    labels: []
+  });
+});
+
 test("rejects non-loopback Taskboard origins", () => {
   assert.throws(
     () => new TaskboardClient({ baseUrl: "https://taskboard.example.com" }),

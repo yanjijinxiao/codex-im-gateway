@@ -320,7 +320,7 @@
             <li><span>1</span><p>进入飞书开放平台“开发者后台”，创建 <b>企业自建应用</b>，并添加机器人能力。</p></li>
             <li><span>2</span><p>在“凭证与基础信息”复制 <b>App ID</b> 和 <b>App Secret</b>，填入下方字段。</p></li>
             <li><span>3</span><p>开通机器人收发消息权限：单聊消息、群聊中 @ 机器人消息、以应用身份发消息。</p></li>
-            <li><span>4</span><p>在“事件与回调”选择 <b>长连接</b>，添加“接收消息”事件 <code>im.message.receive_v1</code>。</p></li>
+            <li><span>4</span><p>在“事件与回调”选择 <b>长连接</b>，添加“接收消息”事件 <code>im.message.receive_v1</code>，并订阅卡片回调 <code>card.action.trigger</code>。</p></li>
             <li><span>5</span><p>创建版本并发布应用，再向机器人发送一条消息以登记接收会话。</p></li>
           </ol>
           <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开飞书开发者后台</span></a><a class="channel-doc-link" href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方长连接文档</span></a></div>

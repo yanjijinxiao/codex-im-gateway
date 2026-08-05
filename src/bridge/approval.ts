@@ -2,6 +2,7 @@ import type {
   CodexApprovalDecision,
   CodexApprovalRequest
 } from "../codex/approval.js";
+import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
 
 const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000;
 
@@ -12,12 +13,17 @@ type PendingApproval = {
   timer: NodeJS.Timeout;
 };
 
+export type ChannelApprovalNotice = {
+  readonly text: string;
+  readonly card?: ChannelActionCard;
+};
+
 export class ChannelApprovalController {
   private readonly pending = new Map<string, PendingApproval>();
   private nextId = 1;
 
   constructor(
-    private readonly send: (senderId: string, text: string) => Promise<void>,
+    private readonly send: (senderId: string, notice: ChannelApprovalNotice) => Promise<void>,
     private readonly timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS
   ) {}
 
@@ -26,10 +32,13 @@ export class ChannelApprovalController {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (!this.settle(senderId, id, "decline")) return;
-        void this.send(senderId, `审批 ${id} 已超时，已自动拒绝。`).catch(() => undefined);
+        this.send(senderId, { text: `审批 ${id} 已超时，已自动拒绝。` }).catch((error: unknown) => {
+          console.warn(`Unable to send approval timeout ${id}: ${errorDetail(error)}`);
+        });
       }, this.timeoutMs);
       this.pending.set(this.key(senderId, id), { id, senderId, resolve, timer });
-      void this.send(senderId, formatApproval(id, request, this.timeoutMs)).catch(() => {
+      this.send(senderId, approvalNotice(id, request, this.timeoutMs)).catch((error: unknown) => {
+        console.warn(`Unable to send approval ${id}: ${errorDetail(error)}`);
         this.settle(senderId, id, "decline");
       });
     });
@@ -70,23 +79,47 @@ export class ChannelApprovalController {
   }
 }
 
-function formatApproval(id: string, request: CodexApprovalRequest, timeoutMs: number): string {
+function approvalNotice(id: string, request: CodexApprovalRequest, timeoutMs: number): ChannelApprovalNotice {
   const details = request.kind === "command"
     ? ["类型：运行命令", request.command ? `命令：\n${limit(request.command)}` : undefined]
     : request.kind === "file"
       ? ["类型：修改文件", request.grantRoot ? `写入范围：${request.grantRoot}` : undefined]
       : ["类型：申请额外权限", request.permissions ? `权限：${limit(JSON.stringify(request.permissions))}` : undefined];
-  return [
+  const timeout = `${Math.max(1, Math.ceil(timeoutMs / 60_000))} 分钟内未处理将自动拒绝。`;
+  const summary = [
     `【Codex 审批 ${id}】`,
     ...details,
     request.cwd ? `工作目录：${request.cwd}` : undefined,
     request.reason ? `原因：${limit(request.reason)}` : undefined,
     `回复 /approve ${id}（/ok ${id}）批准一次`,
     `回复 /reject ${id}（/no ${id}）拒绝`,
-    `${Math.max(1, Math.ceil(timeoutMs / 60_000))} 分钟内未回复将自动拒绝。`
+    timeout
   ].filter(Boolean).join("\n");
+  const body = [
+    ...details,
+    request.cwd ? `工作目录：${request.cwd}` : undefined,
+    request.reason ? `原因：${limit(request.reason)}` : undefined
+  ].filter(Boolean).join("\n");
+  return {
+    text: summary,
+    card: createChoiceCard({
+      title: `Codex 审批 ${id}`,
+      template: "orange",
+      body,
+      note: timeout,
+      fallbackText: summary,
+      choices: [
+        { label: "批准", command: "approve", arg: id, style: "primary", confirm: "确认批准本次操作？" },
+        { label: "拒绝", command: "reject", arg: id, style: "danger" }
+      ]
+    })
+  };
 }
 
 function limit(value: string): string {
   return value.length > 1_200 ? `${value.slice(0, 1_200)}…` : value;
+}
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

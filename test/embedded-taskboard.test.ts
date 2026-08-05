@@ -22,6 +22,23 @@ test("starts and closes the embedded Taskboard with isolated data", async (t) =>
   await assert.rejects(fetch(new URL("/health", taskboard.url)));
 });
 
+test("reuses a healthy Taskboard already listening on the managed port", async (t) => {
+  const ownerDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-taskboard-owner-"));
+  const clientDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "codex-taskboard-client-"));
+  t.after(() => fs.rmSync(ownerDirectory, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(clientDirectory, { recursive: true, force: true }));
+
+  const owner = await startEmbeddedTaskboard({ dataDirectory: ownerDirectory, port: 0 });
+  t.after(() => owner.close());
+  const managedPort = Number(new URL(owner.url).port);
+  const reused = await startEmbeddedTaskboard({ dataDirectory: clientDirectory, port: managedPort });
+
+  await reused.close();
+  const response = await fetch(new URL("/health", owner.url));
+  assert.equal(response.status, 200);
+  assert.equal(fs.existsSync(path.join(clientDirectory, "taskboard.sqlite")), false);
+});
+
 test("derives the managed Taskboard port from a loopback URL", () => {
   assert.equal(embeddedTaskboardPort("http://127.0.0.1:47823"), 47823);
   assert.equal(embeddedTaskboardPort("http://localhost"), 80);

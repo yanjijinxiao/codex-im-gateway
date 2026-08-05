@@ -112,6 +112,29 @@ export class TaskboardClient {
     return z.object({ task: issueSchema }).parse(value).task;
   }
 
+  async createIssue(input: {
+    readonly projectId: string;
+    readonly title: string;
+    readonly description?: string;
+    readonly status?: "backlog" | "todo";
+    readonly priority?: string;
+    readonly labels?: readonly string[];
+  }): Promise<TaskboardIssue> {
+    const value = await this.request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectId: input.projectId,
+        title: input.title,
+        description: input.description ?? "",
+        status: input.status ?? "todo",
+        priority: input.priority ?? "none",
+        labels: input.labels ?? []
+      })
+    });
+    return z.object({ task: issueSchema }).parse(value).task;
+  }
+
   async issueForThread(projectId: string, threadId: string): Promise<TaskboardIssue | undefined> {
     return (await this.listIssues({ projectId, threadId }))[0];
   }
