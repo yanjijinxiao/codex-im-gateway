@@ -105,6 +105,9 @@ export class CodexSessionCompletionMonitor {
   private async initialize(): Promise<void> {
     for (const filePath of await this.listSessionFiles()) {
       if (!this.started) return;
+      // A real Codex home can contain gigabytes of session history. Yield once
+      // per file so startup indexing never starves the local HTTP server.
+      await yieldToEventLoop();
       const cursor = {
         offset: await safeFileSize(filePath),
         ...await readInitialSessionContext(filePath, this.now())
@@ -365,6 +368,10 @@ async function safeFileStat(filePath: string): Promise<{ size: number; mtimeMs: 
 
 async function safeFileSize(filePath: string): Promise<number> {
   return (await safeFileStat(filePath)).size;
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function isDirectory(candidate: string): boolean {
