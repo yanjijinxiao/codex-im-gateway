@@ -174,6 +174,73 @@ test("channel and project notification APIs validate and forward configuration",
   ]);
 });
 
+test("knowledge-base APIs validate llm-wiki records and bind them to projects", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-knowledge-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: unknown[] = [];
+  const knowledgeBase = {
+    accountId: "account-one",
+    id: "kb-one",
+    name: "产品 Wiki",
+    rootPath: "/knowledge/product",
+    boundProjects: []
+  };
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: {
+      listKnowledgeBases() { return [knowledgeBase]; },
+      async createKnowledgeBase(accountId: string, input: unknown) {
+        calls.push({ create: { accountId, input } });
+        return knowledgeBase;
+      },
+      async inspectKnowledgeBase(accountId: string, knowledgeBaseId: string) {
+        calls.push({ inspect: { accountId, knowledgeBaseId } });
+        return { command: "llm-wiki", status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 } };
+      },
+      bindProjectKnowledgeBase(accountId: string, projectId: string, knowledgeBaseId?: string) {
+        calls.push({ bind: { accountId, projectId, knowledgeBaseId } });
+        return { accountId, id: projectId, knowledgeBaseId };
+      }
+    } as never,
+    port: 0
+  });
+  t.after(() => server.close());
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Codex-Weixin-Token": server.requestToken,
+    Origin: server.url
+  };
+
+  const list = await fetch(`${server.url}/api/knowledge-bases`);
+  assert.deepEqual(await list.json(), { knowledgeBases: [knowledgeBase] });
+  const created = await fetch(`${server.url}/api/knowledge-bases`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      accountId: "account-one",
+      name: "产品 Wiki",
+      rootPath: "/knowledge/product"
+    })
+  });
+  assert.equal(created.status, 201);
+  const bound = await fetch(`${server.url}/api/projects/account-one/project-one/knowledge-base`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ knowledgeBaseId: "kb-one" })
+  });
+  assert.equal(bound.status, 200);
+  assert.deepEqual(calls, [
+    {
+      create: {
+        accountId: "account-one",
+        input: { accountId: "account-one", name: "产品 Wiki", rootPath: "/knowledge/product" }
+      }
+    },
+    { inspect: { accountId: "account-one", knowledgeBaseId: "kb-one" } },
+    { bind: { accountId: "account-one", projectId: "project-one", knowledgeBaseId: "kb-one" } }
+  ]);
+});
+
 test("Codex project API lists session-derived projects and authorizes the selected workspace", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-codex-projects-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -356,6 +423,10 @@ test("local API redacts credentials and protects mutations", async (t) => {
   const appSource = await appResponse.text();
   assert.match(appSource, /tab\.setAttribute\("aria-current", "page"\)/);
   assert.match(appSource, /tab\.removeAttribute\("aria-current"\)/);
+  const knowledgeBasesResponse = await fetch(`${server.url}/knowledge-bases.js`);
+  assert.equal(knowledgeBasesResponse.status, 200);
+  assert.match(knowledgeBasesResponse.headers.get("content-type") ?? "", /^text\/javascript/);
+  assert.match(await knowledgeBasesResponse.text(), /openNewKnowledgeBaseDialog/);
   const faviconResponse = await fetch(`${server.url}/favicon.svg`);
   assert.equal(faviconResponse.status, 200);
   assert.match(faviconResponse.headers.get("content-type") ?? "", /^image\/svg\+xml/);

@@ -27,9 +27,55 @@ export type CodexRunnerInput = {
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
   onApproval?: CodexApprovalHandler;
+  onDynamicToolCall?: CodexDynamicToolHandler;
+  onUserInput?: CodexUserInputHandler;
+  dynamicTools?: readonly Record<string, unknown>[];
+  collaborationMode?: "default" | "plan";
   ephemeral?: boolean;
   outputSchema?: Record<string, unknown>;
   sandbox?: CodexExecSandbox;
+};
+
+export type CodexDynamicToolCall = {
+  callId: string;
+  threadId: string;
+  turnId: string;
+  namespace?: string;
+  tool: string;
+  arguments: unknown;
+};
+
+export type CodexDynamicToolHandler = (call: CodexDynamicToolCall) => Promise<string>;
+
+export type CodexUserInputQuestion = {
+  header: string;
+  id: string;
+  question: string;
+  options?: Array<{ label: string; description: string }>;
+};
+
+export type CodexUserInputRequest = {
+  itemId: string;
+  threadId: string;
+  turnId: string;
+  autoResolutionMs?: number;
+  questions: CodexUserInputQuestion[];
+};
+
+export type CodexUserInputAnswer = Record<string, { answers: string[] }>;
+export type CodexUserInputHandler = (request: CodexUserInputRequest) => Promise<CodexUserInputAnswer>;
+
+export type CodexThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+
+export type CodexThreadGoal = {
+  threadId: string;
+  objective: string;
+  status: CodexThreadGoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
 };
 
 export type CodexHistoryMessage = {
@@ -120,6 +166,8 @@ export class AppServerCodexRunner {
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
   private readonly activeTurns = new Map<string, string>();
   private readonly approvalHandlersByThread = new Map<string, CodexApprovalHandler>();
+  private readonly dynamicToolHandlersByThread = new Map<string, CodexDynamicToolHandler>();
+  private readonly userInputHandlersByThread = new Map<string, CodexUserInputHandler>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
   private readonly turnEvents = new Map<string, string[]>();
   private readonly turnTexts = new Map<string, string>();
@@ -146,7 +194,8 @@ export class AppServerCodexRunner {
         ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
         cwd: input.cwd,
         model: input.model,
-        approvalPolicy: "never"
+        approvalPolicy: "never",
+        ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
       })
     ) as Record<string, unknown>;
     const thread = threadResponse.thread as Record<string, unknown> | undefined;
@@ -156,6 +205,14 @@ export class AppServerCodexRunner {
     }
     this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
 
+    const runtimeInfo = this.runtimeInfoByThread.get(threadId);
+    const collaborationModel = input.collaborationMode
+      ? input.model ?? runtimeInfo?.model ?? (await this.getRuntimeInfo(input.cwd, threadId)).model
+      : undefined;
+    if (input.collaborationMode && !collaborationModel) {
+      throw new Error("Codex collaboration mode requires a resolved model");
+    }
+
     const turnParams = compactObject({
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
@@ -164,15 +221,29 @@ export class AppServerCodexRunner {
       sandboxPolicy: appServerSandboxPolicy(input.sandbox ?? this.options.sandbox),
       model: input.model,
       effort: input.effort,
-      outputSchema: input.outputSchema
+      outputSchema: input.outputSchema,
+      ...(input.collaborationMode ? {
+        collaborationMode: {
+          mode: input.collaborationMode,
+          settings: {
+            model: collaborationModel,
+            reasoning_effort: input.effort ?? runtimeInfo?.effort ?? null,
+            developer_instructions: null
+          }
+        }
+      } : {})
     });
     let turnResponse: Record<string, unknown>;
     if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
+    if (input.onDynamicToolCall) this.dynamicToolHandlersByThread.set(threadId, input.onDynamicToolCall);
+    if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
     try {
       turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
     } catch (error) {
       if (!input.threadId || !isThreadBusyError(error)) {
         this.approvalHandlersByThread.delete(threadId);
+        this.dynamicToolHandlersByThread.delete(threadId);
+        this.userInputHandlersByThread.delete(threadId);
         throw error;
       }
       await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
@@ -181,6 +252,8 @@ export class AppServerCodexRunner {
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       } catch (retryError) {
         this.approvalHandlersByThread.delete(threadId);
+        this.dynamicToolHandlersByThread.delete(threadId);
+        this.userInputHandlersByThread.delete(threadId);
         throw retryError;
       }
     }
@@ -188,6 +261,8 @@ export class AppServerCodexRunner {
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
     if (!turnId) {
       this.approvalHandlersByThread.delete(threadId);
+      this.dynamicToolHandlersByThread.delete(threadId);
+      this.userInputHandlersByThread.delete(threadId);
       throw new Error("Codex app-server did not return a turn id");
     }
 
@@ -269,6 +344,31 @@ export class AppServerCodexRunner {
   async getAccountRateLimits(): Promise<CodexAccountBalance> {
     await this.ensureConnected();
     return parseAccountRateLimits(await this.request("account/rateLimits/read", {}));
+  }
+
+  async getGoal(threadId: string): Promise<CodexThreadGoal | undefined> {
+    await this.ensureConnected();
+    const response = await this.request("thread/goal/get", { threadId }) as { goal?: unknown };
+    return parseThreadGoal(response.goal);
+  }
+
+  async setGoal(
+    threadId: string,
+    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number }
+  ): Promise<CodexThreadGoal | undefined> {
+    await this.ensureConnected();
+    const response = await this.request("thread/goal/set", {
+      threadId,
+      ...(input.objective !== undefined ? { objective: input.objective } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {})
+    }) as { goal?: unknown };
+    return parseThreadGoal(response.goal);
+  }
+
+  async clearGoal(threadId: string): Promise<void> {
+    await this.ensureConnected();
+    await this.request("thread/goal/clear", { threadId });
   }
 
   async stop(threadId?: string): Promise<void> {
@@ -498,6 +598,8 @@ export class AppServerCodexRunner {
     };
     this.activeTurns.delete(threadId);
     this.approvalHandlersByThread.delete(threadId);
+    this.dynamicToolHandlersByThread.delete(threadId);
+    this.userInputHandlersByThread.delete(threadId);
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
@@ -657,19 +759,13 @@ export class AppServerCodexRunner {
         this.send({ id, result: { decision: "denied" } });
         return;
       case "item/tool/requestUserInput":
-        this.send({ id, result: { answers: {} } });
+        this.handleUserInputRequest(id, message.params ?? {});
         return;
       case "mcpServer/elicitation/request":
         this.send({ id, result: { action: "cancel", content: null, _meta: null } });
         return;
       case "item/tool/call":
-        this.send({
-          id,
-          result: {
-            contentItems: [{ type: "inputText", text: "Dynamic tools are not available in codex-channel-bridge." }],
-            success: false
-          }
-        });
+        this.handleDynamicToolRequest(id, message.params ?? {});
         return;
       case "currentTime/read":
         this.send({ id, result: { currentTimeAt: Math.floor(Date.now() / 1_000) } });
@@ -680,6 +776,45 @@ export class AppServerCodexRunner {
           error: { code: -32601, message: `Unsupported app-server request: ${message.method ?? "unknown"}` }
         });
     }
+  }
+
+  private handleDynamicToolRequest(id: JsonRpcId, params: Record<string, unknown>): void {
+    const call = parseDynamicToolCall(params);
+    const handler = call ? this.dynamicToolHandlersByThread.get(call.threadId) : undefined;
+    if (!call || !handler) {
+      this.send({
+        id,
+        result: {
+          contentItems: [{ type: "inputText", text: "当前会话没有启用该动态工具。" }],
+          success: false
+        }
+      });
+      return;
+    }
+    Promise.resolve(handler(call))
+      .then((text) => this.send({
+        id,
+        result: { contentItems: [{ type: "inputText", text }], success: true }
+      }))
+      .catch((error) => this.send({
+        id,
+        result: {
+          contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
+          success: false
+        }
+      }));
+  }
+
+  private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>): void {
+    const request = parseUserInputRequest(params);
+    const handler = request ? this.userInputHandlersByThread.get(request.threadId) : undefined;
+    if (!request || !handler) {
+      this.send({ id, result: { answers: {} } });
+      return;
+    }
+    Promise.resolve(handler(request))
+      .then((answers) => this.send({ id, result: { answers } }))
+      .catch(() => this.send({ id, result: { answers: {} } }));
   }
 
   private handleChildFailure(child: ChildProcessWithoutNullStreams, error: Error): void {
@@ -710,6 +845,8 @@ export class AppServerCodexRunner {
     }
     this.activeTurns.clear();
     this.approvalHandlersByThread.clear();
+    this.dynamicToolHandlersByThread.clear();
+    this.userInputHandlersByThread.clear();
     this.turnEvents.clear();
     this.turnTexts.clear();
     this.completedTurns.clear();
@@ -732,6 +869,101 @@ function appServerSandboxPolicy(sandbox: CodexExecSandbox | undefined): AppServe
     case "danger-full-access":
       return { type: "dangerFullAccess" };
   }
+}
+
+function parseDynamicToolCall(params: Record<string, unknown>): CodexDynamicToolCall | undefined {
+  if (
+    typeof params.callId !== "string"
+    || typeof params.threadId !== "string"
+    || typeof params.turnId !== "string"
+    || typeof params.tool !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    callId: params.callId,
+    threadId: params.threadId,
+    turnId: params.turnId,
+    tool: params.tool,
+    arguments: params.arguments,
+    ...(typeof params.namespace === "string" ? { namespace: params.namespace } : {})
+  };
+}
+
+function parseUserInputRequest(params: Record<string, unknown>): CodexUserInputRequest | undefined {
+  if (
+    typeof params.itemId !== "string"
+    || typeof params.threadId !== "string"
+    || typeof params.turnId !== "string"
+    || !Array.isArray(params.questions)
+  ) {
+    return undefined;
+  }
+  const questions = params.questions.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const item = raw as Record<string, unknown>;
+    if (typeof item.header !== "string" || typeof item.id !== "string" || typeof item.question !== "string") {
+      return [];
+    }
+    const options = Array.isArray(item.options)
+      ? item.options.flatMap((rawOption) => {
+          if (!rawOption || typeof rawOption !== "object") return [];
+          const option = rawOption as Record<string, unknown>;
+          return typeof option.label === "string" && typeof option.description === "string"
+            ? [{ label: option.label, description: option.description }]
+            : [];
+        })
+      : [];
+    return [{
+      header: item.header,
+      id: item.id,
+      question: item.question,
+      ...(options.length ? { options } : {})
+    }];
+  });
+  if (!questions.length) return undefined;
+  return {
+    itemId: params.itemId,
+    threadId: params.threadId,
+    turnId: params.turnId,
+    questions,
+    ...(typeof params.autoResolutionMs === "number" ? { autoResolutionMs: params.autoResolutionMs } : {})
+  };
+}
+
+function parseThreadGoal(value: unknown): CodexThreadGoal | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const goal = value as Record<string, unknown>;
+  if (
+    typeof goal.threadId !== "string"
+    || typeof goal.objective !== "string"
+    || !isGoalStatus(goal.status)
+    || typeof goal.tokensUsed !== "number"
+    || typeof goal.timeUsedSeconds !== "number"
+    || typeof goal.createdAt !== "number"
+    || typeof goal.updatedAt !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    threadId: goal.threadId,
+    objective: goal.objective,
+    status: goal.status,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+    ...(typeof goal.tokenBudget === "number" ? { tokenBudget: goal.tokenBudget } : {})
+  };
+}
+
+function isGoalStatus(value: unknown): value is CodexThreadGoalStatus {
+  return value === "active"
+    || value === "paused"
+    || value === "blocked"
+    || value === "usageLimited"
+    || value === "budgetLimited"
+    || value === "complete";
 }
 
 function isThreadBusyError(error: unknown): boolean {

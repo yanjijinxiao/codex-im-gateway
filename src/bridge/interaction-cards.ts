@@ -26,19 +26,22 @@ type CommandSelectionCardInput = {
 export function createMainMenuCard(fallbackText: string): ChannelActionCard {
   return createChoiceCard({
     title: "Codex 渠道工作台",
-    body: "直接点击即可查看或切换；也可以继续用自然语言告诉我你想做什么。",
+    body: "请选择要查看或切换的能力。",
     fallbackText,
     choices: [
       { label: "当前状态", command: "status", arg: "", style: "primary" },
       { label: "Taskboard", command: "task", arg: "list" },
       { label: "项目", command: "project", arg: "list" },
+      { label: "工作模式", command: "mode", arg: "" },
+      { label: "计划模式", command: "plan", arg: "toggle" },
+      { label: "Codex 目标", command: "goal", arg: "" },
       { label: "会话", command: "sessions", arg: "" },
       { label: "新建会话", command: "new", arg: "" },
       { label: "模型", command: "model", arg: "" },
       { label: "推理强度", command: "effort", arg: "" },
       { label: "过程进度", command: "stream", arg: "" },
       { label: "用量", command: "balance", arg: "" },
-      { label: "知识库", command: "memory", arg: "" }
+      { label: "个人记忆", command: "memory", arg: "" }
     ]
   });
 }

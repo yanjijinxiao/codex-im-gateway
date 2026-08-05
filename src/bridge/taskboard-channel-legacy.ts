@@ -32,7 +32,15 @@ export async function handleLegacyTaskboardCommand(input: HandleLegacyTaskboardC
       await input.showIssue(issue);
       return;
     }
-    if (issue.threadId) input.options.stateStore.setSessionThread(input.context.session.id, issue.threadId);
+    if (issue.threadId) {
+      const session = input.context.session ?? input.options.stateStore.createSession(
+        input.message.senderId,
+        input.context.managedProject.workspace,
+        issue.title,
+        input.context.managedProject.id
+      );
+      input.options.stateStore.setSessionThread(session.id, issue.threadId);
+    }
     if (action === "comment" || action === "attach") {
       await updateLegacyEvidence(input, action, issue, rest.join(" ").trim());
       return;
@@ -63,7 +71,13 @@ export async function handleLegacyTaskboardCommand(input: HandleLegacyTaskboardC
   const issue = await input.resolveTarget(rawAction);
   if (!issue) return;
   if (issue.threadId) {
-    input.options.stateStore.setSessionThread(input.context.session.id, issue.threadId);
+    const session = input.context.session ?? input.options.stateStore.createSession(
+      input.message.senderId,
+      input.context.managedProject.workspace,
+      issue.title,
+      input.context.managedProject.id
+    );
+    input.options.stateStore.setSessionThread(session.id, issue.threadId);
     await input.options.replyText(
       input.message.senderId,
       `已绑定 ${issue.identifier} · ${issue.title}\n下一条消息会在对应 Codex 任务中继续。`

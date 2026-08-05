@@ -172,6 +172,76 @@ test("runs AI classification on a persistent ephemeral app-server thread", async
   assert.equal(result.text, "reply:classify-intent");
 });
 
+test("registers llm-wiki dynamic tools and routes autonomous tool calls", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const calls: unknown[] = [];
+
+  const result = await runner.run({
+    prompt: "dynamic-tool",
+    cwd: "/tmp/current-project",
+    dynamicTools: [{ type: "namespace", name: "knowledge", description: "read only", tools: [] }],
+    onDynamicToolCall: async (call) => {
+      calls.push(call);
+      return JSON.stringify({ result: [{ anchor: "wiki/fixture.md#answer" }] });
+    }
+  });
+
+  assert.match(result.text, /wiki\/fixture\.md#answer/);
+  assert.deepEqual(calls, [{
+    callId: "tool-turn-1",
+    threadId: "thread-new",
+    turnId: "turn-1",
+    namespace: "knowledge",
+    tool: "search",
+    arguments: { query: "fixture", limit: 3 }
+  }]);
+});
+
+test("routes Codex request_user_input through a channel-native answer handler", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "request-user-input",
+    cwd: "/tmp/project",
+    onUserInput: async (request) => {
+      assert.equal(request.questions[0]?.options?.[0]?.label, "方案 A");
+      return { direction: { answers: ["方案 A"] } };
+    }
+  });
+
+  assert.equal(result.text, "input:方案 A");
+});
+
+test("propagates plan collaboration mode and manages native thread goals", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "plan-mode",
+    cwd: "/tmp/project",
+    model: "configured-model",
+    collaborationMode: "plan"
+  });
+  assert.equal(result.text, "reply:plan-mode");
+
+  const goal = await runner.setGoal(result.threadId, { objective: "完成渠道问答", status: "active", tokenBudget: 5000 });
+  assert.equal(goal?.objective, "完成渠道问答");
+  assert.equal((await runner.getGoal(result.threadId))?.tokenBudget, 5000);
+  await runner.clearGoal(result.threadId);
+  assert.equal(await runner.getGoal(result.threadId), undefined);
+});
+
 test("routes command, file, and permission approvals to the active channel turn", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

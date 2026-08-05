@@ -11,6 +11,7 @@
   <script defer src="/vendor/marked.umd.js"></script>
   <script defer src="/vendor/purify.min.js"></script>
   <script defer src="/app.js"></script>
+  <script defer src="/knowledge-bases.js"></script>
 </head>
 <body>
   <header class="app-header">
@@ -27,6 +28,7 @@
         <button class="tab is-active" type="button" data-view="accounts" aria-current="page">消息渠道</button>
         <button class="tab" type="button" data-view="sessions">会话</button>
         <button class="tab" type="button" data-view="taskboard">任务面板</button>
+        <button class="tab" type="button" data-view="knowledge">知识库</button>
         <button class="tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="header-actions">
@@ -148,6 +150,31 @@
 
     <section class="view taskboard-view" id="taskboardView" data-view-panel="taskboard" hidden>
       <iframe class="taskboard-frame" id="taskboardFrame" title="任务面板" referrerpolicy="no-referrer"></iframe>
+    </section>
+
+    <section class="view knowledge-view" id="knowledgeView" data-view-panel="knowledge" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">LLM-WIKI KNOWLEDGE</p>
+          <h1>知识库</h1>
+        </div>
+        <button class="button button-primary" id="addKnowledgeBaseButton" type="button">
+          <i data-lucide="library-big"></i>
+          <span>添加 llm-wiki</span>
+        </button>
+      </div>
+      <div class="knowledge-boundary" role="note">
+        <i data-lucide="shield-check" aria-hidden="true"></i>
+        <div><strong>项目负责操作，知识库只提供证据</strong><p>问答时 Codex 的工作目录始终是当前项目；AI 按需调用所选 llm-wiki 的只读搜索与文档工具。</p></div>
+      </div>
+      <div id="knowledgeBaseList" class="knowledge-base-list" aria-live="polite"></div>
+      <section class="knowledge-bindings" aria-labelledby="knowledgeBindingsTitle">
+        <div class="knowledge-section-heading">
+          <div><p class="eyebrow">PROJECT BINDINGS</p><h2 id="knowledgeBindingsTitle">项目问答绑定</h2></div>
+          <p>每个 Codex 项目可绑定一个 llm-wiki；切换绑定后会创建独立的问答上下文。</p>
+        </div>
+        <div id="knowledgeBindingList" class="knowledge-binding-list"></div>
+      </section>
     </section>
 
     <section class="view settings-view" id="settingsView" data-view-panel="settings" hidden>
@@ -544,6 +571,29 @@
       <div class="modal-footer">
         <button class="button button-secondary" type="button" data-close-dialog="projectNotificationDialog">取消</button>
         <button class="button button-primary" type="submit"><i data-lucide="bell"></i><span>保存通知</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="knowledgeBaseDialog" aria-labelledby="knowledgeBaseDialogTitle">
+    <form id="knowledgeBaseForm" method="dialog">
+      <div class="modal-header">
+        <div><p class="eyebrow">LLM-WIKI PROJECT</p><h2 id="knowledgeBaseDialogTitle">添加 llm-wiki</h2></div>
+        <button class="icon-button" type="button" data-close-dialog="knowledgeBaseDialog" title="关闭" aria-label="关闭知识库窗口"><i data-lucide="x"></i></button>
+      </div>
+      <input id="editingKnowledgeBaseId" type="hidden">
+      <input id="editingKnowledgeBaseAccountId" type="hidden">
+      <div class="modal-body form-stack">
+        <label id="knowledgeBaseAccountField"><span>所属渠道账号</span><select id="knowledgeBaseAccountInput" required></select></label>
+        <label><span>显示名称</span><input id="knowledgeBaseNameInput" maxlength="60" autocomplete="off" placeholder="例如：产品文档知识库" required></label>
+        <label><span>llm-wiki 根目录</span><input id="knowledgeBaseRootInput" autocomplete="off" placeholder="/Users/name/code/llm-wiki" required><small class="field-hint">目录必须包含 wiki/，查询只读。</small></label>
+        <label><span>引擎目录（可选）</span><input id="knowledgeBaseEngineInput" autocomplete="off" placeholder="默认使用知识库根目录"><small class="field-hint">当知识数据与 llm-wiki 代码分开时，选择包含 skills/knowledge-base 的引擎项目。</small></label>
+        <label><span>状态目录（可选）</span><input id="knowledgeBaseStateInput" autocomplete="off" placeholder="默认使用根目录内 .llm-wiki"></label>
+        <p class="form-error" id="knowledgeBaseFormError" hidden></p>
+      </div>
+      <div class="modal-footer">
+        <button class="button button-secondary" type="button" data-close-dialog="knowledgeBaseDialog">取消</button>
+        <button class="button button-primary" id="saveKnowledgeBaseButton" type="submit"><i data-lucide="check"></i><span>验证并保存</span></button>
       </div>
     </form>
   </dialog>

@@ -14,6 +14,10 @@ import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
 import { WeComChannelAdapter } from "../channels/wecom.js";
 import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
+import {
+  LlmWikiMcpClientPool,
+  type LlmWikiInspection
+} from "../knowledge/llm-wiki-mcp-client.js";
 import type { CodexAccountBalance } from "../codex/account-balance.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { isWorkspaceAllowed, loadConfig, type CodexWeixinConfig } from "../state/config.js";
@@ -30,6 +34,7 @@ import {
 import {
   RuntimeStateStore,
   type ManagedProject,
+  type ManagedKnowledgeBase,
   type ManagedSession,
   type ProjectNotificationTarget,
   type SessionRuntimeOverrides
@@ -95,6 +100,11 @@ export type AccountProject = ManagedProject & {
   boundSessions: AccountProjectSession[];
   activeTaskCount: number;
   runningTasks: AccountProjectTask[];
+};
+
+export type AccountKnowledgeBase = ManagedKnowledgeBase & {
+  accountId: string;
+  boundProjects: Array<{ id: string; name: string }>;
 };
 
 export type AccountProjectSession = {
@@ -215,6 +225,7 @@ export class AccountManager {
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
   private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
+  private readonly llmWiki = new LlmWikiMcpClientPool();
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
   private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
@@ -275,6 +286,7 @@ export class AccountManager {
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => this.stopAccount(account.accountId, false)));
     this.closeRunner();
+    this.llmWiki.close();
   }
 
   async restartRunning(): Promise<void> {
@@ -338,6 +350,7 @@ export class AccountManager {
       }),
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
+      llmWiki: this.llmWiki,
       taskboard: this.taskboardFor(config),
       onOutboundMessage: (message) => webhook.publish(message),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
@@ -500,6 +513,87 @@ export class AccountManager {
       const store = this.storeFor(account.accountId);
       return store.listProjects().map((project) => this.projectSummary(account.accountId, project, store));
     }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  listKnowledgeBases(accountId?: string): AccountKnowledgeBase[] {
+    const accounts = accountId ? [loadAccount(this.options.paths, accountId)] : listAccounts(this.options.paths);
+    return accounts.flatMap((account) => {
+      const store = this.storeFor(account.accountId);
+      const projects = store.listProjects();
+      return store.listKnowledgeBases().map((knowledgeBase) => ({
+        ...knowledgeBase,
+        accountId: account.accountId,
+        boundProjects: projects
+          .filter((project) => project.knowledgeBaseId === knowledgeBase.id)
+          .map((project) => ({ id: project.id, name: project.name }))
+      }));
+    }).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async inspectKnowledgeBase(accountId: string, knowledgeBaseId: string): Promise<LlmWikiInspection> {
+    const knowledgeBase = this.storeFor(accountId).listKnowledgeBases()
+      .find((candidate) => candidate.id === knowledgeBaseId);
+    if (!knowledgeBase) throw new Error(`Managed knowledge base not found: ${knowledgeBaseId}`);
+    return this.llmWiki.inspect(knowledgeBase);
+  }
+
+  async createKnowledgeBase(
+    accountId: string,
+    input: { name: string; rootPath: string; engineRoot?: string; stateDir?: string }
+  ): Promise<AccountKnowledgeBase> {
+    const now = new Date().toISOString();
+    const candidate: ManagedKnowledgeBase = {
+      id: "validation",
+      name: input.name,
+      rootPath: path.resolve(input.rootPath),
+      ...(input.engineRoot ? { engineRoot: path.resolve(input.engineRoot) } : {}),
+      ...(input.stateDir ? { stateDir: path.resolve(input.stateDir) } : {}),
+      createdAt: now,
+      updatedAt: now
+    };
+    await this.llmWiki.inspect(candidate);
+    const knowledgeBase = this.storeFor(accountId).createKnowledgeBase(input.name, input.rootPath, input);
+    return { ...knowledgeBase, accountId, boundProjects: [] };
+  }
+
+  async updateKnowledgeBase(
+    accountId: string,
+    knowledgeBaseId: string,
+    input: { name?: string; rootPath?: string; engineRoot?: string | null; stateDir?: string | null }
+  ): Promise<{ knowledgeBase: AccountKnowledgeBase; inspection: LlmWikiInspection }> {
+    const store = this.storeFor(accountId);
+    const current = store.listKnowledgeBases().find((candidate) => candidate.id === knowledgeBaseId);
+    if (!current) throw new Error(`Managed knowledge base not found: ${knowledgeBaseId}`);
+    const candidate: ManagedKnowledgeBase = {
+      ...current,
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.rootPath !== undefined ? { rootPath: path.resolve(input.rootPath) } : {}),
+      ...knowledgeBaseOptionalPath(input, "engineRoot", current.engineRoot),
+      ...knowledgeBaseOptionalPath(input, "stateDir", current.stateDir),
+      updatedAt: new Date().toISOString()
+    };
+    const inspection = await this.llmWiki.inspect(candidate);
+    const updated = store.updateKnowledgeBase(knowledgeBaseId, input);
+    this.llmWiki.invalidate(knowledgeBaseId);
+    return {
+      knowledgeBase: this.listKnowledgeBases(accountId).find((item) => item.id === updated.id)!,
+      inspection
+    };
+  }
+
+  deleteKnowledgeBase(accountId: string, knowledgeBaseId: string): void {
+    this.storeFor(accountId).deleteKnowledgeBase(knowledgeBaseId);
+    this.llmWiki.invalidate(knowledgeBaseId);
+  }
+
+  bindProjectKnowledgeBase(
+    accountId: string,
+    projectId: string,
+    knowledgeBaseId?: string
+  ): AccountProject {
+    const store = this.storeFor(accountId);
+    const project = store.bindProjectKnowledgeBase(projectId, knowledgeBaseId);
+    return this.projectSummary(accountId, project, store);
   }
 
   createProject(accountId: string, name: string, workspace: string): AccountProject {
@@ -1389,6 +1483,16 @@ function taskRuntimeKey(sessionId: string, turnId: string): string {
 
 function taskboardNotificationKey(issue: TaskboardIssue): string {
   return `${issue.id}\n${issue.version}\n${issue.status}`;
+}
+
+function knowledgeBaseOptionalPath(
+  input: { engineRoot?: string | null; stateDir?: string | null },
+  key: "engineRoot" | "stateDir",
+  current: string | undefined
+): Partial<Pick<ManagedKnowledgeBase, "engineRoot" | "stateDir">> {
+  if (!Object.hasOwn(input, key)) return current ? { [key]: current } : {};
+  const value = input[key];
+  return value ? { [key]: path.resolve(value) } : {};
 }
 
 function taskboardProjectBase(project: AccountProject): TaskboardIntegrationStatus["projects"][number] {

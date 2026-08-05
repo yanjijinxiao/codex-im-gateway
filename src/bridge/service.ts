@@ -8,17 +8,34 @@ import type { ChannelCommand, FriendlyChannelIntent } from "./channel-intent.js"
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
+import { ChannelUserInputController } from "./user-input.js";
 import { TaskboardChannelController } from "./taskboard-channel-controller.js";
 import {
   conciseButtonLabel,
   createCommandSelectionCard,
   createMainMenuCard
 } from "./interaction-cards.js";
-import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
+import type {
+  CodexDynamicToolCall,
+  CodexModelOption,
+  CodexRuntimeInfo,
+  CodexThreadGoal,
+  CodexThreadGoalStatus
+} from "../codex/app-server-runner.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { HybridCodexRunner } from "../codex/runner.js";
+import {
+  LlmWikiMcpClientPool,
+  llmWikiDynamicTools
+} from "../knowledge/llm-wiki-mcp-client.js";
 import type { CodexWeixinConfig } from "../state/config.js";
-import { RuntimeStateStore, type ManagedProject, type ManagedSession } from "../state/runtime-state.js";
+import {
+  RuntimeStateStore,
+  type ManagedKnowledgeBase,
+  type ManagedProject,
+  type ManagedSession,
+  type ProjectInteractionMode
+} from "../state/runtime-state.js";
 import {
   listCodexProjectCandidates,
   listCodexSessionCandidates,
@@ -37,6 +54,7 @@ import {
   type ChannelActionCard,
   type ChannelChoice
 } from "../channels/action-card.js";
+import { createGoalFormCard } from "../channels/goal-form-card.js";
 import { formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
 import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
 
@@ -56,6 +74,7 @@ export type BridgeServiceOptions = {
   runner?: HybridCodexRunner;
   listCodexModels?: () => Promise<CodexModelOption[]>;
   getCodexBalance?: () => Promise<CodexAccountBalance>;
+  llmWiki?: LlmWikiMcpClientPool;
   listCodexProjects?: () => readonly CodexProjectCandidate[];
   listCodexSessions?: (workspace: string) => readonly CodexSessionCandidate[];
   inboundDir?: string;
@@ -80,6 +99,8 @@ export class BridgeService {
   private readonly runner: HybridCodexRunner;
   private readonly approvals: ChannelApprovalController;
   private readonly taskboardController: TaskboardChannelController;
+  private readonly llmWiki: LlmWikiMcpClientPool;
+  private readonly userInputs: ChannelUserInputController;
 
   constructor(private readonly options: BridgeServiceOptions) {
     this.access = new AccessController({
@@ -101,6 +122,10 @@ export class BridgeService {
       codexBin: options.config.codexBin,
       execSandbox: options.config.codexExecSandbox
     });
+    this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
+    this.userInputs = new ChannelUserInputController(
+      (senderId, card) => this.replyActionCard(senderId, card)
+    );
     this.taskboardController = new TaskboardChannelController({
       client: options.taskboard,
       stateStore: options.stateStore,
@@ -139,10 +164,10 @@ export class BridgeService {
       return;
     }
     const command = slashCommand ?? (friendlyIntent?.kind === "command" ? friendlyIntent.command : undefined);
-    const canRunWithoutProject = command && ![
-      "status", "task", "new", "session", "sessions", "model", "effort", "stream", "prompt", "stop"
+    const canRunWithoutProject = command && [
+      "help", "h", "balance", "memory", "knowledge", "project", "projects", "approve", "reject", "answer"
     ].includes(command.name);
-    if (!canRunWithoutProject && !this.ensureBoundProjectSession(replyTargetId)) {
+    if (!canRunWithoutProject && !this.ensureBoundProjectContext(replyTargetId)) {
       const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
       await this.replyActionCard(replyTargetId, createChoiceCard({
         title: "先添加一个 Codex 项目",
@@ -183,14 +208,18 @@ export class BridgeService {
     const resolver = this.options.intentResolver;
     if (!resolver || !text.trim()) return undefined;
     const projects = this.options.stateStore.listProjects();
-    const activeSession = this.options.stateStore.getActiveSession(senderId);
-    const currentProjectName = activeSession?.projectId
-      ? projects.find((project) => project.id === activeSession.projectId)?.name
+    const activeProject = this.options.stateStore.getActiveProject(senderId);
+    const knowledgeBaseName = activeProject?.knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === activeProject.knowledgeBaseId)?.name
       : undefined;
+    const currentProjectName = activeProject?.name;
+    const currentMode = this.options.stateStore.getInteractionMode(senderId);
     try {
       return await resolver.resolve({
         text,
         ...(currentProjectName ? { currentProjectName } : {}),
+        ...(currentMode !== "session" ? { currentMode } : {}),
+        ...(knowledgeBaseName ? { knowledgeBaseName } : {}),
         projectNames: projects.map((project) => project.name)
       });
     } catch (error) {
@@ -212,7 +241,20 @@ export class BridgeService {
         return;
       case "status":
       case "where":
-        await this.reply(message.senderId, await this.statusText(message.senderId));
+        {
+          const status = await this.statusText(message.senderId);
+          await this.replyActionCard(message.senderId, createChoiceCard({
+            title: "当前工作上下文",
+            body: status.replace(/^当前工作上下文\n/, ""),
+            fallbackText: status,
+            choices: [
+              { label: "切换模式", command: "mode", arg: "", style: "primary" },
+              { label: "任务面板", command: "task", arg: "list" },
+              { label: "会话", command: "sessions", arg: "" },
+              { label: "目标", command: "goal", arg: "" }
+            ]
+          }));
+        }
         return;
       case "balance":
         await this.handleBalanceCommand(message.senderId);
@@ -226,28 +268,34 @@ export class BridgeService {
         await this.handleProjectCommand(message.senderId, command.arg);
         return;
       case "task":
+        this.options.stateStore.setInteractionMode(message.senderId, "task");
         await this.taskboardController.handle(message, command.arg);
+        return;
+      case "mode":
+      case "view":
+        await this.handleModeCommand(message, command.arg);
+        return;
+      case "qa":
+        await this.handleModeCommand(message, "qa");
+        return;
+      case "plan":
+        await this.handlePlanCommand(message.senderId, command.arg);
+        return;
+      case "goal":
+        await this.handleGoalCommand(message, command.arg);
+        return;
+      case "answer":
+        await this.reply(message.senderId, this.userInputs.answer(message.senderId, command.arg));
         return;
       case "new":
         {
-          const activeSession = this.options.stateStore.getActiveSession(message.senderId);
-          if (!activeSession) {
+          const project = this.options.stateStore.getActiveProject(message.senderId);
+          if (!project) {
             await this.replyActionCard(message.senderId, createChoiceCard({
               title: "先选择项目",
               body: "新会话需要归属到一个 Codex 项目。",
               fallbackText: "请先选择一个项目，再新建会话。",
               choices: [{ label: "选择项目", command: "project", arg: "list", style: "primary" }]
-            }));
-            return;
-          }
-          const project = this.options.stateStore.listProjects()
-            .find((candidate) => candidate.id === activeSession.projectId);
-          if (!project) {
-            await this.replyActionCard(message.senderId, createChoiceCard({
-              title: "项目已不存在",
-              body: "当前会话关联的项目已被移除，请重新选择。",
-              fallbackText: "当前会话的项目已不存在，请重新选择项目。",
-              choices: [{ label: "重新选择项目", command: "project", arg: "list", style: "primary" }]
             }));
             return;
           }
@@ -257,6 +305,7 @@ export class BridgeService {
             undefined,
             project.id
           );
+          this.options.stateStore.setInteractionMode(message.senderId, "session");
           await this.reply(
             message.senderId,
             `已在当前项目“${project.name}”新建并绑定会话：${session.title}\n下一条消息将在这个新会话中开始。`
@@ -287,7 +336,8 @@ export class BridgeService {
         return;
       case "stop":
         this.approvals.declineAll(message.senderId);
-        await this.runner.stop(this.options.stateStore.getThread(message.senderId));
+        this.userInputs.cancelSender(message.senderId);
+        await this.runner.stop(this.executionSession(message.senderId)?.threadId);
         await this.reply(message.senderId, "Stop signal sent.");
         return;
       default:
@@ -297,15 +347,14 @@ export class BridgeService {
     }
   }
 
-  private ensureBoundProjectSession(senderId: string): boolean {
+  private ensureBoundProjectContext(senderId: string): boolean {
     const projects = this.options.stateStore.listProjects();
-    const activeSession = this.options.stateStore.getActiveSession(senderId);
-    if (activeSession?.projectId && projects.some((project) => project.id === activeSession.projectId)) {
-      return true;
-    }
+    const activeProject = this.options.stateStore.getActiveProject(senderId);
+    if (activeProject && projects.some((project) => project.id === activeProject.id)) return true;
     const project = projects[0];
     if (!project) return false;
-    this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
+    this.options.stateStore.activateProject(senderId, project.id);
+    this.options.stateStore.setInteractionMode(senderId, "session");
     return true;
   }
 
@@ -380,7 +429,7 @@ export class BridgeService {
       return;
     }
     if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "l") {
-      const activeProjectId = this.options.stateStore.getActiveSession(senderId)?.projectId;
+      const activeProjectId = this.options.stateStore.getActiveProject(senderId)?.id;
       const fallbackText = (projects.length
         ? ["已绑定的 Codex 项目：", ...projects.map((project, index) =>
           `[P${index + 1}] ${project.id === activeProjectId ? "【当前】" : ""}${project.name}\n   ${project.workspace}`
@@ -434,34 +483,299 @@ export class BridgeService {
       }));
       return;
     }
-    const existing = this.recentProjectSessionChoices(senderId, project)[0];
-    const session = existing
-      ? this.bindProjectSessionChoice(senderId, project, existing)
-      : this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
+    this.options.stateStore.activateProject(senderId, project.id);
+    this.options.stateStore.setInteractionMode(senderId, "session");
     const fallbackText = [
       `已切换 Codex 项目：${project.name}`,
       project.workspace,
-      existing ? `已绑定最近活跃会话：${session.title}` : `项目暂无会话，已新建并绑定：${session.title}`,
-      "发送 /sessions 查看当前项目最近 10 个会话，或发送 /new 新建会话。"
+      "请选择接下来要进入的工作模式。"
     ].join("\n");
     await this.replyActionCard(senderId, createChoiceCard({
       title: `已切换到 ${conciseButtonLabel(project.name, 28)}`,
       template: "green",
-      body: `${project.workspace}\n\n${existing ? `已绑定最近活跃会话：${session.title}` : `已新建并绑定会话：${session.title}`}`,
+      body: `${project.workspace}\n\n选择会话、任务或基于绑定 llm-wiki 的问答模式。`,
       fallbackText,
       choices: [
-        { label: "选择会话", command: "sessions", arg: "", style: "primary" },
-        { label: "新建会话", command: "new", arg: "" }
+        { label: "会话模式", command: "mode", arg: "session", style: "primary" },
+        { label: "任务模式", command: "mode", arg: "task" },
+        { label: "问答模式", command: "mode", arg: "qa" }
       ]
     }));
   }
 
+  private async handleModeCommand(message: NormalizedWeixinMessage, arg: string): Promise<void> {
+    const senderId = message.senderId;
+    const project = this.options.stateStore.getActiveProject(senderId);
+    if (!project) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "先选择项目",
+        body: "三种工作模式都归属于当前项目。",
+        fallbackText: "请先选择项目。",
+        choices: [{ label: "选择项目", command: "project", arg: "list", style: "primary" }]
+      }));
+      return;
+    }
+    const requested = normalizeMode(arg);
+    if (!requested) {
+      await this.replyModeCard(senderId, project);
+      return;
+    }
+    if (requested === "task") {
+      this.options.stateStore.setInteractionMode(senderId, "task");
+      await this.taskboardController.handle(message, "list");
+      return;
+    }
+    if (requested === "session") {
+      const existing = this.options.stateStore.listSessions()
+        .filter((session) => (
+          session.senderId === senderId && session.projectId === project.id && session.mode !== "qa"
+        ))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+      const session = existing
+        ? this.options.stateStore.activateSession(existing.id)
+        : this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
+      this.options.stateStore.setInteractionMode(senderId, "session");
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "已进入会话模式",
+        template: "green",
+        body: `项目：${project.name}\n会话：${session.title}\n\n直接发送自然语言即可继续协作。`,
+        fallbackText: `已进入会话模式：${project.name} / ${session.title}`,
+        choices: [
+          { label: "选择会话", command: "sessions", arg: "", style: "primary" },
+          { label: "计划模式", command: "plan", arg: "toggle" },
+          { label: "查看目标", command: "goal", arg: "" }
+        ]
+      }));
+      return;
+    }
+    const knowledgeBase = project.knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
+      : undefined;
+    if (!knowledgeBase) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "尚未绑定 llm-wiki",
+        body: `项目“${project.name}”还没有绑定知识库。请先在渠道后台的“知识库”页面完成绑定。`,
+        fallbackText: `项目“${project.name}”尚未绑定 llm-wiki，请在渠道后台完成绑定。`,
+        choices: [
+          { label: "切换项目", command: "project", arg: "list", style: "primary" },
+          { label: "会话模式", command: "mode", arg: "session" }
+        ]
+      }));
+      return;
+    }
+    try {
+      await this.llmWiki.inspect(knowledgeBase);
+    } catch (error) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "知识库暂不可用",
+        template: "red",
+        body: `${knowledgeBase.name}\n${error instanceof Error ? error.message : String(error)}`,
+        fallbackText: `知识库“${knowledgeBase.name}”暂不可用。`,
+        choices: [
+          { label: "重试", command: "mode", arg: "qa", style: "primary" },
+          { label: "会话模式", command: "mode", arg: "session" }
+        ]
+      }));
+      return;
+    }
+    const current = this.options.stateStore.getActiveQaSession(senderId);
+    const reusable = current?.projectId === project.id && current.knowledgeBaseId === knowledgeBase.id
+      ? current
+      : this.options.stateStore.listSessions()
+        .filter((session) => (
+          session.senderId === senderId
+          && session.projectId === project.id
+          && session.mode === "qa"
+          && session.knowledgeBaseId === knowledgeBase.id
+        ))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    const session = reusable
+      ? this.options.stateStore.activateSession(reusable.id)
+      : this.options.stateStore.createSession(
+          senderId,
+          project.workspace,
+          `问答 · ${knowledgeBase.name}`,
+          project.id,
+          "qa",
+          knowledgeBase.id
+        );
+    this.options.stateStore.setInteractionMode(senderId, "qa");
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: "已进入问答模式",
+      template: "green",
+      body: `当前项目：${project.name}\n知识库：${knowledgeBase.name}\n\nCodex 会在项目目录中工作，并按问题自主调用 llm-wiki 的只读检索工具。`,
+      fallbackText: `已进入问答模式：项目 ${project.name}，知识库 ${knowledgeBase.name}`,
+      choices: [
+        { label: "查看当前上下文", command: "status", arg: "", style: "primary" },
+        { label: "会话模式", command: "mode", arg: "session" },
+        { label: "任务模式", command: "mode", arg: "task" }
+      ]
+    }));
+  }
+
+  private async replyModeCard(senderId: string, project: ManagedProject): Promise<void> {
+    const active = this.options.stateStore.getInteractionMode(senderId);
+    const knowledgeBase = project.knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
+      : undefined;
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: `当前项目 · ${conciseButtonLabel(project.name, 24)}`,
+      body: [
+        project.workspace,
+        `当前模式：${formatInteractionMode(active)}`,
+        `问答知识库：${knowledgeBase?.name ?? "未绑定"}`
+      ].join("\n"),
+      fallbackText: `当前项目 ${project.name}，当前模式 ${formatInteractionMode(active)}`,
+      choices: [
+        { label: "会话模式", command: "mode", arg: "session", style: active === "session" ? "primary" : "default" },
+        { label: "任务模式", command: "mode", arg: "task", style: active === "task" ? "primary" : "default" },
+        { label: "问答模式", command: "mode", arg: "qa", style: active === "qa" ? "primary" : "default" }
+      ]
+    }));
+  }
+
+  private async handlePlanCommand(senderId: string, arg: string): Promise<void> {
+    const session = this.executionSession(senderId);
+    if (!session) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "尚未进入可执行会话",
+        body: "先进入会话或问答模式，再切换 Codex 的计划模式。",
+        fallbackText: "请先进入会话或问答模式。",
+        choices: [{ label: "会话模式", command: "mode", arg: "session", style: "primary" }]
+      }));
+      return;
+    }
+    const input = arg.trim().toLowerCase();
+    const mode = input === "on" || input === "plan"
+      ? "plan"
+      : input === "off" || input === "default"
+        ? "default"
+        : session.collaborationMode === "plan" ? "default" : "plan";
+    this.options.stateStore.setSessionCollaborationMode(session.id, mode);
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: mode === "plan" ? "已开启计划模式" : "已回到执行模式",
+      template: mode === "plan" ? "blue" : "green",
+      body: mode === "plan"
+        ? "下一条消息将使用 Codex 原生 plan collaboration mode，适合先澄清和形成方案。"
+        : "下一条消息将使用默认协作模式，可以继续执行和修改项目。",
+      fallbackText: mode === "plan" ? "已开启 Codex 计划模式。" : "已关闭 Codex 计划模式。",
+      choices: [
+        { label: mode === "plan" ? "切到执行模式" : "切到计划模式", command: "plan", arg: "toggle", style: "primary" },
+        { label: "查看目标", command: "goal", arg: "" }
+      ]
+    }));
+  }
+
+  private async handleGoalCommand(message: NormalizedWeixinMessage, arg: string): Promise<void> {
+    const senderId = message.senderId;
+    const session = this.executionSession(senderId);
+    if (!session?.threadId) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "当前项目尚未开始会话",
+        body: "Codex 目标绑定到具体会话。先选择工作模式并开始协作，创建 thread 后即可用原生目标卡片设置。",
+        fallbackText: "当前项目尚未创建 Codex thread，暂时不能设置目标。",
+        choices: [
+          { label: "会话模式", command: "mode", arg: "session", style: "primary" },
+          { label: "问答模式", command: "mode", arg: "qa" }
+        ]
+      }));
+      return;
+    }
+    const input = arg.trim();
+    if (/^(?:new|form|set)$/i.test(input)) {
+      const project = this.options.stateStore.getActiveProject(senderId);
+      await this.replyTaskCard(message, createGoalFormCard(project?.name ?? "当前项目"));
+      return;
+    }
+    if (/^clear$/i.test(input)) {
+      await this.runner.clearGoal(session.threadId);
+      await this.reply(senderId, "已清除当前 Codex 目标。");
+      return;
+    }
+    const statusMatch = /^(pause|resume|complete)$/i.exec(input);
+    if (statusMatch) {
+      const status = ({ pause: "paused", resume: "active", complete: "complete" } as const)[
+        statusMatch[1].toLowerCase() as "pause" | "resume" | "complete"
+      ];
+      const goal = await this.runner.setGoal(session.threadId, { status });
+      await this.replyGoalCard(message, goal);
+      return;
+    }
+    const setMatch = /^(?:set\s+)?(.+)$/is.exec(input);
+    if (setMatch && input) {
+      const objective = setMatch[1].trim();
+      const goal = await this.runner.setGoal(session.threadId, { objective, status: "active" });
+      await this.replyGoalCard(message, goal);
+      return;
+    }
+    await this.replyGoalCard(message, await this.runner.getGoal(session.threadId));
+  }
+
+  private async replyGoalCard(message: NormalizedWeixinMessage, goal: CodexThreadGoal | undefined): Promise<void> {
+    const senderId = message.senderId;
+    if (!goal) {
+      const project = this.options.stateStore.getActiveProject(senderId);
+      await this.replyTaskCard(message, createGoalFormCard(project?.name ?? "当前项目"));
+      return;
+    }
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: `目标 · ${formatGoalStatus(goal.status)}`,
+      template: goal.status === "complete" ? "green" : goal.status === "blocked" ? "red" : "blue",
+      body: [
+        goal.objective,
+        `已使用 ${goal.tokensUsed} tokens · ${formatDuration(goal.timeUsedSeconds)}`,
+        goal.tokenBudget ? `预算 ${goal.tokenBudget} tokens` : "未设置 token 预算"
+      ].join("\n\n"),
+      fallbackText: `Codex 目标：${goal.objective}（${formatGoalStatus(goal.status)}）`,
+      choices: goal.status === "active"
+          ? [
+            { label: "暂停目标", command: "goal", arg: "pause", style: "primary" },
+            { label: "标记完成", command: "goal", arg: "complete" },
+            { label: "修改目标", command: "goal", arg: "form" },
+            { label: "清除目标", command: "goal", arg: "clear" }
+          ]
+        : [
+            { label: "继续目标", command: "goal", arg: "resume", style: "primary" },
+            { label: "修改目标", command: "goal", arg: "form" },
+            { label: "清除目标", command: "goal", arg: "clear" }
+          ]
+    }));
+  }
+
+  private executionSession(senderId: string): ManagedSession | undefined {
+    const project = this.options.stateStore.getActiveProject(senderId);
+    if (!project) return undefined;
+    const mode = this.options.stateStore.getInteractionMode(senderId);
+    const session = mode === "qa"
+      ? this.options.stateStore.getActiveQaSession(senderId)
+      : this.options.stateStore.getActiveSession(senderId);
+    if (session?.projectId !== project.id) return undefined;
+    if (mode === "qa" && session.knowledgeBaseId !== project.knowledgeBaseId) return undefined;
+    return session;
+  }
+
+  private updateExecutionRuntime(
+    senderId: string,
+    overrides: { model?: string | null; effort?: string | null; streamReplies?: boolean | null }
+  ): void {
+    let session = this.executionSession(senderId);
+    const project = this.options.stateStore.getActiveProject(senderId);
+    if (!session && project) {
+      const knowledgeBase = this.options.stateStore.getInteractionMode(senderId) === "qa"
+        ? this.resolveQaContext(project)
+        : undefined;
+      session = knowledgeBase
+        ? this.ensureQaSession(senderId, project, knowledgeBase)
+        : this.ensureConversationSession(senderId, project);
+    }
+    if (!session) throw new Error("No active session for current mode");
+    this.options.stateStore.updateSessionRuntime(session.id, overrides);
+  }
+
   private async handleSessionCommand(senderId: string, arg: string): Promise<void> {
     const activeSession = this.options.stateStore.getActiveSession(senderId);
-    const project = activeSession?.projectId
-      ? this.options.stateStore.listProjects().find((candidate) => candidate.id === activeSession.projectId)
-      : undefined;
-    if (!activeSession || !project) {
+    const project = this.options.stateStore.getActiveProject(senderId);
+    if (!project) {
       const fallbackText = "请先发送 /project P编号 切换到一个项目。";
       await this.replyActionCard(senderId, createChoiceCard({
         title: "先选择项目",
@@ -474,7 +788,7 @@ export class BridgeService {
     const sessions = this.recentProjectSessionChoices(senderId, project);
     const input = arg.trim();
     if (!input) {
-      const activeId = activeSession.id;
+      const activeId = activeSession?.projectId === project.id ? activeSession.id : undefined;
       const previews = await Promise.all(sessions.map((session) => this.projectSessionChoicePreview(session)));
       const lines = [`项目“${project.name}”最近活跃的会话（最多 ${RECENT_PROJECT_SESSION_LIMIT} 个）：`];
       for (const [index, session] of sessions.entries()) {
@@ -539,6 +853,7 @@ export class BridgeService {
     }
     const preview = await this.projectSessionChoicePreview(selected);
     const bound = this.bindProjectSessionChoice(senderId, project, selected);
+    this.options.stateStore.setInteractionMode(senderId, "session");
     await this.reply(senderId, [
       `已绑定项目“${project.name}”的会话：${bound.title}`,
       `最近内容：${preview}`,
@@ -548,7 +863,9 @@ export class BridgeService {
 
   private recentProjectSessionChoices(senderId: string, project: ManagedProject): ProjectSessionChoice[] {
     const managed = this.options.stateStore.listSessions()
-      .filter((session) => session.senderId === senderId && session.projectId === project.id);
+      .filter((session) => (
+        session.senderId === senderId && session.projectId === project.id && session.mode !== "qa"
+      ));
     const candidates = [...(this.options.listCodexSessions?.(project.workspace)
       ?? listCodexSessionCandidates(project.workspace))];
     const candidatesByThread = new Map(candidates.map((candidate) => [candidate.threadId, candidate]));
@@ -649,7 +966,7 @@ export class BridgeService {
     const input = arg.trim();
     if (!input) {
       const runtime = await this.effectiveRuntime(senderId);
-      const session = this.options.stateStore.getActiveSession(senderId);
+      const session = this.executionSession(senderId);
       const lines = [
         `当前模型：${runtime.model ?? "Codex 默认"}${session?.model ? "（本会话）" : "（继承 Web/Codex 设置）"}`
       ];
@@ -676,7 +993,7 @@ export class BridgeService {
       return;
     }
     if (input.toLowerCase() === "default") {
-      this.options.stateStore.setModelOverride(senderId);
+      this.updateExecutionRuntime(senderId, { model: null });
       const runtime = await this.effectiveRuntime(senderId);
       await this.reply(senderId, `已恢复继承 Web/Codex 模型设置。\n当前模型：${runtime.model ?? "Codex 默认"}`);
       return;
@@ -695,13 +1012,13 @@ export class BridgeService {
     }
     const currentRuntime = await this.effectiveRuntime(senderId);
     const model = selected?.model ?? input;
-    this.options.stateStore.setModelOverride(senderId, model);
+    this.updateExecutionRuntime(senderId, { model });
     let adjustedEffort: string | undefined;
     if (currentRuntime.effort && selected?.supportedEfforts.length && !selected.supportedEfforts.some((option) => option.effort === currentRuntime.effort)) {
       adjustedEffort = selected.supportedEfforts.some((option) => option.effort === selected.defaultEffort)
         ? selected.defaultEffort
         : selected.supportedEfforts[0]?.effort;
-      this.options.stateStore.setEffortOverride(senderId, adjustedEffort);
+      this.updateExecutionRuntime(senderId, { effort: adjustedEffort });
     }
     await this.reply(senderId, [
       `本会话模型已切换为：${selected?.displayName ?? model}（${model}）`,
@@ -717,7 +1034,7 @@ export class BridgeService {
     const efforts = availableEfforts(model, models);
     const input = arg.trim();
     if (!input) {
-      const session = this.options.stateStore.getActiveSession(senderId);
+      const session = this.executionSession(senderId);
       const fallbackText = [
         `当前推理强度：${formatEffort(runtime.effort)}${session?.effort ? "（本会话）" : "（继承 Web/Codex 设置）"}`,
         `当前模型：${runtime.model ?? "Codex 默认"}`,
@@ -745,7 +1062,7 @@ export class BridgeService {
       return;
     }
     if (input.toLowerCase() === "default") {
-      this.options.stateStore.setEffortOverride(senderId);
+      this.updateExecutionRuntime(senderId, { effort: null });
       const nextRuntime = await this.effectiveRuntime(senderId);
       await this.reply(senderId, `已恢复继承 Web/Codex 推理强度设置。\n当前推理强度：${formatEffort(nextRuntime.effort)}`);
       return;
@@ -761,13 +1078,13 @@ export class BridgeService {
       }));
       return;
     }
-    this.options.stateStore.setEffortOverride(senderId, effort);
+    this.updateExecutionRuntime(senderId, { effort });
     await this.reply(senderId, `本会话推理强度已切换为：${formatEffort(effort)}\n下一条消息开始生效。`);
   }
 
   private async handleStreamCommand(senderId: string, arg: string): Promise<void> {
     const input = arg.trim().toLowerCase();
-    const session = this.options.stateStore.getActiveSession(senderId);
+    const session = this.executionSession(senderId);
     const inherited = this.options.config.streamReplies;
     if (!input) {
       const effective = session?.streamReplies ?? inherited;
@@ -787,7 +1104,7 @@ export class BridgeService {
       return;
     }
     if (input === "default") {
-      this.options.stateStore.setStreamRepliesOverride(senderId);
+      this.updateExecutionRuntime(senderId, { streamReplies: null });
       await this.reply(senderId, `已恢复继承全局设置。当前过程进度：${inherited ? "开启" : "关闭"}。`);
       return;
     }
@@ -804,7 +1121,7 @@ export class BridgeService {
       return;
     }
     const enabled = input === "on";
-    this.options.stateStore.setStreamRepliesOverride(senderId, enabled);
+    this.updateExecutionRuntime(senderId, { streamReplies: enabled });
     await this.reply(senderId, `本会话过程进度已${enabled ? "开启" : "关闭"}。`);
   }
 
@@ -990,16 +1307,20 @@ export class BridgeService {
   }
 
   private async runCodexTurn(message: NormalizedWeixinMessage, text: string, attachments: PromptBufferItem[] = []): Promise<void> {
-    const session = this.options.stateStore.getActiveSession(message.senderId);
-    if (!session?.projectId) {
-      throw new Error("No bound Codex project for this sender");
-    }
+    const project = this.options.stateStore.getActiveProject(message.senderId);
+    if (!project) throw new Error("No bound Codex project for this sender");
+    const mode = this.options.stateStore.getInteractionMode(message.senderId);
+    const qaContext = mode === "qa" ? this.resolveQaContext(project) : undefined;
+    if (mode === "qa" && !qaContext) throw new Error("Current project has no available llm-wiki knowledge base");
+    const session = mode === "qa"
+      ? this.ensureQaSession(message.senderId, project, qaContext as ManagedKnowledgeBase)
+      : this.ensureConversationSession(message.senderId, project);
     const promptPreview = buildPromptPreview(text, attachments);
     if (promptPreview) {
       this.options.stateStore.setSessionPromptPreview(session.id, promptPreview);
     }
     const workspace = session.workspace;
-    const threadId = this.options.stateStore.getThread(message.senderId) || undefined;
+    const threadId = session.threadId || undefined;
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
     const sentProgress = new Set<string>();
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
@@ -1007,13 +1328,19 @@ export class BridgeService {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-channel-bridge] starting Codex turn for ${message.senderId} in ${workspace}`);
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
+        const basePrompt = buildPrompt(text, attachments, "WeChat", knowledge);
         const result = await this.runner.run({
-          prompt: buildPrompt(text, attachments, "WeChat", knowledge),
+          prompt: qaContext ? buildQaPrompt(basePrompt, project, qaContext) : basePrompt,
           cwd: workspace,
           threadId,
           queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
+          collaborationMode: session.collaborationMode ?? "default",
+          ...(qaContext ? {
+            dynamicTools: llmWikiDynamicTools(),
+            onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
+          } : {}),
           ...(progressEnabled ? {
             onProgress: async (progress: string) => {
               const progressText = progress.trim();
@@ -1022,11 +1349,12 @@ export class BridgeService {
               await this.reply(message.senderId, `【进度】${progressText}`);
             }
           } : {}),
-          onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request)
+          onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
+          onUserInput: (request) => this.userInputs.request(message.senderId, request)
         });
         console.log(`[codex-channel-bridge] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
-          this.options.stateStore.setThread(message.senderId, result.threadId);
+          this.options.stateStore.setSessionThread(session.id, result.threadId);
         }
         const parsed = parseActionBlocks(result.text);
         for (const memory of parsed.actions.remember) {
@@ -1060,6 +1388,72 @@ export class BridgeService {
     } finally {
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
     }
+  }
+
+  private ensureConversationSession(senderId: string, project: ManagedProject): ManagedSession {
+    const active = this.options.stateStore.getActiveSession(senderId);
+    if (active?.projectId === project.id && active.mode !== "qa") return active;
+    const existing = this.options.stateStore.listSessions()
+      .filter((session) => session.senderId === senderId && session.projectId === project.id && session.mode !== "qa")
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    return existing
+      ? this.options.stateStore.activateSession(existing.id)
+      : this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
+  }
+
+  private ensureQaSession(
+    senderId: string,
+    project: ManagedProject,
+    knowledgeBase: ManagedKnowledgeBase
+  ): ManagedSession {
+    const active = this.options.stateStore.getActiveQaSession(senderId);
+    if (
+      active?.projectId === project.id
+      && active.knowledgeBaseId === knowledgeBase.id
+    ) {
+      return active;
+    }
+    const existing = this.options.stateStore.listSessions()
+      .filter((session) => (
+        session.senderId === senderId
+        && session.projectId === project.id
+        && session.mode === "qa"
+        && session.knowledgeBaseId === knowledgeBase.id
+      ))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    return existing
+      ? this.options.stateStore.activateSession(existing.id)
+      : this.options.stateStore.createSession(
+          senderId,
+          project.workspace,
+          `问答 · ${knowledgeBase.name}`,
+          project.id,
+          "qa",
+          knowledgeBase.id
+        );
+  }
+
+  private resolveQaContext(project: ManagedProject): ManagedKnowledgeBase | undefined {
+    return project.knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
+      : undefined;
+  }
+
+  private async handleKnowledgeToolCall(
+    knowledgeBase: ManagedKnowledgeBase,
+    call: CodexDynamicToolCall
+  ): Promise<string> {
+    if (call.namespace !== "knowledge" || (call.tool !== "search" && call.tool !== "get_document")) {
+      throw new Error(`不允许的知识库工具：${call.namespace ?? ""}.${call.tool}`);
+    }
+    if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+      throw new Error("知识库工具参数必须是 JSON 对象");
+    }
+    return this.llmWiki.call(
+      knowledgeBase,
+      call.tool,
+      call.arguments as Record<string, unknown>
+    );
   }
 
   private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }): Promise<void> {
@@ -1127,10 +1521,12 @@ export class BridgeService {
   }
 
   private async statusText(senderId: string): Promise<string> {
-    const session = this.options.stateStore.getActiveSession(senderId);
-    const workspace = session?.workspace ?? this.options.config.defaultCwd;
-    const project = session?.projectId
-      ? this.options.stateStore.listProjects().find((candidate) => candidate.id === session.projectId)
+    const mode = this.options.stateStore.getInteractionMode(senderId);
+    const project = this.options.stateStore.getActiveProject(senderId);
+    const session = this.executionSession(senderId);
+    const workspace = project?.workspace ?? session?.workspace ?? this.options.config.defaultCwd;
+    const knowledgeBase = project?.knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
       : undefined;
     let issue: TaskboardIssue | undefined;
     if (project && session?.threadId && this.options.taskboard) {
@@ -1147,8 +1543,11 @@ export class BridgeService {
     return [
       "当前工作上下文",
       `项目：${project?.name ?? "尚未选择"}`,
+      `模式：${formatInteractionMode(mode)}`,
+      `问答知识库：${knowledgeBase?.name ?? "未绑定"}`,
       `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
       `会话：${session?.title ?? "新会话"}`,
+      `协作模式：${session?.collaborationMode === "plan" ? "计划" : "执行"}`,
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,
       `backend：${this.options.config.codexBackend}`,
@@ -1179,7 +1578,7 @@ export class BridgeService {
   }
 
   private async effectiveRuntime(senderId: string): Promise<CodexRuntimeInfo> {
-    const session = this.options.stateStore.getActiveSession(senderId);
+    const session = this.executionSession(senderId);
     const workspace = session?.workspace ?? this.options.config.defaultCwd;
     let runtime: CodexRuntimeInfo = {};
     try {
@@ -1340,7 +1739,9 @@ const COMMAND_ALIASES: Readonly<Record<string, string>> = {
   ok: "approve",
   no: "reject",
   x: "stop",
-  tb: "task"
+  tb: "task",
+  v: "mode",
+  q: "qa"
 };
 
 function helpText(): string {
@@ -1349,11 +1750,15 @@ function helpText(): string {
     "/help（/h）- 获取全部内置命令",
     "/status（/st）- 查看当前任务、项目、模型和运行状态",
     "/balance（/bal）- 查看当前 Codex 账号剩余用量",
-    "/memory（/mem）[on|off|f K编号|c] - 管理个人知识库",
+    "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
     "/project（/p）[l|P编号] - 查看或切换已绑定项目",
     "/project add（/p a）[C编号] - 查看或添加 Codex 历史项目",
     "/project rename（/p rn）P1|新名称 - 重命名项目",
     "/project delete（/p d）P1 - 移除没有任务的项目",
+    "/mode（/v）[session|task|qa] - 查看或切换当前项目工作模式",
+    "/qa（/q）- 进入绑定 llm-wiki 的问答模式",
+    "/plan [on|off] - 切换 Codex 原生计划模式",
+    "/goal [目标|pause|resume|complete|clear] - 管理当前 thread 目标",
     "/task（/tb）- 查看当前项目的 Taskboard Issue",
     "/task ISSUE编号 - 绑定并继续对应 Codex 任务",
     "/task new|todo|start|detail|comment|attach|block|review|accept|return - 操作 Taskboard 工作流",
@@ -1382,6 +1787,53 @@ function formatKnowledgeKind(kind: "preference" | "skill" | "knowledge" | "workf
     knowledge: "知识点",
     workflow: "流程"
   }[kind];
+}
+
+function normalizeMode(input: string): ProjectInteractionMode | undefined {
+  const value = input.trim().toLowerCase();
+  if (["session", "chat", "conversation", "会话", "聊天"].includes(value)) return "session";
+  if (["task", "taskboard", "任务", "面板"].includes(value)) return "task";
+  if (["qa", "question", "knowledge", "问答", "知识库"].includes(value)) return "qa";
+  return undefined;
+}
+
+function formatInteractionMode(mode: ProjectInteractionMode): string {
+  return ({ session: "会话模式", task: "任务模式", qa: "问答模式" } as const)[mode];
+}
+
+function formatGoalStatus(status: CodexThreadGoalStatus): string {
+  return ({
+    active: "进行中",
+    paused: "已暂停",
+    blocked: "受阻",
+    usageLimited: "用量受限",
+    budgetLimited: "预算用尽",
+    complete: "已完成"
+  } as const)[status];
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+}
+
+function buildQaPrompt(
+  prompt: string,
+  project: ManagedProject,
+  knowledgeBase: ManagedKnowledgeBase
+): string {
+  return [
+    prompt,
+    "",
+    "[codex-channel-qa-mode]",
+    `当前工作项目：${project.name}（${project.workspace}）。所有文件读取、命令和修改仍以该项目目录为 cwd。`,
+    `只读知识库：${knowledgeBase.name}。它不是工作目录，不能把知识库路径当作 cwd，也不能修改知识库。`,
+    "当问题需要知识库事实时，由你自主决定检索步骤：先调用 knowledge.search，必要时继续调用 knowledge.get_document 核对完整上下文。",
+    "不要假装已经检索；基于知识库作答时，在相关结论附近保留搜索结果中的 anchor 引用。若没有检索到证据，明确说明。",
+    "[/codex-channel-qa-mode]"
+  ].join("\n");
 }
 
 function formatSessionTime(value: string): string {

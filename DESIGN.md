@@ -98,6 +98,22 @@ The legacy workbench contract remains documented for compatibility with older bu
 - Interaction: async state follows idle to submitting to refreshed-success or refreshed-error. Feishu owns control motion; the Bridge communicates progress by replacing actionable controls with the latest card state rather than adding custom animation.
 - Security: card callbacks are parsed at the channel boundary, accept only declared form fields and bounded lengths, and never include credentials. The clicking actor is authorized separately from the reply conversation; an allowed conversation ID is an explicit group-wide ACL. Evidence and its version-checked status transition commit in one Taskboard transaction. Taskboard links remain loopback-only and are supplemental because mobile clients cannot open the host Mac's loopback service.
 
+### Project Interaction Modes
+
+- Structure: the selected Codex project owns three peer modes: 会话, 任务, and 问答. Mode changes use native channel buttons and preserve the project as the stable context.
+- Behavior: session mode resumes or creates a normal Codex thread; task mode opens the project-mapped Taskboard; Q&A mode resumes a separate thread bound to the project's selected llm-wiki knowledge base.
+- Codex controls: plan/default collaboration mode and thread goals are project-session controls surfaced through native cards. A Codex `request_user_input` request is translated into sequential native choice cards on interactive channels.
+- Security: the current project path remains the Codex `cwd` in every mode. The llm-wiki path is never substituted as the workspace and is exposed only through read-only `search` and `get_document` dynamic tools.
+
+### Knowledge Base Management
+
+- Structure: a peer “知识库” management view with one compact row per account-owned llm-wiki project, live inspection state, bound-project chips, and a single add/edit dialog. Project binding is edited beside the knowledge-base row rather than hidden in general settings.
+- States: empty, validating, healthy, unavailable, bound, unbound, editing, deleting, and validation error. Health text shows indexed document/block counts and the latest run status; color is supplemental.
+- Inputs: name, knowledge-base root, optional engine root, and optional state directory. Root paths remain visible and selectable. The engine root defaults to the knowledge-base root.
+- Behavior: create and edit validate the llm-wiki `wiki/` layout and read-only status contract before persistence. “重新检查” performs an explicit inspection; background refresh does not repeatedly spawn the llm-wiki runtime.
+- Accessibility: native selects and labelled inputs own keyboard behavior. Every binding control names both the Codex project and knowledge base, focus is visible, and the mobile layout becomes one column without horizontal page scrolling.
+- Scroll ownership: the page owns vertical scrolling. Knowledge-base rows wrap internally and never create a nested primary scroll container.
+
 ### Codex Sidebar Integration Entries
 
 - Structure: two native-looking rows placed immediately after Codex's Plugins row: “任务面板” first and “渠道配置” second.

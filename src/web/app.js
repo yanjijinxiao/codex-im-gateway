@@ -3,6 +3,7 @@ const state = {
   requestToken: "",
   accounts: [],
   projects: [],
+  knowledgeBases: [],
   codexProjects: [],
   sessions: [],
   config: null,
@@ -197,6 +198,7 @@ async function bootstrap() {
     state.version = data.version || "";
     state.accounts = data.accounts;
     state.projects = data.projects || [];
+    state.knowledgeBases = data.knowledgeBases || [];
     state.sessions = data.sessions;
     state.config = data.config;
     state.codex = data.codex;
@@ -371,14 +373,16 @@ async function refreshData(notify) {
   try {
     const previousSession = selectedSession();
     const taskboardEditing = isTaskboardEditing();
-    const [accounts, projects, sessions, taskboard] = await Promise.all([
+    const [accounts, projects, knowledgeBases, sessions, taskboard] = await Promise.all([
       api("/api/accounts"),
       api("/api/projects"),
+      api("/api/knowledge-bases"),
       api("/api/sessions"),
       api("/api/taskboard")
     ]);
     state.accounts = accounts.accounts;
     state.projects = projects.projects;
+    state.knowledgeBases = knowledgeBases.knowledgeBases;
     state.sessions = sessions.sessions;
     state.taskboard = taskboard;
     await loadTaskboardIssues(!taskboardEditing && !document.querySelector("#taskboardView").hidden);
@@ -386,6 +390,7 @@ async function refreshData(notify) {
     renderAccounts();
     renderSessions();
     renderTaskboardStatus();
+    window.renderKnowledgeBasesPage?.();
     if (!taskboardEditing) renderTaskboardWorkbench();
     drawIcons();
     const currentSession = selectedSession();
@@ -413,6 +418,7 @@ function renderAll() {
   renderAccounts();
   renderSessions();
   renderTaskboardWorkbench();
+  window.renderKnowledgeBasesPage?.();
   renderSettings();
   drawIcons();
 }
@@ -2114,7 +2120,7 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "taskboard", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "taskboard", "knowledge", "settings"].includes(name) ? name : "accounts";
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const visible = panel.dataset.viewPanel === valid;
     panel.hidden = !visible;

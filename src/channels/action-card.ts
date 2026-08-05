@@ -9,6 +9,11 @@ const channelCommandActionValueSchema = z.object({
     "memory",
     "project",
     "task",
+    "mode",
+    "qa",
+    "plan",
+    "goal",
+    "answer",
     "new",
     "sessions",
     "session",
@@ -45,9 +50,21 @@ const channelFormActionValueSchema = z.object({
   fields: z.array(channelFormFieldSchema).max(10)
 }).strict();
 
+const channelGoalFormActionValueSchema = z.object({
+  version: z.literal(3),
+  command: z.literal("goal"),
+  arg: z.literal("set"),
+  field: z.object({
+    name: z.literal("objective"),
+    required: z.literal(true),
+    maximumLength: z.number().int().min(1).max(2_000)
+  }).strict()
+}).strict();
+
 const channelActionValueSchema = z.discriminatedUnion("version", [
   channelCommandActionValueSchema,
-  channelFormActionValueSchema
+  channelFormActionValueSchema,
+  channelGoalFormActionValueSchema
 ]);
 
 export type ChannelActionValue = z.infer<typeof channelActionValueSchema>;
@@ -134,6 +151,15 @@ export function formatChannelActionCommand(value: ChannelActionValue, formValue?
         parameters.set(field.parameter, normalized);
       }
       return `/${value.command} ${value.arg} ${parameters}`;
+    }
+    case 3: {
+      const parsedForm = z.record(z.string(), z.unknown()).safeParse(formValue ?? {});
+      if (!parsedForm.success) return undefined;
+      const raw = parsedForm.data[value.field.name];
+      if (typeof raw !== "string") return undefined;
+      const objective = raw.trim();
+      if (!objective || objective.length > value.field.maximumLength) return undefined;
+      return `/goal ${objective}`;
     }
     default:
       return assertNever(value);

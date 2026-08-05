@@ -7,8 +7,12 @@ let initialized = false;
 let nextTurn = 1;
 const activeTurns = new Map();
 const pendingApprovals = new Map();
+const pendingToolCalls = new Map();
+const pendingUserInputs = new Map();
+const goals = new Map();
 let externalBusyReads = 0;
 let ephemeralThreadStarted = false;
+let dynamicToolsEnabled = false;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -96,12 +100,33 @@ rl.on("line", (line) => {
     return;
   }
 
+  if (!message.method && pendingToolCalls.has(message.id)) {
+    const pending = pendingToolCalls.get(message.id);
+    pendingToolCalls.delete(message.id);
+    const text = `tool:${message.result?.success}:${message.result?.contentItems?.[0]?.text ?? ""}`;
+    send({ method: "item/completed", params: { threadId: pending.threadId, turnId: pending.turnId, completedAtMs: Date.now(), item: { type: "agentMessage", id: `item-${pending.turnId}`, text, phase: "final_answer", memoryCitation: null } } });
+    send({ method: "turn/completed", params: { threadId: pending.threadId, turn: completedTurn(pending.turnId, "completed") } });
+    activeTurns.delete(pending.threadId);
+    return;
+  }
+
+  if (!message.method && pendingUserInputs.has(message.id)) {
+    const pending = pendingUserInputs.get(message.id);
+    pendingUserInputs.delete(message.id);
+    const text = `input:${message.result?.answers?.direction?.answers?.[0] ?? "none"}`;
+    send({ method: "item/completed", params: { threadId: pending.threadId, turnId: pending.turnId, completedAtMs: Date.now(), item: { type: "agentMessage", id: `item-${pending.turnId}`, text, phase: "final_answer", memoryCitation: null } } });
+    send({ method: "turn/completed", params: { threadId: pending.threadId, turn: completedTurn(pending.turnId, "completed") } });
+    activeTurns.delete(pending.threadId);
+    return;
+  }
+
   if (message.method === "thread/start") {
     if (message.params?.approvalPolicy !== "never") {
       fail(message.id, "approvalPolicy must be never");
       return;
     }
     ephemeralThreadStarted = message.params?.ephemeral === true;
+    dynamicToolsEnabled = message.params?.dynamicTools?.[0]?.name === "knowledge";
     respond(message.id, {
       thread: { id: "thread-new" },
       model: message.params.model ?? "configured-model",
@@ -167,6 +192,34 @@ rl.on("line", (line) => {
       rateLimitsByLimitId: null,
       rateLimitResetCredits: null
     });
+    return;
+  }
+
+  if (message.method === "thread/goal/get") {
+    respond(message.id, { goal: goals.get(message.params.threadId) ?? null });
+    return;
+  }
+
+  if (message.method === "thread/goal/set") {
+    const current = goals.get(message.params.threadId);
+    const goal = {
+      threadId: message.params.threadId,
+      objective: message.params.objective ?? current?.objective ?? "",
+      status: message.params.status ?? current?.status ?? "active",
+      tokenBudget: message.params.tokenBudget ?? current?.tokenBudget ?? null,
+      tokensUsed: 42,
+      timeUsedSeconds: 9,
+      createdAt: current?.createdAt ?? 1,
+      updatedAt: 2
+    };
+    goals.set(message.params.threadId, goal);
+    respond(message.id, { goal });
+    return;
+  }
+
+  if (message.method === "thread/goal/clear") {
+    goals.delete(message.params.threadId);
+    respond(message.id, { cleared: true });
     return;
   }
 
@@ -245,6 +298,10 @@ rl.on("line", (line) => {
       fail(message.id, "intent classification must use an ephemeral read-only thread with output schema");
       return;
     }
+    if (prompt === "plan-mode" && message.params?.collaborationMode?.mode !== "plan") {
+      fail(message.id, "turn/start must propagate plan collaboration mode");
+      return;
+    }
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (["command", "file", "permissions"].includes(approvalKind)) {
@@ -277,6 +334,22 @@ rl.on("line", (line) => {
       return;
     }
     if (prompt === "hold") {
+      return;
+    }
+    if (prompt === "dynamic-tool") {
+      if (!dynamicToolsEnabled) {
+        fail(message.id, "thread/start must register knowledge dynamic tools");
+        return;
+      }
+      const requestId = `tool-${turnId}`;
+      pendingToolCalls.set(requestId, { threadId: message.params.threadId, turnId });
+      send({ id: requestId, method: "item/tool/call", params: { callId: requestId, threadId: message.params.threadId, turnId, namespace: "knowledge", tool: "search", arguments: { query: "fixture", limit: 3 } } });
+      return;
+    }
+    if (prompt === "request-user-input") {
+      const requestId = `input-${turnId}`;
+      pendingUserInputs.set(requestId, { threadId: message.params.threadId, turnId });
+      send({ id: requestId, method: "item/tool/requestUserInput", params: { itemId: requestId, threadId: message.params.threadId, turnId, questions: [{ header: "方向", id: "direction", question: "选择方向", options: [{ label: "方案 A", description: "使用 A" }, { label: "方案 B", description: "使用 B" }] }] } });
       return;
     }
     const sendProgress = () => {

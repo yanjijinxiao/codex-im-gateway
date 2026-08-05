@@ -100,6 +100,41 @@ test("manages projects and keeps sessions attached to their project", (t) => {
   assert.equal(store.renameProject(project.id, "嘉兴 AI 社区").name, "嘉兴 AI 社区");
 });
 
+test("keeps project selection, interaction mode, and llm-wiki Q&A sessions independent", (t) => {
+  const store = createStore(t);
+  const project = store.createProject("产品研发", "/work/product");
+  const knowledgeBase = store.createKnowledgeBase("产品 Wiki", "/knowledge/product", {
+    engineRoot: "/tools/llm-wiki",
+    stateDir: "/knowledge/state"
+  });
+  store.bindProjectKnowledgeBase(project.id, knowledgeBase.id);
+
+  store.activateProject("alice@im.wechat", project.id);
+  store.setInteractionMode("alice@im.wechat", "qa");
+  const qa = store.createSession(
+    "alice@im.wechat",
+    project.workspace,
+    "问答 · 产品 Wiki",
+    project.id,
+    "qa",
+    knowledgeBase.id
+  );
+  const chat = store.createSession("alice@im.wechat", project.workspace, "实现功能", project.id);
+
+  assert.equal(store.getActiveProject("alice@im.wechat")?.id, project.id);
+  assert.equal(store.getInteractionMode("alice@im.wechat"), "qa");
+  assert.equal(store.getActiveQaSession("alice@im.wechat")?.id, qa.id);
+  assert.equal(store.getActiveSession("alice@im.wechat")?.id, chat.id);
+  assert.equal(store.listProjects()[0]?.knowledgeBaseId, knowledgeBase.id);
+  assert.equal(store.listKnowledgeBases()[0]?.rootPath, path.resolve("/knowledge/product"));
+
+  assert.throws(() => store.deleteKnowledgeBase(knowledgeBase.id), /still bound/);
+  store.bindProjectKnowledgeBase(project.id);
+  assert.equal(store.getInteractionMode("alice@im.wechat"), "session");
+  store.deleteKnowledgeBase(knowledgeBase.id);
+  assert.equal(store.listKnowledgeBases().length, 0);
+});
+
 test("persists deduplicated project completion notification targets", (t) => {
   const store = createStore(t);
   const project = store.createProject("通知项目", "/work/notifications");

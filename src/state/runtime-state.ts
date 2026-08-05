@@ -17,11 +17,14 @@ export type ManagedSession = {
   title: string;
   workspace: string;
   projectId?: string;
+  mode?: "session" | "qa";
+  knowledgeBaseId?: string;
   threadId?: string;
   lastPromptPreview?: string;
   model?: string;
   effort?: string;
   streamReplies?: boolean;
+  collaborationMode?: "default" | "plan";
   createdAt: string;
   updatedAt: string;
 };
@@ -30,10 +33,23 @@ export type ManagedProject = {
   id: string;
   name: string;
   workspace: string;
+  knowledgeBaseId?: string;
   notifications?: ProjectNotificationTarget[];
   createdAt: string;
   updatedAt: string;
 };
+
+export type ManagedKnowledgeBase = {
+  id: string;
+  name: string;
+  rootPath: string;
+  engineRoot?: string;
+  stateDir?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProjectInteractionMode = "session" | "task" | "qa";
 
 export type ProjectNotificationTarget = {
   accountId: string;
@@ -58,7 +74,11 @@ export type RuntimeState = {
   contextTokens: Record<string, string>;
   sessions: ManagedSession[];
   projects: ManagedProject[];
+  knowledgeBases: ManagedKnowledgeBase[];
   activeSessionIds: Record<string, string>;
+  activeQaSessionIds: Record<string, string>;
+  activeProjectIds: Record<string, string>;
+  interactionModes: Record<string, ProjectInteractionMode>;
   pendingDeliveries: Array<{
     id: string;
     senderId: string;
@@ -76,7 +96,11 @@ export function emptyRuntimeState(): RuntimeState {
     contextTokens: {},
     sessions: [],
     projects: [],
+    knowledgeBases: [],
     activeSessionIds: {},
+    activeQaSessionIds: {},
+    activeProjectIds: {},
+    interactionModes: {},
     pendingDeliveries: [],
     knowledge: [],
     knowledgeEnabled: true
@@ -244,6 +268,14 @@ export class RuntimeStateStore {
     this.save();
   }
 
+  setSessionCollaborationMode(sessionId: string, mode: "default" | "plan"): ManagedSession {
+    const session = this.mutableSession(sessionId);
+    session.collaborationMode = mode;
+    session.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(session);
+  }
+
   listSessions(): ManagedSession[] {
     return structuredClone(this.state.sessions)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -252,6 +284,73 @@ export class RuntimeStateStore {
   listProjects(): ManagedProject[] {
     return structuredClone(this.state.projects)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  listKnowledgeBases(): ManagedKnowledgeBase[] {
+    return structuredClone(this.state.knowledgeBases)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  createKnowledgeBase(
+    name: string,
+    rootPath: string,
+    options: { engineRoot?: string; stateDir?: string } = {}
+  ): ManagedKnowledgeBase {
+    const resolvedRoot = path.resolve(rootPath);
+    const existing = this.state.knowledgeBases.find((item) => item.rootPath === resolvedRoot);
+    if (existing) {
+      throw new Error(`Knowledge base root already exists: ${resolvedRoot}`);
+    }
+    const now = new Date().toISOString();
+    const knowledgeBase: ManagedKnowledgeBase = {
+      id: crypto.randomUUID(),
+      name: cleanProjectName(name),
+      rootPath: resolvedRoot,
+      ...(options.engineRoot ? { engineRoot: path.resolve(options.engineRoot) } : {}),
+      ...(options.stateDir ? { stateDir: path.resolve(options.stateDir) } : {}),
+      createdAt: now,
+      updatedAt: now
+    };
+    this.state.knowledgeBases.push(knowledgeBase);
+    this.save();
+    return structuredClone(knowledgeBase);
+  }
+
+  updateKnowledgeBase(
+    knowledgeBaseId: string,
+    input: { name?: string; rootPath?: string; engineRoot?: string | null; stateDir?: string | null }
+  ): ManagedKnowledgeBase {
+    const knowledgeBase = this.mutableKnowledgeBase(knowledgeBaseId);
+    if (input.name !== undefined) knowledgeBase.name = cleanProjectName(input.name);
+    if (input.rootPath !== undefined) {
+      const resolvedRoot = path.resolve(input.rootPath);
+      const duplicate = this.state.knowledgeBases.some((item) => (
+        item.id !== knowledgeBaseId && item.rootPath === resolvedRoot
+      ));
+      if (duplicate) throw new Error(`Knowledge base root already exists: ${resolvedRoot}`);
+      knowledgeBase.rootPath = resolvedRoot;
+    }
+    if (input.engineRoot !== undefined) {
+      if (input.engineRoot) knowledgeBase.engineRoot = path.resolve(input.engineRoot);
+      else delete knowledgeBase.engineRoot;
+    }
+    if (input.stateDir !== undefined) {
+      if (input.stateDir) knowledgeBase.stateDir = path.resolve(input.stateDir);
+      else delete knowledgeBase.stateDir;
+    }
+    knowledgeBase.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(knowledgeBase);
+  }
+
+  deleteKnowledgeBase(knowledgeBaseId: string): void {
+    this.mutableKnowledgeBase(knowledgeBaseId);
+    if (this.state.projects.some((project) => project.knowledgeBaseId === knowledgeBaseId)) {
+      throw new Error("Knowledge base is still bound to a project");
+    }
+    this.state.knowledgeBases = this.state.knowledgeBases.filter((item) => item.id !== knowledgeBaseId);
+    this.state.sessions = this.state.sessions.filter((session) => session.knowledgeBaseId !== knowledgeBaseId);
+    this.save();
   }
 
   listKnowledge(): KnowledgeEntry[] {
@@ -343,6 +442,48 @@ export class RuntimeStateStore {
     return structuredClone(project);
   }
 
+  bindProjectKnowledgeBase(projectId: string, knowledgeBaseId?: string): ManagedProject {
+    const project = this.mutableProject(projectId);
+    if (knowledgeBaseId) {
+      this.mutableKnowledgeBase(knowledgeBaseId);
+      project.knowledgeBaseId = knowledgeBaseId;
+    } else {
+      delete project.knowledgeBaseId;
+      for (const [senderId, activeProjectId] of Object.entries(this.state.activeProjectIds)) {
+        if (activeProjectId === projectId && this.state.interactionModes[senderId] === "qa") {
+          this.state.interactionModes[senderId] = "session";
+        }
+      }
+    }
+    project.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(project);
+  }
+
+  activateProject(senderId: string, projectId: string): ManagedProject {
+    const project = this.mutableProject(projectId);
+    this.state.activeProjectIds[senderId] = project.id;
+    this.save();
+    return structuredClone(project);
+  }
+
+  getActiveProject(senderId: string): ManagedProject | undefined {
+    const projectId = this.state.activeProjectIds[senderId]
+      ?? this.mutableActiveSession(senderId)?.projectId
+      ?? this.mutableActiveQaSession(senderId)?.projectId;
+    const project = this.state.projects.find((candidate) => candidate.id === projectId);
+    return project ? structuredClone(project) : undefined;
+  }
+
+  getInteractionMode(senderId: string): ProjectInteractionMode {
+    return this.state.interactionModes[senderId] ?? "session";
+  }
+
+  setInteractionMode(senderId: string, mode: ProjectInteractionMode): void {
+    this.state.interactionModes[senderId] = mode;
+    this.save();
+  }
+
   setProjectNotifications(projectId: string, targets: ProjectNotificationTarget[]): ManagedProject {
     const project = this.mutableProject(projectId);
     const unique = new Map<string, ProjectNotificationTarget>();
@@ -364,6 +505,9 @@ export class RuntimeStateStore {
       throw new Error("Project still has sessions");
     }
     this.state.projects = this.state.projects.filter((project) => project.id !== projectId);
+    for (const [senderId, activeProjectId] of Object.entries(this.state.activeProjectIds)) {
+      if (activeProjectId === projectId) delete this.state.activeProjectIds[senderId];
+    }
     this.save();
   }
 
@@ -378,6 +522,14 @@ export class RuntimeStateStore {
     return session ? structuredClone(session) : undefined;
   }
 
+  getActiveQaSession(senderId: string): ManagedSession | undefined {
+    const sessionId = this.state.activeQaSessionIds[senderId];
+    const session = this.state.sessions.find((candidate) => (
+      candidate.id === sessionId && candidate.senderId === senderId && candidate.mode === "qa"
+    ));
+    return session ? structuredClone(session) : undefined;
+  }
+
   ensureActiveSession(senderId: string, workspace: string): ManagedSession {
     const active = this.mutableActiveSession(senderId);
     if (active) {
@@ -386,7 +538,14 @@ export class RuntimeStateStore {
     return this.createSession(senderId, workspace);
   }
 
-  createSession(senderId: string, workspace: string, title?: string, projectId?: string): ManagedSession {
+  createSession(
+    senderId: string,
+    workspace: string,
+    title?: string,
+    projectId?: string,
+    mode: "session" | "qa" = "session",
+    knowledgeBaseId?: string
+  ): ManagedSession {
     const now = new Date().toISOString();
     const resolvedWorkspace = path.resolve(workspace);
     const project = projectId
@@ -395,6 +554,7 @@ export class RuntimeStateStore {
     if (project && project.workspace !== resolvedWorkspace) {
       throw new Error("Session workspace must match its project");
     }
+    if (mode === "qa" && knowledgeBaseId) this.mutableKnowledgeBase(knowledgeBaseId);
     const number = this.state.sessions.filter((session) => session.senderId === senderId).length + 1;
     const session: ManagedSession = {
       id: crypto.randomUUID(),
@@ -402,11 +562,14 @@ export class RuntimeStateStore {
       title: cleanTitle(title) ?? `会话 ${number}`,
       workspace: resolvedWorkspace,
       ...(project ? { projectId: project.id } : {}),
+      ...(mode === "qa" ? { mode, ...(knowledgeBaseId ? { knowledgeBaseId } : {}) } : {}),
       createdAt: now,
       updatedAt: now
     };
     this.state.sessions.push(session);
-    this.state.activeSessionIds[senderId] = session.id;
+    this.state.activeProjectIds[senderId] = project.id;
+    if (mode === "qa") this.state.activeQaSessionIds[senderId] = session.id;
+    else this.state.activeSessionIds[senderId] = session.id;
     this.save();
     return structuredClone(session);
   }
@@ -434,7 +597,9 @@ export class RuntimeStateStore {
 
   activateSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
-    this.state.activeSessionIds[session.senderId] = session.id;
+    if (session.mode === "qa") this.state.activeQaSessionIds[session.senderId] = session.id;
+    else this.state.activeSessionIds[session.senderId] = session.id;
+    if (session.projectId) this.state.activeProjectIds[session.senderId] = session.projectId;
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -494,6 +659,13 @@ export class RuntimeStateStore {
         delete this.state.activeSessionIds[session.senderId];
       }
     }
+    if (this.state.activeQaSessionIds[session.senderId] === sessionId) {
+      const fallback = this.state.sessions
+        .filter((candidate) => candidate.senderId === session.senderId && candidate.mode === "qa")
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+      if (fallback) this.state.activeQaSessionIds[session.senderId] = fallback.id;
+      else delete this.state.activeQaSessionIds[session.senderId];
+    }
     this.save();
   }
 
@@ -511,6 +683,12 @@ export class RuntimeStateStore {
       throw new Error(`Managed project not found: ${projectId}`);
     }
     return project;
+  }
+
+  private mutableKnowledgeBase(knowledgeBaseId: string): ManagedKnowledgeBase {
+    const knowledgeBase = this.state.knowledgeBases.find((candidate) => candidate.id === knowledgeBaseId);
+    if (!knowledgeBase) throw new Error(`Managed knowledge base not found: ${knowledgeBaseId}`);
+    return knowledgeBase;
   }
 
   private projectForWorkspace(workspace: string): ManagedProject {
@@ -532,11 +710,24 @@ export class RuntimeStateStore {
     const sessionId = this.state.activeSessionIds[senderId];
     return this.state.sessions.find((candidate) => candidate.id === sessionId && candidate.senderId === senderId);
   }
+
+  private mutableActiveQaSession(senderId: string): ManagedSession | undefined {
+    const sessionId = this.state.activeQaSessionIds[senderId];
+    return this.state.sessions.find((candidate) => (
+      candidate.id === sessionId && candidate.senderId === senderId && candidate.mode === "qa"
+    ));
+  }
 }
 
 function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
   const sessions = Array.isArray(value.sessions) ? value.sessions : [];
   const projects = Array.isArray(value.projects) ? value.projects : [];
+  const knowledgeBases = Array.isArray(value.knowledgeBases) ? value.knowledgeBases : [];
+  for (const knowledgeBase of knowledgeBases) {
+    knowledgeBase.rootPath = path.resolve(knowledgeBase.rootPath);
+    if (knowledgeBase.engineRoot) knowledgeBase.engineRoot = path.resolve(knowledgeBase.engineRoot);
+    if (knowledgeBase.stateDir) knowledgeBase.stateDir = path.resolve(knowledgeBase.stateDir);
+  }
   for (const project of projects) {
     project.notifications = Array.isArray(project.notifications)
       ? project.notifications.filter((target) => Boolean(
@@ -567,6 +758,11 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
       projectsByWorkspace.set(workspace, project);
     }
     session.projectId = project.id;
+    session.mode = session.mode === "qa" ? "qa" : "session";
+    session.collaborationMode = session.collaborationMode === "plan" ? "plan" : "default";
+    if (session.knowledgeBaseId && !knowledgeBases.some((item) => item.id === session.knowledgeBaseId)) {
+      delete session.knowledgeBaseId;
+    }
   }
   return {
     ...emptyRuntimeState(),
@@ -578,11 +774,22 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     contextTokens: value.contextTokens && typeof value.contextTokens === "object" ? value.contextTokens : {},
     sessions,
     projects,
+    knowledgeBases,
     activeSessionIds: value.activeSessionIds && typeof value.activeSessionIds === "object" ? value.activeSessionIds : {},
+    activeQaSessionIds: value.activeQaSessionIds && typeof value.activeQaSessionIds === "object" ? value.activeQaSessionIds : {},
+    activeProjectIds: value.activeProjectIds && typeof value.activeProjectIds === "object" ? value.activeProjectIds : {},
+    interactionModes: normalizeInteractionModes(value.interactionModes),
     pendingDeliveries: Array.isArray(value.pendingDeliveries) ? value.pendingDeliveries : [],
     knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
     knowledgeEnabled: value.knowledgeEnabled !== false
   };
+}
+
+function normalizeInteractionModes(value: unknown): Record<string, ProjectInteractionMode> {
+  if (!value || typeof value !== "object") return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, ProjectInteractionMode] => (
+    entry[1] === "session" || entry[1] === "task" || entry[1] === "qa"
+  )));
 }
 
 function cleanProjectName(value: string): string {

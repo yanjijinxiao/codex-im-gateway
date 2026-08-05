@@ -60,6 +60,46 @@ test("falls back to ordinary chat when the AI decision is not trusted", async ()
   assert.equal(intent, undefined);
 });
 
+test("maps semantic Q&A, planning, and goal decisions to native channel controls", async () => {
+  const decisions = [
+    { intent: "mode_qa", target: null, detail: null },
+    { intent: "plan_on", target: null, detail: null },
+    { intent: "goal_set", target: null, detail: "完成知识库渠道集成" }
+  ] as const;
+  const intents = [];
+  for (const decision of decisions) {
+    const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
+      schemaVersion: 1,
+      confidence: 0.98,
+      ...decision
+    }));
+    intents.push(await resolver.resolve({
+      text: "自然语言工作模式操作",
+      currentProjectName: "Bridge",
+      currentMode: "session",
+      knowledgeBaseName: "产品 Wiki",
+      projectNames: ["Bridge"]
+    }));
+  }
+
+  assert.deepEqual(intents, [
+    { kind: "command", command: { name: "mode", arg: "qa" } },
+    { kind: "command", command: { name: "plan", arg: "on" } },
+    { kind: "command", command: { name: "goal", arg: "set 完成知识库渠道集成" } }
+  ]);
+});
+
+test("formats native goal form input as a goal command", () => {
+  const value = {
+    version: 3 as const,
+    command: "goal" as const,
+    arg: "set" as const,
+    field: { name: "objective" as const, required: true as const, maximumLength: 2_000 }
+  };
+  assert.equal(formatChannelActionCommand(value, {}), undefined);
+  assert.equal(formatChannelActionCommand(value, { objective: "  完成知识库渠道集成  " }), "/goal 完成知识库渠道集成");
+});
+
 test("maps natural-language task mutations to native forms and explicit confirmation cards", async () => {
   const decisions = [
     { intent: "task_todo", target: null, detail: "补充交互文档" },

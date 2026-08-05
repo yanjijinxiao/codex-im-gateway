@@ -3,7 +3,9 @@ import {
   type CodexHistoryMessage,
   type CodexModelOption,
   type CodexRunnerInput,
-  type CodexRuntimeInfo
+  type CodexRuntimeInfo,
+  type CodexThreadGoal,
+  type CodexThreadGoalStatus
 } from "./app-server-runner.js";
 import { CodexExecRunner, type CodexRunResult } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
@@ -125,6 +127,21 @@ export class HybridCodexRunner {
 
   async getAccountRateLimits(): Promise<CodexAccountBalance> {
     return this.appServer.getAccountRateLimits();
+  }
+
+  async getGoal(threadId: string): Promise<CodexThreadGoal | undefined> {
+    return this.appServer.getGoal(threadId);
+  }
+
+  async setGoal(
+    threadId: string,
+    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number }
+  ): Promise<CodexThreadGoal | undefined> {
+    return this.appServer.setGoal(threadId, input);
+  }
+
+  async clearGoal(threadId: string): Promise<void> {
+    await this.appServer.clearGoal(threadId);
   }
 
   close(): void {

@@ -150,7 +150,7 @@ export class TaskboardChannelController {
         case "issue":
           mutationCompleted = true;
           reservation.finish(true);
-          this.bindThread(context, result.issue);
+          this.bindThread(message.senderId, context, result.issue);
           await this.showIssue({
             message,
             context,
@@ -243,8 +243,15 @@ export class TaskboardChannelController {
     }));
   }
 
-  private bindThread(context: TaskboardChannelContext, issue: TaskboardIssue): void {
-    if (issue.threadId) this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
+  private bindThread(senderId: string, context: TaskboardChannelContext, issue: TaskboardIssue): void {
+    if (!issue.threadId) return;
+    const session = context.session ?? this.options.stateStore.createSession(
+      senderId,
+      context.managedProject.workspace,
+      issue.title,
+      context.managedProject.id
+    );
+    this.options.stateStore.setSessionThread(session.id, issue.threadId);
   }
 
   private requireClient(): TaskboardClient {

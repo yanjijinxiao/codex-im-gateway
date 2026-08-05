@@ -2,7 +2,7 @@ import type { ManagedProject, ManagedSession, RuntimeStateStore } from "../state
 import type { TaskboardClient, TaskboardIssue, TaskboardProject } from "../taskboard/client.js";
 
 export type TaskboardChannelContext = {
-  readonly session: ManagedSession;
+  readonly session?: ManagedSession;
   readonly managedProject: ManagedProject;
   readonly taskboardProject: TaskboardProject;
 };
@@ -17,11 +17,10 @@ export async function resolveTaskboardChannelContext(
   client: TaskboardClient,
   senderId: string
 ): Promise<TaskboardChannelContext | undefined> {
-  const session = options.stateStore.getActiveSession(senderId);
-  const managedProject = session?.projectId
-    ? options.stateStore.listProjects().find((project) => project.id === session.projectId)
-    : undefined;
-  if (!session || !managedProject) {
+  const managedProject = options.stateStore.getActiveProject(senderId);
+  const activeSession = options.stateStore.getActiveSession(senderId);
+  const session = activeSession?.projectId === managedProject?.id ? activeSession : undefined;
+  if (!managedProject) {
     await options.replyText(senderId, "请先在渠道工作台中选择一个 Codex 项目，再打开任务面板。");
     return undefined;
   }
@@ -30,7 +29,7 @@ export async function resolveTaskboardChannelContext(
     await options.replyText(senderId, `当前 Codex 项目尚未映射到 Taskboard：${managedProject.workspace}`);
     return undefined;
   }
-  return { session, managedProject, taskboardProject };
+  return { ...(session ? { session } : {}), managedProject, taskboardProject };
 }
 
 export async function resolveTaskboardTarget(input: {
@@ -43,7 +42,7 @@ export async function resolveTaskboardTarget(input: {
   let issue: TaskboardIssue | undefined;
   try {
     issue = input.identifier.toLowerCase() === "current"
-      ? input.context.session.threadId
+      ? input.context.session?.threadId
         ? await input.client.issueForThread(input.context.taskboardProject.id, input.context.session.threadId)
         : undefined
       : await input.client.getIssue(input.identifier);

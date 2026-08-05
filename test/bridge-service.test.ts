@@ -1112,19 +1112,65 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
   await sendWithProjects("project-rename", `/p rn P${projectNumber}|嘉兴AI社区`);
   assert.match(replies.at(-1) ?? "", /已重命名 Codex 项目/);
   await sendWithProjects("project-switch", `/p P${projectNumber}`);
-  assert.match(replies.at(-1) ?? "", /项目暂无会话，已新建并绑定/);
+  assert.match(replies.at(-1) ?? "", /请选择接下来要进入的工作模式/);
+  assert.equal(stateStore.getActiveProject("alice@im.wechat")?.id, addedProject?.id);
+  assert.equal(stateStore.getActiveSession("alice@im.wechat"), undefined);
   await sendWithProjects("legacy-resume", "/resume R1");
   assert.match(replies.at(-1) ?? "", /未知命令：\/resume/);
 
-  // Then the active Codex task is pinned to that project workspace
-  assert.equal(stateStore.getWorkspace("alice@im.wechat"), workspace);
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, addedProject?.id);
-
+  // Then a mode-specific session is created only when the user enters work.
   await sendWithProjects("project-new-session", "/new");
+  assert.equal(stateStore.getWorkspace("alice@im.wechat"), workspace);
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, addedProject?.id);
   assert.match(replies.at(-1) ?? "", /已在当前项目“嘉兴AI社区”新建并绑定会话/);
   await sendWithProjects("project-delete-blocked", `/p d P${projectNumber}`);
   assert.match(replies.at(-1) ?? "", /项目下还有任务/);
+});
+
+test("switching projects does not expose or control the previous project's session", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-context-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const firstWorkspace = path.join(tmpDir, "first");
+  const secondWorkspace = path.join(tmpDir, "second");
+  fs.mkdirSync(firstWorkspace);
+  fs.mkdirSync(secondWorkspace);
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const firstProject = stateStore.createProject("First", firstWorkspace);
+  const secondProject = stateStore.createProject("Second", secondWorkspace);
+  const firstSession = stateStore.createSession("alice@im.wechat", firstWorkspace, "First session", firstProject.id);
+  stateStore.setSessionThread(firstSession.id, "thread-first");
+  stateStore.setInteractionMode("alice@im.wechat", "qa");
+  const replies: string[] = [];
+  let goalReads = 0;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
+    } as never,
+    runner: {
+      async getGoal() { goalReads += 1; return undefined; },
+      async stop() {}
+    } as never
+  });
+  const secondIndex = stateStore.listProjects().findIndex((project) => project.id === secondProject.id) + 1;
+
+  await service.handleMessage({
+    id: "switch", senderId: "alice@im.wechat", text: `/project P${secondIndex}`, attachments: [], raw: {}
+  });
+  await service.handleMessage({
+    id: "status", senderId: "alice@im.wechat", text: "/status", attachments: [], raw: {}
+  });
+  await service.handleMessage({
+    id: "goal", senderId: "alice@im.wechat", text: "/goal", attachments: [], raw: {}
+  });
+
+  assert.equal(stateStore.getActiveProject("alice@im.wechat")?.id, secondProject.id);
+  assert.equal(stateStore.getInteractionMode("alice@im.wechat"), "session");
+  assert.doesNotMatch(replies.at(-2) ?? "", /First session|thread-first/);
+  assert.match(replies.at(-2) ?? "", /会话：新会话/);
+  assert.equal(goalReads, 0);
+  assert.match(replies.at(-1) ?? "", /尚未创建 Codex thread/);
 });
 
 test("lists and switches model and reasoning effort for the active WeChat session", async (t) => {

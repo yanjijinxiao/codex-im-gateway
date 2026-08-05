@@ -62,6 +62,22 @@ const projectNotificationsSchema = z.object({
     enabled: z.boolean()
   })).max(20)
 });
+const knowledgeBaseCreateSchema = z.object({
+  accountId: z.string().min(1),
+  name: z.string().trim().min(1).max(60),
+  rootPath: z.string().trim().min(1),
+  engineRoot: z.string().trim().min(1).optional(),
+  stateDir: z.string().trim().min(1).optional()
+});
+const knowledgeBasePatchSchema = z.object({
+  name: z.string().trim().min(1).max(60).optional(),
+  rootPath: z.string().trim().min(1).optional(),
+  engineRoot: z.string().trim().min(1).nullable().optional(),
+  stateDir: z.string().trim().min(1).nullable().optional()
+}).refine((value) => Object.keys(value).length > 0, "Knowledge base update is empty");
+const projectKnowledgeBaseSchema = z.object({
+  knowledgeBaseId: z.string().min(1).nullable()
+});
 const sessionCreateSchema = z.object({
   accountId: z.string().min(1),
   senderId: z.string().min(1),
@@ -198,6 +214,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       codexModels,
       accounts: context.accountManager.listAccounts(),
       projects: context.accountManager.listProjects(),
+      knowledgeBases: context.accountManager.listKnowledgeBases(),
       sessions: context.accountManager.listSessions()
     });
     return;
@@ -251,6 +268,17 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { projects: context.accountManager.listProjects() });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/knowledge-bases") {
+    sendJson(response, 200, { knowledgeBases: context.accountManager.listKnowledgeBases() });
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/knowledge-bases") {
+    const body = knowledgeBaseCreateSchema.parse(await readJsonBody(request));
+    const knowledgeBase = await context.accountManager.createKnowledgeBase(body.accountId, body);
+    const inspection = await context.accountManager.inspectKnowledgeBase(body.accountId, knowledgeBase.id);
+    sendJson(response, 201, { knowledgeBase, inspection });
+    return;
+  }
   if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;
   if (method === "POST" && url.pathname === "/api/projects") {
     const body = projectCreateSchema.parse(await readJsonBody(request));
@@ -282,6 +310,49 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
         body.notifications
       )
     });
+    return;
+  }
+  const projectKnowledgeBaseMatch = matchPath(url.pathname, "/api/projects/:accountId/:projectId/knowledge-base");
+  if (method === "PUT" && projectKnowledgeBaseMatch) {
+    const body = projectKnowledgeBaseSchema.parse(await readJsonBody(request));
+    sendJson(response, 200, {
+      project: context.accountManager.bindProjectKnowledgeBase(
+        projectKnowledgeBaseMatch.accountId,
+        projectKnowledgeBaseMatch.projectId,
+        body.knowledgeBaseId ?? undefined
+      )
+    });
+    return;
+  }
+  const knowledgeBaseInspectMatch = matchPath(
+    url.pathname,
+    "/api/knowledge-bases/:accountId/:knowledgeBaseId/inspect"
+  );
+  if (method === "POST" && knowledgeBaseInspectMatch) {
+    sendJson(response, 200, {
+      inspection: await context.accountManager.inspectKnowledgeBase(
+        knowledgeBaseInspectMatch.accountId,
+        knowledgeBaseInspectMatch.knowledgeBaseId
+      )
+    });
+    return;
+  }
+  const knowledgeBaseMatch = matchPath(url.pathname, "/api/knowledge-bases/:accountId/:knowledgeBaseId");
+  if (method === "PATCH" && knowledgeBaseMatch) {
+    const body = knowledgeBasePatchSchema.parse(await readJsonBody(request));
+    sendJson(response, 200, await context.accountManager.updateKnowledgeBase(
+      knowledgeBaseMatch.accountId,
+      knowledgeBaseMatch.knowledgeBaseId,
+      body
+    ));
+    return;
+  }
+  if (method === "DELETE" && knowledgeBaseMatch) {
+    context.accountManager.deleteKnowledgeBase(
+      knowledgeBaseMatch.accountId,
+      knowledgeBaseMatch.knowledgeBaseId
+    );
+    sendJson(response, 200, { ok: true });
     return;
   }
   const projectMatch = matchPath(url.pathname, "/api/projects/:accountId/:projectId");
@@ -524,6 +595,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/favicon.svg": { name: "favicon.svg", type: "image/svg+xml" },
     "/styles.css": { name: "styles.css", type: "text/css; charset=utf-8" },
     "/app.js": { name: "app.js", type: "text/javascript; charset=utf-8" },
+    "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
     "/vendor/lucide.min.js": { name: "vendor/lucide.min.js", type: "text/javascript; charset=utf-8" },
     "/vendor/marked.umd.js": { name: "vendor/marked.umd.js", type: "text/javascript; charset=utf-8" },
     "/vendor/purify.min.js": { name: "vendor/purify.min.js", type: "text/javascript; charset=utf-8" }
