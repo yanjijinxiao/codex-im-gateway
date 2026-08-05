@@ -104,6 +104,7 @@ The legacy workbench contract remains documented for compatibility with older bu
 - Behavior: session mode resumes or creates a normal Codex thread; task mode opens the project-mapped Taskboard; Q&A mode resumes a separate thread bound to the project's selected llm-wiki knowledge base.
 - Codex controls: plan/default collaboration mode and thread goals are project-session controls surfaced through native cards. A Codex `request_user_input` request is translated into sequential native choice cards on interactive channels.
 - Security: the current project path remains the Codex `cwd` in every mode. The llm-wiki path is never substituted as the workspace and is exposed only through read-only `search` and `get_document` dynamic tools.
+- Detailed state, synchronization, fallback, and acceptance rules are documented in [Channel Project Workbench](./docs/channel-project-modes.md).
 
 ### Knowledge Base Management
 

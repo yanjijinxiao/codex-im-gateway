@@ -153,6 +153,81 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
   assert.equal(texts.length, 0);
 });
 
+test("keeps project mode, plan mode, and goals on the selected project's thread", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-project-controls-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const firstProject = stateStore.createProject("First", path.join(root, "first"));
+  const secondProject = stateStore.createProject("Second", path.join(root, "second"));
+  const secondSession = stateStore.createSession("oc_test", secondProject.workspace, "Second session", secondProject.id);
+  stateStore.setSessionThread(secondSession.id, "thread-second");
+  stateStore.createSession("oc_test", firstProject.workspace, "First session", firstProject.id);
+  const cards: ChannelActionCard[] = [];
+  const goalThreads: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
+    stateStore,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendActionCard(input: { readonly card: ChannelActionCard }) {
+        cards.push(input.card);
+        return { messageId: `card-${cards.length}` };
+      }
+    },
+    runner: {
+      async getGoal(threadId: string) {
+        goalThreads.push(threadId);
+        return {
+          objective: "Ship selected project",
+          status: "active" as const,
+          tokensUsed: 120,
+          timeUsedSeconds: 30
+        };
+      },
+      async stop() {}
+    } as never
+  });
+  const secondIndex = stateStore.listProjects().findIndex((project) => project.id === secondProject.id) + 1;
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "oc_test",
+    text,
+    attachments: [],
+    raw: {}
+  });
+
+  await send("project", `/project P${secondIndex}`);
+  assert.deepEqual(cards[0].actionGroups.flatMap((group) => group.map((action) => action.value)), [
+    { version: 1, command: "mode", arg: "session" },
+    { version: 1, command: "mode", arg: "task" },
+    { version: 1, command: "mode", arg: "qa" }
+  ]);
+
+  await send("session-mode", "/mode session");
+  assert.equal(stateStore.getActiveSession("oc_test")?.id, secondSession.id);
+  assert.deepEqual(
+    cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.command)),
+    ["sessions", "plan", "goal"]
+  );
+
+  await send("plan", "/plan on");
+  assert.equal(stateStore.getActiveSession("oc_test")?.collaborationMode, "plan");
+  assert.deepEqual(
+    cards[2].actionGroups.flatMap((group) => group.map((action) => action.value)),
+    [
+      { version: 1, command: "plan", arg: "toggle" },
+      { version: 1, command: "goal", arg: "" }
+    ]
+  );
+
+  await send("goal", "/goal");
+  assert.deepEqual(goalThreads, ["thread-second"]);
+  assert.deepEqual(
+    cards[3].actionGroups.flatMap((group) => group.map((action) => action.value.command)),
+    ["goal", "goal", "goal", "goal"]
+  );
+});
+
 test("Bridge renders approval decisions as buttons on interactive channels", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-approval-card-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

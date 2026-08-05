@@ -156,6 +156,41 @@ function issue(identifier: string, status: TaskboardIssue["status"], version: nu
   };
 }
 
+test("opens the selected project's Taskboard before a Codex session exists", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-project-mode-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  stateStore.createProject("Project One", root);
+  const fixture = createTaskboardFixture(root, [issue("PROJECT-1", "todo", 1)]);
+  const sent: ChannelTaskCard[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
+    stateStore,
+    taskboard: fixture.client,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendTaskCard(input: { readonly card: ChannelTaskCard }) {
+        sent.push(input.card);
+        return { messageId: "overview-card" };
+      }
+    }
+  });
+
+  await service.handleMessage({
+    id: "task-mode",
+    senderId: "oc_test",
+    text: "/mode task",
+    attachments: [],
+    raw: {}
+  });
+
+  assert.equal(stateStore.getInteractionMode("oc_test"), "task");
+  assert.equal(stateStore.listSessions().length, 0);
+  assert.equal(sent.length, 1);
+  assert.equal("kind" in sent[0] ? sent[0].kind : undefined, "overview");
+  assert.equal(sent[0].projectName, "Project One");
+});
+
 test("renders one paged overview card and updates the originating card in place", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-overview-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
