@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { z } from "zod";
+
 import { BridgeService } from "../src/bridge/service.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu.js";
 import { createTaskCard } from "../src/channels/task-card.js";
@@ -110,11 +112,26 @@ test("Feishu sends an interactive Taskboard card and routes its button callback 
     elements: Array<{ tag: string; actions?: Array<{ value?: unknown }> }>;
   };
   const actionElement = content.elements.find((element) => element.tag === "action");
-  assert.deepEqual(actionElement?.actions?.map((action) => action.value), [
-    { version: 1, command: "task", arg: "detail BRIDGE-1" },
-    { version: 1, command: "task", arg: "accept BRIDGE-1" },
-    { version: 1, command: "task", arg: "return BRIDGE-1" }
-  ]);
+  const actionValues = actionElement?.actions?.map((action) => action.value) ?? [];
+  assert.deepEqual(actionValues[0], { version: 1, command: "task", arg: "form comment BRIDGE-1" });
+  assert.deepEqual(actionValues[2], { version: 1, command: "task", arg: "form return BRIDGE-1" });
+  const acceptValue = z.object({
+    version: z.number(),
+    command: z.string(),
+    arg: z.string(),
+    parameters: z.record(z.string(), z.string()),
+    fields: z.array(z.unknown())
+  }).parse(actionValues[1]);
+  assert.deepEqual(
+    { ...acceptValue, parameters: { ...acceptValue.parameters, request_id: "<uuid>" } },
+    {
+      version: 2,
+      command: "task",
+      arg: "submit",
+      parameters: { operation: "accept", identifier: "BRIDGE-1", version: "3", request_id: "<uuid>" },
+      fields: []
+    }
+  );
 
   const controller = new AbortController();
   const monitor = adapter.monitor({

@@ -60,6 +60,31 @@ test("falls back to ordinary chat when the AI decision is not trusted", async ()
   assert.equal(intent, undefined);
 });
 
+test("maps natural-language task mutations to native forms and explicit confirmation cards", async () => {
+  const decisions = [
+    { intent: "task_todo", target: null, detail: "补充交互文档" },
+    { intent: "task_block", target: null, detail: "等待接口权限" },
+    { intent: "task_accept", target: "BRIDGE-12", detail: null },
+    { intent: "task_start", target: null, detail: null }
+  ] as const;
+  const intents = [];
+  for (const decision of decisions) {
+    const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
+      schemaVersion: 1,
+      confidence: 0.98,
+      ...decision
+    }));
+    intents.push(await resolver.resolve({ text: "自然语言任务操作", projectNames: ["Bridge"] }));
+  }
+
+  assert.deepEqual(intents, [
+    { kind: "command", command: { name: "task", arg: "form todo 补充交互文档" } },
+    { kind: "command", command: { name: "task", arg: "form block current 等待接口权限" } },
+    { kind: "command", command: { name: "task", arg: "detail BRIDGE-12" } },
+    { kind: "command", command: { name: "task", arg: "list" } }
+  ]);
+});
+
 test("builds status-aware task card actions and only accepts the bounded callback schema", () => {
   const card = createTaskCard("Bridge", {
     id: "task-one",
@@ -78,13 +103,48 @@ test("builds status-aware task card actions and only accepts the bounded callbac
 
   assert.equal(card.projectName, "Bridge");
   assert.equal(card.identifier, "BRIDGE-1");
-  assert.deepEqual(card.actions.map((action) => action.label), ["查看详情", "通过", "退回"]);
-  assert.equal(formatChannelActionCommand(card.actions[1].value), "/task accept BRIDGE-1");
+  assert.deepEqual(card.actions.map((action) => action.label), ["添加进展", "通过", "退回", "返回任务"]);
+  const acceptCommand = formatChannelActionCommand(card.actions[1].value);
+  assert.ok(acceptCommand?.startsWith("/task submit "));
+  assert.deepEqual(
+    Object.fromEntries(new URLSearchParams(acceptCommand?.slice("/task submit ".length))),
+    {
+      operation: "accept",
+      identifier: "BRIDGE-1",
+      version: "4",
+      request_id: card.actions[1].value.version === 2 ? card.actions[1].value.parameters.request_id : ""
+    }
+  );
   assert.deepEqual(parseChannelActionValue(card.actions[2].value), {
     version: 1,
     command: "task",
-    arg: "return BRIDGE-1"
+    arg: "form return BRIDGE-1"
   });
   assert.equal(parseChannelActionValue({ command: "stop", arg: "" }), undefined);
   assert.equal(parseChannelActionValue({ version: 1, command: "task", arg: "x".repeat(2_001) }), undefined);
+  assert.equal(parseChannelActionValue({
+    version: 2,
+    command: "task",
+    arg: "submit",
+    parameters: {
+      operation: "accept",
+      identifier: "BRIDGE-1",
+      version: "4",
+      request_id: "00000000-0000-4000-8000-000000000001",
+      body: "伪造验收证据"
+    },
+    fields: []
+  }), undefined);
+  assert.equal(parseChannelActionValue({
+    version: 2,
+    command: "task",
+    arg: "submit",
+    parameters: {
+      operation: "block",
+      identifier: "BRIDGE-1",
+      version: "4",
+      request_id: "00000000-0000-4000-8000-000000000001"
+    },
+    fields: [{ name: "reason", parameter: "operation", required: true, maximumLength: 1_000 }]
+  }), undefined);
 });

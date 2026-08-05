@@ -105,41 +105,31 @@ function intentFromDecision(decision: AiChannelIntentDecision): FriendlyChannelI
     case "project_switch":
       return decision.target
         ? command("project", `switch ${decision.target}`)
-        : clarification("请告诉我要切换到哪个项目。");
+        : command("project", "list");
     case "task_list":
       return command("task", "list");
     case "task_new":
-      return decision.detail
-        ? command("task", `new ${decision.detail}`)
-        : clarification("请告诉我新任务的标题。");
+      return command("task", join("form new", decision.detail));
     case "task_todo":
-      return decision.detail
-        ? command("task", `todo ${decision.detail}`)
-        : clarification("请告诉我要记到待办的内容。");
+      return command("task", join("form todo", decision.detail));
     case "task_start":
       return decision.target
         ? command("task", `start ${decision.target}`)
-        : clarification("请告诉我要开始哪个任务，例如 BRIDGE-12。");
+        : command("task", "list");
     case "task_detail":
       return decision.target
         ? command("task", `detail ${decision.target}`)
-        : clarification("请告诉我要查看哪个任务，例如 BRIDGE-12。");
+        : command("task", "list");
     case "task_block":
-      return decision.detail
-        ? command("task", `block ${decision.target ?? "current"} ${decision.detail}`)
-        : clarification("请补充阻塞原因。");
+      return command("task", join(`form block ${decision.target ?? "current"}`, decision.detail));
     case "task_comment":
-      return decision.detail
-        ? command("task", `comment ${decision.target ?? "current"} ${decision.detail}`)
-        : clarification("请补充要记录的内容。");
+      return command("task", join(`form comment ${decision.target ?? "current"}`, decision.detail));
     case "task_review":
-      return command("task", join(`review ${decision.target ?? "current"}`, decision.detail));
+      return command("task", join(`form review ${decision.target ?? "current"}`, decision.detail));
     case "task_accept":
-      return command("task", join(`accept ${decision.target ?? "current"}`, decision.detail));
+      return command("task", `detail ${decision.target ?? "current"}`);
     case "task_return":
-      return decision.detail
-        ? command("task", `return ${decision.target ?? "current"} ${decision.detail}`)
-        : clarification("请补充退回原因。");
+      return command("task", join(`form return ${decision.target ?? "current"}`, decision.detail));
     default:
       return assertNever(decision.intent);
   }
@@ -165,10 +155,6 @@ function buildClassifierPrompt(input: ChannelIntentResolverInput): string {
 
 function command(name: string, arg = ""): FriendlyChannelIntent {
   return { kind: "command", command: { name, arg } };
-}
-
-function clarification(text: string): FriendlyChannelIntent {
-  return { kind: "clarification", text };
 }
 
 function join(prefix: string, detail: string | null): string {

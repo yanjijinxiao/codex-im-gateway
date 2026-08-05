@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-const channelActionValueSchema = z.object({
+const channelCommandActionValueSchema = z.object({
   version: z.literal(1),
   command: z.enum([
     "help",
@@ -21,9 +21,37 @@ const channelActionValueSchema = z.object({
     "stop"
   ]),
   arg: z.string().max(2_000)
-});
+}).strict();
+
+const channelFormFieldSchema = z.object({
+  name: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/),
+  parameter: z.enum(["title", "description", "priority", "labels", "body"]),
+  required: z.boolean(),
+  maximumLength: z.number().int().min(1).max(2_000)
+}).strict();
+
+const channelFormActionValueSchema = z.object({
+  version: z.literal(2),
+  command: z.literal("task"),
+  arg: z.literal("submit"),
+  parameters: z.object({
+    operation: z.enum([
+      "create_todo", "create_start", "comment", "block", "review", "return", "start", "accept"
+    ]),
+    identifier: z.string().trim().min(1).max(100).regex(/^[^\r\n]+$/).optional(),
+    version: z.string().regex(/^\d{1,10}$/).optional(),
+    request_id: z.string().uuid()
+  }).strict(),
+  fields: z.array(channelFormFieldSchema).max(10)
+}).strict();
+
+const channelActionValueSchema = z.discriminatedUnion("version", [
+  channelCommandActionValueSchema,
+  channelFormActionValueSchema
+]);
 
 export type ChannelActionValue = z.infer<typeof channelActionValueSchema>;
+export type ChannelFormParameter = z.infer<typeof channelFormFieldSchema>["parameter"];
 export type ChannelActionCommand = ChannelActionValue["command"];
 export type ChannelCardTemplate = "blue" | "green" | "orange" | "red" | "grey";
 
@@ -82,8 +110,34 @@ export function parseChannelActionValue(value: unknown): ChannelActionValue | un
   return parsed.success ? parsed.data : undefined;
 }
 
-export function formatChannelActionCommand(value: ChannelActionValue): string {
-  return `/${value.command}${value.arg ? ` ${value.arg}` : ""}`;
+export function formatChannelActionCommand(value: ChannelActionValue, formValue?: unknown): string | undefined {
+  switch (value.version) {
+    case 1:
+      return `/${value.command}${value.arg ? ` ${value.arg}` : ""}`;
+    case 2: {
+      const parsedForm = z.record(z.string(), z.unknown()).safeParse(formValue ?? {});
+      if (!parsedForm.success) return undefined;
+      const parameters = new URLSearchParams(value.parameters);
+      for (const field of value.fields) {
+        const raw = parsedForm.data[field.name];
+        if (raw === undefined || raw === null || raw === "") {
+          if (field.required) return undefined;
+          continue;
+        }
+        if (typeof raw !== "string") return undefined;
+        const normalized = raw.trim();
+        if (!normalized) {
+          if (field.required) return undefined;
+          continue;
+        }
+        if (normalized.length > field.maximumLength) return undefined;
+        parameters.set(field.parameter, normalized);
+      }
+      return `/${value.command} ${value.arg} ${parameters}`;
+    }
+    default:
+      return assertNever(value);
+  }
 }
 
 function groupActions(actions: readonly ChannelCardAction[]): readonly (readonly ChannelCardAction[])[] {
@@ -97,4 +151,16 @@ function groupActions(actions: readonly ChannelCardAction[]): readonly (readonly
     current.push(action);
   }
   return groups;
+}
+
+function assertNever(value: never): never {
+  throw new UnexpectedChannelActionValueError(value);
+}
+
+class UnexpectedChannelActionValueError extends Error {
+  readonly name = "UnexpectedChannelActionValueError";
+
+  constructor(readonly value: never) {
+    super("Channel action value was not handled exhaustively");
+  }
 }

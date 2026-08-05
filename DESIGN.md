@@ -88,6 +88,16 @@ The legacy workbench contract remains documented for compatibility with older bu
 - Accessibility: the tab uses the existing keyboard-reachable tab primitive and the frame has a concise Chinese title.
 - Security: the frame policy permits HTTP loopback hosts only; arbitrary remote frame origins remain blocked.
 
+### Channel Task Workbench
+
+- Structure: one project-scoped overview card, paged task rows, a task detail card, and native channel forms for creation, progress, blocking, review, and return. The complete Taskboard remains available through a loopback deep link for desktop clients.
+- Behavior: natural-language intents and card actions resolve to the same typed Taskboard operations as the command surface. Overview filters, task selection, form opening, submissions, and workflow results replace the originating card in place when the channel supports message updates; text-only channels receive the command-compatible fallback.
+- States: overview, filtered overview, empty, detail, form entry, submitting, success, stale-version conflict, invalid transition, and unavailable. A successful action returns to fresh Taskboard data rather than preserving optimistic card state.
+- Workflow: action visibility follows the Taskboard transition map. Blocking, review, and return require a native text field; completion requires an explicit acceptance action. Every mutating card carries the issue version so a stale or duplicate submission refreshes instead of blindly retrying.
+- Accessibility: controls use visible verbs and status text, required fields carry explicit labels, destructive or final actions use confirmation, and the card never relies on color alone. Platform-native focus, keyboard, touch, validation, and reduced-motion behavior remain authoritative.
+- Interaction: async state follows idle to submitting to refreshed-success or refreshed-error. Feishu owns control motion; the Bridge communicates progress by replacing actionable controls with the latest card state rather than adding custom animation.
+- Security: card callbacks are parsed at the channel boundary, accept only declared form fields and bounded lengths, and never include credentials. Taskboard links remain loopback-only and are supplemental because mobile clients cannot open the host Mac's loopback service.
+
 ### Codex Sidebar Integration Entries
 
 - Structure: two native-looking rows placed immediately after Codex's Plugins row: “任务面板” first and “渠道配置” second.

@@ -207,7 +207,9 @@ test("notifies Taskboard review state once as an actionable card with the latest
   assert.equal(sentCards.length, 1);
   assert.equal(sentCards[0]?.card.identifier, "REVIEW-1");
   assert.equal(sentCards[0]?.card.latestComment, "测试与构建均通过");
-  assert.deepEqual(sentCards[0]?.card.actions.map((action) => action.label), ["查看详情", "通过", "退回"]);
+  assert.deepEqual(sentCards[0]?.card.actions.map((action) => action.label), [
+    "添加进展", "通过", "退回", "返回任务", "打开完整面板"
+  ]);
   await manager.stopAll();
 });
 

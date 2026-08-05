@@ -19,6 +19,10 @@ export type NormalizedWeixinMessage = {
   id: string;
   senderId: string;
   contextToken?: string;
+  interaction?: {
+    readonly kind: "card";
+    readonly messageId: string;
+  };
   text: string;
   attachments: WeixinInboundAttachment[];
   raw: WeixinRawMessage;

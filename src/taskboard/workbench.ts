@@ -7,6 +7,7 @@ import type {
   TaskboardProject,
   TaskboardStatus
 } from "./client.js";
+import { isTaskboardTransitionAllowed, taskboardTransitionRequiresComment } from "./workflow.js";
 
 export type TaskboardManagedProject = {
   readonly accountId: string;
@@ -33,16 +34,6 @@ type TaskboardProjectMapping = {
 type TaskboardWorkbenchOptions = {
   readonly client: () => TaskboardClient | undefined;
   readonly projects: () => readonly TaskboardManagedProject[];
-};
-
-const ALLOWED_TRANSITIONS: Readonly<Record<TaskboardStatus, readonly TaskboardStatus[]>> = {
-  backlog: [],
-  todo: ["in_progress"],
-  in_progress: ["blocked", "in_review"],
-  in_review: ["in_progress", "done"],
-  blocked: ["in_progress"],
-  done: [],
-  canceled: []
 };
 
 export class TaskboardWorkbenchError extends Error {
@@ -93,14 +84,14 @@ export class TaskboardWorkbench {
         `Taskboard issue version changed: expected ${version}, current ${issue.version}`
       );
     }
-    if (!ALLOWED_TRANSITIONS[issue.status].includes(status)) {
+    if (!isTaskboardTransitionAllowed(issue.status, status)) {
       throw new TaskboardWorkbenchError(
         "INVALID_TRANSITION",
         `Invalid Taskboard transition: ${issue.status} -> ${status}`
       );
     }
     const note = comment?.trim();
-    if (["blocked", "in_review"].includes(status) && !note) {
+    if (taskboardTransitionRequiresComment(status) && !note) {
       throw new TaskboardWorkbenchError(
         "INVALID_TRANSITION",
         `Taskboard transition to ${status} requires a comment`

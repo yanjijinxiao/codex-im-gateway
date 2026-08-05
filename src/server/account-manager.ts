@@ -1059,7 +1059,8 @@ export class AccountManager {
     const card = issue ? createTaskCard(project.name, issue, {
       title: success ? "Codex 任务已完成" : "Codex 任务执行失败",
       note: excerpt ? `${success ? "结果" : "错误"}：${excerpt}` : undefined,
-      template: success ? "green" : "red"
+      template: success ? "green" : "red",
+      taskboardBaseUrl: this.taskboardFor()?.baseUrl ?? this.configProvider().taskboardUrl
     }) : undefined;
     await this.sendNotificationTargets(targets, text, card);
   }
@@ -1201,7 +1202,8 @@ export class AccountManager {
       ...(excerpt ? [`最新记录：${excerpt}`] : [])
     ].join("\n");
     await this.sendNotificationTargets(targets, text, createTaskCard(project.name, issue, {
-      latestComment: excerpt
+      latestComment: excerpt,
+      taskboardBaseUrl: this.taskboardFor()?.baseUrl ?? this.configProvider().taskboardUrl
     }));
   }
 

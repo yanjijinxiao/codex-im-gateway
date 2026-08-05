@@ -1,139 +1,100 @@
-import type { TaskboardIssue, TaskboardStatus } from "../taskboard/client.js";
-import {
-  formatChannelActionCommand,
-  parseChannelActionValue,
-  type ChannelCardAction,
-  type ChannelCardTemplate
-} from "./action-card.js";
+import type { TaskboardStatus } from "../taskboard/client.js";
+import type { ChannelCardAction, ChannelCardTemplate } from "./action-card.js";
 
 export { formatChannelActionCommand, parseChannelActionValue } from "./action-card.js";
 export type { ChannelActionValue, ChannelCardAction } from "./action-card.js";
+export { createTaskCard } from "./task-detail-card.js";
+export { createTaskFormCard } from "./task-form-card.js";
+export { createTaskOverviewCard } from "./task-overview-card.js";
+export { formatTaskboardStatus } from "./task-card-status.js";
 
-export type ChannelTaskCard = {
+export type ChannelTaskLinkAction = {
+  readonly kind: "link";
+  readonly label: string;
+  readonly style: "default" | "primary" | "danger";
+  readonly url: string;
+};
+
+export type ChannelTaskCommandAction = ChannelCardAction & {
+  readonly kind: "command";
+};
+
+export type ChannelTaskAction = ChannelTaskCommandAction | ChannelTaskLinkAction;
+
+type ChannelTaskCardBase = {
   readonly title: string;
   readonly template: ChannelCardTemplate;
   readonly projectName: string;
   readonly identifier: string;
+  readonly actions: readonly ChannelTaskAction[];
+  readonly fallbackText: string;
+  readonly taskboardUrl?: string;
+};
+
+export type ChannelTaskOverviewItem = {
+  readonly identifier: string;
+  readonly title: string;
+  readonly statusLabel: string;
+  readonly priorityLabel: string;
+  readonly updatedLabel: string;
+  readonly action: ChannelTaskCommandAction;
+};
+
+export type ChannelTaskOverviewCard = ChannelTaskCardBase & {
+  readonly kind: "overview";
+  readonly filter: TaskboardOverviewFilter;
+  readonly filterLabel: string;
+  readonly counts: Readonly<Record<"todo" | "in_progress" | "in_review" | "blocked", number>>;
+  readonly items: readonly ChannelTaskOverviewItem[];
+  readonly page: number;
+  readonly pageCount: number;
+  readonly total: number;
+  readonly filterActions: readonly ChannelTaskCommandAction[];
+  readonly pageActions: readonly ChannelTaskCommandAction[];
+};
+
+export type ChannelTaskDetailCard = ChannelTaskCardBase & {
+  readonly kind: "detail";
   readonly statusLabel: string;
   readonly summary: string;
+  readonly priorityLabel: string;
+  readonly labels: readonly string[];
+  readonly updatedLabel: string;
   readonly description?: string;
   readonly latestComment?: string;
   readonly note?: string;
-  readonly actions: readonly ChannelCardAction[];
-  readonly fallbackText: string;
 };
 
-type CreateTaskCardOptions = {
-  readonly latestComment?: string;
-  readonly title?: string;
-  readonly note?: string;
-  readonly template?: ChannelTaskCard["template"];
+export type ChannelTaskTextField = {
+  readonly kind: "text";
+  readonly name: string;
+  readonly label: string;
+  readonly placeholder: string;
+  readonly required: boolean;
+  readonly maximumLength: number;
+  readonly multiline: boolean;
+  readonly defaultValue?: string;
 };
 
-export function createTaskCard(
-  projectName: string,
-  issue: TaskboardIssue,
-  options: CreateTaskCardOptions = {}
-): ChannelTaskCard {
-  const statusLabel = formatTaskboardStatus(issue.status);
-  const latestComment = clean(options.latestComment, 500);
-  const description = clean(issue.description, 500);
-  const note = clean(options.note, 300);
-  const actions = taskActions(issue);
-  const fallbackText = [
-    `【${options.title ?? `Taskboard · ${statusLabel}`}】`,
-    `项目：${projectName}`,
-    `Issue：${issue.identifier} · ${issue.title}`,
-    ...(description ? [`说明：${description}`] : []),
-    ...(latestComment ? [`最新记录：${latestComment}`] : []),
-    ...(note ? [note] : []),
-    ...(actions.length ? [`可用操作：${actions.map((action) => action.label).join("、")}`] : [])
-  ].join("\n");
-  return {
-    title: options.title ?? `${issue.identifier} · ${statusLabel}`,
-    template: options.template ?? templateForStatus(issue.status),
-    projectName,
-    identifier: issue.identifier,
-    statusLabel,
-    summary: issue.title,
-    ...(description ? { description } : {}),
-    ...(latestComment ? { latestComment } : {}),
-    ...(note ? { note } : {}),
-    actions,
-    fallbackText
-  };
-}
+export type ChannelTaskSelectField = {
+  readonly kind: "select";
+  readonly name: string;
+  readonly label: string;
+  readonly required: boolean;
+  readonly initialOption?: string;
+  readonly options: readonly { readonly label: string; readonly value: string }[];
+};
 
-export function formatTaskboardStatus(status: TaskboardStatus): string {
-  return STATUS_LABELS[status];
-}
+export type ChannelTaskFormField = ChannelTaskTextField | ChannelTaskSelectField;
 
-function taskActions(issue: TaskboardIssue): readonly ChannelCardAction[] {
-  const detail = action("查看详情", "detail", issue.identifier);
-  switch (issue.status) {
-    case "todo":
-      return [detail, action("开始处理", "start", issue.identifier, "primary")];
-    case "in_progress":
-      return [detail, action("提交验收", "review", issue.identifier, "primary")];
-    case "blocked":
-      return [detail, action("继续处理", "start", issue.identifier, "primary")];
-    case "in_review":
-      return [
-        detail,
-        action("通过", "accept", issue.identifier, "primary", "确认该 Issue 已满足验收门禁？"),
-        action("退回", "return", issue.identifier, "danger")
-      ];
-    case "backlog":
-    case "done":
-    case "canceled":
-      return [detail];
-    default:
-      return assertNever(issue.status);
-  }
-}
+export type ChannelTaskFormCard = ChannelTaskCardBase & {
+  readonly kind: "form";
+  readonly body: string;
+  readonly formName: string;
+  readonly fields: readonly ChannelTaskFormField[];
+  readonly submitActions: readonly ChannelTaskCommandAction[];
+};
 
-function action(
-  label: string,
-  taskAction: string,
-  identifier: string,
-  style: ChannelCardAction["style"] = "default",
-  confirm?: string
-): ChannelCardAction {
-  return {
-    label,
-    style,
-    value: { version: 1, command: "task", arg: `${taskAction} ${identifier}` },
-    ...(confirm ? { confirm } : {})
-  };
-}
+export type ChannelTaskCard = ChannelTaskOverviewCard | ChannelTaskDetailCard | ChannelTaskFormCard;
 
-function templateForStatus(status: TaskboardStatus): ChannelTaskCard["template"] {
-  return ({
-    backlog: "grey",
-    todo: "blue",
-    in_progress: "blue",
-    in_review: "orange",
-    blocked: "red",
-    done: "green",
-    canceled: "grey"
-  } as const)[status];
-}
-
-function clean(value: string | undefined, maximumLength: number): string | undefined {
-  const normalized = value?.replace(/\s+/g, " ").trim();
-  return normalized ? normalized.slice(0, maximumLength) : undefined;
-}
-
-function assertNever(value: never): never {
-  throw new Error(`Unexpected Taskboard status: ${String(value)}`);
-}
-
-const STATUS_LABELS = {
-  backlog: "待规划",
-  todo: "待处理",
-  in_progress: "处理中",
-  in_review: "待验收",
-  blocked: "阻塞",
-  done: "已完成",
-  canceled: "已取消"
-} as const satisfies Readonly<Record<TaskboardStatus, string>>;
+export type TaskboardOverviewFilter = "active" | TaskboardStatus;

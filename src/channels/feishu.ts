@@ -8,6 +8,7 @@ import type { FeishuAccount } from "../weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
 import { feishuActionCard } from "./feishu-action-card.js";
+import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
 import { feishuTaskCard } from "./feishu-task-card.js";
 import {
   type ChannelTaskCard
@@ -23,7 +24,8 @@ type FeishuAdapterOptions = {
     readonly im: {
       readonly v1: {
         readonly image: Pick<Lark.Client["im"]["v1"]["image"], "create">;
-        readonly message: Pick<Lark.Client["im"]["v1"]["message"], "create">;
+        readonly message: Pick<Lark.Client["im"]["v1"]["message"], "create">
+          & Partial<Pick<Lark.Client["im"]["v1"]["message"], "patch">>;
         readonly messageResource: Pick<Lark.Client["im"]["v1"]["messageResource"], "get">;
       };
     };
@@ -99,6 +101,15 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
   }
 
+  async updateTaskCard(input: { messageId: string; card: ChannelTaskCard }): Promise<void> {
+    const patch = this.apiClient.im.v1.message.patch;
+    if (!patch) throw new FeishuTaskCardUpdateUnavailableError();
+    await patch({
+      path: { message_id: input.messageId },
+      data: { content: JSON.stringify(feishuTaskCard(input.card)) }
+    });
+  }
+
   async monitor(options: ChannelMonitorOptions): Promise<void> {
     const dispatcher = new Lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (event) => {
@@ -124,15 +135,19 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
       },
       "card.action.trigger": async (rawEvent: Lark.RawCardActionEvent) => {
         const event = Lark.normalizeCardAction(rawEvent, { includeRaw: true });
-        const action = parseChannelActionValue(event?.action.value);
-        if (!event || !action) return;
+        if (!event) return;
+        const action = parseChannelActionValue(event.action.value);
+        if (!action) return;
+        const command = formatChannelActionCommand(action, formValueFromRawCardAction(rawEvent));
+        if (!command) return;
         const token = typeof rawEvent.token === "string" && rawEvent.token.trim()
           ? rawEvent.token.trim()
           : cardActionIdentity(event);
         const pendingMessage: NormalizedWeixinMessage = {
           id: `feishu-card:${token}`,
           senderId: event.chatId,
-          text: formatChannelActionCommand(action),
+          interaction: { kind: "card", messageId: event.messageId },
+          text: command,
           attachments: [],
           raw: { channel: "feishu", event: rawEvent }
         };
@@ -172,14 +187,6 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
       attachments: [{ kind: "image", label: path.basename(targetPath), item: {}, path: targetPath }]
     };
   }
-}
-
-function cardActionIdentity(event: Lark.CardActionEvent): string {
-  const value = JSON.stringify(event.action.value ?? "");
-  return crypto.createHash("sha256")
-    .update(`${event.messageId}\n${event.operator.openId}\n${value}`)
-    .digest("hex")
-    .slice(0, 32);
 }
 
 async function reportMessageError(
@@ -231,4 +238,12 @@ function untilAborted(signal?: AbortSignal): Promise<void> {
 
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+class FeishuTaskCardUpdateUnavailableError extends Error {
+  readonly name = "FeishuTaskCardUpdateUnavailableError";
+
+  constructor() {
+    super("Feishu message patch capability is unavailable");
+  }
 }

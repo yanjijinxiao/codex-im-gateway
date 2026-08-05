@@ -326,7 +326,7 @@ test("lists and binds Taskboard issues to the active Codex session", async (t) =
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.threadId, "thread-one");
   assert.match(replies.at(-1) ?? "", /已绑定.*PROJECT-1/);
   await send("empty-attachment", "/task attach PROJECT-1");
-  assert.match(replies.at(-1) ?? "", /提供评论文字或附件/);
+  assert.match(replies.at(-1) ?? "", /\/task comment PROJECT-1/);
 });
 
 test("routes Taskboard workflow mutations through Codex and the manage-taskboard skill", async (t) => {
@@ -390,6 +390,17 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
       async listIssues() { return [issue]; },
       async getIssue(identifier: string) {
         if (identifier === "PROJECT-1") return issue;
+        if (identifier === "PROJECT-2" && createdTitles.length) {
+          return {
+            ...issue,
+            id: "task-two",
+            identifier: "PROJECT-2",
+            title: createdTitles.at(-1) ?? "Created task",
+            status: "todo",
+            threadId: null,
+            version: 1
+          };
+        }
         throw new Error("not found");
       },
       async issueForThread() { return issue; },
@@ -429,7 +440,7 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   });
 
   await send("list", "把现在手头在忙的事情给我捋一遍");
-  assert.deepEqual(cards.at(-1), { identifier: "PROJECT-1", projectName: "Project One" });
+  assert.deepEqual(cards.at(-1), { identifier: "overview:project-one", projectName: "Project One" });
   assert.deepEqual(classifiedContexts[0], {
     text: "把现在手头在忙的事情给我捋一遍",
     currentProjectName: "Project One",
@@ -460,7 +471,7 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   const classificationCount = classifiedContexts.length;
   await send("slash-list", "/task list");
   assert.equal(classifiedContexts.length, classificationCount);
-  assert.deepEqual(cards.at(-1), { identifier: "PROJECT-1", projectName: "Project One" });
+  assert.deepEqual(cards.at(-1), { identifier: "overview:project-one", projectName: "Project One" });
 });
 
 test("automatically learns and reuses account knowledge with user controls", async (t) => {

@@ -8,6 +8,7 @@ import type { ChannelCommand, FriendlyChannelIntent } from "./channel-intent.js"
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
+import { TaskboardChannelController } from "./taskboard-channel-controller.js";
 import {
   conciseButtonLabel,
   createCommandSelectionCard,
@@ -36,8 +37,8 @@ import {
   type ChannelActionCard,
   type ChannelChoice
 } from "../channels/action-card.js";
-import { createTaskCard, formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
-import type { TaskboardClient, TaskboardIssue, TaskboardProject } from "../taskboard/client.js";
+import { formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
+import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
 
 const RECENT_PROJECT_SESSION_LIMIT = 10;
 
@@ -78,6 +79,7 @@ export class BridgeService {
   private readonly buffers: PromptBuffer;
   private readonly runner: HybridCodexRunner;
   private readonly approvals: ChannelApprovalController;
+  private readonly taskboardController: TaskboardChannelController;
 
   constructor(private readonly options: BridgeServiceOptions) {
     this.access = new AccessController({
@@ -98,6 +100,17 @@ export class BridgeService {
       backend: options.config.codexBackend,
       codexBin: options.config.codexBin,
       execSandbox: options.config.codexExecSandbox
+    });
+    this.taskboardController = new TaskboardChannelController({
+      client: options.taskboard,
+      stateStore: options.stateStore,
+      replyText: (senderId, text) => this.reply(senderId, text),
+      sendCard: (message, card) => this.replyTaskCard(message, card),
+      runWorkflow: (message, instruction) => this.runCodexTurn(message, taskboardSkillPrompt(instruction)),
+      attachmentPaths: async (message) => {
+        const items = await this.promptItemsFromMessageWithNotice(message);
+        return items?.flatMap((item) => item.kind === "text" ? [] : [item.path]);
+      }
     });
   }
 
@@ -209,7 +222,7 @@ export class BridgeService {
         await this.handleProjectCommand(message.senderId, command.arg);
         return;
       case "task":
-        await this.handleTaskCommand(message, command.arg);
+        await this.taskboardController.handle(message, command.arg);
         return;
       case "new":
         {
@@ -290,227 +303,6 @@ export class BridgeService {
     if (!project) return false;
     this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
     return true;
-  }
-
-  private async handleTaskCommand(message: NormalizedWeixinMessage, arg: string): Promise<void> {
-    const taskboard = this.options.taskboard;
-    if (!taskboard) {
-      await this.reply(message.senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
-      return;
-    }
-    const context = await this.taskboardContext(message.senderId);
-    if (!context) return;
-    const input = arg.trim();
-    if (!input || input.toLowerCase() === "list") {
-      const issues = await taskboard.listIssues({ projectId: context.taskboardProject.id });
-      const active = issues.filter((issue) => !["done", "canceled"].includes(issue.status));
-      if (!active.length) {
-        await this.reply(message.senderId, `Taskboard · ${context.taskboardProject.name}\n当前没有未完成 Issue。`);
-        return;
-      }
-      if (this.options.weixin.sendTaskCard) {
-        for (const issue of active) {
-          await this.replyTaskCard(message.senderId, createTaskCard(context.managedProject.name, issue));
-        }
-        return;
-      }
-      await this.reply(message.senderId, [
-        `Taskboard · ${context.taskboardProject.name}`,
-        ...active.map((issue) => `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}`),
-        "发送 /task ISSUE编号 绑定；/task start ISSUE编号 开始处理。"
-      ].join("\n"));
-      return;
-    }
-
-    const [rawAction, rawIdentifier, ...rest] = input.split(/\s+/);
-    const action = rawAction.toLowerCase();
-    if (action === "new" || action === "todo") {
-      const title = [rawIdentifier, ...rest].filter(Boolean).join(" ").trim();
-      if (!title) {
-        await this.reply(message.senderId, `用法：/task ${action} Issue 标题`);
-        return;
-      }
-      const issue = await taskboard.createIssue({
-        projectId: context.taskboardProject.id,
-        title,
-        status: "todo",
-        priority: "none",
-        labels: []
-      });
-      if (action === "todo") {
-        await this.replyTaskCard(message.senderId, createTaskCard(
-          context.managedProject.name,
-          issue,
-          { note: "已记入待办，尚未开始处理。" }
-        ));
-        return;
-      }
-      const managedProject = context.managedProject;
-      this.options.stateStore.createSession(message.senderId, managedProject.workspace, title, managedProject.id);
-      await this.runCodexTurn(message, taskboardSkillPrompt(
-        `领取并开始处理刚创建的 ${issue.identifier}；将当前 Codex thread 绑定到该 Issue。`
-      ));
-      return;
-    }
-
-    if (["start", "block", "review", "accept", "return", "comment", "attach", "detail"].includes(action)) {
-      if (!rawIdentifier) {
-        const fallbackText = `用法：/task ${action} ISSUE编号${action === "comment" ? " 评论内容" : ""}`;
-        await this.replyActionCard(message.senderId, createChoiceCard({
-          title: "先选择 Taskboard Issue",
-          body: action === "comment" ? "请选择 Issue；评论内容仍可直接用自然语言补充。" : "请选择要操作的 Issue。",
-          fallbackText,
-          choices: [{ label: "查看 Issue", command: "task", arg: "list", style: "primary" }]
-        }));
-        return;
-      }
-      const issue = await this.resolveTaskboardIssueTarget(context, rawIdentifier, message.senderId);
-      if (!issue) return;
-      if (action === "detail") {
-        const latestComment = (await taskboard.listComments(issue.id)).at(-1)?.body;
-        await this.replyTaskCard(message.senderId, createTaskCard(
-          context.managedProject.name,
-          issue,
-          { latestComment }
-        ));
-        return;
-      }
-      if (issue.threadId) {
-        this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
-      } else if (action === "start") {
-        this.options.stateStore.createSession(
-          message.senderId,
-          context.managedProject.workspace,
-          issue.title,
-          context.managedProject.id
-        );
-      }
-      if (action === "comment" || action === "attach") {
-        const body = action === "comment" ? rest.join(" ").trim() : "";
-        const threadId = issue.threadId ?? this.options.stateStore.getActiveSession(message.senderId)?.threadId;
-        if (!threadId) {
-          const fallbackText = `Issue ${issue.identifier} 尚未关联 Codex 任务，请先发送 /task start ${issue.identifier}。`;
-          await this.replyActionCard(message.senderId, createChoiceCard({
-            title: `${issue.identifier} 尚未开始`,
-            body: "先领取并开始处理，之后即可添加评论或附件。",
-            fallbackText,
-            choices: [{ label: "开始处理", command: "task", arg: `start ${issue.identifier}`, style: "primary" }]
-          }));
-          return;
-        }
-        if (action === "comment" && body) await taskboard.addComment(issue.id, body, threadId);
-        const items = message.attachments.length ? await this.promptItemsFromMessageWithNotice(message) : [];
-        if (!items) return;
-        const paths = items.flatMap((item) => item.kind === "text" ? [] : [item.path]);
-        for (const localPath of paths) await taskboard.uploadAttachment(issue.id, localPath);
-        if (!body && !paths.length) {
-          await this.reply(message.senderId, `请为 ${issue.identifier} 提供评论文字或附件。`);
-          return;
-        }
-        await this.reply(message.senderId, `已更新 ${issue.identifier}${body ? " 评论" : ""}${paths.length ? `，上传 ${paths.length} 个附件` : ""}。`);
-        return;
-      }
-      const detail = rest.join(" ").trim();
-      if (action === "block" && !detail) {
-        await this.reply(message.senderId, `请补充 ${issue.identifier} 的阻塞原因，例如：/task block ${issue.identifier} 等待接口权限。`);
-        return;
-      }
-      if (action === "return" && !detail) {
-        await this.reply(message.senderId, `请补充 ${issue.identifier} 的退回原因，例如：/task return ${issue.identifier} 缺少运行态验证。`);
-        return;
-      }
-      const instruction = taskboardWorkflowInstruction(action, issue, detail);
-      if (!instruction) {
-        await this.reply(message.senderId, `不支持的 Taskboard 操作：${action}`);
-        return;
-      }
-      await this.runCodexTurn(message, taskboardSkillPrompt(instruction));
-      return;
-    }
-
-    const issue = await this.resolveTaskboardIssue(context.taskboardProject, rawAction, message.senderId);
-    if (!issue) return;
-    if (issue.threadId) {
-      this.options.stateStore.setSessionThread(context.session.id, issue.threadId);
-      await this.reply(message.senderId, `已绑定 ${issue.identifier} · ${issue.title}\n状态：${formatTaskboardStatus(issue.status)}\n下一条消息会在对应 Codex 任务中继续。`);
-    } else {
-      const fallbackText = `${issue.identifier} 尚未关联 Codex 任务。发送 /task start ${issue.identifier} 领取并开始处理。`;
-      await this.replyActionCard(message.senderId, createChoiceCard({
-        title: `${issue.identifier} 尚未开始`,
-        body: issue.title,
-        fallbackText,
-        choices: [{ label: "领取并开始", command: "task", arg: `start ${issue.identifier}`, style: "primary" }]
-      }));
-    }
-  }
-
-  private async resolveTaskboardIssueTarget(
-    context: { session: ManagedSession; taskboardProject: TaskboardProject },
-    identifier: string,
-    senderId: string
-  ): Promise<TaskboardIssue | undefined> {
-    if (identifier.toLowerCase() !== "current") {
-      return this.resolveTaskboardIssue(context.taskboardProject, identifier, senderId);
-    }
-    if (!context.session.threadId) {
-      await this.reply(senderId, "当前会话尚未绑定 Taskboard Issue，请明确提供 ISSUE 编号。");
-      return undefined;
-    }
-    const taskboard = this.options.taskboard;
-    if (!taskboard) {
-      await this.reply(senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
-      return undefined;
-    }
-    const issue = await taskboard.issueForThread(
-      context.taskboardProject.id,
-      context.session.threadId
-    );
-    if (!issue) {
-      await this.reply(senderId, "当前 Codex 会话没有对应的 Taskboard Issue，请明确提供 ISSUE 编号。");
-      return undefined;
-    }
-    return issue;
-  }
-
-  private async taskboardContext(senderId: string): Promise<{
-    session: ManagedSession;
-    managedProject: ManagedProject;
-    taskboardProject: TaskboardProject;
-  } | undefined> {
-    const session = this.options.stateStore.getActiveSession(senderId);
-    const managedProject = session?.projectId
-      ? this.options.stateStore.listProjects().find((project) => project.id === session.projectId)
-      : undefined;
-    if (!session || !managedProject || !this.options.taskboard) return undefined;
-    const taskboardProject = await this.options.taskboard.projectForWorkspace(managedProject.workspace);
-    if (!taskboardProject) {
-      await this.reply(senderId, `当前 Codex 项目尚未映射到 Taskboard：${managedProject.workspace}`);
-      return undefined;
-    }
-    return { session, managedProject, taskboardProject };
-  }
-
-  private async resolveTaskboardIssue(
-    project: TaskboardProject,
-    identifier: string,
-    senderId: string
-  ): Promise<TaskboardIssue | undefined> {
-    try {
-      const taskboard = this.options.taskboard;
-      if (!taskboard) {
-        await this.reply(senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
-        return undefined;
-      }
-      const issue = await taskboard.getIssue(identifier);
-      if (issue.projectId !== project.id) {
-        await this.reply(senderId, `${issue.identifier} 不属于当前 Taskboard 项目“${project.name}”。`);
-        return undefined;
-      }
-      return issue;
-    } catch (error) {
-      await this.reply(senderId, `无法读取 Issue ${identifier}：${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
   }
 
   private async handleProjectCommand(senderId: string, arg: string): Promise<void> {
@@ -1318,7 +1110,9 @@ export class BridgeService {
 
     await sendTyping(true);
     const timer = setInterval(() => {
-      void sendTyping(true);
+      sendTyping(true).catch((error) => {
+        console.warn(`WeChat typing refresh failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }, 5_000);
     try {
       await run();
@@ -1444,10 +1238,28 @@ export class BridgeService {
     }
   }
 
-  private async replyTaskCard(senderId: string, card: ChannelTaskCard): Promise<void> {
+  private async replyTaskCard(message: NormalizedWeixinMessage, card: ChannelTaskCard): Promise<void> {
+    const senderId = message.senderId;
     if (!this.options.weixin.sendTaskCard) {
       await this.reply(senderId, card.fallbackText);
       return;
+    }
+    if (message.interaction && this.options.weixin.updateTaskCard) {
+      try {
+        console.log(`[codex-channel-bridge] updating Taskboard card ${card.identifier} in ${message.interaction.messageId}`);
+        await this.options.weixin.updateTaskCard({ messageId: message.interaction.messageId, card });
+        this.options.onOutboundMessage?.({
+          direction: "outbound",
+          id: message.interaction.messageId,
+          recipientId: senderId,
+          text: card.fallbackText,
+          attachments: []
+        });
+        console.log(`[codex-channel-bridge] updated Taskboard card ${card.identifier}`);
+        return;
+      } catch (error) {
+        console.warn(`Taskboard card update failed for ${senderId}; sending a new card: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     try {
       console.log(`[codex-channel-bridge] sending Taskboard card ${card.identifier} to ${senderId}`);
@@ -1557,23 +1369,6 @@ function helpText(): string {
 
 function taskboardSkillPrompt(instruction: string): string {
   return `使用 manage-taskboard Skill 完成以下操作。遵守其线程归属、状态迁移、评论证据和验收门禁；Taskboard 是任务状态唯一事实源。\n\n${instruction}`;
-}
-
-function taskboardWorkflowInstruction(action: string, issue: TaskboardIssue, detail: string): string | undefined {
-  switch (action) {
-    case "start":
-      return `领取并开始处理 ${issue.identifier}。`;
-    case "block":
-      return `将 ${issue.identifier} 标记为阻塞，并记录阻塞原因：${detail}。`;
-    case "review":
-      return `完成 ${issue.identifier} 的检查与证据记录，然后提交验收。${detail ? ` 补充：${detail}` : ""}`;
-    case "accept":
-      return `用户已明确确认验收 ${issue.identifier}；只有完成门禁满足时才标记完成，否则明确记录未通过原因。${detail ? ` 补充：${detail}` : ""}`;
-    case "return":
-      return `将待验收的 ${issue.identifier} 退回处理中，并记录退回原因：${detail}。`;
-    default:
-      return undefined;
-  }
 }
 
 function formatKnowledgeKind(kind: "preference" | "skill" | "knowledge" | "workflow"): string {
