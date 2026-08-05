@@ -135,12 +135,12 @@ export class TaskboardChannelController {
       }
       return;
     }
-    if (!(await this.authorizeSubmissionTarget(message, context, submission))) {
-      reservation.finish(false);
-      return;
-    }
     let mutationCompleted = false;
     try {
+      if (!(await this.authorizeSubmissionTarget(message, context, submission))) {
+        reservation.finish(false);
+        return;
+      }
       const result = await executeTaskboardSubmission({
         client: this.requireClient(),
         projectId: context.taskboardProject.id,

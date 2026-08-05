@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 
 const RESTORED_TASK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const SESSION_CONTEXT_TAIL_BYTES = 8 * 1024 * 1024;
+const STARTUP_MTIME_TOLERANCE_MS = 1_000;
 
 export type CodexSessionCompletion = {
   sessionId: string;
@@ -36,6 +38,7 @@ export type CodexSessionCompletionMonitorOptions = {
 
 type SessionCursor = {
   offset: number;
+  emitAfter?: number;
   workspace?: string;
   sessionId?: string;
   taskTitle?: string;
@@ -56,6 +59,7 @@ export class CodexSessionCompletionMonitor {
   private scan?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private started = false;
+  private runId = 0;
 
   constructor(private readonly options: CodexSessionCompletionMonitorOptions) {
     this.codexHome = options.codexHome ?? path.join(os.homedir(), ".codex");
@@ -66,8 +70,11 @@ export class CodexSessionCompletionMonitor {
   start(): void {
     if (this.started) return;
     this.started = true;
+    const runId = ++this.runId;
+    const startedAt = this.now();
+    const startedWallClock = Date.now();
     for (const root of this.sessionRoots()) this.watchRoot(root);
-    this.initialization = this.initialize().catch((error) => {
+    this.initialization = this.initialize(runId, startedAt, startedWallClock).catch((error) => {
       console.error(`[codex-channel-bridge] unable to initialize Codex session monitor: ${String(error)}`);
     });
     this.timer = setInterval(() => {
@@ -78,19 +85,23 @@ export class CodexSessionCompletionMonitor {
     this.timer.unref();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    const initialization = this.initialization;
+    const scan = this.scan;
     this.started = false;
+    this.runId += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     for (const watcher of this.watchers) watcher.close();
     this.watchers.length = 0;
     this.pendingFiles.clear();
+    await Promise.allSettled(scan ? [initialization, scan] : [initialization]);
   }
 
   async scanNow(): Promise<void> {
     if (!this.started) return;
     if (this.scan) return this.scan;
-    this.scan = this.performScan();
+    this.scan = this.performScan(this.runId);
     try {
       await this.scan;
     } finally {
@@ -102,28 +113,57 @@ export class CodexSessionCompletionMonitor {
     await this.initialization;
   }
 
-  private async initialize(): Promise<void> {
-    for (const filePath of await this.listSessionFiles()) {
-      if (!this.started) return;
+  private async initialize(runId: number, startedAt: number, startedWallClock: number): Promise<void> {
+    const files = await this.listSessionFiles();
+    if (!this.isActiveRun(runId)) return;
+    const snapshots = await Promise.all(files.map(async (filePath) => ({
+      filePath,
+      stat: await safeFileStat(filePath)
+    })));
+    snapshots.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs);
+    for (const { filePath, stat } of snapshots) {
+      if (!this.isActiveRun(runId)) return;
       // A real Codex home can contain gigabytes of session history. Yield once
       // per file so startup indexing never starves the local HTTP server.
       await yieldToEventLoop();
+      if (!this.isActiveRun(runId)) return;
+      const replayStartupWrite = this.pendingFiles.has(filePath)
+        || stat.mtimeMs >= startedWallClock - STARTUP_MTIME_TOLERANCE_MS;
+      const initialContext = await readInitialSessionContext(filePath, this.now(), stat);
+      if (!this.isActiveRun(runId)) return;
       const cursor = {
-        offset: await safeFileSize(filePath),
-        ...await readInitialSessionContext(filePath, this.now())
+        offset: replayStartupWrite ? Math.max(0, stat.size - SESSION_CONTEXT_TAIL_BYTES) : stat.size,
+        ...(replayStartupWrite ? { emitAfter: startedAt } : {}),
+        ...initialContext
       };
       this.cursors.set(filePath, cursor);
+      if (replayStartupWrite) await this.processFile(filePath, runId);
+      if (!this.isActiveRun(runId)) return;
       const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
-      if (task) await this.options.onTaskChanged?.(task);
+      const activeStartedAt = Date.parse(cursor.activeStartedAt ?? "");
+      const shouldRestoreReplayedTask = Number.isFinite(activeStartedAt)
+        && activeStartedAt < startedAt
+        && startedAt - activeStartedAt <= RESTORED_TASK_MAX_AGE_MS;
+      if (task && (!replayStartupWrite || shouldRestoreReplayedTask)) {
+        await this.options.onTaskChanged?.(task);
+      }
     }
   }
 
-  private async performScan(): Promise<void> {
+  private isActiveRun(runId: number): boolean {
+    return this.started && this.runId === runId;
+  }
+
+  private async performScan(runId: number): Promise<void> {
     await this.ready();
-    if (!this.started) return;
+    if (!this.isActiveRun(runId)) return;
     const files = new Set([...await this.listSessionFiles(), ...this.pendingFiles]);
+    if (!this.isActiveRun(runId)) return;
     this.pendingFiles.clear();
-    for (const filePath of files) await this.processFile(filePath);
+    for (const filePath of files) {
+      if (!this.isActiveRun(runId)) return;
+      await this.processFile(filePath, runId);
+    }
   }
 
   private sessionRoots(): string[] {
@@ -150,11 +190,13 @@ export class CodexSessionCompletionMonitor {
     return (await Promise.all(this.sessionRoots().map((root) => listJsonlFiles(root)))).flat();
   }
 
-  private async processFile(filePath: string): Promise<void> {
+  private async processFile(filePath: string, runId?: number): Promise<void> {
+    if (runId !== undefined && !this.isActiveRun(runId)) return;
     if (this.processingFiles.has(filePath)) return;
     this.processingFiles.add(filePath);
     try {
       const size = await safeFileSize(filePath);
+      if (runId !== undefined && !this.isActiveRun(runId)) return;
       const cursor = this.cursors.get(filePath) ?? { offset: 0 };
       if (size < cursor.offset) cursor.offset = 0;
       if (size === cursor.offset) {
@@ -162,17 +204,20 @@ export class CodexSessionCompletionMonitor {
         return;
       }
       const buffer = await readFileRange(filePath, cursor.offset, size - cursor.offset);
+      if (runId !== undefined && !this.isActiveRun(runId)) return;
       const lastNewline = buffer.lastIndexOf(0x0a);
       if (lastNewline < 0) return;
       const complete = buffer.subarray(0, lastNewline + 1);
       cursor.offset += complete.length;
       this.cursors.set(filePath, cursor);
       for (const line of complete.toString("utf8").split("\n")) {
+        if (runId !== undefined && !this.isActiveRun(runId)) return;
         if (!line) continue;
         const event = parseRecord(line);
         if (!event) continue;
         await this.processEvent(cursor, event);
       }
+      cursor.emitAfter = undefined;
     } catch (error) {
       console.error(`[codex-channel-bridge] unable to read Codex session completion: ${String(error)}`);
     } finally {
@@ -195,13 +240,15 @@ export class CodexSessionCompletionMonitor {
       cursor.activeTurnId = payload.turn_id;
       cursor.activeStartedAt = timestamp;
       cursor.taskTitle = "";
-      await this.emitTask(cursor, "running", timestamp);
+      if (shouldEmitEvent(cursor, timestamp)) await this.emitTask(cursor, "running", timestamp);
       return;
     }
     if (payload.type === "user_message") {
       const message = typeof payload.message === "string" ? payload.message : "";
       cursor.taskTitle = oneLine(message).slice(0, 100);
-      if (cursor.activeTurnId) await this.emitTask(cursor, "running", timestamp);
+      if (cursor.activeTurnId && shouldEmitEvent(cursor, timestamp)) {
+        await this.emitTask(cursor, "running", timestamp);
+      }
       return;
     }
     if (payload.type !== "task_complete" && payload.type !== "turn_aborted") return;
@@ -213,6 +260,11 @@ export class CodexSessionCompletionMonitor {
         ? "failed"
         : "completed";
     cursor.activeTurnId = payload.turn_id;
+    if (!shouldEmitEvent(cursor, timestamp)) {
+      cursor.activeTurnId = undefined;
+      cursor.activeStartedAt = undefined;
+      return;
+    }
     await this.emitTask(cursor, status, timestamp);
     const success = status === "completed";
     const text = success && typeof payload.last_agent_message === "string"
@@ -298,10 +350,10 @@ async function readFileRange(filePath: string, offset: number, length: number): 
 
 async function readInitialSessionContext(
   filePath: string,
-  nowMs: number
+  nowMs: number,
+  file: { size: number; mtimeMs: number }
 ): Promise<Omit<SessionCursor, "offset">> {
   try {
-    const file = await safeFileStat(filePath);
     const fileSize = file.size;
     const firstLine = (await readFileRange(filePath, 0, Math.min(fileSize, 128 * 1024)))
       .toString("utf8")
@@ -322,7 +374,7 @@ async function readInitialSessionContext(
     if (context.threadSource === "subagent" || nowMs - file.mtimeMs > 24 * 60 * 60 * 1000) {
       return context;
     }
-    const tailOffset = Math.max(0, fileSize - 8 * 1024 * 1024);
+    const tailOffset = Math.max(0, fileSize - SESSION_CONTEXT_TAIL_BYTES);
     for (const line of (await readFileRange(filePath, tailOffset, fileSize - tailOffset)).toString("utf8").split("\n")) {
       const tailEvent = parseRecord(line);
       const tailPayload = tailEvent?.type === "event_msg" ? recordValue(tailEvent.payload) : undefined;
@@ -372,6 +424,12 @@ async function safeFileSize(filePath: string): Promise<number> {
 
 function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function shouldEmitEvent(cursor: SessionCursor, timestamp: string): boolean {
+  if (cursor.emitAfter === undefined) return true;
+  const eventTime = Date.parse(timestamp);
+  return Number.isFinite(eventTime) && eventTime >= cursor.emitAfter;
 }
 
 function isDirectory(candidate: string): boolean {

@@ -261,7 +261,7 @@ export class AccountManager {
   async stopAll(): Promise<void> {
     this.codexDesktopApprovalMonitor?.stop();
     this.codexDesktopApprovalMonitor = undefined;
-    this.codexSessionMonitor?.stop();
+    await this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
     this.managedTurnCompletions.clear();

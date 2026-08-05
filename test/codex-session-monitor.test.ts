@@ -109,6 +109,66 @@ test("does not restore a seven-hour-old unfinished turn from a recently touched 
   assert.deepEqual(taskChanges, []);
 });
 
+test("captures a completion appended while existing sessions are still initializing", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-startup-write-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, "project");
+  const sessionDir = path.join(root, ".codex", "sessions", "2026", "08", "01");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const existing = path.join(sessionDir, "existing.jsonl");
+  writeLines(existing, [
+    sessionMeta("startup-session", workspace),
+    taskStarted("startup-turn"),
+    userMessage("启动期间完成的任务")
+  ]);
+  const completions: CodexSessionCompletion[] = [];
+  const monitor = new CodexSessionCompletionMonitor({
+    codexHome: path.join(root, ".codex"),
+    pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T08:00:02.500Z"),
+    onCompletion: (completion) => completions.push(completion)
+  });
+
+  monitor.start();
+  t.after(() => monitor.stop());
+  appendLines(existing, [taskComplete("startup-turn", "启动写入已保留")]);
+  await monitor.ready();
+  await monitor.scanNow();
+
+  assert.equal(completions.length, 1);
+  assert.equal(completions[0]?.turnId, "startup-turn");
+  assert.equal(completions[0]?.text, "启动写入已保留");
+});
+
+test("does not emit restored task state after the monitor is stopped", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-stop-init-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, "project");
+  const sessionDir = path.join(root, ".codex", "sessions", "2026", "08", "01");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(sessionDir, { recursive: true });
+  writeLines(path.join(sessionDir, "existing.jsonl"), [
+    sessionMeta("stopped-session", workspace),
+    taskStarted("stopped-turn"),
+    userMessage("停止后不应恢复")
+  ]);
+  const taskChanges: CodexSessionTask[] = [];
+  const monitor = new CodexSessionCompletionMonitor({
+    codexHome: path.join(root, ".codex"),
+    pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"),
+    onCompletion: () => undefined,
+    onTaskChanged: (task) => taskChanges.push(task)
+  });
+
+  monitor.start();
+  await monitor.stop();
+  await monitor.ready();
+
+  assert.deepEqual(taskChanges, []);
+});
+
 function sessionMeta(sessionId: string, cwd: string): object {
   return { timestamp: "2026-08-01T08:00:00.000Z", type: "session_meta", payload: { session_id: sessionId, cwd } };
 }

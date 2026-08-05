@@ -26,7 +26,11 @@ type TaskboardFixture = {
 function createTaskboardFixture(
   workspace: string,
   initialIssues: readonly TaskboardIssue[],
-  options: { readonly conflictOnTransition?: boolean; readonly createDelayMs?: number } = {}
+  options: {
+    readonly conflictOnTransition?: boolean;
+    readonly createDelayMs?: number;
+    readonly failTaskLookup?: boolean;
+  } = {}
 ): TaskboardFixture {
   const issues = [...initialIssues];
   const comments: string[] = [];
@@ -79,6 +83,7 @@ function createTaskboardFixture(
       }
       const taskMatch = /^\/api\/tasks\/([^/]+)$/.exec(url.pathname);
       if (taskMatch) {
+        if (options.failTaskLookup) throw new Error("task lookup unavailable");
         const identifier = decodeURIComponent(taskMatch[1]);
         const issue = issues.find((candidate) => candidate.id === identifier || candidate.identifier === identifier);
         return issue ? Response.json({ task: issue }) : Response.json({ error: "not found" }, { status: 404 });
@@ -305,6 +310,44 @@ test("reserves a request ID before awaits so concurrent native creates run once"
 
   assert.equal(fixture.created.length, 1);
   assert.equal(fixture.created[0]?.title, "只创建一次");
+});
+
+test("releases concurrent request reservations when target authorization fails", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-failed-authorization-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const fixture = createTaskboardFixture(root, [issue("PROJECT-1", "in_progress", 1)], { failTaskLookup: true });
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] }, stateStore, taskboard: fixture.client,
+    weixin: {
+      async sendText() { throw new Error("reply unavailable"); },
+      async sendTaskCard() { return { messageId: "card" }; }
+    }
+  });
+  const query = new URLSearchParams({
+    operation: "comment",
+    identifier: "PROJECT-1",
+    version: "1",
+    body: "不会写入",
+    request_id: "00000000-0000-4000-8000-000000000012"
+  });
+  const submit = (id: string) => service.handleMessage({
+    id,
+    senderId: "oc_test",
+    text: `/task submit ${query}`,
+    attachments: [],
+    raw: {}
+  });
+
+  const result = await Promise.race([
+    Promise.allSettled([submit("failed-authorization-1"), submit("failed-authorization-2")]),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 500))
+  ]);
+
+  assert.notEqual(result, "timeout");
+  assert.equal(Array.isArray(result) && result.every((entry) => entry.status === "rejected"), true);
 });
 
 test("routes a native start action without a thread through the Taskboard skill", async (t) => {
