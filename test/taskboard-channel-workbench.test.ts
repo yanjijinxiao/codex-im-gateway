@@ -23,7 +23,11 @@ type TaskboardFixture = {
   }>;
 };
 
-function createTaskboardFixture(workspace: string, initialIssues: readonly TaskboardIssue[]): TaskboardFixture {
+function createTaskboardFixture(
+  workspace: string,
+  initialIssues: readonly TaskboardIssue[],
+  options: { readonly conflictOnTransition?: boolean } = {}
+): TaskboardFixture {
   const issues = [...initialIssues];
   const comments: string[] = [];
   const moves: Array<{ status: string; version: number }> = [];
@@ -103,6 +107,32 @@ function createTaskboardFixture(workspace: string, initialIssues: readonly Taskb
         moves.push({ status: String(body.status), version: Number(body.version) });
         return Response.json({ task: next });
       }
+      const transitionMatch = /^\/api\/tasks\/([^/]+)\/transition$/.exec(url.pathname);
+      if (transitionMatch && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        const index = issues.findIndex((candidate) => candidate.id === decodeURIComponent(transitionMatch[1]));
+        const current = issues[index];
+        if (options.conflictOnTransition && current) {
+          issues[index] = { ...current, version: current.version + 1 };
+          return Response.json({ error: "version conflict" }, { status: 409 });
+        }
+        if (!current || current.version !== body.version) {
+          return Response.json({ error: "version conflict" }, { status: 409 });
+        }
+        const next = { ...current, status: body.status, version: current.version + 1, updatedAt: "2026-08-05T04:00:00.000Z" };
+        const comment = {
+          id: `comment-${comments.length + 1}`,
+          taskId: current.id,
+          body: String(body.body),
+          threadId: String(body.threadId),
+          createdAt: "2026-08-05T03:00:00.000Z",
+          updatedAt: "2026-08-05T03:00:00.000Z"
+        };
+        issues[index] = next;
+        comments.push(comment.body);
+        moves.push({ status: String(body.status), version: Number(body.version) });
+        return Response.json({ task: next, comment });
+      }
       return Response.json({ error: `Unhandled ${init?.method ?? "GET"} ${url.pathname}` }, { status: 500 });
     }
   });
@@ -150,6 +180,68 @@ test("renders one paged overview card and updates the originating card in place"
   assert.equal("kind" in updated[0].card ? updated[0].card.kind : undefined, "detail");
 });
 
+test("sends a fresh native card when the originating card can no longer be patched", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-patch-fallback-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const fixture = createTaskboardFixture(root, [issue("PROJECT-1", "todo", 1)]);
+  const sent: ChannelTaskCard[] = [];
+  let patchAttempts = 0;
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] }, stateStore, taskboard: fixture.client,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendTaskCard(input) { sent.push(input.card); return { messageId: "replacement" }; },
+      async updateTaskCard() { patchAttempts += 1; throw new Error("card expired"); }
+    }
+  });
+
+  await service.handleMessage({
+    id: "detail",
+    senderId: "oc_test",
+    text: "/task detail PROJECT-1",
+    attachments: [],
+    raw: {},
+    interaction: { kind: "card", messageId: "expired-card" }
+  });
+
+  assert.equal(patchAttempts, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].identifier, "PROJECT-1");
+});
+
+test("rejects a Feishu card click from an unauthorized operator", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-operator-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const fixture = createTaskboardFixture(root, []);
+  const replies: Array<{ readonly toUserId: string; readonly text: string }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["ou_owner"] },
+    stateStore,
+    taskboard: fixture.client,
+    weixin: {
+      async sendText(input) { replies.push(input); return { messageId: "text" }; },
+      async sendTaskCard() { throw new Error("unauthorized actions must not render a Taskboard card"); }
+    }
+  });
+
+  await service.handleMessage({
+    id: "unauthorized-click",
+    senderId: "ou_intruder",
+    replyTargetId: "oc_untrusted",
+    text: "/task list",
+    attachments: [],
+    raw: {}
+  });
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].toUserId, "oc_untrusted");
+  assert.match(replies[0].text, /Access denied/);
+});
+
 test("uses native forms for task creation and executes their canonical submit command", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-create-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -179,6 +271,44 @@ test("uses native forms for task creation and executes their canonical submit co
   assert.equal("kind" in cards.at(-1) ? cards.at(-1)?.kind : undefined, "detail");
 });
 
+test("routes a native start action without a thread through the Taskboard skill", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-native-start-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const unstarted = { ...issue("PROJECT-1", "todo", 1), threadId: null };
+  const fixture = createTaskboardFixture(root, [unstarted]);
+  const prompts: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
+    stateStore,
+    taskboard: fixture.client,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendTaskCard() { return { messageId: "card" }; }
+    },
+    runner: {
+      async run(input: { readonly prompt: string }) {
+        prompts.push(input.prompt);
+        return { raw: "", text: "已开始", threadId: "thread-new" };
+      },
+      async stop() {}
+    } as never
+  });
+  const query = new URLSearchParams({
+    operation: "start",
+    identifier: "PROJECT-1",
+    version: "1",
+    request_id: "00000000-0000-4000-8000-000000000010"
+  });
+
+  await service.handleMessage({ id: "start", senderId: "oc_test", text: `/task submit ${query}`, attachments: [], raw: {} });
+
+  assert.match(prompts[0] ?? "", /manage-taskboard Skill/);
+  assert.match(prompts[0] ?? "", /PROJECT-1/);
+});
+
 test("rejects a stale native mutation before writing evidence or moving the issue", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-conflict-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -201,6 +331,63 @@ test("rejects a stale native mutation before writing evidence or moving the issu
   assert.deepEqual(fixture.comments, []);
   assert.deepEqual(fixture.moves, []);
   assert.match(cards.at(-1)?.fallbackText ?? "", /任务已更新|版本/);
+});
+
+test("keeps evidence and status unchanged when an atomic transition loses a version race", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-race-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const fixture = createTaskboardFixture(root, [issue("PROJECT-1", "in_review", 4)], { conflictOnTransition: true });
+  const cards: ChannelTaskCard[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] }, stateStore, taskboard: fixture.client,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendTaskCard(input) { cards.push(input.card); return { messageId: "card" }; }
+    }
+  });
+  const query = new URLSearchParams({ operation: "return", identifier: "PROJECT-1", version: "4", body: "缺少真机验证" });
+
+  await service.handleMessage({ id: "race", senderId: "oc_test", text: `/task submit ${query}`, attachments: [], raw: {} });
+
+  assert.deepEqual(fixture.comments, []);
+  assert.deepEqual(fixture.moves, []);
+  assert.match(cards.at(-1)?.fallbackText ?? "", /任务已更新|版本/);
+});
+
+test("never renders a foreign-project task when an invalid request ID is replayed", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-project-scope-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const foreign = { ...issue("FOREIGN-1", "in_progress", 1), projectId: "project-two" };
+  const fixture = createTaskboardFixture(root, [foreign]);
+  const cards: ChannelTaskCard[] = [];
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] }, stateStore, taskboard: fixture.client,
+    weixin: {
+      async sendText(input) { replies.push(input.text); return { messageId: "text" }; },
+      async sendTaskCard(input) { cards.push(input.card); return { messageId: "card" }; }
+    }
+  });
+  const query = new URLSearchParams({
+    operation: "comment",
+    identifier: foreign.identifier,
+    version: "1",
+    body: "探测内容",
+    request_id: "00000000-0000-4000-8000-000000000099"
+  });
+
+  await service.handleMessage({ id: "foreign-1", senderId: "oc_test", text: `/task submit ${query}`, attachments: [], raw: {} });
+  await service.handleMessage({ id: "foreign-2", senderId: "oc_test", text: `/task submit ${query}`, attachments: [], raw: {} });
+
+  assert.equal(cards.length, 0);
+  assert.equal(replies.length, 2);
+  assert.ok(replies.every((reply) => reply.includes("不属于当前 Taskboard 项目")));
 });
 
 test("executes the native workflow and deduplicates repeated form submissions", async (t) => {

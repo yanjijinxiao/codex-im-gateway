@@ -630,6 +630,18 @@ function parseMove(body) {
   };
 }
 
+function parseMoveWithComment(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "status", "sortOrder", "threadId", "body"]));
+  return {
+    version: parseVersion(body.version),
+    status: parseStatus(body.status),
+    sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
+    threadId: parseThreadId(body.threadId),
+    body: stringField(body.body, "body", { required: true, maxLength: 100_000 }),
+  };
+}
+
 function parseArchive(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["version", "threadId"]));
@@ -1970,7 +1982,7 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
+      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|transition))?$/);
       if (taskRoute) {
         let id;
         try {
@@ -2004,6 +2016,20 @@ export function createTaskboardServer(options = {}) {
           const task = database.moveTask(id, move.version, move.status, move.sortOrder, move.threadId);
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });
+        }
+        if (action === "transition" && request.method === "POST") {
+          const transition = parseMoveWithComment(await readJson(request));
+          const result = database.moveTaskWithComment(
+            id,
+            transition.version,
+            transition.status,
+            transition.sortOrder,
+            transition.threadId,
+            { ...transition, actor: actorFromRequest(request) },
+          );
+          events.emit("comment.created", result);
+          events.emit("task.moved", result);
+          return sendJson(response, 200, result);
         }
         if (action === "archive" && request.method === "POST") {
           const { version, threadId } = parseArchive(await readJson(request));

@@ -23,3 +23,10 @@ test("configured allowlist users are allowed without pairing", () => {
   assert.equal(access.requireAccess("owner@im.wechat").allowed, true);
   assert.equal(access.requireAccess("stranger@im.wechat").allowed, false);
 });
+
+test("an explicitly allowed conversation grants group-wide access while other chats do not", () => {
+  const access = new AccessController({ allowedSenderIds: ["oc_trusted_group"] });
+
+  assert.equal(access.requireAccess("ou_member", "oc_trusted_group").allowed, true);
+  assert.equal(access.requireAccess("ou_member", "oc_other_group").allowed, false);
+});

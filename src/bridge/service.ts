@@ -115,32 +115,36 @@ export class BridgeService {
   }
 
   async handleMessage(message: NormalizedWeixinMessage): Promise<void> {
-    if (message.contextToken) {
-      this.options.stateStore.rememberContextToken(message.senderId, message.contextToken);
+    const replyTargetId = message.replyTargetId ?? message.senderId;
+    const scopedMessage = replyTargetId === message.senderId
+      ? message
+      : { ...message, senderId: replyTargetId };
+    if (scopedMessage.contextToken) {
+      this.options.stateStore.rememberContextToken(replyTargetId, scopedMessage.contextToken);
     }
 
-    const access = this.access.requireAccess(message.senderId);
+    const access = this.access.requireAccess(message.senderId, replyTargetId);
     if (!access.allowed) {
-      await this.reply(message.senderId, access.message);
+      await this.reply(replyTargetId, access.message);
       return;
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
 
-    const slashCommand = parseCommand(message.text);
+    const slashCommand = parseCommand(scopedMessage.text);
     const friendlyIntent = slashCommand
       ? undefined
-      : await this.resolveFriendlyChannelIntent(message.senderId, message.text);
+      : await this.resolveFriendlyChannelIntent(replyTargetId, scopedMessage.text);
     if (friendlyIntent?.kind === "clarification") {
-      await this.reply(message.senderId, friendlyIntent.text);
+      await this.reply(replyTargetId, friendlyIntent.text);
       return;
     }
     const command = slashCommand ?? (friendlyIntent?.kind === "command" ? friendlyIntent.command : undefined);
     const canRunWithoutProject = command && ![
       "status", "task", "new", "session", "sessions", "model", "effort", "stream", "prompt", "stop"
     ].includes(command.name);
-    if (!canRunWithoutProject && !this.ensureBoundProjectSession(message.senderId)) {
+    if (!canRunWithoutProject && !this.ensureBoundProjectSession(replyTargetId)) {
       const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
-      await this.replyActionCard(message.senderId, createChoiceCard({
+      await this.replyActionCard(replyTargetId, createChoiceCard({
         title: "先添加一个 Codex 项目",
         body: "还没有绑定项目。点击下方按钮，从 Codex 历史项目中选择。",
         fallbackText,
@@ -149,18 +153,18 @@ export class BridgeService {
       return;
     }
     if (command) {
-      await this.handleCommand(message, command);
+      await this.handleCommand(scopedMessage, command);
       return;
     }
 
-    const items = await this.promptItemsFromMessageWithNotice(message);
+    const items = await this.promptItemsFromMessageWithNotice(scopedMessage);
     if (!items) return;
 
-    if (this.buffers.isActive(message.senderId)) {
+    if (this.buffers.isActive(replyTargetId)) {
       for (const item of items) {
-        this.buffers.append(message.senderId, item);
+        this.buffers.append(replyTargetId, item);
       }
-      await this.replyActionCard(message.senderId, createChoiceCard({
+      await this.replyActionCard(replyTargetId, createChoiceCard({
         title: "消息已加入合并区",
         body: "可以继续发送内容；准备好后点击“提交合并消息”。",
         fallbackText: "Buffered. Send /prompt done when ready.",
@@ -169,7 +173,7 @@ export class BridgeService {
       return;
     }
 
-    await this.runCodexTurn(message, "", items);
+    await this.runCodexTurn(scopedMessage, "", items);
   }
 
   private async resolveFriendlyChannelIntent(

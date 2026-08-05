@@ -86,11 +86,18 @@ async function updateIssue(
     }
     return { kind: "invalid", issue, message: "任务尚未关联 Codex 会话，请先开始处理。" };
   }
-  if (submission.operation === "block" || submission.operation === "review" || submission.operation === "return") {
-    await input.client.addComment(issue.id, submission.body, issue.threadId);
-  }
   try {
-    const moved = await input.client.moveIssue(issue.id, status, issue.version, issue.threadId);
+    const moved = submission.operation === "block"
+      || submission.operation === "review"
+      || submission.operation === "return"
+      ? (await input.client.moveIssueWithComment(
+        issue.id,
+        status,
+        issue.version,
+        issue.threadId,
+        submission.body
+      )).task
+      : await input.client.moveIssue(issue.id, status, issue.version, issue.threadId);
     return {
       kind: "issue",
       issue: moved,

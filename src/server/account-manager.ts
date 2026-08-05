@@ -351,6 +351,13 @@ export class AccountManager {
 
     entry.status = "running";
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      if (channel !== "weixin") {
+        const replyTargetId = message.replyTargetId ?? message.senderId;
+        const allowedIds = new Set([...config.allowedSenderIds, ...store.listPairedSenderIds()]);
+        if (!allowedIds.has(message.senderId) && !allowedIds.has(replyTargetId)) {
+          store.rememberAccessRequest(message.senderId);
+        }
+      }
       webhook.publish({
         direction: "inbound",
         id: message.id,
@@ -358,14 +365,13 @@ export class AccountManager {
         text: message.text,
         attachments: message.attachments.map(({ kind, label }) => ({ kind, label }))
       });
-      if (channel !== "weixin") service.allowSender(message.senderId);
       await service.handleMessage(message);
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
       await this.sendChannelText(entry, {
-        recipientId: message.senderId,
+        recipientId: message.replyTargetId ?? message.senderId,
         text: userFacingMessageHandlingError(error),
-        contextToken: store.getContextToken(message.senderId)
+        contextToken: store.getContextToken(message.replyTargetId ?? message.senderId)
       });
     };
     const task = adapter ? adapter.monitor({

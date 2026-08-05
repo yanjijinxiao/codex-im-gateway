@@ -17,7 +17,10 @@ export type WeixinInboundAttachment = {
 
 export type NormalizedWeixinMessage = {
   id: string;
+  /** The human actor who sent the message or clicked the card. */
   senderId: string;
+  /** The channel conversation that receives replies and owns session state. */
+  replyTargetId?: string;
   contextToken?: string;
   interaction?: {
     readonly kind: "card";

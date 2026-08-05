@@ -20,14 +20,17 @@ export class AccessController {
     return this.configuredAllowlist.has(senderId) || this.pairedSenderIds.has(senderId);
   }
 
-  requireAccess(senderId: string): AccessDecision {
-    if (this.isAllowed(senderId)) {
+  requireAccess(senderId: string, conversationId: string = senderId): AccessDecision {
+    // A conversation ID in the allowlist is an explicit group-wide ACL. Otherwise,
+    // the individual actor must be allowed; card callbacks never inherit authority
+    // merely because their reply target is a chat.
+    if (this.isAllowed(senderId) || this.isAllowed(conversationId)) {
       return { allowed: true, message: "sender is allowed" };
     }
 
     return {
       allowed: false,
-      message: `Access denied. Open the Codex Channel Bridge management page and allow sender: ${senderId}`
+      message: `Access denied. Open the Codex Channel Bridge management page and allow actor ${senderId} or conversation ${conversationId}`
     };
   }
 

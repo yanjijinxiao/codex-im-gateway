@@ -190,7 +190,7 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 管理页顶部提供“任务面板”入口，点击后会在当前主区域切换并展示已配置的本机 Taskboard，不会另开窗口；切回“消息渠道”“会话”或“设置”会恢复对应 Bridge 页面。
 
-执行 `npm run install:local` 后，当前仓库的 `taskboard/skills/manage-taskboard` 和 `taskboard/cli/taskctl.mjs` 会链接到用户目录。聊天端可以通过 `/task` 查询和推进工作流；领取、阻塞、提交验收和验收会交给 Codex 使用该 Skill 执行，继续遵守版本冲突检查和验收门禁；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+执行 `npm run install:local` 后，当前仓库的 `taskboard/skills/manage-taskboard` 和 `taskboard/cli/taskctl.mjs` 会链接到用户目录。聊天端可以通过自然语言、原生交互卡片或 `/task` 查询和推进同一套工作流；卡片表单直接执行受版本保护的 Taskboard 操作，需要 Codex 实际开始工作的领取动作仍使用该 Skill。阻塞、提交验收和退回会把证据与状态流转作为一个原子操作提交，完成继续要求显式验收；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
 
 常用命令：`npm run taskboard:start` 启动本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
 

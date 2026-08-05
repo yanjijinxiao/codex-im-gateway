@@ -2,6 +2,7 @@ import { createTaskCard, createTaskFormCard, createTaskOverviewCard } from "../c
 import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
 import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 import { parseTaskboardChannelCommand, type TaskboardSubmission } from "./taskboard-channel-command.js";
+import { TaskboardSubmissionDeduplicator } from "./taskboard-channel-dedup.js";
 import {
   latestTaskboardComment,
   resolveTaskboardChannelContext,
@@ -20,7 +21,7 @@ import type {
 export type { TaskboardChannelControllerOptions } from "./taskboard-channel-types.js";
 
 export class TaskboardChannelController {
-  private readonly processedSubmissions = new Map<string, number>();
+  private readonly submissionDedup = new TaskboardSubmissionDeduplicator();
 
   constructor(private readonly options: TaskboardChannelControllerOptions) {}
 
@@ -121,13 +122,17 @@ export class TaskboardChannelController {
     submission: TaskboardSubmission
   ): Promise<void> {
     const requestId = submission.request_id;
-    const dedupKey = requestId ? `${message.senderId}:${requestId}` : undefined;
-    this.pruneSubmissions();
-    if (dedupKey && this.processedSubmissions.has(dedupKey)) {
+    const dedup = this.submissionDedup.lookup(requestId, context.taskboardProject.id, submission);
+    if (dedup === "mismatch") {
+      await this.options.replyText(message.senderId, "该请求标识已用于其他任务操作，请刷新任务面板后重试。");
+      return;
+    }
+    if (dedup === "duplicate") {
       await this.refreshSubmissionTarget({ message, context, submission, note: "该操作已处理，任务已刷新。" });
       return;
     }
-    if (dedupKey) this.processedSubmissions.set(dedupKey, Date.now());
+    if (!(await this.authorizeSubmissionTarget(message, context, submission))) return;
+    this.submissionDedup.record(requestId, context.taskboardProject.id, submission);
     let mutationCompleted = false;
     try {
       const result = await executeTaskboardSubmission({
@@ -162,6 +167,7 @@ export class TaskboardChannelController {
           await this.refreshSubmissionTarget({ message, context, submission, note: "已按最新任务状态刷新。" });
           return;
         case "conflict":
+          this.submissionDedup.delete(requestId);
           await this.showIssue({
             message,
             context,
@@ -170,6 +176,7 @@ export class TaskboardChannelController {
           });
           return;
         case "invalid":
+          this.submissionDedup.delete(requestId);
           if (result.issue) await this.showIssue({ message, context, issue: result.issue, note: result.message });
           else await this.options.replyText(message.senderId, result.message);
           return;
@@ -177,9 +184,24 @@ export class TaskboardChannelController {
           return assertNever(result);
       }
     } catch (error) {
-      if (dedupKey && !mutationCompleted) this.processedSubmissions.delete(dedupKey);
+      if (!mutationCompleted) this.submissionDedup.delete(requestId);
       throw error;
     }
+  }
+
+  private async authorizeSubmissionTarget(
+    message: NormalizedWeixinMessage,
+    context: TaskboardChannelContext,
+    submission: TaskboardSubmission
+  ): Promise<boolean> {
+    if (submission.operation === "create_todo" || submission.operation === "create_start") return true;
+    return Boolean(await resolveTaskboardTarget({
+      context,
+      client: this.requireClient(),
+      identifier: submission.identifier,
+      senderId: message.senderId,
+      replyText: this.options.replyText
+    }));
   }
 
   private async refreshSubmissionTarget(input: {
@@ -192,7 +214,14 @@ export class TaskboardChannelController {
       await this.showOverview({ message: input.message, context: input.context, filter: "active", page: 1 });
       return;
     }
-    const issue = await this.requireClient().getIssue(input.submission.identifier);
+    const issue = await resolveTaskboardTarget({
+      context: input.context,
+      client: this.requireClient(),
+      identifier: input.submission.identifier,
+      senderId: input.message.senderId,
+      replyText: this.options.replyText
+    });
+    if (!issue) return;
     await this.showIssue({ message: input.message, context: input.context, issue, note: input.note });
   }
 
@@ -215,12 +244,6 @@ export class TaskboardChannelController {
     return this.options.client;
   }
 
-  private pruneSubmissions(): void {
-    const cutoff = Date.now() - 30 * 60 * 1_000;
-    for (const [key, createdAt] of this.processedSubmissions) {
-      if (createdAt < cutoff) this.processedSubmissions.delete(key);
-    }
-  }
 }
 
 class TaskboardChannelUnavailableError extends Error {

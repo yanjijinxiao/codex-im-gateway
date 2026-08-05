@@ -33,6 +33,8 @@
 4. 发布应用，在管理页选择“飞书自建应用”，填写凭据后连接。
 5. 向机器人发送一条消息，让服务登记可用于通知的会话或用户 ID。
 
+飞书消息与卡片回调会分别保留“操作人”和“回复会话”。请在 Bridge 管理页明确允许具体飞书用户，或明确允许一个会话 ID；允许会话 ID 表示授予该群内所有成员相同的 Bridge 与 Taskboard 操作权限。服务不会因收到一条新消息而自动授权操作人或群聊。
+
 - [打开飞书开发者后台](https://open.feishu.cn/app)
 - [飞书长连接事件订阅文档](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN)
 
@@ -109,6 +111,8 @@ Create a smart bot in API mode from the Enterprise WeChat client, enable long co
 ### Feishu
 
 Create a custom app, enable its bot, configure message events over long connection, publish the app, and enter its App ID and App Secret in the console. Send the bot one message so the service can record a recipient ID.
+
+Feishu messages and card callbacks keep the human actor separate from the reply conversation. Explicitly allow either a user or a conversation in the Bridge console. Allowing a conversation grants every member of that chat the same Bridge and Taskboard authority; receiving a message does not auto-authorize its actor or chat.
 
 - [Feishu developer console](https://open.feishu.cn/app)
 - [Official long-connection event documentation](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=en-US)

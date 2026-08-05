@@ -13,6 +13,15 @@ function createStore(t: test.TestContext): RuntimeStateStore {
   return new RuntimeStateStore(resolveStatePaths(root));
 }
 
+test("records a pending channel actor without authorizing it", (t) => {
+  const store = createStore(t);
+
+  store.rememberAccessRequest("ou_pending");
+
+  assert.equal(store.getLastActiveSenderId(), "ou_pending");
+  assert.deepEqual(store.listPairedSenderIds(), []);
+});
+
 test("creates and activates a managed session for a sender", (t) => {
   const store = createStore(t);
   const first = store.ensureActiveSession("alice@im.wechat", "/work/one");

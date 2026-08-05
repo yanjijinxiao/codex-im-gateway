@@ -1136,6 +1136,58 @@ export class TaskboardDatabase {
     return this.getTask(current.id);
   }
 
+  moveTaskWithComment(id, version, status, sortOrder, threadId, input) {
+    const current = this.#requireTask(id);
+    this.#requireVersion(current, version);
+    if (current.archivedAt !== null) {
+      throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
+    }
+    if (sortOrder === undefined) {
+      const row = this.database.prepare(`
+        SELECT COALESCE(MAX(sort_order), 0) AS maximum
+        FROM tasks
+        WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
+      `).get(current.projectId, status, current.id);
+      sortOrder = row.maximum + 1000;
+    }
+
+    const commentId = randomUUID();
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks
+        SET status = ?, sort_order = ?, thread_id = COALESCE(?, thread_id), version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(status, sortOrder, threadId ?? null, timestamp, current.id, version);
+      if (result.changes !== 1) {
+        this.#throwMissingOrConflict(id, version);
+      }
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name, author_avatar_url,
+          version, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `).run(
+        commentId,
+        current.id,
+        input.body,
+        input.threadId ?? null,
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        timestamp,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return { task: this.getTask(current.id), comment: this.getComment(commentId) };
+  }
+
   archiveTask(id, version, threadId) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);

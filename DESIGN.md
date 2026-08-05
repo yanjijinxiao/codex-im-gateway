@@ -96,7 +96,7 @@ The legacy workbench contract remains documented for compatibility with older bu
 - Workflow: action visibility follows the Taskboard transition map. Blocking, review, and return require a native text field; completion requires an explicit acceptance action. Every mutating card carries the issue version so a stale or duplicate submission refreshes instead of blindly retrying.
 - Accessibility: controls use visible verbs and status text, required fields carry explicit labels, destructive or final actions use confirmation, and the card never relies on color alone. Platform-native focus, keyboard, touch, validation, and reduced-motion behavior remain authoritative.
 - Interaction: async state follows idle to submitting to refreshed-success or refreshed-error. Feishu owns control motion; the Bridge communicates progress by replacing actionable controls with the latest card state rather than adding custom animation.
-- Security: card callbacks are parsed at the channel boundary, accept only declared form fields and bounded lengths, and never include credentials. Taskboard links remain loopback-only and are supplemental because mobile clients cannot open the host Mac's loopback service.
+- Security: card callbacks are parsed at the channel boundary, accept only declared form fields and bounded lengths, and never include credentials. The clicking actor is authorized separately from the reply conversation; an allowed conversation ID is an explicit group-wide ACL. Evidence and its version-checked status transition commit in one Taskboard transaction. Taskboard links remain loopback-only and are supplemental because mobile clients cannot open the host Mac's loopback service.
 
 ### Codex Sidebar Integration Entries
 

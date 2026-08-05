@@ -1191,6 +1191,49 @@ test("moving a task updates its status and sort order", async () => {
   assert.equal(moveResult.body.task.version, 2);
 });
 
+test("transitioning a task writes its evidence and status atomically", async () => {
+  const baseUrl = await startServer();
+  const createResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: { title: "Atomic transition" },
+  });
+  const task = createResult.body.task;
+
+  const transition = await request(baseUrl, `/api/tasks/${task.id}/transition`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      version: task.version,
+      status: "blocked",
+      threadId: "thread-transition",
+      body: "Waiting for production access",
+    },
+  });
+  assert.equal(transition.response.status, 200);
+  assert.equal(transition.body.task.status, "blocked");
+  assert.equal(transition.body.task.version, 2);
+  assert.equal(transition.body.comment.body, "Waiting for production access");
+  assert.equal(transition.body.comment.threadId, "thread-transition");
+
+  const stale = await request(baseUrl, `/api/tasks/${task.id}/transition`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      version: task.version,
+      status: "in_progress",
+      threadId: "thread-transition",
+      body: "This stale evidence must not persist",
+    },
+  });
+  assert.equal(stale.response.status, 409);
+
+  const comments = await request(baseUrl, `/api/tasks/${task.id}/comments`);
+  assert.deepEqual(comments.body.comments.map((comment) => comment.body), ["Waiting for production access"]);
+  const current = await request(baseUrl, `/api/tasks/${task.id}`);
+  assert.equal(current.body.task.status, "blocked");
+  assert.equal(current.body.task.version, 2);
+});
+
 test("tasks can bind, change, and unbind one project workflow", async () => {
   const baseUrl = await startServer();
   const createResult = await request(baseUrl, "/api/tasks", {

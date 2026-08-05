@@ -114,9 +114,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     const dispatcher = new Lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (event) => {
         if (event.message.message_type !== "text" && event.message.message_type !== "image") return;
+        const actorId = event.sender.sender_id?.open_id
+          ?? event.sender.sender_id?.user_id
+          ?? event.sender.sender_id?.union_id;
+        if (!actorId) return;
         const pendingMessage: NormalizedWeixinMessage = {
           id: event.message.message_id,
-          senderId: event.message.chat_id,
+          senderId: actorId,
+          replyTargetId: event.message.chat_id,
           text: "",
           attachments: [],
           raw: { channel: "feishu", event }
@@ -145,7 +150,8 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           : cardActionIdentity(event);
         const pendingMessage: NormalizedWeixinMessage = {
           id: `feishu-card:${token}`,
-          senderId: event.chatId,
+          senderId: event.operator.openId,
+          replyTargetId: event.chatId,
           interaction: { kind: "card", messageId: event.messageId },
           text: command,
           attachments: [],

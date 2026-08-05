@@ -119,6 +119,12 @@ export class RuntimeStateStore {
     return this.state.lastActiveSenderId;
   }
 
+  rememberAccessRequest(senderId: string): void {
+    if (!senderId || this.state.lastActiveSenderId === senderId) return;
+    this.state.lastActiveSenderId = senderId;
+    this.save();
+  }
+
   getSyncKey(): string | undefined {
     return this.state.syncKey;
   }

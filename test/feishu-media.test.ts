@@ -154,7 +154,7 @@ test("Feishu sends an interactive Taskboard card and routes its button callback 
 
   assert.deepEqual(inbound, [{
     id: "feishu-card:callback-token",
-    senderId: "oc_test",
+    senderId: "ou_operator",
     text: "/task accept BRIDGE-1"
   }]);
 });
@@ -248,6 +248,7 @@ test("Feishu downloads an inbound image before forwarding it to Bridge", async (
   assert.ok(dispatcher);
 
   await dispatcher.handles.get("im.message.receive_v1")?.({
+    sender: { sender_id: { open_id: "ou_operator" }, sender_type: "user" },
     message: {
       message_id: "om_test",
       chat_id: "oc_test",
@@ -264,6 +265,8 @@ test("Feishu downloads an inbound image before forwarding it to Bridge", async (
     path: { message_id: "om_test", file_key: "img_inbound" }
   }]);
   assert.equal(messages.length, 1);
+  assert.equal(messages[0].senderId, "ou_operator");
+  assert.equal(messages[0].replyTargetId, "oc_test");
   assert.equal(messages[0].attachments[0].kind, "image");
   assert.ok(messages[0].attachments[0].path);
   assert.equal(fs.readFileSync(messages[0].attachments[0].path, "utf8"), "downloaded image");

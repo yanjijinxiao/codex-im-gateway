@@ -167,6 +167,22 @@ export class TaskboardClient {
     return z.object({ task: issueSchema }).parse(value).task;
   }
 
+  async moveIssueWithComment(
+    taskId: string,
+    status: TaskboardStatus,
+    version: number,
+    threadId: string,
+    body: string
+  ): Promise<{ task: TaskboardIssue; comment: TaskboardComment }> {
+    const value = await this.request(`/api/tasks/${encodeURIComponent(taskId)}/transition`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-taskboard-client": "taskctl" },
+      body: JSON.stringify({ status, version, threadId, body })
+    });
+    const parsed = z.object({ task: issueSchema, comment: commentSchema }).parse(value);
+    return parsed;
+  }
+
   async uploadAttachment(taskId: string, localPath: string): Promise<TaskboardAttachment> {
     const body = await fs.readFile(localPath);
     const filename = path.basename(localPath);

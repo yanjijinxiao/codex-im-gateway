@@ -105,6 +105,8 @@ test("turns a Feishu form callback into one canonical Taskboard command", async 
     kind: "card",
     messageId: "om_task_card"
   });
+  assert.equal(inbound[0].senderId, "ou_operator");
+  assert.equal(inbound[0].replyTargetId, "oc_test");
 });
 
 test("patches an existing Feishu task card instead of creating another message", async () => {

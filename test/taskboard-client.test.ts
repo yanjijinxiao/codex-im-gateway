@@ -122,6 +122,39 @@ test("moves an issue with optimistic versioning and Codex attribution", async ()
   });
 });
 
+test("moves an issue and records evidence through one atomic request", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const task = {
+    id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration",
+    description: "", status: "blocked", priority: "high", labels: ["codex"], threadId: "thread-one",
+    version: 4, createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  };
+  const comment = {
+    id: "comment-one", taskId: "task-one", body: "Waiting for access", threadId: "thread-one",
+    createdAt: "2026-08-03T00:00:00.000Z", updatedAt: "2026-08-03T00:00:00.000Z"
+  };
+  const client = new TaskboardClient({
+    baseUrl: "http://127.0.0.1:47823",
+    fetch: async (input, init) => {
+      calls.push({ url: String(input), init });
+      return Response.json({ task, comment });
+    }
+  });
+
+  const result = await client.moveIssueWithComment("task-one", "blocked", 3, "thread-one", comment.body);
+
+  assert.equal(result.task.status, "blocked");
+  assert.equal(result.comment.body, comment.body);
+  assert.match(calls[0]?.url ?? "", /\/api\/tasks\/task-one\/transition$/);
+  assert.equal(new Headers(calls[0]?.init?.headers).get("x-taskboard-client"), "taskctl");
+  assert.deepEqual(JSON.parse(String(calls[0]?.init?.body)), {
+    status: "blocked",
+    version: 3,
+    threadId: "thread-one",
+    body: "Waiting for access"
+  });
+});
+
 test("creates a Taskboard todo through the bounded local API payload", async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const task = {

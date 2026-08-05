@@ -48,9 +48,12 @@ export async function resolveTaskboardTarget(input: {
         : undefined
       : await input.client.getIssue(input.identifier);
   } catch (error) {
+    console.warn(
+      `[codex-channel-bridge] Taskboard target lookup failed for ${input.identifier}: ${error instanceof Error ? error.message : String(error)}`
+    );
     await input.replyText(
       input.senderId,
-      `无法读取任务 ${input.identifier}：${error instanceof Error ? error.message : String(error)}`
+      `无法读取任务 ${input.identifier}，请刷新任务面板后重试。`
     );
     return undefined;
   }
