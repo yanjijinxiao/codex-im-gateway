@@ -50,6 +50,9 @@ export type SessionRuntimeOverrides = {
 export type RuntimeState = {
   pairedSenderIds: string[];
   lastActiveSenderId?: string;
+  lastActiveActorId?: string;
+  lastAuthorizedSenderId?: string;
+  lastAuthorizedActorId?: string;
   syncKey?: string;
   processedMessageIds: string[];
   contextTokens: Record<string, string>;
@@ -119,10 +122,27 @@ export class RuntimeStateStore {
     return this.state.lastActiveSenderId;
   }
 
-  rememberAccessRequest(senderId: string): void {
-    if (!senderId || this.state.lastActiveSenderId === senderId) return;
-    this.state.lastActiveSenderId = senderId;
+  rememberChannelIdentity(actorId: string, conversationId: string, authorized: boolean): void {
+    if (!actorId || !conversationId) return;
+    this.state.lastActiveActorId = actorId;
+    this.state.lastActiveSenderId = conversationId;
+    if (authorized) {
+      this.state.lastAuthorizedActorId = actorId;
+      this.state.lastAuthorizedSenderId = conversationId;
+    }
     this.save();
+  }
+
+  getLastActiveActorId(): string | undefined {
+    return this.state.lastActiveActorId;
+  }
+
+  getLastAuthorizedSenderId(): string | undefined {
+    return this.state.lastAuthorizedSenderId;
+  }
+
+  getLastAuthorizedActorId(): string | undefined {
+    return this.state.lastAuthorizedActorId;
   }
 
   getSyncKey(): string | undefined {

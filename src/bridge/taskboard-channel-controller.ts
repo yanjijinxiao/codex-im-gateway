@@ -122,17 +122,23 @@ export class TaskboardChannelController {
     submission: TaskboardSubmission
   ): Promise<void> {
     const requestId = submission.request_id;
-    const dedup = this.submissionDedup.lookup(requestId, context.taskboardProject.id, submission);
-    if (dedup === "mismatch") {
+    const reservation = this.submissionDedup.reserve(requestId, context.taskboardProject.id, submission);
+    if (reservation.kind === "mismatch") {
       await this.options.replyText(message.senderId, "该请求标识已用于其他任务操作，请刷新任务面板后重试。");
       return;
     }
-    if (dedup === "duplicate") {
-      await this.refreshSubmissionTarget({ message, context, submission, note: "该操作已处理，任务已刷新。" });
+    if (reservation.kind === "duplicate") {
+      if (await reservation.completion) {
+        await this.refreshSubmissionTarget({ message, context, submission, note: "该操作已处理，任务已刷新。" });
+      } else {
+        await this.submit(message, context, submission);
+      }
       return;
     }
-    if (!(await this.authorizeSubmissionTarget(message, context, submission))) return;
-    this.submissionDedup.record(requestId, context.taskboardProject.id, submission);
+    if (!(await this.authorizeSubmissionTarget(message, context, submission))) {
+      reservation.finish(false);
+      return;
+    }
     let mutationCompleted = false;
     try {
       const result = await executeTaskboardSubmission({
@@ -143,6 +149,7 @@ export class TaskboardChannelController {
       switch (result.kind) {
         case "issue":
           mutationCompleted = true;
+          reservation.finish(true);
           this.bindThread(context, result.issue);
           await this.showIssue({
             message,
@@ -164,10 +171,11 @@ export class TaskboardChannelController {
           }
           await this.options.runWorkflow(message, result.instruction);
           mutationCompleted = true;
+          reservation.finish(true);
           await this.refreshSubmissionTarget({ message, context, submission, note: "已按最新任务状态刷新。" });
           return;
         case "conflict":
-          this.submissionDedup.delete(requestId);
+          reservation.finish(false);
           await this.showIssue({
             message,
             context,
@@ -176,7 +184,7 @@ export class TaskboardChannelController {
           });
           return;
         case "invalid":
-          this.submissionDedup.delete(requestId);
+          reservation.finish(false);
           if (result.issue) await this.showIssue({ message, context, issue: result.issue, note: result.message });
           else await this.options.replyText(message.senderId, result.message);
           return;
@@ -184,7 +192,7 @@ export class TaskboardChannelController {
           return assertNever(result);
       }
     } catch (error) {
-      if (!mutationCompleted) this.submissionDedup.delete(requestId);
+      reservation.finish(mutationCompleted);
       throw error;
     }
   }

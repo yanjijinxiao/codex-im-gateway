@@ -52,6 +52,8 @@ export class CodexSessionCompletionMonitor {
   private readonly watchers: fs.FSWatcher[] = [];
   private readonly pendingFiles = new Set<string>();
   private readonly processingFiles = new Set<string>();
+  private initialization: Promise<void> = Promise.resolve();
+  private scan?: Promise<void>;
   private timer?: NodeJS.Timeout;
   private started = false;
 
@@ -64,19 +66,15 @@ export class CodexSessionCompletionMonitor {
   start(): void {
     if (this.started) return;
     this.started = true;
-    for (const filePath of this.listSessionFiles()) {
-      const cursor = {
-        offset: safeFileSize(filePath),
-        ...readInitialSessionContext(filePath, this.now())
-      };
-      this.cursors.set(filePath, cursor);
-      const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
-      if (task) void Promise.resolve(this.options.onTaskChanged?.(task)).catch((error) => {
-        console.error(`[codex-channel-bridge] unable to restore Codex task status: ${String(error)}`);
-      });
-    }
     for (const root of this.sessionRoots()) this.watchRoot(root);
-    this.timer = setInterval(() => void this.scanNow(), this.pollIntervalMs);
+    this.initialization = this.initialize().catch((error) => {
+      console.error(`[codex-channel-bridge] unable to initialize Codex session monitor: ${String(error)}`);
+    });
+    this.timer = setInterval(() => {
+      this.scanNow().catch((error) => {
+        console.error(`[codex-channel-bridge] unable to scan Codex sessions: ${String(error)}`);
+      });
+    }, this.pollIntervalMs);
     this.timer.unref();
   }
 
@@ -91,7 +89,36 @@ export class CodexSessionCompletionMonitor {
 
   async scanNow(): Promise<void> {
     if (!this.started) return;
-    const files = new Set([...this.listSessionFiles(), ...this.pendingFiles]);
+    if (this.scan) return this.scan;
+    this.scan = this.performScan();
+    try {
+      await this.scan;
+    } finally {
+      this.scan = undefined;
+    }
+  }
+
+  async ready(): Promise<void> {
+    await this.initialization;
+  }
+
+  private async initialize(): Promise<void> {
+    for (const filePath of await this.listSessionFiles()) {
+      if (!this.started) return;
+      const cursor = {
+        offset: await safeFileSize(filePath),
+        ...await readInitialSessionContext(filePath, this.now())
+      };
+      this.cursors.set(filePath, cursor);
+      const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
+      if (task) await this.options.onTaskChanged?.(task);
+    }
+  }
+
+  private async performScan(): Promise<void> {
+    await this.ready();
+    if (!this.started) return;
+    const files = new Set([...await this.listSessionFiles(), ...this.pendingFiles]);
     this.pendingFiles.clear();
     for (const filePath of files) await this.processFile(filePath);
   }
@@ -116,22 +143,22 @@ export class CodexSessionCompletionMonitor {
     }
   }
 
-  private listSessionFiles(): string[] {
-    return this.sessionRoots().flatMap((root) => listJsonlFiles(root));
+  private async listSessionFiles(): Promise<string[]> {
+    return (await Promise.all(this.sessionRoots().map((root) => listJsonlFiles(root)))).flat();
   }
 
   private async processFile(filePath: string): Promise<void> {
     if (this.processingFiles.has(filePath)) return;
     this.processingFiles.add(filePath);
     try {
-      const size = safeFileSize(filePath);
+      const size = await safeFileSize(filePath);
       const cursor = this.cursors.get(filePath) ?? { offset: 0 };
       if (size < cursor.offset) cursor.offset = 0;
       if (size === cursor.offset) {
         this.cursors.set(filePath, cursor);
         return;
       }
-      const buffer = readFileRange(filePath, cursor.offset, size - cursor.offset);
+      const buffer = await readFileRange(filePath, cursor.offset, size - cursor.offset);
       const lastNewline = buffer.lastIndexOf(0x0a);
       if (lastNewline < 0) return;
       const complete = buffer.subarray(0, lastNewline + 1);
@@ -235,15 +262,14 @@ function taskFromCursor(
   };
 }
 
-function listJsonlFiles(root: string): string[] {
-  if (!isDirectory(root)) return [];
+async function listJsonlFiles(root: string): Promise<string[]> {
   const result: string[] = [];
   const pending = [root];
   while (pending.length) {
     const directory = pending.pop()!;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(directory, { withFileTypes: true });
+      entries = await fs.promises.readdir(directory, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -256,24 +282,25 @@ function listJsonlFiles(root: string): string[] {
   return result;
 }
 
-function readFileRange(filePath: string, offset: number, length: number): Buffer {
-  const descriptor = fs.openSync(filePath, "r");
+async function readFileRange(filePath: string, offset: number, length: number): Promise<Buffer> {
+  const descriptor = await fs.promises.open(filePath, "r");
   try {
     const buffer = Buffer.alloc(length);
-    const bytesRead = fs.readSync(descriptor, buffer, 0, length, offset);
+    const { bytesRead } = await descriptor.read(buffer, 0, length, offset);
     return buffer.subarray(0, bytesRead);
   } finally {
-    fs.closeSync(descriptor);
+    await descriptor.close();
   }
 }
 
-function readInitialSessionContext(
+async function readInitialSessionContext(
   filePath: string,
   nowMs: number
-): Omit<SessionCursor, "offset"> {
+): Promise<Omit<SessionCursor, "offset">> {
   try {
-    const fileSize = safeFileSize(filePath);
-    const firstLine = readFileRange(filePath, 0, Math.min(fileSize, 128 * 1024))
+    const file = await safeFileStat(filePath);
+    const fileSize = file.size;
+    const firstLine = (await readFileRange(filePath, 0, Math.min(fileSize, 128 * 1024)))
       .toString("utf8")
       .split("\n", 1)[0];
     const event = parseRecord(firstLine);
@@ -289,11 +316,11 @@ function readInitialSessionContext(
       ...(sessionId ? { sessionId } : {}),
       ...(typeof payload.thread_source === "string" ? { threadSource: payload.thread_source } : {})
     };
-    if (context.threadSource === "subagent" || nowMs - safeFileMtime(filePath) > 24 * 60 * 60 * 1000) {
+    if (context.threadSource === "subagent" || nowMs - file.mtimeMs > 24 * 60 * 60 * 1000) {
       return context;
     }
     const tailOffset = Math.max(0, fileSize - 8 * 1024 * 1024);
-    for (const line of readFileRange(filePath, tailOffset, fileSize - tailOffset).toString("utf8").split("\n")) {
+    for (const line of (await readFileRange(filePath, tailOffset, fileSize - tailOffset)).toString("utf8").split("\n")) {
       const tailEvent = parseRecord(line);
       const tailPayload = tailEvent?.type === "event_msg" ? recordValue(tailEvent.payload) : undefined;
       if (!tailPayload) continue;
@@ -327,20 +354,17 @@ function readInitialSessionContext(
   }
 }
 
-function safeFileSize(filePath: string): number {
+async function safeFileStat(filePath: string): Promise<{ size: number; mtimeMs: number }> {
   try {
-    return fs.statSync(filePath).size;
+    const stat = await fs.promises.stat(filePath);
+    return { size: stat.size, mtimeMs: stat.mtimeMs };
   } catch {
-    return 0;
+    return { size: 0, mtimeMs: 0 };
   }
 }
 
-function safeFileMtime(filePath: string): number {
-  try {
-    return fs.statSync(filePath).mtimeMs;
-  } catch {
-    return 0;
-  }
+async function safeFileSize(filePath: string): Promise<number> {
+  return (await safeFileStat(filePath)).size;
 }
 
 function isDirectory(candidate: string): boolean {

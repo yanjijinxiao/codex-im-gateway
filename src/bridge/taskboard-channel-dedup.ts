@@ -5,44 +5,73 @@ type ProcessedSubmission = {
   readonly projectId: string;
   readonly operation: TaskboardSubmission["operation"];
   readonly identifier?: string;
+  readonly completion: SubmissionCompletion;
+  completedAt?: number;
 };
+
+export type TaskboardSubmissionReservation =
+  | { readonly kind: "owner"; readonly finish: (success: boolean) => void }
+  | { readonly kind: "duplicate"; readonly completion: Promise<boolean> }
+  | { readonly kind: "mismatch" };
 
 export class TaskboardSubmissionDeduplicator {
   private readonly processed = new Map<string, ProcessedSubmission>();
 
-  lookup(
+  reserve(
     requestId: string | undefined,
     projectId: string,
     submission: TaskboardSubmission
-  ): "new" | "duplicate" | "mismatch" {
+  ): TaskboardSubmissionReservation {
     this.prune();
-    if (!requestId) return "new";
+    if (!requestId) return { kind: "owner", finish() {} };
     const existing = this.processed.get(requestId);
-    if (!existing) return "new";
-    return sameSubmission(existing, projectId, submission) ? "duplicate" : "mismatch";
-  }
-
-  record(requestId: string | undefined, projectId: string, submission: TaskboardSubmission): void {
-    if (!requestId) return;
-    this.processed.set(requestId, {
+    if (existing) {
+      return sameSubmission(existing, projectId, submission)
+        ? { kind: "duplicate", completion: existing.completion.promise }
+        : { kind: "mismatch" };
+    }
+    const entry: ProcessedSubmission = {
       createdAt: Date.now(),
       projectId,
       operation: submission.operation,
+      completion: new SubmissionCompletion(),
       ...(submission.operation === "create_todo" || submission.operation === "create_start"
         ? {}
         : { identifier: submission.identifier })
-    });
-  }
-
-  delete(requestId: string | undefined): void {
-    if (requestId) this.processed.delete(requestId);
+    };
+    this.processed.set(requestId, entry);
+    return {
+      kind: "owner",
+      finish: (success) => {
+        if (this.processed.get(requestId) !== entry) return;
+        entry.completion.resolve(success);
+        if (success) entry.completedAt = Date.now();
+        else this.processed.delete(requestId);
+      }
+    };
   }
 
   private prune(): void {
     const cutoff = Date.now() - 30 * 60 * 1_000;
     for (const [key, submission] of this.processed) {
-      if (submission.createdAt < cutoff) this.processed.delete(key);
+      if (submission.completedAt !== undefined && submission.completedAt < cutoff) {
+        this.processed.delete(key);
+      }
     }
+  }
+}
+
+class SubmissionCompletion {
+  private resolver?: (success: boolean) => void;
+  readonly promise = new Promise<boolean>((resolve) => {
+    this.resolver = resolve;
+  });
+
+  resolve(success: boolean): void {
+    const resolver = this.resolver;
+    if (!resolver) return;
+    this.resolver = undefined;
+    resolver(success);
   }
 }
 

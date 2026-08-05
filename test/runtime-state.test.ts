@@ -13,13 +13,20 @@ function createStore(t: test.TestContext): RuntimeStateStore {
   return new RuntimeStateStore(resolveStatePaths(root));
 }
 
-test("records a pending channel actor without authorizing it", (t) => {
+test("keeps a channel actor separate from its conversation scope", (t) => {
   const store = createStore(t);
 
-  store.rememberAccessRequest("ou_pending");
+  store.rememberChannelIdentity("ou_pending", "oc_chat", false);
 
-  assert.equal(store.getLastActiveSenderId(), "ou_pending");
+  assert.equal(store.getLastActiveActorId(), "ou_pending");
+  assert.equal(store.getLastActiveSenderId(), "oc_chat");
+  assert.equal(store.getLastAuthorizedSenderId(), undefined);
   assert.deepEqual(store.listPairedSenderIds(), []);
+
+  store.setPairedSenderIds(["ou_pending"]);
+  store.rememberChannelIdentity("ou_pending", "oc_chat", true);
+  assert.equal(store.getLastAuthorizedActorId(), "ou_pending");
+  assert.equal(store.getLastAuthorizedSenderId(), "oc_chat");
 });
 
 test("creates and activates a managed session for a sender", (t) => {

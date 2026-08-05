@@ -26,7 +26,7 @@ type TaskboardFixture = {
 function createTaskboardFixture(
   workspace: string,
   initialIssues: readonly TaskboardIssue[],
-  options: { readonly conflictOnTransition?: boolean } = {}
+  options: { readonly conflictOnTransition?: boolean; readonly createDelayMs?: number } = {}
 ): TaskboardFixture {
   const issues = [...initialIssues];
   const comments: string[] = [];
@@ -50,6 +50,9 @@ function createTaskboardFixture(
         return Response.json({ tasks: issues });
       }
       if (url.pathname === "/api/tasks" && init?.method === "POST") {
+        if (options.createDelayMs) {
+          await new Promise((resolve) => setTimeout(resolve, options.createDelayMs));
+        }
         const body = JSON.parse(String(init.body));
         const issue: TaskboardIssue = {
           id: `task-${issues.length + 1}`,
@@ -269,6 +272,39 @@ test("uses native forms for task creation and executes their canonical submit co
     title: "完善飞书任务卡", description: "使用原生表单", priority: "high", labels: ["feishu", "channel"]
   }]);
   assert.equal("kind" in cards.at(-1) ? cards.at(-1)?.kind : undefined, "detail");
+});
+
+test("reserves a request ID before awaits so concurrent native creates run once", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "taskboard-channel-concurrent-create-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Project One", root);
+  stateStore.createSession("oc_test", root, "Channel task", project.id);
+  const fixture = createTaskboardFixture(root, [], { createDelayMs: 20 });
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] }, stateStore, taskboard: fixture.client,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendTaskCard() { return { messageId: "card" }; }
+    }
+  });
+  const query = new URLSearchParams({
+    operation: "create_todo",
+    title: "只创建一次",
+    request_id: "00000000-0000-4000-8000-000000000011"
+  });
+  const submit = (id: string) => service.handleMessage({
+    id,
+    senderId: "oc_test",
+    text: `/task submit ${query}`,
+    attachments: [],
+    raw: {}
+  });
+
+  await Promise.all([submit("concurrent-1"), submit("concurrent-2")]);
+
+  assert.equal(fixture.created.length, 1);
+  assert.equal(fixture.created[0]?.title, "只创建一次");
 });
 
 test("routes a native start action without a thread through the Taskboard skill", async (t) => {

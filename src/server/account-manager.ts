@@ -77,6 +77,9 @@ export type AccountSummary = PublicWeixinAccount & {
   error?: string;
   pairedSenderIds: string[];
   lastActiveSenderId?: string;
+  lastActiveActorId?: string;
+  lastAuthorizedSenderId?: string;
+  lastAuthorizedActorId?: string;
   sessionCount: number;
 };
 
@@ -354,9 +357,11 @@ export class AccountManager {
       if (channel !== "weixin") {
         const replyTargetId = message.replyTargetId ?? message.senderId;
         const allowedIds = new Set([...config.allowedSenderIds, ...store.listPairedSenderIds()]);
-        if (!allowedIds.has(message.senderId) && !allowedIds.has(replyTargetId)) {
-          store.rememberAccessRequest(message.senderId);
-        }
+        store.rememberChannelIdentity(
+          message.senderId,
+          replyTargetId,
+          allowedIds.has(message.senderId) || allowedIds.has(replyTargetId)
+        );
       }
       webhook.publish({
         direction: "inbound",
@@ -1267,6 +1272,9 @@ export class AccountManager {
       ...(entry?.error ? { error: entry.error } : {}),
       pairedSenderIds: store.listPairedSenderIds(),
       lastActiveSenderId: store.getLastActiveSenderId(),
+      lastActiveActorId: store.getLastActiveActorId(),
+      lastAuthorizedSenderId: store.getLastAuthorizedSenderId(),
+      lastAuthorizedActorId: store.getLastAuthorizedActorId(),
       sessionCount: store.listSessions().length
     };
   }

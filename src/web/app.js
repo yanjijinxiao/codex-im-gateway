@@ -452,8 +452,13 @@ function renderAccounts() {
     return;
   }
   els.accountsList.innerHTML = state.accounts.map((account) => {
-    const pendingSender = account.lastActiveSenderId && !account.pairedSenderIds.includes(account.lastActiveSenderId)
-      ? account.lastActiveSenderId : "";
+    const activeActor = account.lastActiveActorId || account.lastActiveSenderId;
+    const activeConversationAllowed = account.lastActiveSenderId
+      && account.pairedSenderIds.includes(account.lastActiveSenderId);
+    const pendingSender = activeActor
+      && !account.pairedSenderIds.includes(activeActor)
+      && !activeConversationAllowed
+      ? activeActor : "";
     const authorized = account.pairedSenderIds.length > 0;
     const channel = account.channel || "weixin";
     const channelMeta = channelInfo(channel);
@@ -1768,7 +1773,7 @@ function openProjectNotificationDialog(project) {
   accountInput.value = current?.accountId || defaultAccount?.accountId || "";
   const selectedAccount = state.accounts.find((account) => account.accountId === accountInput.value);
   document.querySelector("#notificationRecipientInput").value = current?.recipientId
-    || selectedAccount?.lastActiveSenderId
+    || (selectedAccount ? authorizedConversationId(selectedAccount) : "")
     || selectedAccount?.pairedSenderIds?.[0]
     || "";
   document.querySelector("#notificationEnabledInput").checked = current?.enabled === true;
@@ -1844,9 +1849,7 @@ function setQrStatus(text, kind = "") {
 
 function openNewSessionDialog(preselectedProject) {
   const options = state.accounts.flatMap((account) => {
-    const sender = account.lastActiveSenderId && account.pairedSenderIds.includes(account.lastActiveSenderId)
-      ? account.lastActiveSenderId
-      : account.pairedSenderIds[0];
+    const sender = authorizedConversationId(account);
     const hasProject = state.projects.some((project) => project.accountId === account.accountId);
     return sender && hasProject ? [{ account, sender }] : [];
   });
@@ -1871,6 +1874,20 @@ function openNewSessionDialog(preselectedProject) {
   updateSessionProjectOptions(preselectedProject?.id);
   els.sessionDialog.showModal();
   document.querySelector("#sessionTitleInput").focus();
+}
+
+function authorizedConversationId(account) {
+  const authorizedActor = account.lastAuthorizedActorId || account.lastAuthorizedSenderId;
+  if (account.lastAuthorizedSenderId && (
+    account.pairedSenderIds.includes(account.lastAuthorizedSenderId)
+    || (authorizedActor && account.pairedSenderIds.includes(authorizedActor))
+  )) return account.lastAuthorizedSenderId;
+  const activeActor = account.lastActiveActorId || account.lastActiveSenderId;
+  if (account.lastActiveSenderId && (
+    account.pairedSenderIds.includes(account.lastActiveSenderId)
+    || (activeActor && account.pairedSenderIds.includes(activeActor))
+  )) return account.lastActiveSenderId;
+  return account.pairedSenderIds[0];
 }
 
 function updateNewSessionDefaultTitle() {

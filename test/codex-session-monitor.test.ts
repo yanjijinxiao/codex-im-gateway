@@ -35,6 +35,7 @@ test("reports only new Codex task completions from existing and new sessions", a
   });
   monitor.start();
   t.after(() => monitor.stop());
+  await monitor.ready();
 
   appendLines(existing, [
     taskComplete("new-turn", "修复完成")
@@ -81,7 +82,7 @@ test("reports only new Codex task completions from existing and new sessions", a
   ), true);
 });
 
-test("does not restore a seven-hour-old unfinished turn from a recently touched session file", (t) => {
+test("does not restore a seven-hour-old unfinished turn from a recently touched session file", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-stale-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const workspace = path.join(root, "project");
@@ -103,6 +104,7 @@ test("does not restore a seven-hour-old unfinished turn from a recently touched 
   });
   monitor.start();
   t.after(() => monitor.stop());
+  await monitor.ready();
 
   assert.deepEqual(taskChanges, []);
 });
