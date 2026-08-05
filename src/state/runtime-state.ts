@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import path from "node:path";
 
+import type { ProjectInteractionMode } from "../channels/channel-mode-settings.js";
+
 import { readJsonFile, writeJsonFile } from "./json-store.js";
 import {
   cleanKnowledgeInput,
@@ -49,7 +51,7 @@ export type ManagedKnowledgeBase = {
   updatedAt: string;
 };
 
-export type ProjectInteractionMode = "session" | "task" | "qa";
+export type { ProjectInteractionMode } from "../channels/channel-mode-settings.js";
 
 export type ProjectNotificationTarget = {
   accountId: string;

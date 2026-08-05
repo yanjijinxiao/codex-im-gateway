@@ -29,6 +29,11 @@ test("reuses the existing local account when the same WeChat user scans again", 
     displayName: "图小超",
     webhookUrl: "https://hooks.example.test/wechat",
     webhookProvider: "slack",
+    modeSettings: {
+      defaultMode: "qa",
+      enabledModes: ["session", "qa"],
+      qaKnowledgeBaseId: "kb-product"
+    },
     savedAt: "2026-07-14T00:00:00.000Z",
     enabled: true
   });
@@ -52,6 +57,11 @@ test("reuses the existing local account when the same WeChat user scans again", 
   assert.equal(saved.account.displayName, "图小超");
   assert.equal(saved.account.webhookUrl, "https://hooks.example.test/wechat");
   assert.equal(saved.account.webhookProvider, "slack");
+  assert.deepEqual(saved.account.modeSettings, {
+    defaultMode: "qa",
+    enabledModes: ["session", "qa"],
+    qaKnowledgeBaseId: "kb-product"
+  });
   assert.equal(saved.account.token, "new-token");
   assert.deepEqual(listAccounts(paths).map((account) => account.accountId), ["old-bot"]);
   const preserved = new RuntimeStateStore(accountStatePaths(paths, "old-bot"));

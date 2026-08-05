@@ -1,6 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  normalizeChannelModeSettings,
+  type ChannelModeSettings
+} from "../channels/channel-mode-settings.js";
 import { ensureDir, readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { StatePaths } from "../state/paths.js";
 import { resolveWebhookProvider, type WebhookProvider } from "../webhooks/webhook-provider.js";
@@ -16,6 +20,7 @@ export type WeixinAccount = {
   displayName?: string;
   webhookUrl?: string;
   webhookProvider?: WebhookProvider;
+  modeSettings?: ChannelModeSettings;
   savedAt: string;
   enabled: boolean;
 };
@@ -28,6 +33,7 @@ export type WeComAccount = {
   displayName?: string;
   webhookUrl?: string;
   webhookProvider?: WebhookProvider;
+  modeSettings?: ChannelModeSettings;
   savedAt: string;
   enabled: boolean;
 };
@@ -40,6 +46,7 @@ export type FeishuAccount = {
   displayName?: string;
   webhookUrl?: string;
   webhookProvider?: WebhookProvider;
+  modeSettings?: ChannelModeSettings;
   savedAt: string;
   enabled: boolean;
 };
@@ -51,6 +58,7 @@ export type RetainedWeixinAccount = {
   accountId: string;
   userId: string;
   displayName?: string;
+  modeSettings?: ChannelModeSettings;
   retainedAt: string;
 };
 
@@ -107,6 +115,7 @@ export function saveScannedAccount(
     ...(previous.displayName ? { displayName: previous.displayName } : {}),
     ...(existing?.webhookUrl ? { webhookUrl: existing.webhookUrl } : {}),
     ...(existing?.webhookProvider ? { webhookProvider: existing.webhookProvider } : {}),
+    ...(previous.modeSettings ? { modeSettings: normalizeChannelModeSettings(previous.modeSettings) } : {}),
     enabled: true
   } : { ...scanned, botId };
   saveAccount(paths, account);
@@ -124,7 +133,11 @@ export function listRetainedAccounts(paths: StatePaths): RetainedWeixinAccount[]
     && typeof account.userId === "string"
     && typeof account.retainedAt === "string"
     && (account.displayName === undefined || typeof account.displayName === "string")
-  )).sort((a, b) => a.accountId.localeCompare(b.accountId));
+    && (account.modeSettings === undefined || typeof account.modeSettings === "object")
+  )).map((account) => ({
+    ...account,
+    ...(account.modeSettings ? { modeSettings: normalizeChannelModeSettings(account.modeSettings) } : {})
+  })).sort((a, b) => a.accountId.localeCompare(b.accountId));
 }
 
 export function retainAccountHistory(paths: StatePaths, account: WeixinAccount): RetainedWeixinAccount {
@@ -135,6 +148,7 @@ export function retainAccountHistory(paths: StatePaths, account: WeixinAccount):
     accountId: account.accountId,
     userId: account.userId,
     ...(account.displayName ? { displayName: account.displayName } : {}),
+    ...(account.modeSettings ? { modeSettings: normalizeChannelModeSettings(account.modeSettings) } : {}),
     retainedAt: new Date().toISOString()
   };
   const accounts = listRetainedAccounts(paths)
@@ -165,7 +179,11 @@ export function listAccounts(paths: StatePaths): ChannelAccount[] {
   return fs.readdirSync(paths.accountsDir)
     .filter((name) => name.endsWith(".json"))
     .map((name) => readJsonFile<ChannelAccount>(path.join(paths.accountsDir, name), undefined as never))
-    .map((account) => ({ ...account, enabled: account.enabled !== false }))
+    .map((account) => ({
+      ...account,
+      enabled: account.enabled !== false,
+      modeSettings: normalizeChannelModeSettings(account.modeSettings)
+    }))
     .sort((a, b) => a.accountId.localeCompare(b.accountId));
 }
 
@@ -197,6 +215,20 @@ export function setAccountSettings(paths: StatePaths, accountId: string, patch: 
     else delete updated.webhookUrl;
   }
   if (patch.webhookProvider !== undefined) updated.webhookProvider = patch.webhookProvider;
+  saveAccount(paths, updated);
+  return updated;
+}
+
+export function setAccountModeSettings(
+  paths: StatePaths,
+  accountId: string,
+  modeSettings: ChannelModeSettings
+): ChannelAccount {
+  const account = loadAccount(paths, accountId);
+  const updated: ChannelAccount = {
+    ...account,
+    modeSettings: normalizeChannelModeSettings(modeSettings)
+  };
   saveAccount(paths, updated);
   return updated;
 }

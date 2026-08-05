@@ -72,6 +72,106 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
   assert.match(replies.at(-1) ?? "", /effort: high/);
 });
 
+test("uses the channel default mode and lets a project binding override the channel Q&A knowledge base", async (t) => {
+  // Given
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-channel-mode-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("产品项目", root);
+  const channelKnowledgeBase = stateStore.createKnowledgeBase("渠道 Wiki", path.join(root, "channel-wiki"));
+  const projectKnowledgeBase = stateStore.createKnowledgeBase("项目 Wiki", path.join(root, "project-wiki"));
+  stateStore.bindProjectKnowledgeBase(project.id, projectKnowledgeBase.id);
+  const runs: Array<{
+    cwd: string;
+    dynamicTools?: readonly { name: string; tools?: readonly { name: string }[] }[];
+  }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    modeSettings: {
+      defaultMode: "qa",
+      enabledModes: ["session", "qa"],
+      qaKnowledgeBaseId: channelKnowledgeBase.id
+    },
+    weixin: {
+      async sendTyping() {},
+      async sendText() { return { messageId: "text" }; }
+    } as never,
+    runner: {
+      async run(input: {
+        cwd: string;
+        dynamicTools?: readonly { name: string; tools?: readonly { name: string }[] }[];
+      }) {
+        runs.push(input);
+        return { raw: "", text: "完成", threadId: "thread-qa" };
+      },
+      async stop() {}
+    } as never
+  });
+
+  // When
+  await service.handleMessage({
+    id: "qa-default",
+    senderId: "alice@im.wechat",
+    text: "总结当前知识库",
+    attachments: [],
+    raw: {}
+  });
+
+  // Then
+  assert.equal(stateStore.getInteractionMode("alice@im.wechat"), "qa");
+  assert.equal(stateStore.getActiveQaSession("alice@im.wechat")?.knowledgeBaseId, projectKnowledgeBase.id);
+  assert.equal(runs[0]?.cwd, root);
+  assert.equal(runs[0]?.dynamicTools?.[0]?.name, "knowledge");
+  assert.deepEqual(runs[0]?.dynamicTools?.[0]?.tools?.map((tool) => tool.name), ["search", "get_document"]);
+});
+
+test("keeps disabled channel modes out of native choices and command routing", async (t) => {
+  // Given
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-disabled-mode-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  stateStore.createProject("只允许会话", root);
+  const cards: Array<{ actionGroups: readonly (readonly { value: { command: string; arg: string } }[])[] }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    modeSettings: { defaultMode: "session", enabledModes: ["session"] },
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendActionCard(input: { card: typeof cards[number] }) {
+        cards.push(input.card);
+        return { messageId: `card-${cards.length}` };
+      }
+    } as never,
+    runner: { async stop() {} } as never
+  });
+
+  // When
+  await service.handleMessage({
+    id: "mode-card",
+    senderId: "alice@im.wechat",
+    text: "/mode",
+    attachments: [],
+    raw: {}
+  });
+  await service.handleMessage({
+    id: "task-disabled",
+    senderId: "alice@im.wechat",
+    text: "/task list",
+    attachments: [],
+    raw: {}
+  });
+
+  // Then
+  assert.deepEqual(
+    cards[0]?.actionGroups.flatMap((group) => group.map((action) => action.value)),
+    [{ command: "mode", arg: "session", version: 1 }]
+  );
+  assert.equal(stateStore.getInteractionMode("alice@im.wechat"), "session");
+  assert.equal(cards[1]?.actionGroups.flatMap((group) => group.map((action) => action.value.command)).includes("task"), false);
+});
+
 test("lists every built-in command and reports the current Codex account balance without a project", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-balance-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));

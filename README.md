@@ -146,7 +146,7 @@ npm run taskboard:codex
 
 企业微信和飞书都使用官方长连接 SDK，本机无需公网域名或回调地址。完整步骤、后台入口和接收 ID 获取方法见 [消息渠道与任务通知配置](./docs/channel-setup.md)。渠道凭据只保存在 `~/.codex-weixin/`，不会通过管理 API 返回浏览器。
 
-每个渠道都可以在铅笔按钮打开的“渠道设置”中单独配置可选 Webhook，并选择通用 JSON、企业微信、飞书/Lark、钉钉、Slack 或 Discord。配置后，该渠道每条成功收取或发出的消息都会按所选平台格式额外 POST 一次；未配置时不会发起请求。管理 API 只返回是否已配置和平台类型，不会把可能包含签名密钥的 Webhook 地址返回浏览器。详细格式见 [Webhook 镜像](./docs/channel-setup.md#webhook-镜像)。
+每个渠道都可以在铅笔按钮打开的“渠道设置”中单独配置可用的会话、任务和问答模式，以及选中项目后的默认模式。问答优先使用项目绑定的知识库；项目未绑定时，可跟随项目、选择该渠道已有知识库，或配置一个经过校验的 llm-wiki 项目目录。同一设置页还可以配置可选 Webhook，并选择通用 JSON、企业微信、飞书/Lark、钉钉、Slack 或 Discord。配置后，该渠道每条成功收取或发出的消息都会按所选平台格式额外 POST 一次；未配置时不会发起请求。管理 API 只返回是否已配置和平台类型，不会把可能包含签名密钥的 Webhook 地址返回浏览器。详细格式见 [Webhook 镜像](./docs/channel-setup.md#webhook-镜像)。
 
 ## 第一次接入个人微信
 
@@ -182,7 +182,7 @@ npm run taskboard:codex
 - 每个项目可以独立开启任务结束通知，选择通知渠道和接收会话（或用户）ID；成功、失败和中断都会发送结果摘要。
 - 通知按钮为绿色并显示“通知已开启”时表示配置生效；任务数量表示当前正在运行的任务数，不是历史会话总数。
 
-渠道端只需选择一次项目，随后可以用原生按钮进入会话、任务或问答模式。任务模式按该项目的绝对目录打开同一个 Taskboard 项目，不要求先创建 Codex 会话；计划模式和目标则绑定当前项目的当前 thread，不会跨项目复用。完整状态模型、渠道卡片流程和验收规则见 [渠道项目工作台方案](./docs/channel-project-modes.md)。
+渠道端只需选择一次项目，随后可以用原生按钮进入渠道已启用的会话、任务或问答模式，并自动进入渠道配置的默认模式。任务模式按该项目的绝对目录打开同一个 Taskboard 项目，不要求先创建 Codex 会话；计划模式和目标则绑定当前项目的当前 thread，不会跨项目复用。完整状态模型、渠道卡片流程和验收规则见 [渠道项目工作台方案](./docs/channel-project-modes.md)。
 
 ## Taskboard 联动
 
@@ -218,7 +218,7 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 /project rename P1|名称 /p rn P1|名称  重命名项目
 /project delete P1      /p d P1        移除没有运行任务的项目
 /mode [session|task|qa] /v    查看或切换当前项目工作模式
-/qa                /q        进入绑定 llm-wiki 的问答模式
+/qa                /q        进入项目绑定或渠道默认 llm-wiki 的问答模式
 /plan [on|off]               切换当前会话的 Codex 原生计划模式
 /goal [目标|pause|resume|complete|clear] 管理当前 thread 的 Codex 目标
 /task            /tb          查看当前项目未完成的 Taskboard Issue

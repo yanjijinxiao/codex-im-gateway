@@ -18,16 +18,45 @@ import { UpdateManager, type UpdateService } from "./update-manager.js";
 import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
 import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
+import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
   const protocol = new URL(value).protocol;
   return protocol === "http:" || protocol === "https:";
 }, "Invalid Webhook URL: HTTP or HTTPS required");
+const projectInteractionModeSchema = z.enum(PROJECT_INTERACTION_MODES);
+const qaKnowledgeBaseSelectionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("project") }).strict(),
+  z.object({
+    kind: z.literal("managed"),
+    knowledgeBaseId: z.string().trim().min(1)
+  }).strict(),
+  z.object({
+    kind: z.literal("directory"),
+    rootPath: z.string().trim().min(1),
+    name: z.string().trim().min(1).max(60).optional(),
+    engineRoot: z.string().trim().min(1).optional(),
+    stateDir: z.string().trim().min(1).optional()
+  }).strict()
+]);
+const channelModeSettingsSchema = z.object({
+  defaultMode: projectInteractionModeSchema,
+  enabledModes: z.array(projectInteractionModeSchema).min(1).max(PROJECT_INTERACTION_MODES.length),
+  qaKnowledgeBase: qaKnowledgeBaseSelectionSchema
+}).strict().superRefine((value, context) => {
+  if (new Set(value.enabledModes).size !== value.enabledModes.length) {
+    context.addIssue({ code: "custom", path: ["enabledModes"], message: "Enabled modes must be unique" });
+  }
+  if (!value.enabledModes.includes(value.defaultMode)) {
+    context.addIssue({ code: "custom", path: ["defaultMode"], message: "Default mode must be enabled" });
+  }
+});
 const accountSettingsSchema = z.object({
   displayName: z.string().max(40),
   webhookUrl: webhookUrlSchema.nullable().optional(),
-  webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional()
+  webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional(),
+  modeSettings: channelModeSettingsSchema.optional()
 });
 const accountDeleteSchema = z.object({
   retainHistory: z.boolean().optional()
@@ -149,7 +178,7 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
       port: actualPort
     }).catch((error: unknown) => {
       const message = requestErrorMessage(error);
-      sendJson(response, errorStatus(message), { error: message });
+      sendJson(response, errorStatus(error, message), { error: message });
     });
   });
 
@@ -390,8 +419,12 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   const accountMatch = matchPath(url.pathname, "/api/accounts/:accountId");
   if (method === "PATCH" && accountMatch) {
     const body = accountSettingsSchema.parse(await readJsonBody(request));
+    if (body.modeSettings) {
+      await context.accountManager.updateAccountModeSettings(accountMatch.accountId, body.modeSettings);
+    }
+    const { modeSettings: _modeSettings, ...accountSettings } = body;
     sendJson(response, 200, {
-      account: context.accountManager.updateAccount(accountMatch.accountId, body)
+      account: context.accountManager.updateAccount(accountMatch.accountId, accountSettings)
     });
     return;
   }
@@ -595,6 +628,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/favicon.svg": { name: "favicon.svg", type: "image/svg+xml" },
     "/styles.css": { name: "styles.css", type: "text/css; charset=utf-8" },
     "/app.js": { name: "app.js", type: "text/javascript; charset=utf-8" },
+    "/account-mode-settings.js": { name: "account-mode-settings.js", type: "text/javascript; charset=utf-8" },
     "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
     "/vendor/lucide.min.js": { name: "vendor/lucide.min.js", type: "text/javascript; charset=utf-8" },
     "/vendor/marked.umd.js": { name: "vendor/marked.umd.js", type: "text/javascript; charset=utf-8" },
@@ -731,7 +765,8 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function errorStatus(message: string): number {
+function errorStatus(error: unknown, message: string): number {
+  if (error instanceof z.ZodError) return 400;
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;
   if (/unable to verify|timed out/i.test(message)) return 503;

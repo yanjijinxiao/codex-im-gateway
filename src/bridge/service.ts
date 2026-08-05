@@ -30,11 +30,15 @@ import {
 } from "../knowledge/llm-wiki-mcp-client.js";
 import type { CodexWeixinConfig } from "../state/config.js";
 import {
+  normalizeChannelModeSettings,
+  type ChannelModeSettings,
+  type ProjectInteractionMode
+} from "../channels/channel-mode-settings.js";
+import {
   RuntimeStateStore,
   type ManagedKnowledgeBase,
   type ManagedProject,
-  type ManagedSession,
-  type ProjectInteractionMode
+  type ManagedSession
 } from "../state/runtime-state.js";
 import {
   listCodexProjectCandidates,
@@ -75,6 +79,7 @@ export type BridgeServiceOptions = {
   listCodexModels?: () => Promise<CodexModelOption[]>;
   getCodexBalance?: () => Promise<CodexAccountBalance>;
   llmWiki?: LlmWikiMcpClientPool;
+  modeSettings?: ChannelModeSettings;
   listCodexProjects?: () => readonly CodexProjectCandidate[];
   listCodexSessions?: (workspace: string) => readonly CodexSessionCandidate[];
   inboundDir?: string;
@@ -101,6 +106,7 @@ export class BridgeService {
   private readonly taskboardController: TaskboardChannelController;
   private readonly llmWiki: LlmWikiMcpClientPool;
   private readonly userInputs: ChannelUserInputController;
+  private modeSettings: ChannelModeSettings;
 
   constructor(private readonly options: BridgeServiceOptions) {
     this.access = new AccessController({
@@ -123,6 +129,7 @@ export class BridgeService {
       execSandbox: options.config.codexExecSandbox
     });
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
+    this.modeSettings = normalizeChannelModeSettings(options.modeSettings);
     this.userInputs = new ChannelUserInputController(
       (senderId, card) => this.replyActionCard(senderId, card)
     );
@@ -137,6 +144,15 @@ export class BridgeService {
         return items?.flatMap((item) => item.kind === "text" ? [] : [item.path]);
       }
     });
+  }
+
+  configureModeSettings(settings: ChannelModeSettings): void {
+    this.modeSettings = normalizeChannelModeSettings(settings);
+    for (const [senderId, mode] of Object.entries(this.options.stateStore.snapshot.interactionModes)) {
+      if (!this.modeSettings.enabledModes.includes(mode)) {
+        this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
+      }
+    }
   }
 
   async handleMessage(message: NormalizedWeixinMessage): Promise<void> {
@@ -209,9 +225,7 @@ export class BridgeService {
     if (!resolver || !text.trim()) return undefined;
     const projects = this.options.stateStore.listProjects();
     const activeProject = this.options.stateStore.getActiveProject(senderId);
-    const knowledgeBaseName = activeProject?.knowledgeBaseId
-      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === activeProject.knowledgeBaseId)?.name
-      : undefined;
+    const knowledgeBaseName = activeProject ? this.resolveQaContext(activeProject)?.name : undefined;
     const currentProjectName = activeProject?.name;
     const currentMode = this.options.stateStore.getInteractionMode(senderId);
     try {
@@ -234,6 +248,11 @@ export class BridgeService {
   }
 
   private async handleCommand(message: NormalizedWeixinMessage, command: ChannelCommand): Promise<void> {
+    const requiredMode = commandMode(command.name);
+    if (requiredMode && !this.modeSettings.enabledModes.includes(requiredMode)) {
+      await this.replyModeUnavailable(message.senderId, requiredMode);
+      return;
+    }
     switch (command.name) {
       case "help":
       case "h":
@@ -350,12 +369,22 @@ export class BridgeService {
   private ensureBoundProjectContext(senderId: string): boolean {
     const projects = this.options.stateStore.listProjects();
     const activeProject = this.options.stateStore.getActiveProject(senderId);
-    if (activeProject && projects.some((project) => project.id === activeProject.id)) return true;
+    if (activeProject && projects.some((project) => project.id === activeProject.id)) {
+      this.ensureEnabledMode(senderId);
+      return true;
+    }
     const project = projects[0];
     if (!project) return false;
     this.options.stateStore.activateProject(senderId, project.id);
-    this.options.stateStore.setInteractionMode(senderId, "session");
+    this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
     return true;
+  }
+
+  private ensureEnabledMode(senderId: string): void {
+    const currentMode = this.options.stateStore.getInteractionMode(senderId);
+    if (!this.modeSettings.enabledModes.includes(currentMode)) {
+      this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
+    }
   }
 
   private async handleProjectCommand(senderId: string, arg: string): Promise<void> {
@@ -484,7 +513,7 @@ export class BridgeService {
       return;
     }
     this.options.stateStore.activateProject(senderId, project.id);
-    this.options.stateStore.setInteractionMode(senderId, "session");
+    this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
     const fallbackText = [
       `已切换 Codex 项目：${project.name}`,
       project.workspace,
@@ -493,13 +522,9 @@ export class BridgeService {
     await this.replyActionCard(senderId, createChoiceCard({
       title: `已切换到 ${conciseButtonLabel(project.name, 28)}`,
       template: "green",
-      body: `${project.workspace}\n\n选择会话、任务或基于绑定 llm-wiki 的问答模式。`,
+      body: `${project.workspace}\n\n请选择此渠道已开放的工作模式。`,
       fallbackText,
-      choices: [
-        { label: "会话模式", command: "mode", arg: "session", style: "primary" },
-        { label: "任务模式", command: "mode", arg: "task" },
-        { label: "问答模式", command: "mode", arg: "qa" }
-      ]
+      choices: this.modeChoices(this.modeSettings.defaultMode)
     }));
   }
 
@@ -518,6 +543,10 @@ export class BridgeService {
     const requested = normalizeMode(arg);
     if (!requested) {
       await this.replyModeCard(senderId, project);
+      return;
+    }
+    if (!this.modeSettings.enabledModes.includes(requested)) {
+      await this.replyModeUnavailable(senderId, requested);
       return;
     }
     if (requested === "task") {
@@ -548,9 +577,7 @@ export class BridgeService {
       }));
       return;
     }
-    const knowledgeBase = project.knowledgeBaseId
-      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
-      : undefined;
+    const knowledgeBase = this.resolveQaContext(project);
     if (!knowledgeBase) {
       await this.replyActionCard(senderId, createChoiceCard({
         title: "尚未绑定 llm-wiki",
@@ -558,7 +585,7 @@ export class BridgeService {
         fallbackText: `项目“${project.name}”尚未绑定 llm-wiki，请在渠道后台完成绑定。`,
         choices: [
           { label: "切换项目", command: "project", arg: "list", style: "primary" },
-          { label: "会话模式", command: "mode", arg: "session" }
+          ...this.modeChoices().filter((choice) => choice.arg !== "qa")
         ]
       }));
       return;
@@ -573,7 +600,7 @@ export class BridgeService {
         fallbackText: `知识库“${knowledgeBase.name}”暂不可用。`,
         choices: [
           { label: "重试", command: "mode", arg: "qa", style: "primary" },
-          { label: "会话模式", command: "mode", arg: "session" }
+          ...this.modeChoices().filter((choice) => choice.arg !== "qa")
         ]
       }));
       return;
@@ -607,17 +634,14 @@ export class BridgeService {
       fallbackText: `已进入问答模式：项目 ${project.name}，知识库 ${knowledgeBase.name}`,
       choices: [
         { label: "查看当前上下文", command: "status", arg: "", style: "primary" },
-        { label: "会话模式", command: "mode", arg: "session" },
-        { label: "任务模式", command: "mode", arg: "task" }
+        ...this.modeChoices("qa").filter((choice) => choice.arg !== "qa")
       ]
     }));
   }
 
   private async replyModeCard(senderId: string, project: ManagedProject): Promise<void> {
     const active = this.options.stateStore.getInteractionMode(senderId);
-    const knowledgeBase = project.knowledgeBaseId
-      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
-      : undefined;
+    const knowledgeBase = this.resolveQaContext(project);
     await this.replyActionCard(senderId, createChoiceCard({
       title: `当前项目 · ${conciseButtonLabel(project.name, 24)}`,
       body: [
@@ -626,11 +650,33 @@ export class BridgeService {
         `问答知识库：${knowledgeBase?.name ?? "未绑定"}`
       ].join("\n"),
       fallbackText: `当前项目 ${project.name}，当前模式 ${formatInteractionMode(active)}`,
-      choices: [
-        { label: "会话模式", command: "mode", arg: "session", style: active === "session" ? "primary" : "default" },
-        { label: "任务模式", command: "mode", arg: "task", style: active === "task" ? "primary" : "default" },
-        { label: "问答模式", command: "mode", arg: "qa", style: active === "qa" ? "primary" : "default" }
-      ]
+      choices: this.modeChoices(active)
+    }));
+  }
+
+  private modeChoices(active?: ProjectInteractionMode): ChannelChoice[] {
+    return this.modeSettings.enabledModes.map((mode): ChannelChoice => {
+      switch (mode) {
+        case "session":
+          return { label: "会话模式", command: "mode", arg: mode, style: active === mode ? "primary" : "default" };
+        case "task":
+          return { label: "任务模式", command: "mode", arg: mode, style: active === mode ? "primary" : "default" };
+        case "qa":
+          return { label: "问答模式", command: "mode", arg: mode, style: active === mode ? "primary" : "default" };
+        default:
+          return assertNeverMode(mode);
+      }
+    });
+  }
+
+  private async replyModeUnavailable(senderId: string, requested: ProjectInteractionMode): Promise<void> {
+    const active = this.options.stateStore.getInteractionMode(senderId);
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: "此渠道未开放该模式",
+      template: "orange",
+      body: `${formatInteractionMode(requested)}未在渠道配置中启用。可直接选择当前渠道开放的模式。`,
+      fallbackText: `${formatInteractionMode(requested)}未在渠道配置中启用。`,
+      choices: this.modeChoices(active)
     }));
   }
 
@@ -750,7 +796,7 @@ export class BridgeService {
       ? this.options.stateStore.getActiveQaSession(senderId)
       : this.options.stateStore.getActiveSession(senderId);
     if (session?.projectId !== project.id) return undefined;
-    if (mode === "qa" && session.knowledgeBaseId !== project.knowledgeBaseId) return undefined;
+    if (mode === "qa" && session.knowledgeBaseId !== this.resolveQaContext(project)?.id) return undefined;
     return session;
   }
 
@@ -1434,8 +1480,9 @@ export class BridgeService {
   }
 
   private resolveQaContext(project: ManagedProject): ManagedKnowledgeBase | undefined {
-    return project.knowledgeBaseId
-      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
+    const knowledgeBaseId = project.knowledgeBaseId ?? this.modeSettings.qaKnowledgeBaseId;
+    return knowledgeBaseId
+      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === knowledgeBaseId)
       : undefined;
   }
 
@@ -1525,9 +1572,7 @@ export class BridgeService {
     const project = this.options.stateStore.getActiveProject(senderId);
     const session = this.executionSession(senderId);
     const workspace = project?.workspace ?? session?.workspace ?? this.options.config.defaultCwd;
-    const knowledgeBase = project?.knowledgeBaseId
-      ? this.options.stateStore.listKnowledgeBases().find((item) => item.id === project.knowledgeBaseId)
-      : undefined;
+    const knowledgeBase = project ? this.resolveQaContext(project) : undefined;
     let issue: TaskboardIssue | undefined;
     if (project && session?.threadId && this.options.taskboard) {
       try {
@@ -1789,6 +1834,13 @@ function formatKnowledgeKind(kind: "preference" | "skill" | "knowledge" | "workf
   }[kind];
 }
 
+function commandMode(name: string): ProjectInteractionMode | undefined {
+  if (["task", "tb"].includes(name)) return "task";
+  if (["qa", "q"].includes(name)) return "qa";
+  if (["new", "n", "session", "sessions", "s", "ss"].includes(name)) return "session";
+  return undefined;
+}
+
 function normalizeMode(input: string): ProjectInteractionMode | undefined {
   const value = input.trim().toLowerCase();
   if (["session", "chat", "conversation", "会话", "聊天"].includes(value)) return "session";
@@ -1799,6 +1851,10 @@ function normalizeMode(input: string): ProjectInteractionMode | undefined {
 
 function formatInteractionMode(mode: ProjectInteractionMode): string {
   return ({ session: "会话模式", task: "任务模式", qa: "问答模式" } as const)[mode];
+}
+
+function assertNeverMode(mode: never): never {
+  throw new Error(`Unsupported project interaction mode: ${mode}`);
 }
 
 function formatGoalStatus(status: CodexThreadGoalStatus): string {

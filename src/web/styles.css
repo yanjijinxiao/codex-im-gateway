@@ -16,6 +16,15 @@
   --shadow: 0 16px 48px rgb(23 34 29 / 14%);
   --radius: 6px;
   --content: 1180px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --font-caption: 9px;
+  --font-helper: 10px;
+  --font-label: 11px;
+  --font-body: 12px;
+  --font-control: 13px;
   font-family: "Avenir Next", Avenir, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: var(--ink);
   background: var(--canvas);
@@ -62,10 +71,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 
 .status-band { border-bottom: 1px solid var(--line); background: #e8ece9; }
 .status-inner { width: min(calc(100% - 40px), var(--content)); min-height: 84px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 36px; }
-.service-state { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; }
+.service-state { min-width: 0; display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; }
+.service-state > span:last-child { min-width: 0; overflow-wrap: anywhere; }
 .pulse-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 5px rgb(18 161 80 / 12%); }
 .pulse-dot.is-error { background: var(--red); box-shadow: 0 0 0 5px rgb(200 64 61 / 12%); }
-.metrics { margin: 0; display: grid; grid-template-columns: 100px 100px minmax(240px, 1fr); gap: 28px; }
+.metrics { min-width: 0; margin: 0; display: grid; grid-template-columns: 100px 100px minmax(240px, 1fr); gap: 28px; }
 .metrics div { min-width: 0; }
 .metrics dt { margin-bottom: 5px; color: var(--ink-soft); font-size: 11px; font-weight: 650; text-transform: uppercase; }
 .metrics dd { margin: 0; overflow: hidden; font-size: 14px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
@@ -88,7 +98,7 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 
 .account-list { display: grid; gap: 12px; }
 .account-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
-.account-main { min-height: 98px; padding: 20px; display: grid; grid-template-columns: minmax(220px, 1.3fr) minmax(140px, .7fr) minmax(180px, .8fr) auto; align-items: center; gap: 22px; }
+.account-main { min-height: 98px; padding: 20px; display: grid; grid-template-columns: minmax(220px, 1.3fr) minmax(112px, .6fr) minmax(72px, .4fr) minmax(180px, .8fr) auto; align-items: center; gap: 22px; }
 .account-identity { min-width: 0; display: flex; align-items: center; gap: 14px; }
 .account-avatar { width: 46px; height: 46px; flex: 0 0 46px; border-radius: var(--radius); color: var(--green-dark); background: var(--green-soft); display: grid; place-items: center; }
 .account-avatar svg { width: 24px; height: 24px; }
@@ -103,6 +113,12 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 .status-error::before { background: var(--red); }
 .account-stat span { display: block; color: var(--ink-soft); font-size: 11px; }
 .account-stat strong { display: block; margin-top: 4px; font-size: 15px; }
+.account-mode-summary { min-width: 0; padding: var(--space-2); border: 0; border-radius: var(--radius); color: var(--ink); background: transparent; text-align: left; display: grid; gap: var(--space-1); }
+.account-mode-summary:hover { background: var(--surface-muted); }
+.account-mode-summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--focus) 24%, transparent); outline-offset: 2px; }
+.account-mode-summary > span { color: var(--ink-soft); font-size: var(--font-label); }
+.account-mode-summary > strong { font-size: var(--font-control); }
+.account-mode-summary > small { min-width: 0; overflow: hidden; color: var(--ink-soft); font-size: var(--font-caption); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .account-actions { display: flex; gap: 8px; }
 .account-identifiers { border-top: 1px solid var(--line); background: #fcfdfc; }
 .account-identifiers summary { min-height: 46px; padding: 9px 20px; color: var(--ink-soft); cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
@@ -388,6 +404,20 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 .toggle-control input:focus-visible + span { outline: 3px solid color-mix(in srgb, var(--focus) 30%, transparent); outline-offset: 2px; }
 label { min-width: 0; display: grid; gap: 8px; color: var(--ink-soft); font-size: 11px; font-weight: 700; }
 .field-hint { color: var(--ink-soft); font-size: 10px; font-weight: 500; line-height: 1.5; }
+.channel-mode-settings { --mode-choice-min-height: 72px; margin: 0; padding: var(--space-4); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-muted); display: grid; gap: var(--space-4); }
+.channel-mode-settings legend { padding-inline: var(--space-1); color: var(--ink); font-size: var(--font-body); font-weight: 700; }
+.channel-mode-settings > p { margin: 0; color: var(--ink-soft); font-size: var(--font-helper); line-height: 1.5; }
+.channel-mode-settings > [hidden] { display: none; }
+.channel-mode-choices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2); }
+.channel-mode-choice { min-height: var(--mode-choice-min-height); padding: var(--space-3); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); align-content: start; grid-template-columns: auto minmax(0, 1fr); }
+.channel-mode-choice:has(input:checked) { border-color: var(--green); background: var(--green-soft); }
+.channel-mode-choice input { width: var(--space-4); min-height: var(--space-4); margin: calc(var(--space-1) / 2) 0 0; accent-color: var(--green-dark); }
+.channel-mode-choice span { min-width: 0; display: grid; gap: var(--space-1); }
+.channel-mode-choice strong { color: var(--ink); font-size: var(--font-label); }
+.channel-mode-choice small { color: var(--ink-soft); font-size: var(--font-caption); font-weight: 500; line-height: 1.45; }
+.channel-mode-directory { padding: var(--space-4); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.channel-mode-advanced summary { color: var(--green-dark); cursor: pointer; font-size: var(--font-helper); font-weight: 700; }
+.channel-mode-advanced[open] summary { margin-bottom: var(--space-3); }
 .effective-setting { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .effective-setting span { flex: 0 0 auto; }
 .effective-setting strong { min-width: 0; overflow: hidden; color: var(--green-dark); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
@@ -570,7 +600,7 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
   .tab { flex: 1; }
   .app-header { position: static; }
   .metrics { grid-template-columns: 88px 88px minmax(180px, 1fr); gap: 18px; }
-  .account-main { grid-template-columns: minmax(220px, 1fr) 110px auto; }
+  .account-main { grid-template-columns: minmax(220px, 1fr) 72px minmax(180px, .8fr) auto; }
   .account-main .account-stat:first-of-type { display: none; }
   .session-workbench { grid-template-columns: minmax(250px, 290px) minmax(0, 1fr); }
   .chat-message { max-width: 88%; }
@@ -595,8 +625,8 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
   .tab { min-width: 0; padding-inline: 4px; font-size: 11px; }
   .header-action { width: 38px; padding: 0; }
   .header-action span { display: none; }
-  .status-inner { padding: 16px 0; align-items: start; display: grid; gap: 15px; }
-  .metrics { width: 100%; grid-template-columns: 1fr 1fr; }
+  .status-inner { padding: 16px 0; align-items: start; display: grid; grid-template-columns: minmax(0, 1fr); gap: 15px; }
+  .metrics { width: 100%; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .workspace-metric { grid-column: 1 / -1; max-width: none; }
   .view { padding: 30px 0 56px; }
   .taskboard-view { width: 100%; margin: 0; padding: 0; }
@@ -607,6 +637,8 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
   .account-main { padding: 16px; grid-template-columns: 1fr auto; gap: 16px; }
   .account-main .account-stat { display: none; }
   .account-actions { grid-column: 2; grid-row: 1; }
+  .account-mode-summary { grid-column: 1 / -1; grid-row: 2; }
+  .channel-mode-choices { grid-template-columns: 1fr; }
   .account-detail, .pending-access { padding: 12px 16px; align-items: start; flex-direction: column; }
   .account-projects-head { padding-inline: 16px; align-items: stretch; flex-direction: column; }
   .account-projects-head .button { width: 100%; }

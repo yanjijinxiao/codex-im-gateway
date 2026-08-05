@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { AccountManager } from "../src/server/account-manager.js";
 import { checkCodex, startLocalHttpServer } from "../src/server/http-server.js";
 import { defaultConfig, loadConfig, saveConfig } from "../src/state/config.js";
-import { resolveStatePaths } from "../src/state/paths.js";
+import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
+import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 
 test("Codex status probe reuses the runner command resolver", async () => {
@@ -418,11 +419,20 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.match(pageHtml, /data-view="accounts" aria-current="page"/);
   assert.match(pageHtml, /id="accountDialog" aria-labelledby="accountDialogTitle"/);
   assert.match(pageHtml, /id="accountWebhookProviderInput"/);
+  assert.match(pageHtml, /id="accountDefaultModeInput"/);
+  assert.match(pageHtml, /id="accountQaSourceInput"/);
+  assert.match(pageHtml, /id="accountQaDirectoryRootInput"[^>]+aria-describedby="accountQaDirectoryHint accountFormError"/);
   assert.match(pageHtml, /重新扫码后恢复/);
   const appResponse = await fetch(`${server.url}/app.js`);
   const appSource = await appResponse.text();
   assert.match(appSource, /tab\.setAttribute\("aria-current", "page"\)/);
   assert.match(appSource, /tab\.removeAttribute\("aria-current"\)/);
+  const accountModeSettingsResponse = await fetch(`${server.url}/account-mode-settings.js`);
+  assert.equal(accountModeSettingsResponse.status, 200);
+  const accountModeSettingsSource = await accountModeSettingsResponse.text();
+  assert.match(accountModeSettingsSource, /channelModeSettings/);
+  assert.match(accountModeSettingsSource, /enabledModes\.includes\("qa"\)/);
+  assert.match(accountModeSettingsSource, /rootInput\.required = directoryEnabled/);
   const knowledgeBasesResponse = await fetch(`${server.url}/knowledge-bases.js`);
   assert.equal(knowledgeBasesResponse.status, 200);
   assert.match(knowledgeBasesResponse.headers.get("content-type") ?? "", /^text\/javascript/);
@@ -495,6 +505,44 @@ test("local API redacts credentials and protects mutations", async (t) => {
   });
   assert.equal(invalidWebhookProvider.status, 400);
 
+  const duplicateModes = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      displayName: "工作微信",
+      modeSettings: {
+        defaultMode: "session",
+        enabledModes: ["session", "session"],
+        qaKnowledgeBase: { kind: "project" }
+      }
+    })
+  });
+  assert.equal(duplicateModes.status, 400);
+  assert.deepEqual(await duplicateModes.json(), { error: "Enabled modes must be unique" });
+
+  const disabledDefaultMode = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      displayName: "工作微信",
+      modeSettings: {
+        defaultMode: "qa",
+        enabledModes: ["session", "task"],
+        qaKnowledgeBase: { kind: "project" }
+      }
+    })
+  });
+  assert.equal(disabledDefaultMode.status, 400);
+  assert.deepEqual(await disabledDefaultMode.json(), { error: "Default mode must be enabled" });
+
   const renamed = await fetch(`${server.url}/api/accounts/account-one`, {
     method: "PATCH",
     headers: {
@@ -516,6 +564,33 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.equal(renamedAccount.webhookConfigured, true);
   assert.equal(renamedAccount.webhookProvider, "dingtalk");
   assert.equal(renamedAccount.webhookUrl, undefined);
+
+  const channelState = new RuntimeStateStore(accountStatePaths(paths, "account-one"));
+  const channelKnowledgeBase = channelState.createKnowledgeBase("产品 Wiki", path.join(root, "product-wiki"));
+  const configuredModes = await fetch(`${server.url}/api/accounts/account-one`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": bootstrap.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      displayName: "工作微信",
+      modeSettings: {
+        defaultMode: "qa",
+        enabledModes: ["session", "qa"],
+        qaKnowledgeBase: { kind: "managed", knowledgeBaseId: channelKnowledgeBase.id }
+      }
+    })
+  });
+  assert.equal(configuredModes.status, 200);
+  assert.deepEqual((await configuredModes.json() as {
+    account: { modeSettings: unknown };
+  }).account.modeSettings, {
+    defaultMode: "qa",
+    enabledModes: ["session", "qa"],
+    qaKnowledgeBaseId: channelKnowledgeBase.id
+  });
 
   const accountsResponse = await fetch(`${server.url}/api/accounts`);
   const accounts = await accountsResponse.json() as {

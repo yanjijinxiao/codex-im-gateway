@@ -139,6 +139,20 @@ function bindEvents() {
     updateAccountWebhookProviderPresentation();
     setAccountFormError("");
   });
+  document.querySelectorAll("#accountDialog .channel-mode-choice input").forEach((input) => {
+    input.addEventListener("change", () => {
+      channelModeSettings.syncForm();
+      setAccountFormError("");
+    });
+  });
+  document.querySelector("#accountQaSourceInput").addEventListener("change", () => {
+    channelModeSettings.syncForm();
+    setAccountFormError("");
+  });
+  document.querySelector("#accountQaDirectoryRootInput").addEventListener("input", () => setAccountFormError(""));
+  document.querySelector("#accountQaDirectoryRootInput").addEventListener("invalid", () => {
+    setAccountFormError("请填写 llm-wiki 根目录。", "directory");
+  });
   document.querySelector("#accountWebhookInput").addEventListener("input", (event) => {
     if (event.target.value.trim()) document.querySelector("#clearAccountWebhookInput").checked = false;
     setAccountFormError("");
@@ -469,6 +483,7 @@ function renderAccounts() {
     const channel = account.channel || "weixin";
     const channelMeta = channelInfo(channel);
     const projects = state.projects.filter((project) => project.accountId === account.accountId);
+    const modeSummary = channelModeSettings.summary(account, state.knowledgeBases);
     return `<article class="account-card">
       <div class="account-main">
         <div class="account-identity">
@@ -480,8 +495,11 @@ function renderAccounts() {
         </div>
         <div class="account-stat"><span>状态</span><strong class="status-label status-${escapeAttr(account.status)}">${statusText(account.status)}</strong></div>
         <div class="account-stat"><span>会话</span><strong>${account.sessionCount}</strong></div>
+        <button class="account-mode-summary" type="button" data-account-action="settings" data-account-id="${escapeAttr(account.accountId)}" title="问答知识来源：${escapeAttr(modeSummary.qaLabel)}" aria-label="配置${escapeAttr(accountDisplayName(account.accountId))}的工作模式，当前默认${escapeAttr(modeSummary.defaultLabel)}模式">
+          <span>工作模式</span><strong>默认 · ${escapeHtml(modeSummary.defaultLabel)}</strong><small>${escapeHtml(modeSummary.enabledLabel)} · ${escapeHtml(modeSummary.qaLabel)}</small>
+        </button>
         <div class="account-actions">
-          <button class="icon-button" type="button" data-account-action="settings" data-account-id="${escapeAttr(account.accountId)}" title="渠道设置" aria-label="配置${escapeAttr(accountDisplayName(account.accountId))}的 Webhook 和备注"><i data-lucide="pencil"></i></button>
+          <button class="icon-button" type="button" data-account-action="settings" data-account-id="${escapeAttr(account.accountId)}" title="渠道设置" aria-label="配置${escapeAttr(accountDisplayName(account.accountId))}的工作模式、Webhook 和备注"><i data-lucide="pencil"></i></button>
           <button class="icon-button" type="button" data-account-action="${account.status === "running" ? "stop" : "start"}" data-account-id="${escapeAttr(account.accountId)}" title="${account.status === "running" ? "停止账号" : "启动账号"}" aria-label="${account.status === "running" ? "停止账号" : "启动账号"}"><i data-lucide="${account.status === "running" ? "pause" : "play"}"></i></button>
           <button class="icon-button is-danger" type="button" data-account-action="remove" data-account-id="${escapeAttr(account.accountId)}" title="移除账号" aria-label="移除账号"><i data-lucide="trash-2"></i></button>
         </div>
@@ -1034,6 +1052,7 @@ function openAccountSettingsDialog(account) {
   document.querySelector("#accountRemarkInput").value = account.displayName || "";
   document.querySelector("#accountWebhookInput").value = "";
   document.querySelector("#accountWebhookProviderInput").value = account.webhookProvider || "generic";
+  channelModeSettings.populate(account, state.knowledgeBases);
   updateAccountWebhookProviderPresentation();
   document.querySelector("#clearAccountWebhookInput").checked = false;
   setAccountFormError("");
@@ -1092,6 +1111,7 @@ async function saveAccountSettings(event) {
   setAccountFormError("");
   try {
     button.disabled = true;
+    body.modeSettings = channelModeSettings.serialize();
     await api(`/api/accounts/${encodeURIComponent(accountId)}`, {
       method: "PATCH",
       body
@@ -1102,11 +1122,13 @@ async function saveAccountSettings(event) {
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
     const webhookInvalid = /Webhook URL|webhookUrl|Invalid url/i.test(rawMessage);
+    const directoryInvalid = document.querySelector("#accountQaDirectoryRootInput").required && !webhookInvalid;
     setAccountFormError(
       webhookInvalid ? "Webhook 地址无效。请以 http:// 或 https:// 开头。" : rawMessage,
-      webhookInvalid
+      webhookInvalid ? "webhook" : directoryInvalid ? "directory" : ""
     );
     if (webhookInvalid) document.querySelector("#accountWebhookInput").focus();
+    else if (directoryInvalid) document.querySelector("#accountQaDirectoryRootInput").focus();
   } finally {
     button.disabled = false;
   }
@@ -1119,11 +1141,12 @@ function updateAccountWebhookProviderPresentation() {
   document.querySelector("#accountWebhookProviderHint").textContent = presentation.hint;
 }
 
-function setAccountFormError(message, webhookInvalid = false) {
+function setAccountFormError(message, invalidField = "") {
   const error = document.querySelector("#accountFormError");
   error.textContent = message;
   error.hidden = !message;
-  document.querySelector("#accountWebhookInput").setAttribute("aria-invalid", webhookInvalid ? "true" : "false");
+  document.querySelector("#accountWebhookInput").setAttribute("aria-invalid", invalidField === "webhook" ? "true" : "false");
+  document.querySelector("#accountQaDirectoryRootInput").setAttribute("aria-invalid", invalidField === "directory" ? "true" : "false");
 }
 
 async function handleSessionAction(event) {

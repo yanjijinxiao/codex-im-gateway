@@ -54,12 +54,12 @@ function renderKnowledgeBaseRow(knowledgeBase) {
     <div class="knowledge-base-main">
       <div class="knowledge-base-title"><strong>${kbEscape(knowledgeBase.name)}</strong>${status}</div>
       <code title="${kbEscape(knowledgeBase.rootPath)}">${kbEscape(knowledgeBase.rootPath)}</code>
-      <p>${kbEscape(account?.displayName || account?.name || knowledgeBase.accountId)} · ${boundProjects.length ? `已绑定 ${boundProjects.map((project) => project.name).join("、")}` : "尚未绑定项目"}</p>
+      <p>${kbEscape(account?.displayName || account?.name || knowledgeBase.accountId)} · ${knowledgeBase.channelDefault ? "渠道问答默认" : "非渠道默认"} · ${boundProjects.length ? `已绑定 ${boundProjects.map((project) => project.name).join("、")}` : "尚未绑定项目"}</p>
     </div>
     <div class="knowledge-base-actions">
       <button class="icon-button" type="button" data-knowledge-action="inspect" data-account-id="${kbEscape(knowledgeBase.accountId)}" data-knowledge-id="${kbEscape(knowledgeBase.id)}" title="重新检查 ${kbEscape(knowledgeBase.name)}" aria-label="重新检查 ${kbEscape(knowledgeBase.name)}"><i data-lucide="activity"></i></button>
       <button class="icon-button" type="button" data-knowledge-action="edit" data-account-id="${kbEscape(knowledgeBase.accountId)}" data-knowledge-id="${kbEscape(knowledgeBase.id)}" title="编辑 ${kbEscape(knowledgeBase.name)}" aria-label="编辑 ${kbEscape(knowledgeBase.name)}"><i data-lucide="pencil"></i></button>
-      <button class="icon-button is-danger" type="button" data-knowledge-action="delete" data-account-id="${kbEscape(knowledgeBase.accountId)}" data-knowledge-id="${kbEscape(knowledgeBase.id)}" title="删除 ${kbEscape(knowledgeBase.name)}" aria-label="删除 ${kbEscape(knowledgeBase.name)}" ${boundProjects.length ? "disabled" : ""}><i data-lucide="trash-2"></i></button>
+      <button class="icon-button is-danger" type="button" data-knowledge-action="delete" data-account-id="${kbEscape(knowledgeBase.accountId)}" data-knowledge-id="${kbEscape(knowledgeBase.id)}" title="${knowledgeBase.channelDefault ? "请先取消渠道问答默认" : `删除 ${kbEscape(knowledgeBase.name)}`}" aria-label="${knowledgeBase.channelDefault ? `无法删除 ${kbEscape(knowledgeBase.name)}：仍是渠道问答默认` : `删除 ${kbEscape(knowledgeBase.name)}`}" ${boundProjects.length || knowledgeBase.channelDefault ? "disabled" : ""}><i data-lucide="trash-2"></i></button>
     </div>
   </article>`;
 }

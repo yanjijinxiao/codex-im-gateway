@@ -46,10 +46,18 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 
 ### Channel Settings Dialog
 
-- Structure: local display name, Webhook notification-platform selector, optional Webhook URL replacement field, provider-specific URL guidance, current Webhook status, explicit clear switch, and cancel/save actions.
+- Structure: local display name, channel work-mode controls, Q&A knowledge-source controls, Webhook notification-platform selector, optional Webhook URL replacement field, provider-specific URL guidance, current Webhook status, explicit clear switch, and cancel/save actions.
+- Work modes: three native checkbox choices control the available session, task, and Q&A modes; a native select chooses the default from the enabled set. Q&A can follow the current project's binding, select an existing account-owned llm-wiki project, or validate and register an llm-wiki directory.
 - States: not configured, configured, replacing, clearing, validation error, submitting.
-- Accessibility: the dialog title and close action name the channel settings task; the platform uses a native select, the URL input uses native URL semantics, and configured state is expressed in text rather than color alone.
+- Accessibility: the dialog title and close action name the channel settings task; mode choices use native checkboxes, the llm-wiki root becomes required only while directory input is visible and shares the form alert through `aria-describedby`, the platform uses a native select, the URL input uses native URL semantics, and configured state is expressed in text rather than color alone.
 - Security: Webhook URLs may contain signing secrets, so account list responses expose only `webhookConfigured`; the saved URL is never rendered back into the browser or written to logs.
+
+### Channel Mode Summary
+
+- Structure: one compact button in the account-card summary row showing the default mode, enabled-mode set, and effective channel-level Q&A source.
+- States: default, hover, focus-visible, project-following Q&A, managed knowledge-base Q&A, and Q&A disabled.
+- Behavior: activating the summary opens the existing Channel Settings Dialog at the work-mode controls; the pencil action remains an equivalent entry point.
+- Layout: it occupies the account card's existing summary-column rhythm on wide screens and becomes a full-width second row below the account identity at 375px without horizontal scrolling.
 
 ### Webhook Status Row
 

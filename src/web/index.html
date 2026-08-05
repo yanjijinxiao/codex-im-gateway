@@ -10,6 +10,7 @@
   <script defer src="/vendor/lucide.min.js"></script>
   <script defer src="/vendor/marked.umd.js"></script>
   <script defer src="/vendor/purify.min.js"></script>
+  <script defer src="/account-mode-settings.js"></script>
   <script defer src="/app.js"></script>
   <script defer src="/knowledge-bases.js"></script>
 </head>
@@ -390,7 +391,7 @@
     </div>
   </dialog>
 
-  <dialog class="modal" id="accountDialog" aria-labelledby="accountDialogTitle">
+  <dialog class="modal channel-modal" id="accountDialog" aria-labelledby="accountDialogTitle">
     <form id="accountForm" method="dialog">
       <div class="modal-header">
         <div>
@@ -408,6 +409,51 @@
           <input id="accountRemarkInput" maxlength="40" autocomplete="off" placeholder="例如：张三、李四">
           <small class="field-hint">备注只保存在本机；清空后恢复默认名称。</small>
         </label>
+        <fieldset class="channel-mode-settings">
+          <legend>渠道工作模式</legend>
+          <p>选择用户在这个渠道中可以进入的模式，并设置选择项目后的默认模式。</p>
+          <div class="channel-mode-choices" role="group" aria-label="可用工作模式">
+            <label class="channel-mode-choice" for="accountModeSessionInput">
+              <input id="accountModeSessionInput" type="checkbox" checked>
+              <span><strong>会话</strong><small>自然语言协作与命令行底层能力</small></span>
+            </label>
+            <label class="channel-mode-choice" for="accountModeTaskInput">
+              <input id="accountModeTaskInput" type="checkbox" checked>
+              <span><strong>任务</strong><small>当前项目的 Taskboard 工作流</small></span>
+            </label>
+            <label class="channel-mode-choice" for="accountModeQaInput">
+              <input id="accountModeQaInput" type="checkbox" checked>
+              <span><strong>问答</strong><small>llm-wiki 只读检索</small></span>
+            </label>
+          </div>
+          <label>
+            <span>默认进入</span>
+            <select id="accountDefaultModeInput"></select>
+          </label>
+          <label id="accountQaSourceField">
+            <span>问答知识来源</span>
+            <select id="accountQaSourceInput"></select>
+            <small class="field-hint">项目自身的知识库绑定优先；未绑定时使用这里选择的渠道知识库。</small>
+          </label>
+          <div class="channel-mode-directory form-stack" id="accountQaDirectoryFields" hidden>
+            <label>
+              <span>知识库名称（可选）</span>
+              <input id="accountQaDirectoryNameInput" maxlength="60" autocomplete="off" placeholder="默认使用目录名">
+            </label>
+            <label>
+              <span>llm-wiki 根目录</span>
+              <input id="accountQaDirectoryRootInput" autocomplete="off" placeholder="/Users/name/code/product-wiki" aria-describedby="accountQaDirectoryHint accountFormError" aria-invalid="false" aria-required="false">
+              <small class="field-hint" id="accountQaDirectoryHint">必须是可通过 llm-wiki 检查的项目或目录；保存前会验证 wiki/ 和只读查询能力。</small>
+            </label>
+            <details class="channel-mode-advanced">
+              <summary>高级目录设置</summary>
+              <div class="form-stack">
+                <label><span>引擎目录（可选）</span><input id="accountQaEngineRootInput" autocomplete="off" placeholder="默认使用知识库根目录"></label>
+                <label><span>状态目录（可选）</span><input id="accountQaStateDirInput" autocomplete="off" placeholder="默认使用根目录内 .llm-wiki"></label>
+              </div>
+            </details>
+          </div>
+        </fieldset>
         <label>
           <span>通知平台</span>
           <select id="accountWebhookProviderInput" aria-describedby="accountWebhookProviderHint">

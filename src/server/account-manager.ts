@@ -9,6 +9,10 @@ import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
 import { FeishuChannelAdapter } from "../channels/feishu.js";
+import {
+  normalizeChannelModeSettings,
+  type ChannelModeSettingsUpdate
+} from "../channels/channel-mode-settings.js";
 import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
 import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
 import { WeComChannelAdapter } from "../channels/wecom.js";
@@ -48,6 +52,7 @@ import {
   publicAccount,
   retainAccountHistory,
   saveAccount,
+  setAccountModeSettings,
   setAccountSettings,
   setAccountEnabled,
   normalizeAccountId,
@@ -74,6 +79,7 @@ import {
   type TaskboardIssueSummary
 } from "../taskboard/workbench.js";
 import { ChannelMessageWebhook } from "../webhooks/channel-message-webhook.js";
+import { resolveChannelModeSettings } from "./channel-mode-settings.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -105,6 +111,7 @@ export type AccountProject = ManagedProject & {
 export type AccountKnowledgeBase = ManagedKnowledgeBase & {
   accountId: string;
   boundProjects: Array<{ id: string; name: string }>;
+  channelDefault: boolean;
 };
 
 export type AccountProjectSession = {
@@ -207,6 +214,7 @@ export type AccountManagerOptions = {
     }
   ) => CodexDesktopApprovalMonitor;
   taskboardClientFactory?: (url: string) => TaskboardClient;
+  llmWiki?: LlmWikiMcpClientPool;
 };
 
 export class AccountManager {
@@ -225,7 +233,7 @@ export class AccountManager {
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
   private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
-  private readonly llmWiki = new LlmWikiMcpClientPool();
+  private readonly llmWiki: LlmWikiMcpClientPool;
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
   private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
@@ -254,6 +262,7 @@ export class AccountManager {
     this.codexDesktopApprovalMonitorFactory = options.codexDesktopApprovalMonitorFactory
       ?? ((handlers) => new CodexDesktopApprovalMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
+    this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
     this.taskboardWorkbench = new TaskboardWorkbench({
       client: () => this.taskboardFor(),
       projects: () => this.listProjects().map(taskboardProjectBase)
@@ -351,6 +360,7 @@ export class AccountManager {
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
       llmWiki: this.llmWiki,
+      modeSettings: normalizeChannelModeSettings(account.modeSettings),
       taskboard: this.taskboardFor(config),
       onOutboundMessage: (message) => webhook.publish(message),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
@@ -461,6 +471,21 @@ export class AccountManager {
     return this.summary(account);
   }
 
+  async updateAccountModeSettings(
+    accountId: string,
+    settings: ChannelModeSettingsUpdate
+  ): Promise<AccountSummary> {
+    const account = loadAccount(this.options.paths, accountId);
+    const modeSettings = await resolveChannelModeSettings({
+      store: this.storeFor(account.accountId),
+      llmWiki: this.llmWiki,
+      settings
+    });
+    const updated = setAccountModeSettings(this.options.paths, account.accountId, modeSettings);
+    this.entries.get(account.accountId)?.service?.configureModeSettings?.(modeSettings);
+    return this.summary(updated);
+  }
+
   addChannelAccount(input:
     | { channel: "wecom"; botId: string; secret: string; displayName?: string }
     | { channel: "feishu"; appId: string; appSecret: string; displayName?: string }
@@ -520,12 +545,14 @@ export class AccountManager {
     return accounts.flatMap((account) => {
       const store = this.storeFor(account.accountId);
       const projects = store.listProjects();
+      const modeSettings = normalizeChannelModeSettings(account.modeSettings);
       return store.listKnowledgeBases().map((knowledgeBase) => ({
         ...knowledgeBase,
         accountId: account.accountId,
         boundProjects: projects
           .filter((project) => project.knowledgeBaseId === knowledgeBase.id)
-          .map((project) => ({ id: project.id, name: project.name }))
+          .map((project) => ({ id: project.id, name: project.name })),
+        channelDefault: modeSettings.qaKnowledgeBaseId === knowledgeBase.id
       }));
     }).sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
@@ -553,7 +580,7 @@ export class AccountManager {
     };
     await this.llmWiki.inspect(candidate);
     const knowledgeBase = this.storeFor(accountId).createKnowledgeBase(input.name, input.rootPath, input);
-    return { ...knowledgeBase, accountId, boundProjects: [] };
+    return { ...knowledgeBase, accountId, boundProjects: [], channelDefault: false };
   }
 
   async updateKnowledgeBase(
@@ -582,6 +609,10 @@ export class AccountManager {
   }
 
   deleteKnowledgeBase(accountId: string, knowledgeBaseId: string): void {
+    const modeSettings = normalizeChannelModeSettings(loadAccount(this.options.paths, accountId).modeSettings);
+    if (modeSettings.qaKnowledgeBaseId === knowledgeBaseId) {
+      throw new Error("Knowledge base is still configured as the channel Q&A default");
+    }
     this.storeFor(accountId).deleteKnowledgeBase(knowledgeBaseId);
     this.llmWiki.invalidate(knowledgeBaseId);
   }

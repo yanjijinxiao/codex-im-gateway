@@ -15,7 +15,7 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
-function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean } = {}) {
+function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
@@ -79,6 +79,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     paths,
     configProvider: () => ({ ...defaultConfig(root), taskboardEnabled: Boolean(options.taskboardClient) }),
     taskboardClientFactory: () => options.taskboardClient as never,
+    llmWiki: options.llmWiki as never,
     clientFactory: (account) => ({
       accountId: account.accountId,
       async sendText(input: { toUserId: string; text: string }) {
@@ -651,6 +652,68 @@ test("persists channel settings without exposing the webhook URL", (t) => {
   assert.equal(cleared.webhookProvider, "feishu");
   assert.equal(loadAccount(paths, "account-one").displayName, undefined);
   assert.equal(loadAccount(paths, "account-one").webhookUrl, undefined);
+});
+
+test("configures channel modes from a validated llm-wiki directory", async (t) => {
+  // Given
+  const inspectedRoots: string[] = [];
+  const { manager, paths, root } = setup(t, {
+    llmWiki: {
+      async inspect(knowledgeBase: { rootPath: string }) {
+        inspectedRoots.push(knowledgeBase.rootPath);
+        return { command: "llm-wiki", status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 } };
+      },
+      invalidate() {}
+    }
+  });
+  const rootPath = path.join(root, "product-wiki");
+
+  // When
+  const configured = await manager.updateAccountModeSettings("account-one", {
+    defaultMode: "qa",
+    enabledModes: ["session", "task", "qa"],
+    qaKnowledgeBase: { kind: "directory", rootPath, name: "产品 Wiki" }
+  });
+
+  // Then
+  const knowledgeBase = manager.listKnowledgeBases("account-one")[0];
+  assert.equal(knowledgeBase?.name, "产品 Wiki");
+  assert.deepEqual(inspectedRoots, [path.resolve(rootPath)]);
+  assert.deepEqual(configured.modeSettings, {
+    defaultMode: "qa",
+    enabledModes: ["session", "task", "qa"],
+    qaKnowledgeBaseId: knowledgeBase?.id
+  });
+  assert.deepEqual(loadAccount(paths, "account-one").modeSettings, configured.modeSettings);
+});
+
+test("does not validate or register a hidden Q&A directory when Q&A is disabled", async (t) => {
+  // Given
+  let inspectionCount = 0;
+  const { manager, root } = setup(t, {
+    llmWiki: {
+      async inspect() {
+        inspectionCount += 1;
+        throw new Error("Hidden Q&A directory must not be inspected");
+      },
+      invalidate() {}
+    }
+  });
+
+  // When
+  const configured = await manager.updateAccountModeSettings("account-one", {
+    defaultMode: "session",
+    enabledModes: ["session", "task"],
+    qaKnowledgeBase: { kind: "directory", rootPath: path.join(root, "hidden-wiki") }
+  });
+
+  // Then
+  assert.equal(inspectionCount, 0);
+  assert.equal(manager.listKnowledgeBases("account-one").length, 0);
+  assert.deepEqual(configured.modeSettings, {
+    defaultMode: "session",
+    enabledModes: ["session", "task"]
+  });
 });
 
 test("mirrors each inbound channel message to its configured webhook", { timeout: 2_000 }, async (t) => {

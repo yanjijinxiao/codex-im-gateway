@@ -151,7 +151,7 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 - Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
 - A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
 
-Channel users select a project once, then use native controls to enter session, task, or Q&A mode. Task mode resolves the Taskboard project by the selected project's absolute workspace and does not require an existing Codex session. Plan mode and goals belong to the current project's active thread and never fall through to a thread from another project. See the [channel project workbench specification](./docs/channel-project-modes.md) for the state and acceptance contract.
+Channel users select a project once, then use native controls to enter the session, task, or Q&A modes enabled for that channel account; project selection enters the configured default mode. Task mode resolves the Taskboard project by the selected project's absolute workspace and does not require an existing Codex session. Q&A prefers the project's bound knowledge base and otherwise uses the channel account's managed knowledge base or validated llm-wiki directory while keeping the selected project as the working directory. Plan mode and goals belong to the current project's active thread and never fall through to a thread from another project. See the [channel project workbench specification](./docs/channel-project-modes.md) for the state and acceptance contract.
 
 ## Taskboard integration
 
@@ -182,7 +182,7 @@ Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --l
 /project rename P1|name /p rn P1|name  Rename a project
 /project delete P1      /p d P1        Remove a project with no running tasks
 /mode [session|task|qa] /v    Show or switch the selected project's work mode
-/qa                /q        Enter Q&A mode for the bound llm-wiki knowledge base
+/qa                /q        Enter Q&A mode with the project-bound or channel-default llm-wiki knowledge base
 /plan [on|off]               Switch the current session's native Codex plan mode
 /goal [objective|pause|resume|complete|clear] Manage the current thread's Codex goal
 /task            /tb          List unfinished Taskboard issues in the current project
