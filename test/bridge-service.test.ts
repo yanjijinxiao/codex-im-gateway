@@ -133,6 +133,7 @@ test("keeps disabled channel modes out of native choices and command routing", a
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
   stateStore.createProject("只允许会话", root);
   const cards: Array<{ actionGroups: readonly (readonly { value: { command: string; arg: string } }[])[] }> = [];
+  let runnerCalls = 0;
   const service = new BridgeService({
     config: { ...defaultConfig(root), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
@@ -144,7 +145,24 @@ test("keeps disabled channel modes out of native choices and command routing", a
         return { messageId: `card-${cards.length}` };
       }
     } as never,
-    runner: { async stop() {} } as never
+    intentResolver: {
+      async resolve() {
+        return {
+          kind: "command_sequence",
+          commands: [
+            { name: "mode", arg: "task" },
+            { name: "status", arg: "" }
+          ]
+        };
+      }
+    },
+    runner: {
+      async run() {
+        runnerCalls += 1;
+        return { raw: "", text: "unexpected" };
+      },
+      async stop() {}
+    } as never
   });
 
   // When
@@ -152,6 +170,13 @@ test("keeps disabled channel modes out of native choices and command routing", a
     id: "mode-card",
     senderId: "alice@im.wechat",
     text: "/mode",
+    attachments: [],
+    raw: {}
+  });
+  await service.handleMessage({
+    id: "compound-task-disabled",
+    senderId: "alice@im.wechat",
+    text: "先打开任务，再查看状态",
     attachments: [],
     raw: {}
   });
@@ -170,6 +195,8 @@ test("keeps disabled channel modes out of native choices and command routing", a
   );
   assert.equal(stateStore.getInteractionMode("alice@im.wechat"), "session");
   assert.equal(cards[1]?.actionGroups.flatMap((group) => group.map((action) => action.value.command)).includes("task"), false);
+  assert.equal(cards.length, 3);
+  assert.equal(runnerCalls, 0);
 });
 
 test("lists every built-in command and reports the current Codex account balance without a project", async (t) => {
@@ -461,6 +488,9 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   const project = stateStore.createProject("Project One", tmpDir);
+  const secondWorkspace = path.join(tmpDir, "project-two");
+  fs.mkdirSync(secondWorkspace);
+  const secondProject = stateStore.createProject("Project Two", secondWorkspace);
   const session = stateStore.createSession("alice@im.wechat", project.workspace, "Taskboard task", project.id);
   stateStore.setSessionThread(session.id, "thread-one");
   const prompts: string[] = [];
@@ -468,6 +498,7 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   const cards: Array<{ identifier: string; projectName: string }> = [];
   const replies: string[] = [];
   const createdTitles: string[] = [];
+  const taskboardWorkspaces: string[] = [];
   const classifiedContexts: ChannelIntentResolverInput[] = [];
   const resolvedIntents = new Map<string, FriendlyChannelIntent>([
     ["把现在手头在忙的事情给我捋一遍", { kind: "command", command: { name: "task", arg: "list" } }],
@@ -475,7 +506,14 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
     ["新任务：完成飞书按钮回调", { kind: "command", command: { name: "task", arg: "new 完成飞书按钮回调" } }],
     ["记录：测试和构建均通过", { kind: "command", command: { name: "task", arg: "comment current 测试和构建均通过" } }],
     ["退回：缺少飞书真机点击验证", { kind: "command", command: { name: "task", arg: "return current 缺少飞书真机点击验证" } }],
-    ["查看当前项目", { kind: "command", command: { name: "status", arg: "" } }]
+    ["查看当前项目", { kind: "command", command: { name: "status", arg: "" } }],
+    ["先切到 Project Two，再查看任务", {
+      kind: "command_sequence",
+      commands: [
+        { name: "project", arg: "switch Project Two" },
+        { name: "task", arg: "list" }
+      ]
+    }]
   ]);
   const issue = {
     id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration",
@@ -486,8 +524,13 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
     taskboard: {
-      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
-      async listIssues() { return [issue]; },
+      async projectForWorkspace(workspace: string) {
+        taskboardWorkspaces.push(workspace);
+        return workspace === secondWorkspace
+          ? { id: "project-two", name: "Project Two", workspacePath: secondWorkspace, issueCount: 0 }
+          : { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 };
+      },
+      async listIssues(projectId: string) { return projectId === "project-two" ? [] : [issue]; },
       async getIssue(identifier: string) {
         if (identifier === "PROJECT-1") return issue;
         if (identifier === "PROJECT-2" && createdTitles.length) {
@@ -541,10 +584,18 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
 
   await send("list", "把现在手头在忙的事情给我捋一遍");
   assert.deepEqual(cards.at(-1), { identifier: "overview:project-one", projectName: "Project One" });
-  assert.deepEqual(classifiedContexts[0], {
+  const directContext = classifiedContexts[0];
+  assert.ok(directContext);
+  assert.deepEqual({
+    ...directContext,
+    projectNames: [...directContext.projectNames].sort()
+  }, {
     text: "把现在手头在忙的事情给我捋一遍",
+    actorId: "alice@im.wechat",
+    conversationId: "alice@im.wechat",
+    conversationKind: "direct",
     currentProjectName: "Project One",
-    projectNames: ["Project One"]
+    projectNames: ["Project One", "Project Two"]
   });
   assert.equal(prompts.length, 0);
 
@@ -567,6 +618,32 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   await send("status", "查看当前项目");
   assert.match(replies.at(-1) ?? "", /项目：Project One/);
   assert.match(replies.at(-1) ?? "", /任务：PROJECT-1 · 待验收 · Ship integration/);
+
+  const promptsBeforeCompound = prompts.length;
+  await service.handleMessage({
+    id: "shared-compound",
+    senderId: "alice@im.wechat",
+    replyTargetId: "chat-team",
+    text: "先切到 Project Two，再查看任务",
+    attachments: [],
+    raw: {}
+  });
+  const sharedContext = classifiedContexts.at(-1);
+  assert.ok(sharedContext);
+  assert.deepEqual({
+    ...sharedContext,
+    projectNames: [...sharedContext.projectNames].sort()
+  }, {
+    text: "先切到 Project Two，再查看任务",
+    actorId: "alice@im.wechat",
+    conversationId: "chat-team",
+    conversationKind: "shared",
+    projectNames: ["Project One", "Project Two"]
+  });
+  assert.equal(stateStore.getActiveProject("chat-team")?.id, secondProject.id);
+  assert.equal(taskboardWorkspaces.at(-1), secondWorkspace);
+  assert.equal(cards.at(-1)?.identifier, "overview:project-two");
+  assert.equal(prompts.length, promptsBeforeCompound);
 
   const classificationCount = classifiedContexts.length;
   await send("slash-list", "/task list");

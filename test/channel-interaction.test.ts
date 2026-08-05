@@ -10,15 +10,21 @@ import {
 
 test("maps the spoken panel question from an AI decision to the Taskboard task list", async () => {
   const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
-    schemaVersion: 1,
-    intent: "task_list",
-    confidence: 0.97,
-    target: null,
-    detail: null
+    schemaVersion: 2,
+    kind: "actions",
+    actions: [{
+      intent: "task_list",
+      confidence: 0.97,
+      target: null,
+      detail: null
+    }]
   }));
 
   const intent = await resolver.resolve({
     text: "前面板有哪些",
+    actorId: "alice",
+    conversationId: "alice",
+    conversationKind: "direct",
     currentProjectName: "Codex Channel Bridge",
     projectNames: ["Codex Channel Bridge"]
   });
@@ -31,14 +37,23 @@ test("maps the spoken panel question from an AI decision to the Taskboard task l
 
 test("maps an AI command-list decision to built-in help", async () => {
   const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
-    schemaVersion: 1,
-    intent: "help",
-    confidence: 0.98,
-    target: null,
-    detail: null
+    schemaVersion: 2,
+    kind: "actions",
+    actions: [{
+      intent: "help",
+      confidence: 0.98,
+      target: null,
+      detail: null
+    }]
   }));
 
-  const intent = await resolver.resolve({ text: "当前有哪些命令", projectNames: [] });
+  const intent = await resolver.resolve({
+    text: "当前有哪些命令",
+    actorId: "alice",
+    conversationId: "alice",
+    conversationKind: "direct",
+    projectNames: []
+  });
 
   assert.deepEqual(intent, {
     kind: "command",
@@ -48,14 +63,23 @@ test("maps an AI command-list decision to built-in help", async () => {
 
 test("falls back to ordinary chat when the AI decision is not trusted", async () => {
   const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
-    schemaVersion: 1,
-    intent: "task_accept",
-    confidence: 0.4,
-    target: "BRIDGE-12",
-    detail: null
+    schemaVersion: 2,
+    kind: "actions",
+    actions: [{
+      intent: "task_accept",
+      confidence: 0.4,
+      target: "BRIDGE-12",
+      detail: null
+    }]
   }));
 
-  const intent = await resolver.resolve({ text: "帮我看看这段代码", projectNames: [] });
+  const intent = await resolver.resolve({
+    text: "帮我看看这段代码",
+    actorId: "alice",
+    conversationId: "alice",
+    conversationKind: "direct",
+    projectNames: []
+  });
 
   assert.equal(intent, undefined);
 });
@@ -69,12 +93,15 @@ test("maps semantic Q&A, planning, and goal decisions to native channel controls
   const intents = [];
   for (const decision of decisions) {
     const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
-      schemaVersion: 1,
-      confidence: 0.98,
-      ...decision
+      schemaVersion: 2,
+      kind: "actions",
+      actions: [{ confidence: 0.98, ...decision }]
     }));
     intents.push(await resolver.resolve({
       text: "自然语言工作模式操作",
+      actorId: "alice",
+      conversationId: "alice",
+      conversationKind: "direct",
       currentProjectName: "Bridge",
       currentMode: "session",
       knowledgeBaseName: "产品 Wiki",
@@ -110,11 +137,17 @@ test("maps natural-language task mutations to native forms and explicit confirma
   const intents = [];
   for (const decision of decisions) {
     const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
-      schemaVersion: 1,
-      confidence: 0.98,
-      ...decision
+      schemaVersion: 2,
+      kind: "actions",
+      actions: [{ confidence: 0.98, ...decision }]
     }));
-    intents.push(await resolver.resolve({ text: "自然语言任务操作", projectNames: ["Bridge"] }));
+    intents.push(await resolver.resolve({
+      text: "自然语言任务操作",
+      actorId: "alice",
+      conversationId: "alice",
+      conversationKind: "direct",
+      projectNames: ["Bridge"]
+    }));
   }
 
   assert.deepEqual(intents, [

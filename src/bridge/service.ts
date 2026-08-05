@@ -4,7 +4,12 @@ import path from "node:path";
 import { AccessController } from "./access.js";
 import { ChannelApprovalController } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
-import type { ChannelCommand, FriendlyChannelIntent } from "./channel-intent.js";
+import { commandProjectRequirement, requiredModeForCommand } from "./channel-command-policy.js";
+import {
+  commandsFromFriendlyChannelIntent,
+  type ChannelCommand,
+  type FriendlyChannelIntent
+} from "./channel-intent.js";
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
@@ -174,27 +179,35 @@ export class BridgeService {
     const slashCommand = parseCommand(scopedMessage.text);
     const friendlyIntent = slashCommand
       ? undefined
-      : await this.resolveFriendlyChannelIntent(replyTargetId, scopedMessage.text);
+      : await this.resolveFriendlyChannelIntent(message.senderId, replyTargetId, scopedMessage.text);
     if (friendlyIntent?.kind === "clarification") {
       await this.reply(replyTargetId, friendlyIntent.text);
       return;
     }
-    const command = slashCommand ?? (friendlyIntent?.kind === "command" ? friendlyIntent.command : undefined);
-    const canRunWithoutProject = command && [
-      "help", "h", "balance", "memory", "knowledge", "project", "projects", "approve", "reject", "answer"
-    ].includes(command.name);
-    if (!canRunWithoutProject && !this.ensureBoundProjectContext(replyTargetId)) {
-      const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
-      await this.replyActionCard(replyTargetId, createChoiceCard({
-        title: "先添加一个 Codex 项目",
-        body: "还没有绑定项目。点击下方按钮，从 Codex 历史项目中选择。",
-        fallbackText,
-        choices: [{ label: "选择历史项目", command: "project", arg: "add", style: "primary" }]
-      }));
+    const commands = slashCommand
+      ? [slashCommand]
+      : commandsFromFriendlyChannelIntent(friendlyIntent);
+    if (commands) {
+      for (const command of commands) {
+        const requiredMode = requiredModeForCommand(command);
+        if (requiredMode && !this.modeSettings.enabledModes.includes(requiredMode)) {
+          await this.replyModeUnavailable(replyTargetId, requiredMode);
+          return;
+        }
+        if (
+          commandProjectRequirement(command) === "required"
+          && !this.ensureBoundProjectContext(replyTargetId)
+        ) {
+          await this.replyProjectRequired(replyTargetId);
+          return;
+        }
+        await this.handleCommand(scopedMessage, command);
+      }
       return;
     }
-    if (command) {
-      await this.handleCommand(scopedMessage, command);
+
+    if (!this.ensureBoundProjectContext(replyTargetId)) {
+      await this.replyProjectRequired(replyTargetId);
       return;
     }
 
@@ -218,19 +231,23 @@ export class BridgeService {
   }
 
   private async resolveFriendlyChannelIntent(
-    senderId: string,
+    actorId: string,
+    conversationId: string,
     text: string
   ): Promise<FriendlyChannelIntent | undefined> {
     const resolver = this.options.intentResolver;
     if (!resolver || !text.trim()) return undefined;
     const projects = this.options.stateStore.listProjects();
-    const activeProject = this.options.stateStore.getActiveProject(senderId);
+    const activeProject = this.options.stateStore.getActiveProject(conversationId);
     const knowledgeBaseName = activeProject ? this.resolveQaContext(activeProject)?.name : undefined;
     const currentProjectName = activeProject?.name;
-    const currentMode = this.options.stateStore.getInteractionMode(senderId);
+    const currentMode = this.options.stateStore.getInteractionMode(conversationId);
     try {
       return await resolver.resolve({
         text,
+        actorId,
+        conversationId,
+        conversationKind: actorId === conversationId ? "direct" : "shared",
         ...(currentProjectName ? { currentProjectName } : {}),
         ...(currentMode !== "session" ? { currentMode } : {}),
         ...(knowledgeBaseName ? { knowledgeBaseName } : {}),
@@ -248,11 +265,6 @@ export class BridgeService {
   }
 
   private async handleCommand(message: NormalizedWeixinMessage, command: ChannelCommand): Promise<void> {
-    const requiredMode = commandMode(command.name);
-    if (requiredMode && !this.modeSettings.enabledModes.includes(requiredMode)) {
-      await this.replyModeUnavailable(message.senderId, requiredMode);
-      return;
-    }
     switch (command.name) {
       case "help":
       case "h":
@@ -364,6 +376,16 @@ export class BridgeService {
           `未知命令：/${command.name}。发送 /help 查看可用命令。`
         ));
     }
+  }
+
+  private async replyProjectRequired(senderId: string): Promise<void> {
+    const fallbackText = "还没有绑定 Codex 项目。发送 /project add 查看 Codex 历史项目，再用 /project add C编号 添加。";
+    await this.replyActionCard(senderId, createChoiceCard({
+      title: "先添加一个 Codex 项目",
+      body: "还没有绑定项目。点击下方按钮，从 Codex 历史项目中选择。",
+      fallbackText,
+      choices: [{ label: "选择历史项目", command: "project", arg: "add", style: "primary" }]
+    }));
   }
 
   private ensureBoundProjectContext(senderId: string): boolean {
@@ -1832,13 +1854,6 @@ function formatKnowledgeKind(kind: "preference" | "skill" | "knowledge" | "workf
     knowledge: "知识点",
     workflow: "流程"
   }[kind];
-}
-
-function commandMode(name: string): ProjectInteractionMode | undefined {
-  if (["task", "tb"].includes(name)) return "task";
-  if (["qa", "q"].includes(name)) return "qa";
-  if (["new", "n", "session", "sessions", "s", "ss"].includes(name)) return "session";
-  return undefined;
 }
 
 function normalizeMode(input: string): ProjectInteractionMode | undefined {

@@ -167,6 +167,8 @@ Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --l
 
 ## Message-channel commands
 
+Natural language is the default entry point. The classifier receives the authenticated channel actor separately from the conversation that owns project and mode state, so a shared chat never turns its room ID into a user identity. It may return one action or an ordered sequence of up to four allow-listed actions, such as switching projects and then opening that project's tasks. Every action must pass the strict schema and confidence threshold; otherwise the entire decision falls back to ordinary Codex chat. During execution, project and enabled-mode guards are checked before each step and the sequence stops at the first unavailable step. Slash commands remain the deterministic, scriptable low-level interface and bypass AI classification.
+
 ```text
 /help            /h           Show commands
 /status          /st          Show session, workspace, thread, backend, effective model, and reasoning effort
