@@ -423,7 +423,7 @@ async function safeFileSize(filePath: string): Promise<number> {
 }
 
 function yieldToEventLoop(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
+  return new Promise((resolve) => setTimeout(resolve, 1));
 }
 
 function shouldEmitEvent(cursor: SessionCursor, timestamp: string): boolean {
