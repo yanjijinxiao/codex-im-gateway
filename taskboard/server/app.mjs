@@ -24,6 +24,7 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { createIssueAutomation } from "./issue-automation.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -175,13 +176,15 @@ function assertTrustedNetworkRequest(request) {
   }
 }
 
-function assertLoopbackRequest(request) {
+function isLoopbackRequest(request) {
   const address = request.socket.remoteAddress;
-  if (
-    address !== "127.0.0.1"
-    && address !== "::1"
-    && address !== "::ffff:127.0.0.1"
-  ) {
+  return address === "127.0.0.1"
+    || address === "::1"
+    || address === "::ffff:127.0.0.1";
+}
+
+function assertLoopbackRequest(request) {
+  if (!isLoopbackRequest(request)) {
     throw new ApiError(403, "LOCAL_ONLY", "This endpoint is only available on this device");
   }
 }
@@ -1295,6 +1298,9 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    automationPoliciesPath: options.automationPoliciesPath
+      ?? process.env.CODEX_TASKBOARD_AUTOMATION_POLICIES_PATH
+      ?? path.join(PROJECT_ROOT, ".data", "codex-automation-policies.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
     skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
     codexExecutable: options.codexExecutable ?? process.env.CODEX_EXECUTABLE ?? "codex",
@@ -1348,6 +1354,15 @@ export function createTaskboardServer(options = {}) {
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
   });
+  const issueAutomation = createIssueAutomation({
+    automationPoliciesPath: resolved.automationPoliciesPath,
+    codexExecutable: resolved.codexExecutable,
+  });
+  const triggerIssueAutomation = (task) => {
+    issueAutomation.trigger(task).catch((error) => {
+      console.error(`Taskboard issue automation trigger failed: ${error.message}`);
+    });
+  };
   const aiEventResponses = new Set();
 
   const server = createServer(async (request, response) => {
@@ -1594,10 +1609,61 @@ export function createTaskboardServer(options = {}) {
         if (currentCloudConfig.remoteUrl) {
           assertLoopbackRequest(request);
           if (!isLocalCompanionRoute(pathname)) {
-            return sendFetchResponse(
-              response,
-              await cloudProxy.forward(toFetchRequest(request)),
+            const taskCreated = request.method === "POST" && pathname === "/api/tasks";
+            const taskMayEnterTodo = (
+              request.method === "PATCH" && /^\/api\/tasks\/[^/]+$/.test(pathname)
+            ) || (
+              request.method === "POST"
+              && /^\/api\/tasks\/[^/]+\/(?:move|transition)$/.test(pathname)
             );
+            const proxyRequest = toFetchRequest(request);
+            let requestedTodo = false;
+            let previousStatus;
+            if (taskMayEnterTodo) {
+              try {
+                const body = await proxyRequest.clone().json();
+                requestedTodo = body?.status === "todo";
+              } catch {
+                requestedTodo = false;
+              }
+              if (requestedTodo) {
+                const taskPath = pathname.replace(/\/(?:move|transition)$/, "");
+                const headers = new Headers(proxyRequest.headers);
+                headers.delete("content-length");
+                try {
+                  const previousResponse = await cloudProxy.forward(new Request(
+                    new URL(taskPath, proxyRequest.url),
+                    { method: "GET", headers },
+                  ));
+                  if (previousResponse.ok) {
+                    const previousPayload = await previousResponse.clone().json();
+                    previousStatus = previousPayload?.task?.status;
+                  }
+                } catch {
+                  previousStatus = undefined;
+                }
+              }
+            }
+            const upstream = await cloudProxy.forward(proxyRequest);
+            if (upstream.ok && (taskCreated || taskMayEnterTodo)) {
+              const payload = await upstream.clone().json();
+              if (payload?.task) {
+                if (taskCreated) events.emit("task.created", { task: payload.task });
+                const confirmedPreviousStatus = payload.previousStatus ?? previousStatus;
+                if (
+                  taskCreated
+                  || (
+                    requestedTodo
+                    && confirmedPreviousStatus !== undefined
+                    && confirmedPreviousStatus !== "todo"
+                    && payload.task.status === "todo"
+                  )
+                ) {
+                  triggerIssueAutomation(payload.task);
+                }
+              }
+            }
+            return sendFetchResponse(response, upstream);
           }
         }
       }
@@ -1706,6 +1772,9 @@ export function createTaskboardServer(options = {}) {
             assignee: resolveAssignee(assigneeTarget, actor),
           });
           events.emit("task.created", { task });
+          if (isLoopbackRequest(request)) {
+            triggerIssueAutomation(task);
+          }
           return sendJson(response, 201, { task });
         }
         return methodNotAllowed(response, ["GET", "POST"]);
@@ -2004,21 +2073,38 @@ export function createTaskboardServer(options = {}) {
         }
         if (!action && request.method === "PATCH") {
           const { version, changes, threadId, assigneeTarget } = parseTaskPatch(await readJson(request));
+          const previousTask = database.getTask(id);
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actorFromRequest(request));
           }
           const task = database.updateTask(id, version, changes, threadId);
           events.emit("task.updated", { task });
-          return sendJson(response, 200, { task });
+          if (
+            isLoopbackRequest(request)
+            && previousTask?.status !== "todo"
+            && task.status === "todo"
+          ) {
+            triggerIssueAutomation(task);
+          }
+          return sendJson(response, 200, { task, previousStatus: previousTask?.status ?? task.status });
         }
         if (action === "move" && request.method === "POST") {
           const move = parseMove(await readJson(request));
+          const previousTask = database.getTask(id);
           const task = database.moveTask(id, move.version, move.status, move.sortOrder, move.threadId);
           events.emit("task.moved", { task });
-          return sendJson(response, 200, { task });
+          if (
+            isLoopbackRequest(request)
+            && previousTask?.status !== "todo"
+            && task.status === "todo"
+          ) {
+            triggerIssueAutomation(task);
+          }
+          return sendJson(response, 200, { task, previousStatus: previousTask?.status ?? task.status });
         }
         if (action === "transition" && request.method === "POST") {
           const transition = parseMoveWithComment(await readJson(request));
+          const previousTask = database.getTask(id);
           const result = database.moveTaskWithComment(
             id,
             transition.version,
@@ -2029,7 +2115,17 @@ export function createTaskboardServer(options = {}) {
           );
           events.emit("comment.created", result);
           events.emit("task.moved", result);
-          return sendJson(response, 200, result);
+          if (
+            isLoopbackRequest(request)
+            && previousTask?.status !== "todo"
+            && result.task.status === "todo"
+          ) {
+            triggerIssueAutomation(result.task);
+          }
+          return sendJson(response, 200, {
+            ...result,
+            previousStatus: previousTask?.status ?? result.task.status,
+          });
         }
         if (action === "archive" && request.method === "POST") {
           const { version, threadId } = parseArchive(await readJson(request));
@@ -2108,6 +2204,7 @@ export function createTaskboardServer(options = {}) {
       events.close();
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
+      await issueAutomation.close();
       await aiChat.close();
       await serverClosed;
       listening = false;

@@ -30,7 +30,7 @@ export function parseTaskboardAutomationHostRequest(value) {
   if (!validProjectId(value.taskboardProjectId)) return null;
   if (!validText(value.codexProjectId, 256) || !validText(value.projectName, 200)) return null;
   if (!validAbsolutePath(value.workspacePath) || !validAbsolutePath(value.skillPath)) return null;
-  if (!INTERVAL_MINUTES.has(value.intervalMinutes)) return null;
+  if (value.intervalMinutes !== undefined && !INTERVAL_MINUTES.has(value.intervalMinutes)) return null;
   if (!isSupportedModelEffort(value.model, value.reasoningEffort)) return null;
   if (value.automationId !== undefined && !validText(value.automationId, 256)) return null;
   if (typeof value.enabledByUser !== "boolean" || typeof value.quotaAware !== "boolean") return null;
@@ -48,10 +48,20 @@ export function parseTaskboardAutomationHostRequest(value) {
     ...(value.automationId === undefined ? {} : { automationId: value.automationId }),
     enabledByUser: value.enabledByUser,
     quotaAware: value.quotaAware,
-    intervalMinutes: value.intervalMinutes,
+    ...(value.intervalMinutes === undefined ? {} : { intervalMinutes: value.intervalMinutes }),
     model: value.model,
     reasoningEffort: value.reasoningEffort,
   };
+}
+
+export function parseStoredTaskboardAutomationPolicy(value) {
+  return parseTaskboardAutomationHostRequest({
+    ...value,
+    id: "stored-policy",
+    action: "automation",
+    requestId: "stored-policy",
+    operation: "apply-policy",
+  });
 }
 
 export function buildTaskboardAutomationName(request) {
@@ -60,14 +70,17 @@ export function buildTaskboardAutomationName(request) {
 
 export function buildTaskboardAutomationPrompt(request) {
   return [
-    `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
-    "每次仅处理一个 todo：先用 issue get 读取最新议题内容，并用 comment list 读取全部评论，确认是否包含已完成后被打回的返工要求。",
-    "认领时使用最新 version 将议题移动到 in_progress；若发生版本冲突或最新状态已变化，立即跳过，避免多个 Agent 抢同一任务。",
+    `[$manage-taskboard](${request.skillPath}) e-taskboard 处理任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
+    "这是由新建议题事件启动的一次队列执行，不要创建、恢复或等待任何定时任务。",
+    "循环处理 todo 队列，直到没有 todo 后立即退出：每次先用 issue list 获取一个 todo，再用 issue get 读取最新议题内容，并用 comment list 读取全部评论，确认是否包含已完成后被打回的返工要求。",
+    "认领时使用最新 version 将议题移动到 in_progress；若发生版本冲突或最新状态已变化，跳过该议题并继续检查下一个，避免多个 Agent 抢同一任务。",
     "若议题已绑定 branch 或 worktree，必须在该议题绑定的开发上下文执行，避免并行 Agent 修改同一工作目录。",
     "执行完成并验证后，先用 comment add 记录关键改动、验证结果、执行结果和剩余风险，再使用最新 version 将议题移动到 in_review；不要直接标记为 done。",
+    "完成一个议题后继续领取下一个 todo；只有 todo 队列为空时才结束本次执行。",
   ].join("\n");
 }
 
+// Kept only to provide the complete payload required when pausing a legacy Cron.
 export function buildTaskboardAutomationSpec(request) {
   return {
     kind: "cron",
@@ -78,7 +91,7 @@ export function buildTaskboardAutomationSpec(request) {
     localEnvironmentConfigPath: null,
     model: request.model,
     reasoningEffort: request.reasoningEffort,
-    rrule: `RRULE:FREQ=MINUTELY;INTERVAL=${request.intervalMinutes}`,
+    rrule: `RRULE:FREQ=MINUTELY;INTERVAL=${request.intervalMinutes ?? 5}`,
   };
 }
 
@@ -97,26 +110,65 @@ export async function reconcileTaskboardAutomation(request, rpc) {
       ? matchingItems.find((item) => item?.id === request.automationId)
       : null
   ) ?? matchingItems[0];
-  const spec = buildTaskboardAutomationSpec(request);
+  if (!existing) return { error: "not-found" };
+  if (existing.status === "PAUSED") return { item: existing };
 
-  if (request.operation === "pause") {
-    if (!existing) return { error: "not-found" };
-    if (automationMatchesSpec(existing, spec, "PAUSED")) return { item: existing };
-    return rpc("automation-update", { ...spec, id: existing.id, status: "PAUSED" });
-  }
+  return rpc("automation-update", {
+    ...buildTaskboardAutomationSpec(request),
+    id: existing.id,
+    status: "PAUSED",
+  });
+}
 
-  if (request.operation !== "ensure-active") {
-    throw new Error(`Unsupported automation operation: ${request.operation}`);
-  }
-  if (existing) {
-    if (automationMatchesSpec(existing, spec, "ACTIVE")) return { item: existing };
-    return rpc("automation-update", {
+export async function pauseLegacyTaskboardAutomations(rpc) {
+  const listed = await rpc("list-automations", {});
+  const items = Array.isArray(listed?.items) ? listed.items : [];
+  const results = [];
+  for (const item of items) {
+    const spec = legacyAutomationSpec(item);
+    if (!spec) continue;
+    if (item.status === "PAUSED") {
+      results.push(item);
+      continue;
+    }
+    const updated = await rpc("automation-update", {
       ...spec,
-      id: existing.id,
-      status: "ACTIVE",
+      id: item.id,
+      status: "PAUSED",
     });
+    if (updated?.item) results.push(updated.item);
   }
-  return rpc("automation-create", spec);
+  return { items: results.map(sanitizeAutomation).filter(Boolean) };
+}
+
+function legacyAutomationSpec(item) {
+  const projectId = item?.projectId ?? item?.target?.projectId;
+  if (
+    !validText(item?.id, 256)
+    || item.kind !== "cron"
+    || typeof item.name !== "string"
+    || !item.name.startsWith("Taskboard 自动认领 · ")
+    || typeof item.prompt !== "string"
+    || item.prompt.length === 0
+    || item.prompt.length > 100_000
+    || !validText(projectId, 256)
+    || item.executionEnvironment !== "local"
+    || (item.localEnvironmentConfigPath !== null && item.localEnvironmentConfigPath !== undefined)
+    || !isSupportedModelEffort(item.model, item.reasoningEffort)
+    || !validRrule(item.rrule)
+    || (item.status !== "ACTIVE" && item.status !== "PAUSED")
+  ) return null;
+  return {
+    kind: "cron",
+    name: item.name,
+    prompt: item.prompt,
+    projectId,
+    executionEnvironment: "local",
+    localEnvironmentConfigPath: null,
+    model: item.model,
+    reasoningEffort: item.reasoningEffort,
+    rrule: item.rrule,
+  };
 }
 
 function sanitizeAutomation(item) {
@@ -132,26 +184,12 @@ function sanitizeAutomation(item) {
     model: item.model,
     reasoningEffort: item.reasoningEffort,
     rrule: item.rrule,
-    ...(
-      item.nextRunAt === null || Number.isFinite(item.nextRunAt)
-        ? { nextRunAt: item.nextRunAt }
-        : {}
-    ),
   };
 }
 
 function validRrule(value) {
   return typeof value === "string"
     && /^RRULE:FREQ=MINUTELY;INTERVAL=(5|10|15|30|60)$/.test(value);
-}
-
-function automationMatchesSpec(item, spec, status) {
-  return item?.status === status
-    && Object.entries(spec).every(([field, value]) => (
-      field === "projectId"
-        ? (item.projectId ?? item.target?.projectId) === value
-        : item[field] === value
-    ));
 }
 
 function validIdentifier(value, maxLength) {

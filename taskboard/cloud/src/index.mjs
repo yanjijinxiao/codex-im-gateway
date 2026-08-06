@@ -1220,7 +1220,10 @@ async function updateTask(env, id, input, actor) {
       { expectedVersion: input.version, actualVersion: latest.version },
     );
   }
-  return getTask(env, current.id);
+  return {
+    task: await getTask(env, current.id),
+    previousStatus: currentTask.status,
+  };
 }
 
 async function moveTask(env, id, input) {
@@ -1264,7 +1267,10 @@ async function moveTask(env, id, input) {
       { expectedVersion: input.version, actualVersion: latest.version },
     );
   }
-  return getTask(env, current.id);
+  return {
+    task: await getTask(env, current.id),
+    previousStatus: current.status,
+  };
 }
 
 async function archiveTask(env, id, input) {
@@ -2113,19 +2119,15 @@ async function routeApi(request, env, actor, url) {
       return json(200, { task });
     }
     if (!action && request.method === "PATCH") {
-      return json(200, {
-        task: await updateTask(
-          env,
-          taskId,
-          parseTaskPatch(await readJson(request)),
-          actor,
-        ),
-      });
+      return json(200, await updateTask(
+        env,
+        taskId,
+        parseTaskPatch(await readJson(request)),
+        actor,
+      ));
     }
     if (action === "move" && request.method === "POST") {
-      return json(200, {
-        task: await moveTask(env, taskId, parseMove(await readJson(request))),
-      });
+      return json(200, await moveTask(env, taskId, parseMove(await readJson(request))));
     }
     if (action === "archive" && request.method === "POST") {
       return json(200, {

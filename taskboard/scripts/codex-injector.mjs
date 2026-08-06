@@ -2,14 +2,16 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { resolvePort } from "../server/app.mjs";
 import {
+  parseStoredTaskboardAutomationPolicy,
   parseTaskboardAutomationHostRequest,
+  pauseLegacyTaskboardAutomations,
   reconcileTaskboardAutomation,
 } from "../shared/taskboard-automation.mjs";
 import {
@@ -38,11 +40,9 @@ const injectionSourceHashName = "__CODEX_TASKBOARD_SOURCE_HASH__";
 const injectionScriptIdentifierName = "__CODEX_TASKBOARD_SCRIPT_IDENTIFIER__";
 const codexAutomationMethods = new Set([
   "list-automations",
-  "automation-create",
   "automation-update",
 ]);
 let codexAutomationRequestSequence = 0;
-const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
 let quotaPoliciesLoadPromise = null;
@@ -698,16 +698,16 @@ async function applyTaskboardAutomationPolicy(request, rpc, stillCurrent = () =>
     ? await readCodexQuotaStatus(request.model)
     : null;
   if (!stillCurrent()) return { quota, stale: true };
-  const shouldRun = request.enabledByUser
-    && (!request.quotaAware || quota?.state === "available");
-  const result = await reconcileTaskboardAutomation(
-    { ...request, operation: shouldRun ? "ensure-active" : "pause" },
-    rpc,
-  );
-  if (result?.error === "not-found") {
-    return { ...(quota ? { quota } : {}) };
-  }
-  return { ...result, ...(quota ? { quota } : {}) };
+  await reconcileTaskboardAutomation({ ...request, operation: "pause" }, rpc);
+  return {
+    item: {
+      id: `taskboard-event-${request.taskboardProjectId}`,
+      status: request.enabledByUser ? "ACTIVE" : "PAUSED",
+      model: request.model,
+      reasoningEffort: request.reasoningEffort,
+    },
+    ...(quota ? { quota } : {}),
+  };
 }
 
 function storedAutomationPolicy(request) {
@@ -717,23 +717,11 @@ function storedAutomationPolicy(request) {
     projectName: request.projectName,
     workspacePath: request.workspacePath,
     skillPath: request.skillPath,
-    ...(request.automationId ? { automationId: request.automationId } : {}),
     enabledByUser: request.enabledByUser,
     quotaAware: request.quotaAware,
-    intervalMinutes: request.intervalMinutes,
     model: request.model,
     reasoningEffort: request.reasoningEffort,
   };
-}
-
-function restoredAutomationPolicy(value) {
-  return parseTaskboardAutomationHostRequest({
-    ...value,
-    id: "restored-policy",
-    action: "automation",
-    requestId: "restored-policy",
-    operation: "apply-policy",
-  });
 }
 
 async function ensureQuotaPoliciesLoaded() {
@@ -747,7 +735,7 @@ async function ensureQuotaPoliciesLoaded() {
     }
     if (!stored || typeof stored !== "object" || Array.isArray(stored)) return;
     for (const value of Object.values(stored)) {
-      const request = restoredAutomationPolicy(value);
+      const request = parseStoredTaskboardAutomationPolicy(value);
       if (!request) continue;
       quotaPolicyRecords.set(request.taskboardProjectId, { version: 1, request });
     }
@@ -766,46 +754,16 @@ function persistQuotaPolicies() {
     .catch(() => {})
     .then(async () => {
       await mkdir(path.dirname(automationPoliciesPath), { recursive: true });
-      await writeFile(automationPoliciesPath, `${JSON.stringify(data, null, 2)}\n`, {
+      const temporaryPath = `${automationPoliciesPath}.${process.pid}.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(data, null, 2)}\n`, {
         mode: 0o600,
       });
+      await rename(temporaryPath, automationPoliciesPath);
     });
   return quotaPoliciesWritePromise;
 }
 
-function scheduleQuotaPolicyCheck(record, cdp, result) {
-  const { request, version } = record;
-  const key = request.taskboardProjectId;
-  const previous = quotaPolicyTimers.get(key);
-  if (previous) clearTimeout(previous);
-  quotaPolicyTimers.delete(key);
-  if (!request.enabledByUser || !request.quotaAware) return;
-
-  const nextRunAt = Number(result.item?.nextRunAt);
-  const nextRunDelay = Number.isFinite(nextRunAt) && nextRunAt > Date.now()
-    ? Math.max(1_000, nextRunAt - Date.now() - 15_000)
-    : 60_000;
-  const resetDelay = result.quota?.state === "blocked"
-    && Number.isFinite(result.quota.resetsAt)
-    ? Math.max(1_000, result.quota.resetsAt * 1_000 - Date.now() + 1_000)
-    : nextRunDelay;
-  const timer = setTimeout(async () => {
-    if (quotaPolicyRecords.get(key)?.version !== version) return;
-    try {
-      await enqueueCurrentQuotaPolicy(key, cdp);
-    } catch (error) {
-      console.error(`Taskboard quota policy check failed: ${error.message}`);
-      const current = quotaPolicyRecords.get(key);
-      if (current?.version === version) {
-        scheduleQuotaPolicyCheck(current, cdp, { quota: { state: "unknown" } });
-      }
-    }
-  }, Math.min(nextRunDelay, resetDelay));
-  timer.unref();
-  quotaPolicyTimers.set(key, timer);
-}
-
-function enqueueQuotaPolicyMutation(record, cdp, rpc) {
+function enqueueQuotaPolicyMutation(record, rpc) {
   const key = record.request.taskboardProjectId;
   const previous = quotaPolicyQueues.get(key) ?? Promise.resolve();
   const run = previous
@@ -819,11 +777,6 @@ function enqueueQuotaPolicyMutation(record, cdp, rpc) {
         () => quotaPolicyRecords.get(key)?.version === current.version,
       );
       if (result.stale) return result;
-      if (result.item?.id && quotaPolicyRecords.get(key)?.version === current.version) {
-        current.request = { ...current.request, automationId: result.item.id };
-        await persistQuotaPolicies();
-      }
-      scheduleQuotaPolicyCheck(current, cdp, result);
       return result;
     });
   const tracked = run.finally(() => {
@@ -833,7 +786,7 @@ function enqueueQuotaPolicyMutation(record, cdp, rpc) {
   return tracked;
 }
 
-async function updateAndApplyQuotaPolicy(request, cdp, rpc) {
+async function updateAndApplyQuotaPolicy(request, rpc) {
   await ensureQuotaPoliciesLoaded();
   const previous = quotaPolicyRecords.get(request.taskboardProjectId);
   const record = {
@@ -843,7 +796,7 @@ async function updateAndApplyQuotaPolicy(request, cdp, rpc) {
   quotaPolicyRecords.set(request.taskboardProjectId, record);
   try {
     await persistQuotaPolicies();
-    return await enqueueQuotaPolicyMutation(record, cdp, rpc);
+    return await enqueueQuotaPolicyMutation(record, rpc);
   } catch (error) {
     if (quotaPolicyRecords.get(request.taskboardProjectId)?.version === record.version) {
       if (previous) quotaPolicyRecords.set(request.taskboardProjectId, previous);
@@ -866,22 +819,23 @@ async function enqueueCurrentQuotaPolicy(projectId, cdp) {
   if (!record) return { stale: true };
   return enqueueQuotaPolicyMutation(
     record,
-    cdp,
     (method, body) => requestCodexAutomationViaCdp(cdp, undefined, method, body),
   );
 }
 
 async function restoreQuotaPolicies(cdp) {
   if (quotaPoliciesRestored) return;
-  quotaPoliciesRestored = true;
+  await pauseLegacyTaskboardAutomations(
+    (method, body) => requestCodexAutomationViaCdp(cdp, undefined, method, body),
+  );
   await ensureQuotaPoliciesLoaded();
-  for (const [projectId, record] of quotaPolicyRecords) {
-    if (record.request.enabledByUser && record.request.quotaAware) {
-      void enqueueCurrentQuotaPolicy(projectId, cdp).catch((error) => {
-        console.error(`Taskboard quota policy restore failed: ${error.message}`);
-      });
-    }
-  }
+  await persistQuotaPolicies();
+  await Promise.all([...quotaPolicyRecords.keys()].map((projectId) => (
+    enqueueCurrentQuotaPolicy(projectId, cdp).catch((error) => {
+      console.error(`Taskboard event policy restore failed: ${error.message}`);
+    })
+  )));
+  quotaPoliciesRestored = true;
 }
 
 async function prefillTaskComposerViaCdp(cdp, executionContextId, request) {
@@ -1043,7 +997,7 @@ async function installTaskboardHostBinding(cdp, supervisor) {
             body,
           );
           const result = request.operation === "apply-policy"
-            ? await updateAndApplyQuotaPolicy(request, cdp, rpc)
+            ? await updateAndApplyQuotaPolicy(request, rpc)
             : await reconcileTaskboardAutomation(request, rpc);
           if (request.operation === "list") {
             const policy = await readStoredAutomationPolicy(request.taskboardProjectId);

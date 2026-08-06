@@ -5,6 +5,7 @@ export type TaskboardServerOptions = {
   databasePath?: string;
   attachmentsDirectory?: string;
   cloudConfigPath?: string;
+  automationPoliciesPath?: string;
   staticDirectory?: string;
   skillPath?: string;
   codexExecutable?: string;

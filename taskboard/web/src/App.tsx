@@ -130,7 +130,6 @@ interface UndoNotice {
 type ColumnVisibilityByProject = Record<string, Partial<Record<TaskStatus, boolean>>>;
 type ProjectAutomationStatus = "ACTIVE" | "PAUSED";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
-type AutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
 
 interface AutomationQuotaStatus {
   state: AutomationQuotaState;
@@ -140,13 +139,11 @@ interface AutomationQuotaStatus {
 }
 
 interface ProjectAutomationRecord {
-  automationId?: string;
   codexProjectId: string;
   status: ProjectAutomationStatus;
   enabledByUser: boolean;
   quotaAware: boolean;
   quota?: AutomationQuotaStatus;
-  intervalMinutes: AutomationIntervalMinutes;
   model: AutomationModel;
   reasoningEffort: AutomationReasoningEffort;
 }
@@ -158,7 +155,6 @@ interface AutomationHostItem {
   status: ProjectAutomationStatus;
   model: AutomationModel;
   reasoningEffort: AutomationReasoningEffort;
-  rrule: string;
 }
 
 interface AutomationHostResponse {
@@ -168,10 +164,8 @@ interface AutomationHostResponse {
   items?: AutomationHostItem[];
   quota?: AutomationQuotaStatus;
   policy?: {
-    automationId?: string;
     enabledByUser: boolean;
     quotaAware: boolean;
-    intervalMinutes: AutomationIntervalMinutes;
     model: AutomationModel;
     reasoningEffort: AutomationReasoningEffort;
   };
@@ -200,7 +194,6 @@ const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
 const DEFAULT_AUTOMATION_OPTIONS = {
   enabledByUser: false,
   quotaAware: false,
-  intervalMinutes: 5,
   model: "gpt-5.5",
   reasoningEffort: "high",
 } as const;
@@ -271,26 +264,21 @@ function readProjectAutomations(): ProjectAutomations {
       const enabledByUser = candidate.enabledByUser ?? candidate.status === "ACTIVE";
       const quotaAware = candidate.quotaAware ?? false;
       if (
-        (candidate.automationId !== undefined && typeof candidate.automationId !== "string")
-        || typeof candidate.codexProjectId !== "string"
+        typeof candidate.codexProjectId !== "string"
         || (candidate.status !== "ACTIVE" && candidate.status !== "PAUSED")
-        || !isAutomationIntervalMinutes(candidate.intervalMinutes ?? 5)
         || !isAutomationModel(model)
         || !isAutomationReasoningEffort(reasoningEffort)
         || !isSupportedModelEffort(model, reasoningEffort)
-        || (candidate.status === "ACTIVE" && !candidate.automationId)
         || typeof enabledByUser !== "boolean"
         || typeof quotaAware !== "boolean"
       ) continue;
       const quota = isAutomationQuotaStatus(candidate.quota) ? candidate.quota : undefined;
       result[projectId] = {
-        automationId: candidate.automationId,
         codexProjectId: candidate.codexProjectId,
         status: candidate.status,
         enabledByUser,
         quotaAware,
         ...(quota ? { quota } : {}),
-        intervalMinutes: candidate.intervalMinutes ?? 5,
         model,
         reasoningEffort,
       };
@@ -320,23 +308,12 @@ function isAutomationHostPolicy(
 ): value is NonNullable<AutomationHostResponse["policy"]> {
   return Boolean(
     value
-    && (value.automationId === undefined || typeof value.automationId === "string")
     && typeof value.enabledByUser === "boolean"
     && typeof value.quotaAware === "boolean"
-    && isAutomationIntervalMinutes(value.intervalMinutes)
     && isAutomationModel(value.model)
     && isAutomationReasoningEffort(value.reasoningEffort)
     && isSupportedModelEffort(value.model, value.reasoningEffort),
   );
-}
-
-function isAutomationIntervalMinutes(value: unknown): value is AutomationIntervalMinutes {
-  return value === 5 || value === 10 || value === 15 || value === 30 || value === 60;
-}
-
-function intervalMinutesFromRrule(value: string): AutomationIntervalMinutes | null {
-  const match = /^RRULE:FREQ=MINUTELY;INTERVAL=(5|10|15|30|60)$/.exec(value);
-  return match ? Number(match[1]) as AutomationIntervalMinutes : null;
 }
 
 function readColumnVisibilityByProject(): ColumnVisibilityByProject {
@@ -380,8 +357,6 @@ function isAutomationHostItem(value: unknown): value is AutomationHostItem {
     && isAutomationModel(item.model)
     && isAutomationReasoningEffort(item.reasoningEffort)
     && isSupportedModelEffort(item.model, item.reasoningEffort)
-    && typeof item.rrule === "string"
-    && intervalMinutesFromRrule(item.rrule) !== null
   );
 }
 
@@ -713,13 +688,11 @@ export function App() {
     setProjectAutomations((current) => {
       if (
         record
-        && current[projectId]?.automationId === record.automationId
         && current[projectId]?.codexProjectId === record.codexProjectId
         && current[projectId]?.status === record.status
         && current[projectId]?.enabledByUser === record.enabledByUser
         && current[projectId]?.quotaAware === record.quotaAware
         && JSON.stringify(current[projectId]?.quota) === JSON.stringify(record.quota)
-        && current[projectId]?.intervalMinutes === record.intervalMinutes
         && current[projectId]?.model === record.model
         && current[projectId]?.reasoningEffort === record.reasoningEffort
       ) {
@@ -738,9 +711,8 @@ export function App() {
     operation: "ensure-active" | "pause" | "list" | "apply-policy",
     options: Pick<
       ProjectAutomationRecord,
-      "enabledByUser" | "quotaAware" | "intervalMinutes" | "model" | "reasoningEffort"
+      "enabledByUser" | "quotaAware" | "model" | "reasoningEffort"
     >,
-    automationId?: string,
   ) => {
     if (
       !selectedProject
@@ -769,10 +741,8 @@ export function App() {
         projectName: selectedProject.name,
         workspacePath: automationProjectContext.workspacePath,
         skillPath: manageTaskboardSkillPath,
-        ...(automationId ? { automationId } : {}),
         enabledByUser: options.enabledByUser,
         quotaAware: options.quotaAware,
-        intervalMinutes: options.intervalMinutes,
         model: options.model,
         reasoningEffort: options.reasoningEffort,
       },
@@ -803,54 +773,18 @@ export function App() {
       const response = await sendAutomationRequest(
         stored ? "apply-policy" : "list",
         options,
-        stored?.automationId,
       );
-      const items = Array.isArray(response.items)
-        ? response.items.filter(isAutomationHostItem)
-        : [];
-      if (!stored) {
-        const policy = isAutomationHostPolicy(response.policy) ? response.policy : null;
-        if (!policy) return;
-        const item = items.find((candidate) => candidate.id === policy.automationId)
-          ?? (items.length === 1 ? items[0] : undefined);
-        writeProjectAutomation(selectedProjectId, {
-          automationId: item?.id ?? policy.automationId,
-          codexProjectId: automationProjectContext.codexProjectId,
-          status: item?.status ?? "PAUSED",
-          enabledByUser: policy.enabledByUser,
-          quotaAware: policy.quotaAware,
-          intervalMinutes: policy.intervalMinutes,
-          model: policy.model,
-          reasoningEffort: policy.reasoningEffort,
-        });
-        return;
-      }
-      const item = (isAutomationHostItem(response.item) ? response.item : undefined)
-        ?? items.find((item) => item.id === stored?.automationId)
-        ?? (items.length === 1 ? items[0] : undefined);
-      if (!item) {
-        if (stored) {
-          writeProjectAutomation(selectedProjectId, {
-            ...stored,
-            automationId: undefined,
-            status: "PAUSED",
-            ...(response.quota ? { quota: response.quota } : {}),
-          });
-        }
-        return;
-      }
-      const intervalMinutes = intervalMinutesFromRrule(item.rrule);
-      if (!intervalMinutes) return;
+      const policy = isAutomationHostPolicy(response.policy) ? response.policy : stored;
+      if (!policy) return;
+      const item = isAutomationHostItem(response.item) ? response.item : undefined;
       writeProjectAutomation(selectedProjectId, {
-        automationId: item.id,
         codexProjectId: automationProjectContext.codexProjectId,
-        status: item.status,
-        enabledByUser: stored.enabledByUser,
-        quotaAware: stored.quotaAware,
+        status: item?.status ?? (policy.enabledByUser ? "ACTIVE" : "PAUSED"),
+        enabledByUser: policy.enabledByUser,
+        quotaAware: policy.quotaAware,
         ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes,
-        model: item.model,
-        reasoningEffort: item.reasoningEffort,
+        model: item?.model ?? policy.model,
+        reasoningEffort: item?.reasoningEffort ?? policy.reasoningEffort,
       });
     } catch (error) {
       setAutomationError(error instanceof Error ? error.message : "无法读取自动化状态");
@@ -868,7 +802,6 @@ export function App() {
   const saveProjectAutomation = useCallback(async (options: {
     enabledByUser: boolean;
     quotaAware: boolean;
-    intervalMinutes: AutomationIntervalMinutes;
     model: AutomationModel;
     reasoningEffort: AutomationReasoningEffort;
   }) => {
@@ -884,16 +817,14 @@ export function App() {
     setAutomationPending(true);
     setAutomationError(null);
     try {
-      const response = await sendAutomationRequest("apply-policy", options, stored?.automationId);
+      const response = await sendAutomationRequest("apply-policy", options);
       const item = isAutomationHostItem(response.item) ? response.item : undefined;
       writeProjectAutomation(selectedProjectId, {
-        automationId: item?.id,
         codexProjectId: automationProjectContext.codexProjectId,
-        status: item?.status ?? "PAUSED",
+        status: item?.status ?? (options.enabledByUser ? "ACTIVE" : "PAUSED"),
         enabledByUser: options.enabledByUser,
         quotaAware: options.quotaAware,
         ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes: options.intervalMinutes,
         model: options.model,
         reasoningEffort: options.reasoningEffort,
       });
@@ -985,7 +916,9 @@ export function App() {
 
   useEffect(() => {
     setAutomationError(null);
-    void reconcileProjectAutomation();
+    reconcileProjectAutomation().catch((error) => {
+      setAutomationError(error instanceof Error ? error.message : "无法读取自动化状态");
+    });
   }, [selectedProjectId, reconcileProjectAutomation]);
 
   useEffect(() => {

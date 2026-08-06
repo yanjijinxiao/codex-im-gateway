@@ -174,6 +174,7 @@ test("concurrent issue creation has unique identifiers and stale writes return 4
     json: { version: task.version, title: "Winner" },
   });
   assert.equal(winner.response.status, 200);
+  assert.equal(winner.body.previousStatus, task.status);
 
   const stale = await cloud.request(`/api/tasks/${task.id}`, {
     method: "PATCH",
@@ -335,6 +336,7 @@ test("task lifecycle keeps optimistic versions and never persists a worktree pat
   });
   assert.equal(moved.response.status, 200);
   assert.equal(moved.body.task.status, "in_progress");
+  assert.equal(moved.body.previousStatus, created.body.task.status);
 
   const archived = await cloud.request(`/api/tasks/${created.body.task.id}/archive`, {
     method: "POST",
