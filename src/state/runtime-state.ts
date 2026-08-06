@@ -272,7 +272,8 @@ export class RuntimeStateStore {
 
   setSessionCollaborationMode(sessionId: string, mode: "default" | "plan"): ManagedSession {
     const session = this.mutableSession(sessionId);
-    session.collaborationMode = mode;
+    if (mode === "plan") session.collaborationMode = mode;
+    else delete session.collaborationMode;
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -761,7 +762,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     }
     session.projectId = project.id;
     session.mode = session.mode === "qa" ? "qa" : "session";
-    session.collaborationMode = session.collaborationMode === "plan" ? "plan" : "default";
+    if (session.collaborationMode !== "plan") delete session.collaborationMode;
     if (session.knowledgeBaseId && !knowledgeBases.some((item) => item.id === session.knowledgeBaseId)) {
       delete session.knowledgeBaseId;
     }

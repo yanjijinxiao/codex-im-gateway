@@ -70,6 +70,42 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
   });
   assert.match(replies.at(-1) ?? "", /model: gpt-test/);
   assert.match(replies.at(-1) ?? "", /effort: high/);
+  assert.match(replies.at(-1) ?? "", /普通对话（未附加模式）/);
+});
+
+test("does not send an experimental collaboration mode for an ordinary bound session", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-neutral-session-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Bridge", root);
+  const session = stateStore.createSession("alice@im.wechat", project.workspace, "历史会话", project.id);
+  stateStore.setSessionCollaborationMode(session.id, "default");
+  let sentCollaborationMode: unknown = Symbol("not-called");
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["alice@im.wechat"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText() { return { messageId: "text" }; }
+    } as never,
+    runner: {
+      async run(input: { collaborationMode?: unknown }) {
+        sentCollaborationMode = input.collaborationMode;
+        return { raw: "", text: "普通回复", threadId: "thread-neutral" };
+      },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({
+    id: "ordinary-chat",
+    senderId: "alice@im.wechat",
+    text: "当前会话模式应该是普通对话，不应该默认进入目标或计划",
+    attachments: [],
+    raw: {}
+  });
+
+  assert.equal(sentCollaborationMode, undefined);
 });
 
 test("uses the channel default mode and lets a project binding override the channel Q&A knowledge base", async (t) => {

@@ -110,6 +110,25 @@ test("includes actor and conversation identity in classifier context", async () 
   ]);
 });
 
+test("instructs the AI to keep mode and goal product discussions in ordinary chat", async () => {
+  let classifierPrompt = "";
+  const resolver = new AiChannelIntentResolver(async (prompt) => {
+    classifierPrompt = prompt;
+    return JSON.stringify({ schemaVersion: 2, kind: "ordinary_chat", actions: [] });
+  });
+
+  await resolver.resolve({
+    text: "为什么会话模式默认进入目标，目标和计划也应该正常回复对话内容",
+    actorId: "alice",
+    conversationId: "alice",
+    conversationKind: "direct",
+    currentProjectName: "Bridge",
+    projectNames: ["Bridge"]
+  });
+
+  assert.match(classifierPrompt, /讨论或质疑.*模式.*目标.*计划.*ordinary_chat/);
+});
+
 test("resolves one action compatibly and multiple actions as an ordered sequence", async () => {
   const outputs = [
     {

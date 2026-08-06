@@ -203,8 +203,10 @@ test("keeps project mode, plan mode, and goals on the selected project's thread"
     { version: 1, command: "mode", arg: "qa" }
   ]);
 
+  stateStore.setSessionCollaborationMode(secondSession.id, "plan");
   await send("session-mode", "/mode session");
   assert.equal(stateStore.getActiveSession("oc_test")?.id, secondSession.id);
+  assert.equal(stateStore.getActiveSession("oc_test")?.collaborationMode, undefined);
   assert.deepEqual(
     cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.command)),
     ["sessions", "plan", "goal"]
@@ -220,12 +222,96 @@ test("keeps project mode, plan mode, and goals on the selected project's thread"
     ]
   );
 
+  await send("plan-off", "/plan off");
+  assert.equal(stateStore.getActiveSession("oc_test")?.collaborationMode, undefined);
+  assert.equal(cards[3]?.title, "已回到普通对话");
+
   await send("goal", "/goal");
   assert.deepEqual(goalThreads, ["thread-second"]);
   assert.deepEqual(
-    cards[3].actionGroups.flatMap((group) => group.map((action) => action.value.command)),
+    cards[4].actionGroups.flatMap((group) => group.map((action) => action.value.command)),
     ["goal", "goal", "goal", "goal"]
   );
+});
+
+test("natural plan and goal actions continue the original message while slash controls stay card-only", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-conversational-controls-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  const project = stateStore.createProject("Bridge", root);
+  const session = stateStore.createSession("oc_test", project.workspace, "对话", project.id);
+  stateStore.setSessionThread(session.id, "thread-existing");
+  const runs: Array<{ prompt: string; collaborationMode?: "default" | "plan" }> = [];
+  const replies: string[] = [];
+  const goals: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
+    stateStore,
+    weixin: {
+      async sendTyping() {},
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `text-${replies.length}` };
+      },
+      async sendActionCard() { return { messageId: "card" }; }
+    } as never,
+    intentResolver: {
+      async resolve(input) {
+        if (input.text.startsWith("先规划")) {
+          return { kind: "command", command: { name: "plan", arg: "on" } };
+        }
+        return { kind: "command", command: { name: "goal", arg: "set 完成渠道交互" } };
+      }
+    },
+    runner: {
+      async run(input: { prompt: string; collaborationMode?: "default" | "plan" }) {
+        runs.push(input);
+        return { raw: "", text: `正常回复 ${runs.length}`, threadId: "thread-existing" };
+      },
+      async setGoal(_threadId: string, input: { objective?: string }) {
+        goals.push(input.objective ?? "");
+        return {
+          objective: input.objective ?? "",
+          status: "active" as const,
+          tokensUsed: 0,
+          timeUsedSeconds: 0
+        };
+      },
+      async stop() {}
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "oc_test",
+    text,
+    attachments: [],
+    raw: {}
+  });
+
+  await send("slash-plan", "/plan on");
+  await send("slash-plan-off", "/plan off");
+  assert.equal(runs.length, 0);
+
+  await send("natural-plan", "先规划一下渠道交互，然后给我方案");
+  await send("slash-plan-off-again", "/plan off");
+  await send("natural-goal", "目标是完成渠道交互，请告诉我下一步");
+
+  assert.equal(runs.length, 2);
+  assert.match(runs[0]?.prompt ?? "", /先规划一下渠道交互/);
+  assert.equal(runs[0]?.collaborationMode, "plan");
+  assert.match(runs[1]?.prompt ?? "", /目标是完成渠道交互/);
+  assert.equal(runs[1]?.collaborationMode, undefined);
+  assert.deepEqual(goals, ["完成渠道交互"]);
+  assert.deepEqual(replies, ["正常回复 1", "正常回复 2"]);
+
+  stateStore.resetSession(session.id);
+  await send("natural-goal-new-thread", "目标是完成渠道交互，请直接开始");
+
+  assert.equal(runs.length, 3);
+  assert.equal(runs[2]?.collaborationMode, undefined);
+  assert.equal(stateStore.getActiveSession("oc_test")?.threadId, "thread-existing");
+  assert.deepEqual(goals, ["完成渠道交互", "完成渠道交互"]);
+  assert.deepEqual(replies, ["正常回复 1", "正常回复 2", "正常回复 3"]);
 });
 
 test("Bridge renders approval decisions as buttons on interactive channels", async (t) => {

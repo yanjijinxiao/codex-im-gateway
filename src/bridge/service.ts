@@ -4,7 +4,12 @@ import path from "node:path";
 import { AccessController } from "./access.js";
 import { ChannelApprovalController } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
-import { commandProjectRequirement, requiredModeForCommand } from "./channel-command-policy.js";
+import {
+  commandProjectRequirement,
+  friendlyCommandsContinueConversation,
+  isGoalSetCommand,
+  requiredModeForCommand
+} from "./channel-command-policy.js";
 import {
   commandsFromFriendlyChannelIntent,
   type ChannelCommand,
@@ -187,6 +192,10 @@ export class BridgeService {
     const commands = slashCommand
       ? [slashCommand]
       : commandsFromFriendlyChannelIntent(friendlyIntent);
+    const continueAsConversation = Boolean(
+      !slashCommand && commands && friendlyCommandsContinueConversation(commands)
+    );
+    const deferredCommands: ChannelCommand[] = [];
     if (commands) {
       for (const command of commands) {
         const requiredMode = requiredModeForCommand(command);
@@ -201,9 +210,17 @@ export class BridgeService {
           await this.replyProjectRequired(replyTargetId);
           return;
         }
+        if (
+          continueAsConversation
+          && isGoalSetCommand(command)
+          && !this.executionSession(replyTargetId)?.threadId
+        ) {
+          deferredCommands.push(command);
+          continue;
+        }
         await this.handleCommand(scopedMessage, command);
       }
-      return;
+      if (!continueAsConversation) return;
     }
 
     if (!this.ensureBoundProjectContext(replyTargetId)) {
@@ -228,6 +245,9 @@ export class BridgeService {
     }
 
     await this.runCodexTurn(scopedMessage, "", items);
+    for (const command of deferredCommands) {
+      await this.handleCommand(scopedMessage, command);
+    }
   }
 
   private async resolveFriendlyChannelIntent(
@@ -585,6 +605,7 @@ export class BridgeService {
       const session = existing
         ? this.options.stateStore.activateSession(existing.id)
         : this.options.stateStore.createSession(senderId, project.workspace, undefined, project.id);
+      this.options.stateStore.setSessionCollaborationMode(session.id, "default");
       this.options.stateStore.setInteractionMode(senderId, "session");
       await this.replyActionCard(senderId, createChoiceCard({
         title: "已进入会话模式",
@@ -721,14 +742,14 @@ export class BridgeService {
         : session.collaborationMode === "plan" ? "default" : "plan";
     this.options.stateStore.setSessionCollaborationMode(session.id, mode);
     await this.replyActionCard(senderId, createChoiceCard({
-      title: mode === "plan" ? "已开启计划模式" : "已回到执行模式",
+      title: mode === "plan" ? "已开启计划模式" : "已回到普通对话",
       template: mode === "plan" ? "blue" : "green",
       body: mode === "plan"
-        ? "下一条消息将使用 Codex 原生 plan collaboration mode，适合先澄清和形成方案。"
-        : "下一条消息将使用默认协作模式，可以继续执行和修改项目。",
-      fallbackText: mode === "plan" ? "已开启 Codex 计划模式。" : "已关闭 Codex 计划模式。",
+        ? "下一条消息起，Codex 会在同一会话中使用原生计划能力，并正常回复澄清问题和方案。"
+        : "已移除计划协作状态。下一条消息起使用不附加任何模式的普通对话。",
+      fallbackText: mode === "plan" ? "已开启 Codex 计划模式。" : "已回到普通对话。",
       choices: [
-        { label: mode === "plan" ? "切到执行模式" : "切到计划模式", command: "plan", arg: "toggle", style: "primary" },
+        { label: mode === "plan" ? "回到普通对话" : "切到计划模式", command: "plan", arg: "toggle", style: "primary" },
         { label: "查看目标", command: "goal", arg: "" }
       ]
     }));
@@ -792,7 +813,8 @@ export class BridgeService {
       body: [
         goal.objective,
         `已使用 ${goal.tokensUsed} tokens · ${formatDuration(goal.timeUsedSeconds)}`,
-        goal.tokenBudget ? `预算 ${goal.tokenBudget} tokens` : "未设置 token 预算"
+        goal.tokenBudget ? `预算 ${goal.tokenBudget} tokens` : "未设置 token 预算",
+        "继续直接发送消息，Codex 会在这个目标下正常回复；清除目标后回到无目标的普通对话。"
       ].join("\n\n"),
       fallbackText: `Codex 目标：${goal.objective}（${formatGoalStatus(goal.status)}）`,
       choices: goal.status === "active"
@@ -1404,7 +1426,7 @@ export class BridgeService {
           queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
-          collaborationMode: session.collaborationMode ?? "default",
+          collaborationMode: session.collaborationMode === "plan" ? "plan" : undefined,
           ...(qaContext ? {
             dynamicTools: llmWikiDynamicTools(),
             onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
@@ -1614,7 +1636,7 @@ export class BridgeService {
       `问答知识库：${knowledgeBase?.name ?? "未绑定"}`,
       `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
       `会话：${session?.title ?? "新会话"}`,
-      `协作模式：${session?.collaborationMode === "plan" ? "计划" : "执行"}`,
+      `对话状态：${session?.collaborationMode === "plan" ? "计划协作" : "普通对话（未附加模式）"}`,
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,
       `backend：${this.options.config.codexBackend}`,

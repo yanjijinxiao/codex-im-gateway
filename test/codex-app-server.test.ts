@@ -220,7 +220,7 @@ test("routes Codex request_user_input through a channel-native answer handler", 
   assert.equal(result.text, "input:方案 A");
 });
 
-test("propagates plan collaboration mode and manages native thread goals", async (t) => {
+test("declares experimentalApi before starting plan collaboration mode and manages native thread goals", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
     requestTimeoutMs: 2_000

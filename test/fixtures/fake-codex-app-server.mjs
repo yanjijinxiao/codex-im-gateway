@@ -4,6 +4,7 @@ import readline from "node:readline";
 
 const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
+let experimentalApiEnabled = false;
 let nextTurn = 1;
 const activeTurns = new Map();
 const pendingApprovals = new Map();
@@ -51,6 +52,7 @@ rl.on("line", (line) => {
       fail(message.id, "missing codex-channel-bridge clientInfo");
       return;
     }
+    experimentalApiEnabled = message.params?.capabilities?.experimentalApi === true;
     respond(message.id, {
       userAgent: "fake-codex",
       codexHome: "/tmp/fake-codex-home",
@@ -298,9 +300,15 @@ rl.on("line", (line) => {
       fail(message.id, "intent classification must use an ephemeral read-only thread with output schema");
       return;
     }
-    if (prompt === "plan-mode" && message.params?.collaborationMode?.mode !== "plan") {
-      fail(message.id, "turn/start must propagate plan collaboration mode");
-      return;
+    if (prompt === "plan-mode") {
+      if (!experimentalApiEnabled) {
+        fail(message.id, "turn/start.collaborationMode requires experimentalApi capability");
+        return;
+      }
+      if (message.params?.collaborationMode?.mode !== "plan") {
+        fail(message.id, "turn/start must propagate plan collaboration mode");
+        return;
+      }
     }
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });

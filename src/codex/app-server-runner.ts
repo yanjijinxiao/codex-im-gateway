@@ -441,7 +441,7 @@ export class AppServerCodexRunner {
           version: "0.2.0"
         },
         capabilities: {
-          experimentalApi: false,
+          experimentalApi: true,
           requestAttestation: false
         }
       }, Math.min(this.options.requestTimeoutMs ?? 600_000, 60_000));

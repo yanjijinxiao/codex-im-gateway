@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   commandProjectRequirement,
+  friendlyCommandsContinueConversation,
+  isGoalSetCommand,
   requiredModeForCommand
 } from "../src/bridge/channel-command-policy.js";
 
@@ -32,4 +34,23 @@ test("preserves the exact command mode policy", () => {
   assert.equal(requiredModeForCommand({ name: "mode", arg: "session" }), "session");
   assert.equal(requiredModeForCommand({ name: "mode", arg: "task" }), "task");
   assert.equal(requiredModeForCommand({ name: "mode", arg: "qa" }), "qa");
+});
+
+test("continues only conversational plan starts and goal creation", () => {
+  const planOn = { name: "plan", arg: "on" };
+  const goalSet = { name: "goal", arg: "set 完成渠道交互" };
+  assert.equal(friendlyCommandsContinueConversation([planOn]), true);
+  assert.equal(friendlyCommandsContinueConversation([goalSet]), true);
+  assert.equal(friendlyCommandsContinueConversation([planOn, goalSet]), true);
+  assert.equal(isGoalSetCommand(goalSet), true);
+
+  for (const command of [
+    { name: "plan", arg: "off" },
+    { name: "goal", arg: "" },
+    { name: "goal", arg: "clear" },
+    { name: "status", arg: "" }
+  ]) {
+    assert.equal(friendlyCommandsContinueConversation([command]), false);
+    assert.equal(isGoalSetCommand(command), false);
+  }
 });

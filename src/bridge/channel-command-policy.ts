@@ -49,3 +49,19 @@ export function requiredModeForCommand(command: ChannelCommand): ProjectInteract
       return undefined;
   }
 }
+
+export function friendlyCommandsContinueConversation(commands: readonly ChannelCommand[]): boolean {
+  return commands.some((command) => (
+    isPlanStartCommand(command) || isGoalSetCommand(command)
+  ));
+}
+
+export function isGoalSetCommand(command: ChannelCommand): boolean {
+  return command.name === "goal" && /^set\s+\S/is.test(command.arg.trim());
+}
+
+function isPlanStartCommand(command: ChannelCommand): boolean {
+  if (command.name !== "plan") return false;
+  const arg = command.arg.trim().toLowerCase();
+  return arg === "on" || arg === "plan";
+}
