@@ -88,7 +88,6 @@ export async function inspectLlmWikiKnowledgeBase(
   knowledgeBase: ManagedKnowledgeBase
 ): Promise<LlmWikiInspection> {
   assertDirectory(knowledgeBase.rootPath, "知识库根目录");
-  assertDirectory(path.join(knowledgeBase.rootPath, "wiki"), "llm-wiki 的 wiki 目录");
   if (knowledgeBase.stateDir) assertDirectory(knowledgeBase.stateDir, "llm-wiki state 目录");
   const command = resolveLlmWikiCommand(knowledgeBase);
   const args = ["status", knowledgeBase.rootPath, "--json"];
