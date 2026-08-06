@@ -141,6 +141,46 @@ test("captures a completion appended while existing sessions are still initializ
   assert.equal(completions[0]?.text, "启动写入已保留");
 });
 
+test("stops emitting completed turns once a live Codex session is archived", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-archive-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const workspace = path.join(root, "project");
+  const codexHome = path.join(root, ".codex");
+  const sessionDir = path.join(codexHome, "sessions", "2026", "08", "01");
+  const archivedSessionDir = path.join(codexHome, "archived_sessions");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.mkdirSync(archivedSessionDir, { recursive: true });
+  const liveSession = path.join(sessionDir, "session.jsonl");
+  writeLines(liveSession, [
+    sessionMeta("archived-session", workspace),
+    taskStarted("historical-turn"),
+    userMessage("归档前已经完成的任务"),
+    taskComplete("historical-turn", "历史结果")
+  ]);
+  const completions: CodexSessionCompletion[] = [];
+  const monitor = new CodexSessionCompletionMonitor({
+    codexHome,
+    pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"),
+    onCompletion: (completion) => completions.push(completion)
+  });
+  monitor.start();
+  t.after(() => monitor.stop());
+  await monitor.ready();
+
+  const archivedSession = path.join(archivedSessionDir, "session.jsonl");
+  fs.renameSync(liveSession, archivedSession);
+  appendLines(archivedSession, [
+    taskStarted("post-archive-turn"),
+    userMessage("归档后继续写入的任务"),
+    taskComplete("post-archive-turn", "归档后结果")
+  ]);
+  await monitor.scanNow();
+
+  assert.deepEqual(completions, []);
+});
+
 test("does not emit restored task state after the monitor is stopped", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-stop-init-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

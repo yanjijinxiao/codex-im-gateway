@@ -167,7 +167,7 @@ export class CodexSessionCompletionMonitor {
   }
 
   private sessionRoots(): string[] {
-    return [path.join(this.codexHome, "sessions"), path.join(this.codexHome, "archived_sessions")];
+    return [path.join(this.codexHome, "sessions")];
   }
 
   private watchRoot(root: string): void {
