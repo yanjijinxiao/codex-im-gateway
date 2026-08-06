@@ -21,10 +21,14 @@ export class EmbeddedTaskboardStartError extends Error {
 export async function startEmbeddedTaskboard(options: {
   dataDirectory: string;
   port: number;
+  codexExecutable?: string;
 }): Promise<EmbeddedTaskboard> {
   const existing = await reuseHealthyTaskboard(options.port);
   if (existing) return existing;
-  const taskboard = createTaskboardServer({ dataDirectory: options.dataDirectory });
+  const taskboard = createTaskboardServer({
+    dataDirectory: options.dataDirectory,
+    codexExecutable: options.codexExecutable
+  });
   try {
     const address = await taskboard.listen({ host: "127.0.0.1", port: options.port });
     if (!isAddressInfo(address)) {

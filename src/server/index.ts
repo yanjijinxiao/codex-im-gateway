@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import open from "open";
 
+import { resolveCodexCommand } from "../codex/exec-runner.js";
 import { loadConfig } from "../state/config.js";
 import { resolveStatePaths } from "../state/paths.js";
 import { embeddedTaskboardPort, startEmbeddedTaskboard, type EmbeddedTaskboard } from "../taskboard/embedded-server.js";
@@ -57,9 +58,13 @@ async function main(): Promise<void> {
   };
   try {
     if (config.taskboardEnabled) {
+      const codexCommand = resolveCodexCommand(config.codexBin);
       taskboard = await startEmbeddedTaskboard({
         dataDirectory: paths.taskboardDir,
-        port: embeddedTaskboardPort(config.taskboardUrl)
+        port: embeddedTaskboardPort(config.taskboardUrl),
+        codexExecutable: codexCommand.argsPrefix.length === 0
+          ? codexCommand.command
+          : config.codexBin
       });
     }
     server = await startLocalHttpServer({ paths, accountManager, port, onUpdateInstalled: scheduleRestart });
