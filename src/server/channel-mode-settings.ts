@@ -43,13 +43,20 @@ async function resolveQaKnowledgeBase(
       const knowledgeBase = store.listKnowledgeBases()
         .find((candidate) => candidate.id === selection.knowledgeBaseId);
       if (!knowledgeBase) throw new Error(`Managed knowledge base not found: ${selection.knowledgeBaseId}`);
+      await llmWiki.inspect(knowledgeBase);
       return knowledgeBase.id;
     }
     case "directory": {
       const rootPath = path.resolve(selection.rootPath);
       const existing = store.listKnowledgeBases().find((candidate) => candidate.rootPath === rootPath);
       if (existing) {
-        await llmWiki.inspect(existing);
+        const update = {
+          ...(selection.name !== undefined ? { name: selection.name } : {}),
+          ...(selection.engineRoot !== undefined ? { engineRoot: path.resolve(selection.engineRoot) } : {}),
+          ...(selection.stateDir !== undefined ? { stateDir: path.resolve(selection.stateDir) } : {})
+        };
+        await llmWiki.inspect({ ...existing, ...update });
+        if (Object.keys(update).length) store.updateKnowledgeBase(existing.id, update);
         return existing.id;
       }
       const now = new Date().toISOString();

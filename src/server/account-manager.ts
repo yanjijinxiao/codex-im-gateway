@@ -567,7 +567,7 @@ export class AccountManager {
   async createKnowledgeBase(
     accountId: string,
     input: { name: string; rootPath: string; engineRoot?: string; stateDir?: string }
-  ): Promise<AccountKnowledgeBase> {
+  ): Promise<{ knowledgeBase: AccountKnowledgeBase; inspection: LlmWikiInspection }> {
     const now = new Date().toISOString();
     const candidate: ManagedKnowledgeBase = {
       id: "validation",
@@ -578,9 +578,12 @@ export class AccountManager {
       createdAt: now,
       updatedAt: now
     };
-    await this.llmWiki.inspect(candidate);
+    const inspection = await this.llmWiki.inspect(candidate);
     const knowledgeBase = this.storeFor(accountId).createKnowledgeBase(input.name, input.rootPath, input);
-    return { ...knowledgeBase, accountId, boundProjects: [], channelDefault: false };
+    return {
+      knowledgeBase: { ...knowledgeBase, accountId, boundProjects: [], channelDefault: false },
+      inspection
+    };
   }
 
   async updateKnowledgeBase(

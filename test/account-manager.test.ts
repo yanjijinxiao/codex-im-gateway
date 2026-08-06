@@ -687,6 +687,67 @@ test("configures channel modes from a validated llm-wiki directory", async (t) =
   assert.deepEqual(loadAccount(paths, "account-one").modeSettings, configured.modeSettings);
 });
 
+test("revalidates an existing knowledge base and applies a corrected project CLI root atomically", async (t) => {
+  // Given
+  const inspected: Array<{ id: string; engineRoot?: string }> = [];
+  const { manager, paths, root } = setup(t, {
+    llmWiki: {
+      async inspect(knowledgeBase: { id: string; engineRoot?: string }) {
+        inspected.push({ id: knowledgeBase.id, engineRoot: knowledgeBase.engineRoot });
+        return { command: "llm-wiki", status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 } };
+      },
+      invalidate() {}
+    }
+  });
+  const store = new RuntimeStateStore(accountStatePaths(paths, "account-one"));
+  const rootPath = path.join(root, "product-wiki");
+  const oldEngineRoot = path.join(root, "old-engine");
+  const correctedEngineRoot = path.join(rootPath, "tools", "knowledge-base");
+  const knowledgeBase = store.createKnowledgeBase("产品 Wiki", rootPath, { engineRoot: oldEngineRoot });
+
+  // When
+  const configured = await manager.updateAccountModeSettings("account-one", {
+    defaultMode: "qa",
+    enabledModes: ["session", "qa"],
+    qaKnowledgeBase: {
+      kind: "directory",
+      rootPath,
+      engineRoot: correctedEngineRoot
+    }
+  });
+
+  // Then
+  assert.deepEqual(inspected, [{ id: knowledgeBase.id, engineRoot: correctedEngineRoot }]);
+  assert.equal(manager.listKnowledgeBases("account-one")[0]?.engineRoot, correctedEngineRoot);
+  assert.equal(configured.modeSettings.qaKnowledgeBaseId, knowledgeBase.id);
+});
+
+test("revalidates a managed knowledge base before selecting it as the channel default", async (t) => {
+  // Given
+  const inspectedIds: string[] = [];
+  const { manager, paths, root } = setup(t, {
+    llmWiki: {
+      async inspect(knowledgeBase: { id: string }) {
+        inspectedIds.push(knowledgeBase.id);
+        return { command: "llm-wiki", status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 } };
+      },
+      invalidate() {}
+    }
+  });
+  const knowledgeBase = new RuntimeStateStore(accountStatePaths(paths, "account-one"))
+    .createKnowledgeBase("产品 Wiki", path.join(root, "product-wiki"));
+
+  // When
+  await manager.updateAccountModeSettings("account-one", {
+    defaultMode: "qa",
+    enabledModes: ["session", "qa"],
+    qaKnowledgeBase: { kind: "managed", knowledgeBaseId: knowledgeBase.id }
+  });
+
+  // Then
+  assert.deepEqual(inspectedIds, [knowledgeBase.id]);
+});
+
 test("does not validate or register a hidden Q&A directory when Q&A is disabled", async (t) => {
   // Given
   let inspectionCount = 0;

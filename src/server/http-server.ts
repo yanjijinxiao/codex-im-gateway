@@ -303,9 +303,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   if (method === "POST" && url.pathname === "/api/knowledge-bases") {
     const body = knowledgeBaseCreateSchema.parse(await readJsonBody(request));
-    const knowledgeBase = await context.accountManager.createKnowledgeBase(body.accountId, body);
-    const inspection = await context.accountManager.inspectKnowledgeBase(body.accountId, knowledgeBase.id);
-    sendJson(response, 201, { knowledgeBase, inspection });
+    sendJson(response, 201, await context.accountManager.createKnowledgeBase(body.accountId, body));
     return;
   }
   if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;

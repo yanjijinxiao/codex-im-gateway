@@ -43,6 +43,7 @@ rl.on("line", (line) => {
 
   const inspection = await pool.inspect(knowledgeBase);
   assert.equal(inspection.command, command);
+  assert.equal(inspection.transport, "mcp");
   assert.deepEqual(inspection.status, {
     documentCount: 3,
     blockCount: 12,
@@ -56,6 +57,128 @@ rl.on("line", (line) => {
   const namespace = llmWikiDynamicTools()[0] as { name: string; tools: Array<{ name: string }> };
   assert.equal(namespace.name, "knowledge");
   assert.deepEqual(namespace.tools.map((tool) => tool.name), ["search", "get_document"]);
+});
+
+test("uses an installed legacy read-only CLI when the knowledge engine has no MCP command", async (t) => {
+  // Given
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-legacy-llm-wiki-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const engineRoot = path.join(root, "vault");
+  const commandDir = path.join(engineRoot, "tools", "knowledge-base", ".venv", "bin");
+  const fallbackCommand = path.join(root, "global-llm-wiki");
+  const documentPath = path.join(engineRoot, "notes", "answer.md");
+  fs.mkdirSync(commandDir, { recursive: true });
+  fs.mkdirSync(path.dirname(documentPath), { recursive: true });
+  fs.writeFileSync(documentPath, "# Answer\n\nVerified knowledge.\n");
+  const command = path.join(commandDir, "llm-wiki");
+  fs.writeFileSync(command, `#!/usr/bin/env node
+const [subcommand] = process.argv.slice(2);
+if (subcommand === "status") {
+  process.stdout.write(JSON.stringify({documents:861,blocks:16191,cas_blobs:2810}));
+} else if (subcommand === "search") {
+  process.stdout.write(JSON.stringify([{document_id:"doc-1",anchor:"notes/answer.md#Answer:L1-L3",snippet:"Verified knowledge."}]));
+} else if (subcommand === "trace") {
+  process.stdout.write(JSON.stringify({document_id:"doc-1",relative_path:"notes/answer.md",title:"Answer",artifact_hash:"hash-1"}));
+} else {
+  process.stderr.write("No such command 'mcp'\\n");
+  process.exitCode = 2;
+}
+`);
+  fs.chmodSync(command, 0o755);
+  fs.writeFileSync(fallbackCommand, `#!/usr/bin/env node
+process.stderr.write("Global llm-wiki must not override the selected project CLI\\n");
+process.exitCode = 9;
+`);
+  fs.chmodSync(fallbackCommand, 0o755);
+  const previousConfiguredCommand = process.env.LLM_WIKI_BIN;
+  process.env.LLM_WIKI_BIN = fallbackCommand;
+  t.after(() => {
+    if (previousConfiguredCommand === undefined) delete process.env.LLM_WIKI_BIN;
+    else process.env.LLM_WIKI_BIN = previousConfiguredCommand;
+  });
+  const now = new Date().toISOString();
+  const knowledgeBase: ManagedKnowledgeBase = {
+    id: "legacy-kb",
+    name: "Legacy Wiki",
+    rootPath: engineRoot,
+    createdAt: now,
+    updatedAt: now
+  };
+  const pool = new LlmWikiMcpClientPool();
+  t.after(() => pool.close());
+
+  // When
+  const inspection = await pool.inspect(knowledgeBase);
+  const search = await pool.call(knowledgeBase, "search", { query: "verified", limit: 5 });
+  const document = await pool.call(knowledgeBase, "get_document", { document_id: "doc-1" });
+
+  // Then
+  assert.deepEqual(inspection.status, {
+    documentCount: 861,
+    blockCount: 16_191,
+    rawArtifactCount: 2_810
+  });
+  assert.equal(inspection.transport, "cli");
+  assert.match(search, /Verified knowledge/);
+  assert.match(document, /# Answer/);
+});
+
+test("rejects a status-only CLI that cannot provide read-only knowledge tools", async (t) => {
+  // Given
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-status-only-wiki-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const commandDir = path.join(root, ".venv", "bin");
+  fs.mkdirSync(commandDir, { recursive: true });
+  const command = path.join(commandDir, "llm-wiki");
+  fs.writeFileSync(command, `#!/usr/bin/env node
+const [subcommand] = process.argv.slice(2);
+if (subcommand === "status") {
+  process.stdout.write(JSON.stringify({documents:1,blocks:2,cas_blobs:1}));
+} else {
+  process.stderr.write("No such command '" + subcommand + "'\\n");
+  process.exitCode = 2;
+}
+`);
+  fs.chmodSync(command, 0o755);
+  const now = new Date().toISOString();
+  const pool = new LlmWikiMcpClientPool();
+  t.after(() => pool.close());
+
+  // When / Then
+  await assert.rejects(pool.inspect({
+    id: "status-only",
+    name: "Status Only",
+    rootPath: root,
+    createdAt: now,
+    updatedAt: now
+  }), /search.*调用失败|只读工具/s);
+});
+
+test("rejects an executable whose status JSON is not an llm-wiki status contract", async (t) => {
+  // Given
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-invalid-status-wiki-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const commandDir = path.join(root, ".venv", "bin");
+  fs.mkdirSync(commandDir, { recursive: true });
+  const command = path.join(commandDir, "llm-wiki");
+  fs.writeFileSync(command, `#!/usr/bin/env node
+const [subcommand] = process.argv.slice(2);
+if (subcommand === "status") process.stdout.write(JSON.stringify({ok:true}));
+else process.exitCode = 2;
+`);
+  fs.chmodSync(command, 0o755);
+  const now = new Date().toISOString();
+  const pool = new LlmWikiMcpClientPool();
+  t.after(() => pool.close());
+
+  // When / Then
+  await assert.rejects(pool.inspect({
+    id: "invalid-status",
+    name: "Invalid Status",
+    rootPath: root,
+    createdAt: now,
+    updatedAt: now
+  }), /status.*格式无效/s);
 });
 
 test("rejects a directory that is not an llm-wiki project", async (t) => {

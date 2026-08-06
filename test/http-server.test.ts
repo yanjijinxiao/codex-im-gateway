@@ -192,7 +192,13 @@ test("knowledge-base APIs validate llm-wiki records and bind them to projects", 
       listKnowledgeBases() { return [knowledgeBase]; },
       async createKnowledgeBase(accountId: string, input: unknown) {
         calls.push({ create: { accountId, input } });
-        return knowledgeBase;
+        return {
+          knowledgeBase,
+          inspection: {
+            command: "llm-wiki",
+            status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 }
+          }
+        };
       },
       async inspectKnowledgeBase(accountId: string, knowledgeBaseId: string) {
         calls.push({ inspect: { accountId, knowledgeBaseId } });
@@ -237,7 +243,6 @@ test("knowledge-base APIs validate llm-wiki records and bind them to projects", 
         input: { accountId: "account-one", name: "产品 Wiki", rootPath: "/knowledge/product" }
       }
     },
-    { inspect: { accountId: "account-one", knowledgeBaseId: "kb-one" } },
     { bind: { accountId: "account-one", projectId: "project-one", knowledgeBaseId: "kb-one" } }
   ]);
 });
@@ -346,7 +351,19 @@ test("local API redacts credentials and protects mutations", async (t) => {
     savedAt: new Date().toISOString(),
     enabled: false
   });
-  const manager = new AccountManager({ paths });
+  const manager = new AccountManager({
+    paths,
+    llmWiki: {
+      async inspect() {
+        return {
+          command: "llm-wiki",
+          status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 }
+        };
+      },
+      invalidate() {},
+      close() {}
+    } as never
+  });
   const managedProject = manager.createProject("account-one", "Web project", root);
   let resolveRestart!: (version: string) => void;
   const restartRequested = new Promise<string>((resolve) => {
