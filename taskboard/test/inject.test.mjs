@@ -24,19 +24,38 @@ test("injection is an idempotent IIFE guarded by its current source hash", () =>
 test("embedded page uses the local taskboard URL and supports a runtime override", () => {
   assert.match(source, /http:\/\/127\.0\.0\.1:47823\/\?host=codex/);
   assert.match(source, /window\.__CODEX_TASKBOARD_URL__/);
+  assert.match(source, /url\.hostname !== "127\.0\.0\.1" && url\.hostname !== "localhost"/);
+  assert.match(source, /\|\| url\.username\s*\|\| url\.password/);
   assert.match(source, /nextFrame\.src = taskboardUrl\.href/);
   assert.match(source, /frameOrigin = taskboardUrl\.origin/);
 });
 
-test("Taskboard and Channel Configuration switch one main-workspace surface", () => {
+test("Taskboard, Channel Configuration, and capability navigation switch one main-workspace surface", () => {
   assert.match(source, /ariaLabel: "切换到任务面板"/);
   assert.match(source, /ariaLabel: "切换到渠道配置"/);
   assert.match(source, /activeView = TASKBOARD_VIEW/);
   assert.match(source, /activeView = CHANNEL_VIEW/);
-  assert.match(source, /page\.setAttribute\("aria-label", activeView === CHANNEL_VIEW \? "渠道配置" : "任务面板"\)/);
+  assert.match(source, /const pageLabel = activeView === CHANNEL_VIEW[\s\S]*activeCapability\(\)\?\.label \|\| "任务面板"/);
   assert.match(source, /frameReady && frame\?\.isConnected && frameMatchesChannelBridgeUrl\(channelUrl\)/);
   assert.match(source, /frameReady[\s\S]*frame\?\.isConnected[\s\S]*frameMatchesTaskboardUrl\(taskboardUrl\)/);
   assert.doesNotMatch(source, /window\.open\(/);
+});
+
+test("capability navigation is fetched, validated, ordered, reconciled, and loaded generically", () => {
+  assert.match(source, /new URL\("\/api\/channel-capabilities", resolveChannelBridgeUrl\(\)\)/);
+  assert.match(source, /function normalizeCapabilityNavigation\(payload\)/);
+  assert.match(source, /result\.sort\(\(left, right\) => left\.order - right\.order/);
+  assert.match(source, /capabilityEntries = new Map\(\)/);
+  assert.match(source, /function openCapability\(id\)/);
+  assert.match(source, /function loadCapabilityFrame\(generation, capability/);
+  assert.match(source, /frameMatchesCapabilityUrl\(capabilityUrl\)/);
+  assert.match(
+    source,
+    /function loadCapabilityFrame\(generation, capability[\s\S]*if \(capability\.allowClipboard\) \{\s*nextFrame\.setAttribute\("allow", "clipboard-read; clipboard-write"\)/,
+  );
+  assert.equal(source.match(/if \(capability\.allowClipboard\)/g)?.length, 1);
+  assert.match(source, /openTaskboard\(\);/);
+  assert.doesNotMatch(source, /weekly-report|WEEKLY_REPORT|周报/i);
 });
 
 test("entry clones the native Plugins row and the page fills the Codex workspace below its titlebar", () => {
@@ -44,7 +63,8 @@ test("entry clones the native Plugins row and the page fills the Codex workspace
   assert.match(source, /if \(plugin\?\.parentElement\) return plugin;/);
   assert.match(source, /return directButtons\.length >= 3/);
   assert.match(source, /const button = reference\.cloneNode\(true\)/);
-  assert.match(source, /reference\.after\(entry\)/);
+  assert.match(source, /reference\.after\(sub2apiEntry\)/);
+  assert.match(source, /previousEntry\.after\(entry\)/);
   assert.match(source, /document\.querySelector\("\.app-shell-main-content-frame"\)/);
   assert.match(source, /const surface = viewport\?\.parentElement/);
   assert.match(source, /surface\.appendChild\(page\)/);
@@ -57,6 +77,14 @@ test("entry clones the native Plugins row and the page fills the Codex workspace
   assert.doesNotMatch(source, /codex-taskboard-overlay/);
   assert.doesNotMatch(source, /codex-taskboard-toolbar/);
   assert.doesNotMatch(source, /aria-modal/);
+});
+
+test("opening an integration keeps its active sidebar entry visible", () => {
+  const syncEntrySource = source.slice(
+    source.indexOf("function syncEntryState"),
+    source.indexOf("function isIntegrationEntry"),
+  );
+  assert.match(syncEntrySource, /activeIntegrationEntry\(\)\?\.scrollIntoView\(\{ block: "nearest" \}\)/);
 });
 
 test("opening Taskboard suppresses native selection and contextual header until close", () => {
@@ -229,11 +257,15 @@ test("complete App automation payloads cross the injected forwarder into the cur
 });
 
 test("only a loopback Taskboard iframe can request native automation", () => {
-  assert.match(source, /function isLocalTaskboardOrigin\(origin\)/);
-  assert.match(source, /hostname === "127\.0\.0\.1" \|\| hostname === "localhost"/);
+  assert.match(source, /function isTrustedTaskboardOrigin\(origin\)/);
+  assert.match(source, /url\.hostname !== "127\.0\.0\.1" && url\.hostname !== "localhost"/);
   assert.match(
     source,
-    /if \(!isLocalTaskboardOrigin\(frameOrigin\)\) \{\s*postToFrame\(\{\s*type: "taskboard:automation-response"/,
+    /if \(activeView !== TASKBOARD_VIEW \|\| !isTrustedTaskboardOrigin\(frameOrigin\)\) \{\s*postToFrame\(\{\s*type: "taskboard:automation-response"/,
+  );
+  assert.match(
+    source,
+    /activeView !== TASKBOARD_VIEW[\s\S]*event\.origin !== taskboardUrl\.origin[\s\S]*!frameMatchesTaskboardUrl\(taskboardUrl\)/,
   );
 });
 

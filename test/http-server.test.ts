@@ -80,6 +80,40 @@ test("exposes Taskboard health and workspace mappings", async (t) => {
   assert.deepEqual(await response.json(), expected);
 });
 
+test("exposes only validated Skill capability navigation to the Codex app", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-capability-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const navigation = [{
+    id: "example",
+    label: "示例",
+    ariaLabel: "切换到示例",
+    url: "http://127.0.0.1:43210/",
+    order: 10,
+    icon: "document"
+  }];
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: {
+      async listChannelCapabilityNavigation() { return navigation; }
+    } as never,
+    port: 0
+  });
+  t.after(() => server.close());
+
+  const response = await fetch(`${server.url}/api/channel-capabilities`, {
+    headers: { Origin: "app://-" }
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("access-control-allow-origin"), "app://-");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { navigation });
+
+  const remoteOrigin = await fetch(`${server.url}/api/channel-capabilities`, {
+    headers: { Origin: "https://example.com" }
+  });
+  assert.equal(remoteOrigin.headers.get("access-control-allow-origin"), null);
+});
+
 test("exposes Taskboard issue details and forwards protected management actions", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-taskboard-workbench-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

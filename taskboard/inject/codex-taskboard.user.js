@@ -5,9 +5,13 @@
   const SOURCE_HASH = window.__CODEX_TASKBOARD_SOURCE_HASH__;
   const SENTINEL_KEY = "__codexTaskboardInjection__";
   const DEFAULT_TASKBOARD_URL = "http://127.0.0.1:47823/?host=codex";
+  const DEFAULT_SUB2API_URL = "http://127.0.0.1:10009/";
   const DEFAULT_CHANNEL_BRIDGE_URL = "http://127.0.0.1:8787/";
   const ENTRY_ID = "codex-taskboard-entry";
+  const SUB2API_ENTRY_ID = "codex-sub2api-entry";
   const CHANNEL_ENTRY_ID = "codex-channel-bridge-entry";
+  const CAPABILITY_ENTRY_PREFIX = "codex-capability-entry-";
+  const CAPABILITY_ENTRY_ATTRIBUTE = "data-codex-capability-entry";
   const PAGE_ID = "codex-taskboard-page";
   const FRAME_ID = "codex-taskboard-frame";
   const DRAG_REGION_ID = "codex-taskboard-drag-region";
@@ -25,10 +29,13 @@
   const FRAME_READY_TIMEOUT_MS = 12_000;
   const HOST_REQUEST_TIMEOUT_MS = 12_000;
   const HOST_HEARTBEAT_MAX_AGE_MS = 8_000;
+  const CAPABILITY_REFRESH_MS = 5_000;
   const MACOS_TITLEBAR_SAFE_LEFT = 80;
   const FRAME_REFRESH_PARAM = "__codex_taskboard_refresh";
   const TASKBOARD_VIEW = "taskboard";
+  const SUB2API_VIEW = "sub2api";
   const CHANNEL_VIEW = "channel";
+  const CAPABILITY_VIEW_PREFIX = "capability:";
   const PLUGIN_LABELS = ["插件", "plugins"];
   const NATIVE_PAGE_LABELS = [
     "新建任务",
@@ -56,7 +63,12 @@
   } catch (_) {}
 
   let entry = null;
+  let sub2apiEntry = null;
   let channelEntry = null;
+  let capabilityEntries = new Map();
+  let capabilityNavigation = [];
+  let capabilityRefreshTimer = null;
+  let capabilityRequestGeneration = 0;
   let page = null;
   let frame = null;
   let dragRegion = null;
@@ -94,8 +106,13 @@
       : "";
     try {
       const url = new URL(configured || DEFAULT_TASKBOARD_URL);
-      if (url.protocol !== "http:" && url.protocol !== "https:") {
-        throw new Error("Unsupported taskboard URL protocol");
+      if (
+        (url.protocol !== "http:" && url.protocol !== "https:")
+        || (url.hostname !== "127.0.0.1" && url.hostname !== "localhost")
+        || url.username
+        || url.password
+      ) {
+        throw new Error("Unsupported local Taskboard URL");
       }
       if (!url.searchParams.has("host")) url.searchParams.set("host", "codex");
       return url;
@@ -122,11 +139,108 @@
     }
   }
 
-  function isLocalTaskboardOrigin(origin) {
+  function resolveSub2apiUrl() {
+    return new URL(DEFAULT_SUB2API_URL);
+  }
+
+  function resolveCapabilityApiUrl() {
+    return new URL("/api/channel-capabilities", resolveChannelBridgeUrl());
+  }
+
+  function capabilityView(id) {
+    return `${CAPABILITY_VIEW_PREFIX}${id}`;
+  }
+
+  function activeCapability() {
+    if (!activeView?.startsWith?.(CAPABILITY_VIEW_PREFIX)) return null;
+    const id = activeView.slice(CAPABILITY_VIEW_PREFIX.length);
+    return capabilityNavigation.find((candidate) => candidate.id === id) || null;
+  }
+
+  function normalizeCapabilityNavigation(payload) {
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.navigation)) return [];
+    const result = [];
+    const ids = new Set();
+    for (const value of payload.navigation) {
+      if (!value || typeof value !== "object") continue;
+      const { id, label, ariaLabel, url, order, icon, allowClipboard } = value;
+      if (
+        typeof id !== "string"
+        || !/^[a-z][a-z0-9-]{0,63}$/.test(id)
+        || ids.has(id)
+        || typeof label !== "string"
+        || !label.trim()
+        || label.length > 32
+        || typeof ariaLabel !== "string"
+        || !ariaLabel.trim()
+        || ariaLabel.length > 80
+        || typeof url !== "string"
+        || typeof order !== "number"
+        || !Number.isInteger(order)
+        || !["document", "database", "generic"].includes(icon)
+        || (allowClipboard !== undefined && typeof allowClipboard !== "boolean")
+      ) continue;
+      try {
+        const parsedUrl = new URL(url);
+        if (
+          !["http:", "https:"].includes(parsedUrl.protocol)
+          || !["127.0.0.1", "localhost"].includes(parsedUrl.hostname)
+          || parsedUrl.username
+          || parsedUrl.password
+        ) continue;
+        ids.add(id);
+        result.push({
+          id,
+          label: label.trim(),
+          ariaLabel: ariaLabel.trim(),
+          url: parsedUrl.href,
+          order,
+          icon,
+          allowClipboard: allowClipboard === true,
+        });
+      } catch (_) {}
+    }
+    return result.sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+  }
+
+  async function refreshCapabilityNavigation() {
+    const generation = ++capabilityRequestGeneration;
     try {
-      const { protocol, hostname } = new URL(origin);
-      return (protocol === "http:" || protocol === "https:")
-        && (hostname === "127.0.0.1" || hostname === "localhost");
+      const response = await window.fetch(resolveCapabilityApiUrl(), {
+        cache: "no-store",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error(`Capability API returned ${response.status}`);
+      const nextNavigation = normalizeCapabilityNavigation(await response.json());
+      if (destroyed || generation !== capabilityRequestGeneration) return;
+      if (JSON.stringify(nextNavigation) === JSON.stringify(capabilityNavigation)) return;
+      const activeId = activeCapability()?.id || null;
+      capabilityEntries.forEach((button) => button.remove());
+      capabilityEntries.clear();
+      capabilityNavigation = nextNavigation;
+      ensureEntry();
+      if (activeId && !capabilityNavigation.some((candidate) => candidate.id === activeId)) {
+        openTaskboard();
+      } else if (activeId) {
+        openCapability(activeId);
+      }
+    } catch (_) {
+      // A transient local-service failure must not disturb existing navigation.
+    }
+  }
+
+  function scheduleCapabilityRefresh() {
+    if (destroyed) return;
+    if (capabilityRefreshTimer !== null) window.clearTimeout(capabilityRefreshTimer);
+    capabilityRefreshTimer = window.setTimeout(() => {
+      capabilityRefreshTimer = null;
+      refreshCapabilityNavigation().finally(scheduleCapabilityRefresh);
+    }, CAPABILITY_REFRESH_MS);
+  }
+
+  function isTrustedTaskboardOrigin(origin) {
+    try {
+      return new URL(origin).origin === resolveTaskboardUrl().origin;
     } catch (_) {
       return false;
     }
@@ -139,11 +253,15 @@
     style.setAttribute(OWNED_ATTRIBUTE, "true");
     style.textContent = `
       #${ENTRY_ID}[aria-current="page"],
+      #${SUB2API_ENTRY_ID}[aria-current="page"],
+      [${CAPABILITY_ENTRY_ATTRIBUTE}="true"][aria-current="page"],
       #${CHANNEL_ENTRY_ID}[aria-current="page"] {
         background: var(--color-token-list-hover-background, color-mix(in srgb, currentColor 8%, transparent));
         color: var(--color-token-foreground, inherit);
       }
       #${ENTRY_ID}:focus-visible,
+      #${SUB2API_ENTRY_ID}:focus-visible,
+      [${CAPABILITY_ENTRY_ATTRIBUTE}="true"]:focus-visible,
       #${CHANNEL_ENTRY_ID}:focus-visible {
         outline: 2px solid var(--color-token-border, Highlight);
         outline-offset: 2px;
@@ -268,12 +386,37 @@
     icon.setAttribute("stroke-width", "1.8");
     icon.setAttribute("stroke-linecap", "round");
     icon.setAttribute("stroke-linejoin", "round");
-    icon.innerHTML = kind === "taskboard"
-      ? `
+    if (kind === "taskboard") {
+      icon.innerHTML = `
         <rect x="3.5" y="4" width="17" height="16" rx="2.5"></rect>
         <path d="M9 4v16M14.5 8h2.5M14.5 12h2.5M14.5 16h2.5"></path>
-      `
-      : `
+      `;
+      return;
+    }
+    if (kind === "document") {
+      icon.innerHTML = `
+        <path d="M6 3.5h8l4 4v13H6z"></path>
+        <path d="M14 3.5v4h4M9 12h6M9 15.5h6"></path>
+      `;
+      return;
+    }
+    if (kind === "database") {
+      icon.innerHTML = `
+        <ellipse cx="12" cy="5.5" rx="7.5" ry="3"></ellipse>
+        <path d="M4.5 5.5v6c0 1.65 3.36 3 7.5 3s7.5-1.35 7.5-3v-6"></path>
+        <path d="M4.5 11.5v6c0 1.65 3.36 3 7.5 3s7.5-1.35 7.5-3v-6"></path>
+      `;
+      return;
+    }
+    if (kind === "sub2api") {
+      icon.innerHTML = `
+        <ellipse cx="12" cy="5.5" rx="7.5" ry="3"></ellipse>
+        <path d="M4.5 5.5v6c0 1.65 3.36 3 7.5 3s7.5-1.35 7.5-3v-6"></path>
+        <path d="M4.5 11.5v6c0 1.65 3.36 3 7.5 3s7.5-1.35 7.5-3v-6"></path>
+      `;
+      return;
+    }
+    icon.innerHTML = `
         <path d="M12 3.5a2.2 2.2 0 0 1 2.1 1.55l.23.75a7 7 0 0 1 1.18.68l.77-.18a2.2 2.2 0 0 1 2.45 1.16l.8 1.38a2.2 2.2 0 0 1-.35 2.68l-.55.57c.03.22.04.45.04.68 0 .23-.01.46-.04.68l.55.57a2.2 2.2 0 0 1 .35 2.68l-.8 1.38a2.2 2.2 0 0 1-2.45 1.16l-.77-.18a7 7 0 0 1-1.18.68l-.23.75A2.2 2.2 0 0 1 12 21.5h-1.6a2.2 2.2 0 0 1-2.1-1.55l-.23-.75a7 7 0 0 1-1.18-.68l-.77.18a2.2 2.2 0 0 1-2.45-1.16l-.8-1.38a2.2 2.2 0 0 1 .35-2.68l.55-.57a5 5 0 0 1 0-1.36l-.55-.57a2.2 2.2 0 0 1-.35-2.68l.8-1.38A2.2 2.2 0 0 1 6.12 6.3l.77.18a7 7 0 0 1 1.18-.68l.23-.75a2.2 2.2 0 0 1 2.1-1.55H12Z"></path>
         <circle cx="11.2" cy="12.5" r="2.7"></circle>
       `;
@@ -306,13 +449,47 @@
   }
 
   function syncEntryState() {
-    if (!entry || !channelEntry) return;
+    if (!entry || !sub2apiEntry || !channelEntry) return;
     const taskboardActive = active && activeView === TASKBOARD_VIEW;
+    const sub2apiActive = active && activeView === SUB2API_VIEW;
     const channelActive = active && activeView === CHANNEL_VIEW;
     if (taskboardActive) entry.setAttribute("aria-current", "page");
     else entry.removeAttribute("aria-current");
+    if (sub2apiActive) sub2apiEntry.setAttribute("aria-current", "page");
+    else sub2apiEntry.removeAttribute("aria-current");
+    capabilityEntries.forEach((button, id) => {
+      if (active && activeView === capabilityView(id)) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
     if (channelActive) channelEntry.setAttribute("aria-current", "page");
     else channelEntry.removeAttribute("aria-current");
+    activeIntegrationEntry()?.scrollIntoView({ block: "nearest" });
+  }
+
+  function activeIntegrationEntry() {
+    if (!active) return null;
+    if (activeView === TASKBOARD_VIEW) return entry;
+    if (activeView === SUB2API_VIEW) return sub2apiEntry;
+    if (activeView === CHANNEL_VIEW) return channelEntry;
+    for (const [id, button] of capabilityEntries) {
+      if (activeView === capabilityView(id)) return button;
+    }
+    return null;
+  }
+
+  function isIntegrationEntry(node) {
+    return node === entry
+      || node === sub2apiEntry
+      || node === channelEntry
+      || capabilityEntriesHasNode(node)
+      || Boolean(node?.closest?.(`#${ENTRY_ID}, #${SUB2API_ENTRY_ID}, #${CHANNEL_ENTRY_ID}, [${CAPABILITY_ENTRY_ATTRIBUTE}="true"]`));
+  }
+
+  function capabilityEntriesHasNode(node) {
+    for (const button of capabilityEntries.values()) {
+      if (button === node) return true;
+    }
+    return false;
   }
 
   function ensureEntry() {
@@ -338,8 +515,43 @@
         onClick: openChannelConfig,
       });
     }
-    if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
-      reference.after(entry);
+    if (!sub2apiEntry) {
+      sub2apiEntry = createEntry(reference, {
+        id: SUB2API_ENTRY_ID,
+        labelText: "Sub2API",
+        ariaLabel: "切换到 Sub2API",
+        iconKind: "sub2api",
+        onClick: openSub2api,
+      });
+    }
+    if (
+      sub2apiEntry.parentElement !== reference.parentElement
+      || sub2apiEntry.previousElementSibling !== reference
+    ) {
+      reference.after(sub2apiEntry);
+    }
+    let previousEntry = sub2apiEntry;
+    for (const capability of capabilityNavigation) {
+      let capabilityEntry = capabilityEntries.get(capability.id);
+      if (!capabilityEntry) {
+        capabilityEntry = createEntry(reference, {
+          id: `${CAPABILITY_ENTRY_PREFIX}${capability.id}`,
+          labelText: capability.label,
+          ariaLabel: capability.ariaLabel,
+          iconKind: capability.icon,
+          onClick: () => openCapability(capability.id),
+        });
+        capabilityEntry.setAttribute(CAPABILITY_ENTRY_ATTRIBUTE, "true");
+        capabilityEntries.set(capability.id, capabilityEntry);
+      }
+      if (
+        capabilityEntry.parentElement !== reference.parentElement
+        || capabilityEntry.previousElementSibling !== previousEntry
+      ) previousEntry.after(capabilityEntry);
+      previousEntry = capabilityEntry;
+    }
+    if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== previousEntry) {
+      previousEntry.after(entry);
     }
     if (
       channelEntry.parentElement !== reference.parentElement
@@ -389,11 +601,7 @@
     if (!active) return;
     document.querySelectorAll('aside nav[role="navigation"] [aria-current]')
       .forEach((node) => {
-        if (
-          node === entry
-          || node === channelEntry
-          || node.closest(`#${ENTRY_ID}, #${CHANNEL_ENTRY_ID}`)
-        ) return;
+        if (isIntegrationEntry(node)) return;
         if (!mutedNativeSelections.has(node)) {
           mutedNativeSelections.set(node, node.getAttribute("aria-current"));
         }
@@ -812,7 +1020,7 @@
   async function handleAutomationRequest(payload) {
     const requestId = typeof payload?.requestId === "string" ? payload.requestId : "";
     if (!requestId) return;
-    if (!isLocalTaskboardOrigin(frameOrigin)) {
+    if (activeView !== TASKBOARD_VIEW || !isTrustedTaskboardOrigin(frameOrigin)) {
       postToFrame({
         type: "taskboard:automation-response",
         payload: { requestId, ok: false, error: "仅本地任务面板可用" },
@@ -851,6 +1059,13 @@
 
   function onFrameMessage(event) {
     if (!frame || event.source !== frame.contentWindow || event.origin !== frameOrigin) return;
+    const taskboardUrl = resolveTaskboardUrl();
+    if (
+      !active
+      || activeView !== TASKBOARD_VIEW
+      || event.origin !== taskboardUrl.origin
+      || !frameMatchesTaskboardUrl(taskboardUrl)
+    ) return;
     const message = event.data;
     if (!message || typeof message !== "object") return;
     if (message.type === "taskboard:ready") {
@@ -1040,6 +1255,100 @@
     }
   }
 
+  function frameMatchesCapabilityUrl(capabilityUrl) {
+    if (!frame) return false;
+    try {
+      const loadedUrl = new URL(frame.getAttribute("src") || frame.src);
+      loadedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      const expectedUrl = new URL(capabilityUrl.href);
+      expectedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      return loadedUrl.href === expectedUrl.href;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function frameMatchesSub2apiUrl(sub2apiUrl) {
+    if (!frame) return false;
+    try {
+      const loadedUrl = new URL(frame.getAttribute("src") || frame.src);
+      loadedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      const expectedUrl = new URL(sub2apiUrl.href);
+      expectedUrl.searchParams.delete(FRAME_REFRESH_PARAM);
+      return loadedUrl.href === expectedUrl.href;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function loadSub2apiFrame(generation, cacheBust = false) {
+    cancelFrameReadyWaiters(new Error("Sub2API 正在重新加载"));
+    frame?.remove();
+    frame = null;
+    frameReady = false;
+    updateDragRegion(null);
+
+    const sub2apiUrl = resolveSub2apiUrl();
+    if (cacheBust) {
+      sub2apiUrl.searchParams.set(FRAME_REFRESH_PARAM, Date.now().toString(36));
+    }
+    frameOrigin = sub2apiUrl.origin;
+    const nextFrame = document.createElement("iframe");
+    nextFrame.id = FRAME_ID;
+    nextFrame.hidden = true;
+    nextFrame.src = sub2apiUrl.href;
+    nextFrame.title = "Sub2API";
+    nextFrame.referrerPolicy = "no-referrer";
+    nextFrame.setAttribute("allow", "clipboard-read; clipboard-write");
+    nextFrame.addEventListener("load", () => {
+      if (
+        frame !== nextFrame
+        || !active
+        || activeView !== SUB2API_VIEW
+        || generation !== openGeneration
+      ) return;
+      frameReady = true;
+      showFrame();
+    }, { once: true });
+    frame = nextFrame;
+    page.appendChild(nextFrame);
+  }
+
+  function loadCapabilityFrame(generation, capability, cacheBust = false) {
+    cancelFrameReadyWaiters(new Error(`${capability.label} 正在重新加载`));
+    frame?.remove();
+    frame = null;
+    frameReady = false;
+    updateDragRegion(null);
+
+    const capabilityUrl = new URL(capability.url);
+    if (cacheBust) {
+      capabilityUrl.searchParams.set(FRAME_REFRESH_PARAM, Date.now().toString(36));
+    }
+    frameOrigin = capabilityUrl.origin;
+    const nextFrame = document.createElement("iframe");
+    nextFrame.id = FRAME_ID;
+    nextFrame.hidden = true;
+    nextFrame.src = capabilityUrl.href;
+    nextFrame.title = capability.label;
+    nextFrame.referrerPolicy = "no-referrer";
+    if (capability.allowClipboard) {
+      nextFrame.setAttribute("allow", "clipboard-read; clipboard-write");
+    }
+    nextFrame.addEventListener("load", () => {
+      if (
+        frame !== nextFrame
+        || !active
+        || activeView !== capabilityView(capability.id)
+        || generation !== openGeneration
+      ) return;
+      frameReady = true;
+      showFrame();
+    }, { once: true });
+    frame = nextFrame;
+    page.appendChild(nextFrame);
+  }
+
   function loadChannelBridgeFrame(generation, cacheBust = false) {
     cancelFrameReadyWaiters(new Error("渠道配置正在重新加载"));
     frame?.remove();
@@ -1077,6 +1386,17 @@
   function reloadFrame() {
     if (!frame) return false;
     const generation = ++openGeneration;
+    if (activeView === SUB2API_VIEW) {
+      showLoading("正在打开 Sub2API…");
+      loadSub2apiFrame(generation, true);
+      return true;
+    }
+    const capability = activeCapability();
+    if (capability) {
+      showLoading(`正在打开 ${capability.label}…`);
+      loadCapabilityFrame(generation, capability, true);
+      return true;
+    }
     if (activeView === CHANNEL_VIEW) {
       showLoading("正在启动渠道配置…");
       loadChannelBridgeFrame(generation, true);
@@ -1245,7 +1565,12 @@
     });
     hideNativeHeader();
     muteNativeSelection();
-    page.setAttribute("aria-label", activeView === CHANNEL_VIEW ? "渠道配置" : "任务面板");
+    const pageLabel = activeView === CHANNEL_VIEW
+      ? "渠道配置"
+      : activeView === SUB2API_VIEW
+        ? "Sub2API"
+        : activeCapability()?.label || "任务面板";
+    page.setAttribute("aria-label", pageLabel);
     page.hidden = false;
     document.documentElement.setAttribute("data-codex-taskboard-open", "true");
   }
@@ -1306,13 +1631,63 @@
     loadChannelBridgeFrame(generation);
   }
 
+  function openCapability(id) {
+    if (destroyed) return;
+    const capability = capabilityNavigation.find((candidate) => candidate.id === id);
+    if (!capability) return;
+    if (!active) {
+      lastFocusedElement = document.activeElement;
+      hostContextSnapshot = null;
+    }
+    const generation = ++openGeneration;
+    active = true;
+    activeView = capabilityView(capability.id);
+    updateDragRegion(null);
+    ensureEntry();
+    mountActivePage();
+    syncEntryState();
+
+    const capabilityUrl = new URL(capability.url);
+    if (frameReady && frame?.isConnected && frameMatchesCapabilityUrl(capabilityUrl)) {
+      showFrame();
+      return;
+    }
+    showLoading(`正在打开 ${capability.label}…`);
+    loadCapabilityFrame(generation, capability);
+  }
+
+  function openSub2api() {
+    if (destroyed) return;
+    if (!active) {
+      lastFocusedElement = document.activeElement;
+      hostContextSnapshot = null;
+    }
+    const generation = ++openGeneration;
+    active = true;
+    activeView = SUB2API_VIEW;
+    updateDragRegion(null);
+    ensureEntry();
+    mountActivePage();
+    syncEntryState();
+
+    const sub2apiUrl = resolveSub2apiUrl();
+    if (frameReady && frame?.isConnected && frameMatchesSub2apiUrl(sub2apiUrl)) {
+      showFrame();
+      return;
+    }
+    showLoading("正在打开 Sub2API…");
+    loadSub2apiFrame(generation);
+  }
+
   function isNativePageNavigation(target) {
     const clickable = target?.closest?.("button,a,[role='button'],[data-app-action-sidebar-thread-id]");
     if (
       !clickable
       || clickable === entry
+      || clickable === sub2apiEntry
       || clickable === channelEntry
-      || clickable.closest(`#${ENTRY_ID}, #${CHANNEL_ENTRY_ID}`)
+      || capabilityEntriesHasNode(clickable)
+      || clickable.closest(`#${ENTRY_ID}, #${SUB2API_ENTRY_ID}, #${CHANNEL_ENTRY_ID}, [${CAPABILITY_ENTRY_ATTRIBUTE}="true"]`)
     ) return false;
     if (!clickable.closest("aside nav[role='navigation']")) return false;
     if (clickable.hasAttribute("data-app-action-sidebar-section-toggle")) return false;
@@ -1346,12 +1721,14 @@
     ensureEntry();
     mountActivePage();
     postHostContext();
+    refreshCapabilityNavigation();
   }
 
   function mount() {
     document.removeEventListener("DOMContentLoaded", mount);
     if (destroyed || observer || !document.documentElement) return;
     ensureEntry();
+    refreshCapabilityNavigation().finally(scheduleCapabilityRefresh);
     observer = new MutationObserver(scheduleRefresh);
     observer.observe(document.documentElement, {
       childList: true,
@@ -1373,6 +1750,9 @@
     destroyed = true;
     if (reattachTimer !== null) window.clearTimeout(reattachTimer);
     reattachTimer = null;
+    if (capabilityRefreshTimer !== null) window.clearTimeout(capabilityRefreshTimer);
+    capabilityRefreshTimer = null;
+    capabilityRequestGeneration += 1;
     observer?.disconnect();
     observer = null;
     cancelFrameReadyWaiters(new Error("任务面板已关闭"));
@@ -1391,7 +1771,10 @@
     closeTaskboard(false);
     document.querySelectorAll(`[${OWNED_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     entry = null;
+    sub2apiEntry = null;
     channelEntry = null;
+    capabilityEntries.clear();
+    capabilityNavigation = [];
     page = null;
     frame = null;
     dragRegion = null;
@@ -1412,6 +1795,8 @@
     refresh,
     reloadFrame,
     open: openTaskboard,
+    openSub2api,
+    openCapability,
     openChannelConfig,
     close: closeTaskboard,
     destroy,

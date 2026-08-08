@@ -106,7 +106,7 @@ npm run build
 node dist/server/index.js
 ```
 
-这里的 npm 只用于按锁文件安装依赖和执行构建，不发布本服务。也可以执行 `npm run install:local` 一次完成 Bridge、内置 Taskboard、`taskctl` 和 `manage-taskboard` Skill 的本机准备。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)，Taskboard 的安装、数据迁移和回滚见 [内置 Taskboard 模块指南](./docs/taskboard-module.md)。
+这里的 npm 只用于按锁文件安装依赖和执行构建，不发布本服务。也可以执行 `npm run install:local` 一次完成 Bridge、内置 Taskboard、`taskctl` 和 `taskboard/skills/*` 下全部内置 Skill 的本机准备；安装器按目录发现 Skill，不保存业务 Skill 名单。服务由 Node.js 直接启动并打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。完整的更新、启动和停止方法见 [本地运行指南](./docs/local-run.md)，Taskboard 的安装、数据迁移和回滚见 [内置 Taskboard 模块指南](./docs/taskboard-module.md)。
 
 ## 一键集成到 Codex
 
@@ -204,11 +204,11 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 管理页顶部提供“任务面板”入口，点击后会在当前主区域切换并展示已配置的本机 Taskboard，不会另开窗口；切回“消息渠道”“会话”或“设置”会恢复对应 Bridge 页面。
 
-执行 `npm run install:local` 后，当前仓库的 `taskboard/skills/manage-taskboard` 和 `taskboard/cli/taskctl.mjs` 会链接到用户目录。聊天端可以通过自然语言、原生交互卡片或 `/task` 查询和推进同一套工作流；卡片表单直接执行受版本保护的 Taskboard 操作，需要 Codex 实际开始工作的领取动作仍使用该 Skill。阻塞、提交验收和退回会把证据与状态流转作为一个原子操作提交，完成继续要求显式验收；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
+执行 `npm run install:local` 后，当前仓库 `taskboard/skills/*` 中包含 `SKILL.md` 的全部目录和 `taskboard/cli/taskctl.mjs` 会链接到用户目录。`manage-weekly-report` 是其中一个声明式扩展示例：它使用当前会话与 Taskboard 的只读证据采集周报，并与本机周报渲染器及企业微信未发送草稿流程衔接。聊天端可以通过自然语言、原生交互卡片或 `/task` 查询和推进同一套工作流；卡片表单直接执行受版本保护的 Taskboard 操作，需要 Codex 实际开始工作的领取动作仍使用 `manage-taskboard` Skill。阻塞、提交验收和退回会把证据与状态流转作为一个原子操作提交，完成继续要求显式验收；评论与聊天附件会带真实 Codex threadId 写回 Issue。Taskboard 进入“阻塞 / 待验收 / 已完成”时，会复用项目通知目标推送状态与最新证据，并和普通 Codex 完成通知去重。
 
 常用命令：`npm run taskboard:start` 启动本机服务，`npm run taskboard:taskctl -- project list --json` 调用 CLI，`npm run taskboard:check` 执行 Taskboard 校验。
 
-以 `taskboard/scripts/codex-injector.mjs --launch --watch` 启动正常 Codex 后，原生侧边栏会在“插件”下增加“任务面板”和“渠道配置”两个入口。两者是同级导航：点击后在同一个 Codex 主工作区内分别切换本机 Taskboard 和 `http://127.0.0.1:8787/` 的 Codex Channel Bridge 管理页，不会另开浏览器侧栏。当前 Codex 使用的 Chromium 会检查本机网络 iframe，因此必须由该启动器添加 `--disable-features=LocalNetworkAccessChecks`；直接从 Dock 启动且没有调试端口的既有进程无法在运行中补注入。常驻后台时可增加 `--adopt-normal-launch`；若安装时 Codex 已打开，再增加 `--defer-existing`，注入器会保留当前窗口，并在它退出后的下一次正常启动时短暂重启 Codex、补齐所需参数并完成注入。
+以 `taskboard/scripts/codex-injector.mjs --launch --watch` 启动正常 Codex 后，原生侧边栏会在“插件”下增加内置的“任务面板”“渠道配置”，并按已安装 Skill 的 `channel-capability.json.sidebar` 增加可选入口。所有入口都是同级导航，共用同一个 Codex 主工作区，不会另开浏览器侧栏；扩展入口只接受 HTTP(S) 回环地址，并从只读 `/api/channel-capabilities` 接口每 5 秒刷新。当前 Codex 使用的 Chromium 会检查本机网络 iframe，因此必须由该启动器添加 `--disable-features=LocalNetworkAccessChecks`；直接从 Dock 启动且没有调试端口的既有进程无法在运行中补注入。常驻后台时可增加 `--adopt-normal-launch`；若安装时 Codex 已打开，再增加 `--defer-existing`，注入器会保留当前窗口，并在它退出后的下一次正常启动时短暂重启 Codex、补齐所需参数并完成注入。
 
 ## 消息渠道内命令
 
@@ -245,6 +245,8 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 /task review ISSUE编号       验证、记录证据并提交验收
 /task accept ISSUE编号       按验收门禁处理；只有用户确认后才可完成
 /task return ISSUE编号 原因  从待验收退回处理中并记录原因
+/weekly [status|open|collect|draft|confirm|mail|publish]  管理周报
+/wr <操作> /周报 <操作>      /weekly 的英文和中文快捷入口；不带操作时查看状态
 /sessions        /ss          查看当前项目最近活跃的 10 个会话
 /session R1      /s R1        绑定并继续当前项目的指定会话
 /new             /n           在当前项目新建并绑定 Codex 会话
@@ -260,6 +262,81 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 /reject A1       /no A1       拒绝当前渠道收到的 Codex 审批
 /stop            /x           中断当前 Codex 任务
 ```
+
+### 可后置扩展的渠道能力
+
+周报采用“Skill 提供业务规则和声明，Bridge 只提供通用加载器”的后置扩展方式。核心源码不导入周报 Skill，也没有周报命令、自然语言 action 或左侧入口的专用分支。运行链路如下：
+
+```text
+taskboard/skills/<skill>/{SKILL.md,channel-capability.json}
+        ↓ npm run install:local 建立用户级链接
+~/.codex/skills/<skill>/channel-capability.json
+        ↓ 通用 Provider 在每条消息开始时严格校验并取一次快照
+快捷指令 / 帮助菜单 / AI action / 可选左侧入口
+        ↓ 映射为同一个规范化 ChannelCommand
+Bridge 项目与模式门禁
+        ↓ 生成带 capability id 和 operation 的 Skill prompt
+当前项目、当前会话中的 Codex turn
+```
+
+新增同类能力只需增加或安装一个 Skill 目录：
+
+1. 在 `<skill>/SKILL.md` 和 `references/` 中保存业务状态、事实来源、确认条件与外部副作用边界；Bridge 不复制这些规则。实际调用名以 `SKILL.md` frontmatter 的 `name` 为准，不要求与安装目录同名。
+2. 在同目录增加严格的数据文件 `channel-capability.json`。它只能声明命令、操作、受限的 AI action 说明和可选回环导航，不能声明脚本、模块路径、Shell、HTML、CSS 或任意可执行代码。扩展 iframe 默认没有剪贴板权限，只有显式声明 `sidebar.allowClipboard: true` 才会获得读写权限。
+3. 将目录放入 `taskboard/skills/` 后运行 `npm run install:local`，或直接安装到 `~/.codex/skills/<skill>/`。安装器自动枚举所有带 `SKILL.md` 的内置目录，无需修改安装脚本。
+4. Provider 每条消息只扫描一次；同一快照同时用于别名、帮助、动态输出 schema、模型结果复验和执行。安装、更新、删除在下一条消息生效，进行中的消息不会混用两个版本。
+5. 内置命令、别名和 AI action 永远优先。无效版本、未知字段、超限、无效 Skill frontmatter、远程导航、重复 ID/命令/别名/action 或与内置名称冲突的声明会被整项忽略，不能覆盖核心功能。扩展 iframe 也不能使用 Taskboard 的线程与自动化宿主协议。
+6. `confirmation: "explicit"` 只是在通用层增加一道确认要求；`confirm`、`publish`、`send` 等操作仍必须由 Skill 根据自身状态再次确认，意图分类不能直接触发外部副作用。
+
+能力声明的最小形态：
+
+```json
+{
+  "schemaVersion": 1,
+  "channel": {
+    "capabilityId": "example",
+    "command": {
+      "name": "example",
+      "aliases": ["ex"],
+      "helpLine": "/example（/ex）[status|run] - 管理示例能力",
+      "usage": "/example [status|run]",
+      "defaultOperation": "status"
+    },
+    "operations": [{
+      "name": "status",
+      "aliases": ["show", "查看"],
+      "instruction": "查看示例能力状态。",
+      "ai": {
+        "intent": "example_status",
+        "guidance": "用户明确要求查看示例状态时使用。",
+        "argument": "detail"
+      }
+    }]
+  },
+  "sidebar": {
+    "id": "example",
+    "label": "示例",
+    "ariaLabel": "切换到示例",
+    "url": "http://127.0.0.1:43210/",
+    "order": 20,
+    "icon": "document"
+  }
+}
+```
+
+周报是这套机制的参考数据包，完整声明见 `taskboard/skills/manage-weekly-report/channel-capability.json`；增加下一个同类能力不应编辑 `src/`、安装脚本或注入器。
+
+第一次部署本通用加载器需要构建并重启 Bridge；之后只安装、更新或移除 Skill 不需要重启 Bridge，渠道能力在下一条消息生效，已运行的 Codex 注入器会在 5 秒内刷新左侧入口：
+
+```bash
+npm run install:local
+launchctl kickstart -k gui/$(id -u)/com.lsiten.codex-channel-bridge
+npm run install:check
+curl http://127.0.0.1:47823/health
+curl http://127.0.0.1:8787/api/taskboard
+```
+
+不要另行启动独立 Taskboard；Bridge 统一拥有 `8787` 和内嵌 Taskboard 的 `47823`，避免两个进程争用同一端口。
 
 普通消息直接进入当前活动会话。图片、文件、视频和无转写语音会先保存到账号独立的入站目录，再以本地路径加入 prompt；有微信转写文本的语音优先使用转写文本。
 

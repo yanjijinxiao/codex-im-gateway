@@ -6,6 +6,19 @@ import { AccessController } from "./access.js";
 import { ChannelApprovalController } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
+  assertNeverChannelCapabilityResolution,
+  buildChannelCapabilityPrompt,
+  channelCapabilityAliases,
+  resolveChannelCapabilityCommand,
+  type ChannelCapabilityProvider,
+  type ChannelCommandCapability
+} from "./channel-capability.js";
+import {
+  channelHelpText,
+  isReservedChannelCommandToken,
+  parseCommand
+} from "./channel-commands.js";
+import {
   commandProjectRequirement,
   friendlyCommandsContinueConversation,
   isGoalSetCommand,
@@ -73,6 +86,8 @@ import { createGoalFormCard } from "../channels/goal-form-card.js";
 import { formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
 import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
 
+export { parseCommand } from "./channel-commands.js";
+
 const RECENT_PROJECT_SESSION_LIMIT = 10;
 
 type ProjectSessionChoice = {
@@ -97,6 +112,7 @@ export type BridgeServiceOptions = {
   mediaFetch?: FetchLike;
   taskboard?: TaskboardClient;
   intentResolver?: ChannelIntentResolver;
+  channelCapabilities?: ChannelCapabilityProvider;
   approvalTimeoutMs?: number;
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
   onTurnCompleted?: (result: {
@@ -187,10 +203,16 @@ export class BridgeService {
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
 
-    const slashCommand = parseCommand(scopedMessage.text);
+    const channelCapabilities = await (this.options.channelCapabilities?.() ?? []);
+    const slashCommand = parseCommand(scopedMessage.text, channelCapabilityAliases(channelCapabilities));
     const friendlyIntent = slashCommand
       ? undefined
-      : await this.resolveFriendlyChannelIntent(message.senderId, replyTargetId, scopedMessage.text);
+      : await this.resolveFriendlyChannelIntent(
+          message.senderId,
+          replyTargetId,
+          scopedMessage.text,
+          channelCapabilities
+        );
     if (friendlyIntent?.kind === "clarification") {
       await this.reply(replyTargetId, friendlyIntent.text);
       return;
@@ -224,7 +246,7 @@ export class BridgeService {
           deferredCommands.push(command);
           continue;
         }
-        await this.handleCommand(scopedMessage, command);
+        await this.handleCommand(scopedMessage, command, channelCapabilities);
       }
       if (!continueAsConversation) return;
     }
@@ -252,14 +274,15 @@ export class BridgeService {
 
     await this.runCodexTurn(scopedMessage, "", items);
     for (const command of deferredCommands) {
-      await this.handleCommand(scopedMessage, command);
+      await this.handleCommand(scopedMessage, command, channelCapabilities);
     }
   }
 
   private async resolveFriendlyChannelIntent(
     actorId: string,
     conversationId: string,
-    text: string
+    text: string,
+    availableCapabilities: readonly ChannelCommandCapability[]
   ): Promise<FriendlyChannelIntent | undefined> {
     const resolver = this.options.intentResolver;
     if (!resolver || !text.trim()) return undefined;
@@ -277,6 +300,7 @@ export class BridgeService {
         ...(currentProjectName ? { currentProjectName } : {}),
         ...(currentMode !== "session" ? { currentMode } : {}),
         ...(knowledgeBaseName ? { knowledgeBaseName } : {}),
+        ...(availableCapabilities.length ? { availableCapabilities } : {}),
         projectNames: projects.map((project) => project.name)
       });
     } catch (error) {
@@ -290,11 +314,30 @@ export class BridgeService {
     }
   }
 
-  private async handleCommand(message: NormalizedWeixinMessage, command: ChannelCommand): Promise<void> {
+  private async handleCommand(
+    message: NormalizedWeixinMessage,
+    command: ChannelCommand,
+    channelCapabilities: readonly ChannelCommandCapability[]
+  ): Promise<void> {
+    const capabilityResolution = isReservedChannelCommandToken(command.name)
+      ? undefined
+      : resolveChannelCapabilityCommand(command, channelCapabilities);
+    if (capabilityResolution) {
+      switch (capabilityResolution.kind) {
+        case "reply":
+          await this.reply(message.senderId, capabilityResolution.text);
+          return;
+        case "run_skill":
+          await this.runCodexTurn(message, buildChannelCapabilityPrompt(capabilityResolution));
+          return;
+        default:
+          return assertNeverChannelCapabilityResolution(capabilityResolution);
+      }
+    }
     switch (command.name) {
       case "help":
       case "h":
-        await this.replyActionCard(message.senderId, createMainMenuCard(helpText()));
+        await this.replyActionCard(message.senderId, createMainMenuCard(channelHelpText(channelCapabilities)));
         return;
       case "status":
       case "where":
@@ -1821,72 +1864,6 @@ function isWeixinMediaClient(client: ChannelTextClient, kind: "image" | "file" |
       : kind === "video"
         ? "sendVideoMessage"
         : "sendFileMessage"] === "function";
-}
-
-export function parseCommand(text: string): ChannelCommand | undefined {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("/")) {
-    return undefined;
-  }
-  const [rawName, ...rest] = trimmed.slice(1).split(/\s+/);
-  const name = rawName.toLowerCase();
-  return { name: COMMAND_ALIASES[name] ?? name, arg: rest.join(" ") };
-}
-
-const COMMAND_ALIASES: Readonly<Record<string, string>> = {
-  h: "help",
-  where: "status",
-  st: "status",
-  bal: "balance",
-  knowledge: "memory",
-  mem: "memory",
-  projects: "project",
-  p: "project",
-  n: "new",
-  ss: "sessions",
-  s: "session",
-  m: "model",
-  e: "effort",
-  str: "stream",
-  pp: "prompt",
-  ok: "approve",
-  no: "reject",
-  x: "stop",
-  tb: "task",
-  v: "mode",
-  q: "qa"
-};
-
-function helpText(): string {
-  return [
-    "Codex 渠道工作台（也可直接说“查看任务”“新任务：…”“提交验收”）：",
-    "/help（/h）- 获取全部内置命令",
-    "/status（/st）- 查看当前任务、项目、模型和运行状态",
-    "/balance（/bal）- 查看当前 Codex 账号剩余用量",
-    "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
-    "/project（/p）[l|P编号] - 查看或切换已绑定项目",
-    "/project add（/p a）[C编号] - 查看或添加 Codex 历史项目",
-    "/project rename（/p rn）P1|新名称 - 重命名项目",
-    "/project delete（/p d）P1 - 移除没有任务的项目",
-    "/mode（/v）[session|task|qa] - 查看或切换当前项目工作模式",
-    "/qa（/q）- 进入绑定 llm-wiki 的问答模式",
-    "/plan [on|off] - 切换 Codex 原生计划模式",
-    "/goal [目标|pause|resume|complete|clear] - 管理当前 thread 目标",
-    "/task（/tb）- 查看当前项目的 Taskboard Issue",
-    "/task ISSUE编号 - 绑定并继续对应 Codex 任务",
-    "/task new|todo|start|detail|comment|attach|block|review|accept|return - 操作 Taskboard 工作流",
-    "/sessions（/ss）- 查看当前项目最近活跃的 10 个会话",
-    "/session（/s）R编号 - 绑定会话并在其中继续对话",
-    "/new（/n）- 在当前项目新建并绑定会话",
-    "/model（/m）[编号|模型ID|default] - 查看或切换当前任务模型",
-    "/effort（/e）[编号|级别|default] - 查看或切换推理强度",
-    "/stream（/str）[on|off|default] - 查看或切换流式回复",
-    "/prompt start（/pp s）- 开始合并多条微信消息",
-    "/prompt done（/pp d）- 提交已合并的消息",
-    "/approve（/ok）[A编号] - 批准一次当前渠道收到的 Codex 审批",
-    "/reject（/no）[A编号] - 拒绝当前渠道收到的 Codex 审批",
-    "/stop（/x）- 中断当前 Codex 任务"
-  ].join("\n");
 }
 
 function taskboardSkillPrompt(instruction: string): string {

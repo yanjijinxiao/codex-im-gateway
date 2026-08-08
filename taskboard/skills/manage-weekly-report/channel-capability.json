@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "channel": {
+    "capabilityId": "weekly-report",
+    "command": {
+      "name": "weekly",
+      "aliases": ["wr", "周报"],
+      "helpLine": "/weekly（/wr、/周报）[status|open|collect|draft|confirm|mail|publish] - 管理周报",
+      "usage": "/weekly [status|open|collect|draft|confirm|mail|publish]",
+      "defaultOperation": "status"
+    },
+    "operations": [
+      {
+        "name": "status",
+        "aliases": ["list", "show", "状态", "查看"],
+        "instruction": "查看当前周报列表、报告周期和草稿、已确认、已发布状态。",
+        "ai": {
+          "intent": "weekly_status",
+          "guidance": "查看当前周报列表、报告周期或状态。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "open",
+        "aliases": ["view", "preview", "打开", "预览"],
+        "instruction": "打开周报入口或当前周报详情，并先检查渲染器是否可用。",
+        "ai": {
+          "intent": "weekly_open",
+          "guidance": "打开周报入口、当前周报详情或预览。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "collect",
+        "aliases": ["continue", "start", "收集", "继续", "整理"],
+        "instruction": "继续增量收集本周周报；复用已有事实，每次只问一个小问题。",
+        "ai": {
+          "intent": "weekly_collect",
+          "guidance": "开始、继续收集或整理周报事实。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "draft",
+        "aliases": ["generate", "compose", "草稿", "生成"],
+        "instruction": "基于已确认事实生成或更新完整周报草稿，不得虚构内容。",
+        "ai": {
+          "intent": "weekly_draft",
+          "guidance": "根据已有事实生成或更新完整周报草稿。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "confirm",
+        "aliases": ["approve", "确认", "定稿"],
+        "instruction": "处理用户对完整周报的确认；只有明确确认完整内容后才能归档。",
+        "confirmation": "explicit",
+        "ai": {
+          "intent": "weekly_confirm",
+          "guidance": "仅在用户明确确认完整周报内容时处理确认。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "mail",
+        "aliases": ["email", "邮件", "邮件草稿"],
+        "instruction": "为当前周报生成企业微信邮件草稿，保留未发送状态供用户检查，绝不代替用户发送。",
+        "ai": {
+          "intent": "weekly_mail",
+          "guidance": "生成并打开未发送的企业微信邮件草稿，不发送邮件。",
+          "argument": "detail"
+        }
+      },
+      {
+        "name": "publish",
+        "aliases": ["published", "发布", "已发布", "已发送"],
+        "instruction": "处理发布状态；只有用户明确确认邮件已发送或周报已发布后才能标记已发布。",
+        "confirmation": "explicit",
+        "ai": {
+          "intent": "weekly_publish",
+          "guidance": "仅在用户明确表示邮件已发送或周报已发布时标记已发布。",
+          "argument": "detail"
+        }
+      }
+    ]
+  },
+  "sidebar": {
+    "id": "weekly-report",
+    "label": "周报",
+    "ariaLabel": "切换到周报",
+    "url": "http://127.0.0.1:42732/",
+    "order": 20,
+    "icon": "document"
+  }
+}

@@ -85,12 +85,12 @@ After building locally and starting the Bridge as described above, run this comm
 npm run taskboard:codex
 ```
 
-It launches Codex with the required local debugging flags and adds two peer entries below Plugins in the native sidebar:
+It launches Codex with the required local debugging flags and adds built-in peer entries below Plugins in the native sidebar:
 
 - **Channel Configuration (Message Channels)** opens the Codex Channel Bridge console for Personal WeChat, Enterprise WeChat, and Feishu.
 - **Taskboard** opens the embedded board while retaining the current Codex project and conversation context.
 
-Both entries use the Codex main workspace instead of opening a separate browser side panel. Keep the command's terminal running while using the integration, because the injector keeps the entries attached. Use the same command whenever you want to launch the integrated Codex window again.
+Both built-in entries and optional entries declared by installed Skills use the Codex main workspace instead of opening a separate browser side panel. Keep the command's terminal running while using the integration, because the injector keeps the entries attached. Use the same command whenever you want to launch the integrated Codex window again.
 
 If Codex was launched from the Dock or Finder and the sidebar shows only an older Taskboard entry, quit Codex completely, stop the old injector terminal, and rerun the command from the **current repository root**. An already-running Codex process cannot gain a debugging port after launch, which is the usual cause of a stale single-entry sidebar.
 
@@ -161,9 +161,9 @@ The management header includes a Taskboard tab that switches the current main ar
 
 The Settings page connects to `http://127.0.0.1:47823` by default and maps Codex projects to Taskboard projects by absolute workspace path. Taskboard remains the single source of truth for issue state; the bridge does not copy board issues into its own state files. Issues without a real Codex thread are read-only, blocking and review require evidence, and completion requires explicit acceptance. Only HTTP loopback origins are accepted. The configured `manage-taskboard` Skill and `taskctl` command point directly to this repository's `taskboard/` workspace.
 
-Running `npm run install:local` links `taskboard/skills/manage-taskboard` and `taskboard/cli/taskctl.mjs` into the user environment. Useful commands: `npm run taskboard:start` starts a standalone local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
+Running `npm run install:local` links every directory under `taskboard/skills/*` that contains `SKILL.md`, plus `taskboard/cli/taskctl.mjs`, into the user environment. The installer discovers bundled Skills by directory and contains no business-Skill list. `manage-weekly-report` is one declarative extension example: it collects read-only evidence from the current conversation and Taskboard, then connects the confirmed report to the local renderer and an unsent WeCom email draft. Useful commands: `npm run taskboard:start` starts a standalone local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
 
-Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --launch --watch` adds two native-looking peer navigation entries below Plugins. **Taskboard** and **Channel Configuration** switch the same Codex main workspace between the local board and the Codex Channel Bridge management page at `http://127.0.0.1:8787/`; neither opens a separate browser side panel. Current Codex Chromium builds enforce Local Network Access checks for loopback iframes, so the launcher supplies `--disable-features=LocalNetworkAccessChecks`; an already-running Dock-launched process without a debugging port cannot be injected in place. A resident background injector can add `--adopt-normal-launch`; when installed while Codex is already open, add `--defer-existing` so it preserves the current window and briefly relaunches the next normal opening with the required flags before injecting it.
+Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --launch --watch` adds native-looking peer navigation entries below Plugins. **Taskboard** and **Channel Configuration** are built in; installed Skill manifests can add optional loopback entries to the same Codex main workspace through the read-only `/api/channel-capabilities` endpoint. The injector refreshes those entries every five seconds and never opens a separate browser side panel. Current Codex Chromium builds enforce Local Network Access checks for loopback iframes, so the launcher supplies `--disable-features=LocalNetworkAccessChecks`; an already-running Dock-launched process without a debugging port cannot be injected in place. A resident background injector can add `--adopt-normal-launch`; when installed while Codex is already open, add `--defer-existing` so it preserves the current window and briefly relaunches the next normal opening with the required flags before injecting it.
 
 ## Message-channel commands
 
@@ -212,6 +212,14 @@ Natural language is the default entry point. The classifier receives the authent
 /reject A1       /no A1       Decline a Codex request received in this channel
 /stop            /x           Interrupt the current Codex task
 ```
+
+### Post-installed Skill capabilities
+
+The Bridge core does not import business Skills. An installed Skill may add `channel-capability.json` next to its `SKILL.md` to declare slash-command aliases, help text, bounded operations, optional natural-language actions, and an optional loopback sidebar entry. The manifest is strict data only: it cannot name a module, script, shell command, HTML, CSS, or arbitrary filesystem path. Invocation uses the validated `name` in `SKILL.md` frontmatter rather than assuming it matches the install directory; extension iframes cannot use Taskboard's privileged thread or automation host protocol, and receive clipboard access only when `sidebar.allowClipboard` is explicitly `true`.
+
+The generic provider validates installed manifests at the beginning of each inbound message and reuses that immutable snapshot for parsing, help, the classifier output schema, post-model validation, and execution. Installing, updating, or removing a Skill therefore applies to the next message without restarting the Bridge. Built-in commands and actions always win; invalid, oversized, unsupported, remote, duplicate, or conflicting manifests fail closed. Operations marked `confirmation: "explicit"` still rely on the Skill to verify domain state and user confirmation before any external side effect.
+
+Bundled extensions need only a `taskboard/skills/<skill>/{SKILL.md,channel-capability.json}` directory. `npm run install:local` discovers and links it automatically; adding another extension must not require editing `src/`, the installer, or the Codex injector. The weekly-report package at `taskboard/skills/manage-weekly-report/channel-capability.json` is the reference manifest.
 
 Regular messages enter the active session. Images, files, videos, and voice/audio without transcription are saved under the account's inbound directory and added to the prompt by local path. WeChat voice transcription is preferred when available.
 

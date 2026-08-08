@@ -125,12 +125,12 @@ The legacy workbench contract remains documented for compatibility with older bu
 
 ### Codex Sidebar Integration Entries
 
-- Structure: two native-looking rows placed immediately after Codex's Plugins row: “任务面板” first and “渠道配置” second.
-- Behavior: the two rows are peer navigation entries. “任务面板” and “渠道配置” switch the same embedded main-workspace surface between Taskboard and the loopback Codex Channel Bridge page; selecting the current row keeps the current page instead of opening another surface.
+- Structure: native-looking peer rows placed immediately after Codex's Plugins row. Sub2API, Taskboard, and Channel Configuration are built in; validated installed Skill manifests may contribute sorted rows between Sub2API and Taskboard.
+- Behavior: every built-in and manifest-contributed row switches the same embedded main-workspace surface. Selecting the current row keeps the current page instead of opening another surface; removing an active extension safely returns to Taskboard.
 - Layout: the shared embedded surface begins below Codex's measured native titlebar and fills the remaining project workspace; standalone Taskboard and Channel Bridge pages retain their own full-page layout.
 - States: default, hover, focus-visible, and active. Exactly one integration row claims the current-page state while its embedded surface is visible.
-- Accessibility: each row has a distinct icon, visible text, and an action-specific accessible name.
-- Security: the channel entry resolves only to an HTTP(S) loopback URL and never carries credentials in its label or DOM text. Channel Bridge permits the exact `app://-` Codex frame ancestor while ordinary web ancestors remain blocked; mutation-origin checks remain unchanged.
+- Accessibility: each row has an enumerated SVG icon, visible text, and an action-specific accessible name.
+- Security: Sub2API keeps its fixed loopback URL. Extension navigation comes only from strict installed manifests through a read-only API and accepts HTTP(S) loopback URLs without credentials; labels, icons, order, and URLs are validated again in the injected client. Channel Bridge permits the exact `app://-` Codex frame ancestor while ordinary web ancestors remain blocked; mutation-origin checks remain unchanged.
 
 ## 6. Motion & Interaction
 

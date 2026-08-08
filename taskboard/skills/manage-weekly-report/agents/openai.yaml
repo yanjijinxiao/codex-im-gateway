@@ -1,0 +1,4 @@
+interface:
+  display_name: "周报助手"
+  short_description: "采集事实、整理并确认归档周报，生成企业微信邮件草稿"
+  default_prompt: "使用 $manage-weekly-report 继续收集并整理本周周报。"

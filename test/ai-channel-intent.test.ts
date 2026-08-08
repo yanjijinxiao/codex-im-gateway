@@ -6,6 +6,7 @@ import {
   AI_CHANNEL_INTENT_OUTPUT_SCHEMA,
   commandsFromAiChannelIntentOutput
 } from "../src/bridge/ai-channel-intent-decision.js";
+import type { ChannelCommandCapability } from "../src/bridge/channel-capability.js";
 
 const action = (intent: string, overrides: Record<string, unknown> = {}) => ({
   intent,
@@ -61,6 +62,29 @@ test("maps ordinary chat and malformed output to no commands", () => {
     actions: []
   })), undefined);
   assert.equal(commandsFromAiChannelIntentOutput("not-json"), undefined);
+});
+
+test("ignores classifier arguments for extension actions that declare no argument", () => {
+  const capability: ChannelCommandCapability = {
+    id: "example",
+    commandName: "example",
+    aliases: {},
+    helpLine: "/example - 示例",
+    aiActions: [{
+      intent: "example_status",
+      operation: "status",
+      guidance: "查看示例状态。",
+      argument: "none"
+    }],
+    resolve: () => ({ kind: "reply", text: "unused" })
+  };
+  const commands = commandsFromAiChannelIntentOutput(JSON.stringify({
+    schemaVersion: 2,
+    kind: "actions",
+    actions: [action("example_status", { target: "ignored", detail: "ignored" })]
+  }), [capability]);
+
+  assert.deepEqual(commands, [{ name: "example", arg: "status" }]);
 });
 
 test("uses a response-format-compatible schema without unsupported oneOf", () => {

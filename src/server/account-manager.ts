@@ -4,6 +4,11 @@ import path from "node:path";
 
 import { parseActionBlocks } from "../bridge/actions.js";
 import { createCodexChannelIntentResolver } from "../bridge/ai-channel-intent.js";
+import type {
+  ChannelCapabilityNavigation,
+  ChannelCapabilityProvider
+} from "../bridge/channel-capability.js";
+import { createInstalledSkillCapabilitiesProvider } from "../bridge/installed-skill-capabilities.js";
 import { buildPrompt, buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
@@ -219,6 +224,7 @@ export type AccountManagerOptions = {
   ) => CodexDesktopApprovalMonitor;
   taskboardClientFactory?: (url: string) => TaskboardClient;
   llmWiki?: LlmWikiMcpClientPool;
+  channelCapabilities?: ChannelCapabilityProvider;
 };
 
 export class AccountManager {
@@ -238,6 +244,7 @@ export class AccountManager {
   private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private readonly llmWiki: LlmWikiMcpClientPool;
+  private readonly channelCapabilities: ChannelCapabilityProvider;
   private runner?: HybridCodexRunner;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
   private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
@@ -267,6 +274,7 @@ export class AccountManager {
       ?? ((handlers) => new CodexDesktopApprovalMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
+    this.channelCapabilities = options.channelCapabilities ?? createInstalledSkillCapabilitiesProvider();
     this.taskboardWorkbench = new TaskboardWorkbench({
       client: () => this.taskboardFor(),
       projects: () => this.listProjects().map(taskboardProjectBase)
@@ -366,6 +374,7 @@ export class AccountManager {
       llmWiki: this.llmWiki,
       modeSettings: normalizeChannelModeSettings(account.modeSettings),
       taskboard: this.taskboardFor(config),
+      channelCapabilities: this.channelCapabilities,
       onOutboundMessage: (message) => webhook.publish(message),
       onTurnStatus: ({ sessionId, active }) => this.setSessionResponding(account.accountId, sessionId, active),
       onTurnCompleted: ({ sessionId, text, success, turnId }) => this.notifyProjectCompletion(
@@ -529,6 +538,12 @@ export class AccountManager {
     return listAccounts(this.options.paths).map((account) => this.summary(account));
   }
 
+  async listChannelCapabilityNavigation(): Promise<readonly ChannelCapabilityNavigation[]> {
+    const capabilities = await this.channelCapabilities();
+    return capabilities.flatMap((capability) => capability.navigation ? [capability.navigation] : [])
+      .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+  }
+
   async syncFeishuShortcutMenu(accountId: string): Promise<FeishuShortcutMenuSyncResult> {
     const account = loadAccount(this.options.paths, accountId);
     if (account.channel !== "feishu") {
@@ -623,8 +638,13 @@ export class AccountManager {
     const inspection = await this.llmWiki.inspect(candidate);
     const updated = store.updateKnowledgeBase(knowledgeBaseId, input);
     this.llmWiki.invalidate(knowledgeBaseId);
+    const knowledgeBase = this.listKnowledgeBases(accountId)
+      .find((item) => item.id === updated.id);
+    if (!knowledgeBase) {
+      throw new Error(`Managed knowledge base not found after update: ${updated.id}`);
+    }
     return {
-      knowledgeBase: this.listKnowledgeBases(accountId).find((item) => item.id === updated.id)!,
+      knowledgeBase,
       inspection
     };
   }

@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import type { ChannelCommandCapability } from "./channel-capability.js";
 import type { ChannelCommand } from "./channel-intent.js";
 
 export const MAX_AI_CHANNEL_ACTIONS = 4;
@@ -33,8 +34,10 @@ export const AI_CHANNEL_ACTION_NAMES = [
   "task_return"
 ] as const;
 
+const AI_CHANNEL_ACTION_NAME_SET = new Set<string>(AI_CHANNEL_ACTION_NAMES);
+
 const AiChannelActionSchema = z.object({
-  intent: z.enum(AI_CHANNEL_ACTION_NAMES),
+  intent: z.string().trim().min(1).max(80).regex(/^[a-z][a-z0-9_]*$/),
   confidence: z.number().min(0).max(1),
   target: z.string().trim().min(1).max(200).regex(/^[^\r\n]+$/).nullable(),
   detail: z.string().trim().min(1).max(2_000).nullable()
@@ -65,11 +68,55 @@ export const AI_CHANNEL_INTENT_OUTPUT_SCHEMA = z.toJSONSchema(AiChannelIntentDec
 
 type AiChannelAction = z.infer<typeof AiChannelActionSchema>;
 
-export function commandsFromAiChannelIntentOutput(output: string): readonly ChannelCommand[] | undefined {
+export function commandsFromAiChannelIntentOutput(
+  output: string,
+  capabilities: readonly ChannelCommandCapability[] = []
+): readonly ChannelCommand[] | undefined {
   const decision = parseAiChannelIntentDecision(output);
   if (!decision || decision.kind === "ordinary_chat") return undefined;
   if (decision.actions.some((action) => action.confidence < 0.8)) return undefined;
-  return decision.actions.map(commandFromAction);
+  const availableActionNames = new Set(aiChannelActionNamesForCapabilities(capabilities));
+  if (decision.actions.some((action) => !availableActionNames.has(action.intent))) return undefined;
+  const commands = decision.actions.map((action) => commandFromAction(action, capabilities));
+  return commands.every(isChannelCommand) ? commands : undefined;
+}
+
+export function aiChannelActionNamesForCapabilities(
+  capabilities: readonly ChannelCommandCapability[]
+): readonly string[] {
+  return [
+    ...AI_CHANNEL_ACTION_NAMES,
+    ...capabilities.flatMap((capability) => capability.aiActions.map((action) => action.intent))
+  ];
+}
+
+export function aiChannelIntentOutputSchemaForCapabilities(
+  capabilities: readonly ChannelCommandCapability[]
+): Readonly<Record<string, unknown>> {
+  return {
+    type: "object",
+    properties: {
+      schemaVersion: { type: "number", const: 2 },
+      kind: { type: "string", enum: ["ordinary_chat", "actions"] },
+      actions: {
+        type: "array",
+        maxItems: MAX_AI_CHANNEL_ACTIONS,
+        items: {
+          type: "object",
+          properties: {
+            intent: { type: "string", enum: aiChannelActionNamesForCapabilities(capabilities) },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            target: { type: ["string", "null"], minLength: 1, maxLength: 200 },
+            detail: { type: ["string", "null"], minLength: 1, maxLength: 2_000 }
+          },
+          required: ["intent", "confidence", "target", "detail"],
+          additionalProperties: false
+        }
+      }
+    },
+    required: ["schemaVersion", "kind", "actions"],
+    additionalProperties: false
+  };
 }
 
 function parseAiChannelIntentDecision(output: string): z.infer<typeof AiChannelIntentDecisionSchema> | undefined {
@@ -87,7 +134,23 @@ function parseAiChannelIntentDecision(output: string): z.infer<typeof AiChannelI
   return parsed.success ? parsed.data : undefined;
 }
 
-function commandFromAction(action: AiChannelAction): ChannelCommand {
+function commandFromAction(
+  action: AiChannelAction,
+  capabilities: readonly ChannelCommandCapability[]
+): ChannelCommand | undefined {
+  if (!isBuiltInAiChannelActionName(action.intent)) {
+    for (const capability of capabilities) {
+      const extensionAction = capability.aiActions.find((candidate) => candidate.intent === action.intent);
+      if (!extensionAction) continue;
+      const argument = extensionAction.argument === "target"
+        ? action.target
+        : extensionAction.argument === "detail"
+          ? action.detail
+          : null;
+      return command(capability.commandName, join(extensionAction.operation, argument));
+    }
+    return undefined;
+  }
   switch (action.intent) {
     case "help":
       return command("help");
@@ -152,6 +215,16 @@ function commandFromAction(action: AiChannelAction): ChannelCommand {
     default:
       return assertNever(action.intent);
   }
+}
+
+export function isBuiltInAiChannelActionName(
+  value: string
+): value is (typeof AI_CHANNEL_ACTION_NAMES)[number] {
+  return AI_CHANNEL_ACTION_NAME_SET.has(value);
+}
+
+function isChannelCommand(commandValue: ChannelCommand | undefined): commandValue is ChannelCommand {
+  return commandValue !== undefined;
 }
 
 function command(name: string, arg = ""): ChannelCommand {

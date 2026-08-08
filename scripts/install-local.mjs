@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { lstat, mkdir, readlink, realpath, stat, symlink, unlink } from "node:fs/promises";
+import { lstat, mkdir, readdir, readlink, realpath, stat, symlink, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,6 +80,27 @@ async function ensureLink(source, destination, checkOnly) {
   return entry ? "migrated" : "created";
 }
 
+async function ensureBundledSkillLinks(home, checkOnly) {
+  const skillsRoot = path.join(taskboardRoot, "skills");
+  const entries = await readdir(skillsRoot, { withFileTypes: true });
+  const skillNames = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+    const skillEntry = await fileStatus(path.join(skillsRoot, entry.name, "SKILL.md"));
+    if (skillEntry?.isFile()) skillNames.push(entry.name);
+  }
+  skillNames.sort((left, right) => left.localeCompare(right));
+  const statuses = await Promise.all(skillNames.map(async (skillName) => [
+    skillName,
+    await ensureLink(
+      path.join(skillsRoot, skillName),
+      path.join(home, ".codex", "skills", skillName),
+      checkOnly
+    )
+  ]));
+  return Object.fromEntries(statuses);
+}
+
 async function main() {
   const options = parseOptions(process.argv.slice(2));
   if (Number(process.versions.node.split(".")[0]) < 22) {
@@ -98,15 +119,12 @@ async function main() {
       path.join(home, ".local", "bin", "taskctl"),
       options.check
     ),
-    skill: await ensureLink(
-      path.join(taskboardRoot, "skills", "manage-taskboard"),
-      path.join(home, ".codex", "skills", "manage-taskboard"),
-      options.check
-    )
+    skills: await ensureBundledSkillLinks(home, options.check)
   };
+  const linkStatuses = [links.taskctl, ...Object.values(links.skills)];
   const ok = await dependenciesAreCurrent()
     && await buildIsCurrent()
-    && Object.values(links).every((value) => value === "current" || value === "created" || value === "migrated");
+    && linkStatuses.every((value) => value === "current" || value === "created" || value === "migrated");
   console.log(JSON.stringify({
     ok,
     mode: options.check ? "check" : "install",

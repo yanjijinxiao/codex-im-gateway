@@ -222,6 +222,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
   const method = request.method ?? "GET";
+  if (method === "GET" && url.pathname === "/api/channel-capabilities") {
+    const origin = request.headers.origin;
+    if (origin === "app://-") response.setHeader("Access-Control-Allow-Origin", origin);
+    sendJson(response, 200, {
+      navigation: await context.accountManager.listChannelCapabilityNavigation()
+    });
+    return;
+  }
   if (isMutation(method)) {
     if (!isAllowedOrigin(request.headers.origin, context.port)) {
       sendJson(response, 403, { error: "Local origin required" });
