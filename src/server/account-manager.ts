@@ -78,6 +78,10 @@ import {
   type TaskboardIssueDetail,
   type TaskboardIssueSummary
 } from "../taskboard/workbench.js";
+import {
+  syncFeishuShortcutMenu,
+  type FeishuShortcutMenuSyncResult
+} from "../channels/feishu-menu-sync.js";
 import { ChannelMessageWebhook } from "../webhooks/channel-message-webhook.js";
 import { resolveChannelModeSettings } from "./channel-mode-settings.js";
 
@@ -377,23 +381,29 @@ export class AccountManager {
 
     entry.status = "running";
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      const authorizedConversation = message.source === "native-menu"
+        ? store.getAuthorizedConversation(message.senderId)
+        : undefined;
+      const messageWithConversation = authorizedConversation
+        ? { ...message, replyTargetId: authorizedConversation }
+        : message;
       if (channel !== "weixin") {
-        const replyTargetId = message.replyTargetId ?? message.senderId;
+        const replyTargetId = messageWithConversation.replyTargetId ?? messageWithConversation.senderId;
         const allowedIds = new Set([...config.allowedSenderIds, ...store.listPairedSenderIds()]);
         store.rememberChannelIdentity(
-          message.senderId,
+          messageWithConversation.senderId,
           replyTargetId,
-          allowedIds.has(message.senderId) || allowedIds.has(replyTargetId)
+          allowedIds.has(messageWithConversation.senderId) || allowedIds.has(replyTargetId)
         );
       }
       webhook.publish({
         direction: "inbound",
-        id: message.id,
-        senderId: message.senderId,
-        text: message.text,
-        attachments: message.attachments.map(({ kind, label }) => ({ kind, label }))
+        id: messageWithConversation.id,
+        senderId: messageWithConversation.senderId,
+        text: messageWithConversation.text,
+        attachments: messageWithConversation.attachments.map(({ kind, label }) => ({ kind, label }))
       });
-      await service.handleMessage(message);
+      await service.handleMessage(messageWithConversation);
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
       await this.sendChannelText(entry, {
@@ -517,6 +527,14 @@ export class AccountManager {
 
   listAccounts(): AccountSummary[] {
     return listAccounts(this.options.paths).map((account) => this.summary(account));
+  }
+
+  async syncFeishuShortcutMenu(accountId: string): Promise<FeishuShortcutMenuSyncResult> {
+    const account = loadAccount(this.options.paths, accountId);
+    if (account.channel !== "feishu") {
+      throw new Error("只有飞书渠道可以同步机器人快捷菜单");
+    }
+    return syncFeishuShortcutMenu(account);
   }
 
   listSessions(): AccountSession[] {

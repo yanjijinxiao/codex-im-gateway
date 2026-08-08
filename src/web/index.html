@@ -433,7 +433,7 @@
           <label id="accountQaSourceField">
             <span>问答知识来源</span>
             <select id="accountQaSourceInput"></select>
-            <small class="field-hint">项目自身的知识库绑定优先；未绑定时使用这里选择的渠道知识库。</small>
+            <small class="field-hint">可选当前 Codex 项目或独立目录。项目自身的知识库绑定优先；当前聊天项目始终是 Codex 工作目录。</small>
           </label>
           <div class="channel-mode-directory form-stack" id="accountQaDirectoryFields" hidden>
             <label>
@@ -443,7 +443,7 @@
             <label>
               <span>llm-wiki 根目录</span>
               <input id="accountQaDirectoryRootInput" autocomplete="off" placeholder="/Users/name/code/product-wiki" aria-describedby="accountQaDirectoryHint accountFormError" aria-invalid="false" aria-required="false">
-              <small class="field-hint" id="accountQaDirectoryHint">必须是可通过 llm-wiki 检查的项目或目录；保存前会验证 wiki/ 和只读查询能力。</small>
+              <small class="field-hint" id="accountQaDirectoryHint">必须是能通过 llm-wiki 只读状态检查的项目或目录，不以文件夹结构判断。</small>
             </label>
             <details class="channel-mode-advanced">
               <summary>高级目录设置</summary>
@@ -621,7 +621,7 @@
     </form>
   </dialog>
 
-  <dialog class="modal" id="knowledgeBaseDialog" aria-labelledby="knowledgeBaseDialogTitle">
+  <dialog class="modal knowledge-base-modal" id="knowledgeBaseDialog" aria-labelledby="knowledgeBaseDialogTitle">
     <form id="knowledgeBaseForm" method="dialog">
       <div class="modal-header">
         <div><p class="eyebrow">LLM-WIKI PROJECT</p><h2 id="knowledgeBaseDialogTitle">添加 llm-wiki</h2></div>
@@ -631,10 +631,26 @@
       <input id="editingKnowledgeBaseAccountId" type="hidden">
       <div class="modal-body form-stack">
         <label id="knowledgeBaseAccountField"><span>所属渠道账号</span><select id="knowledgeBaseAccountInput" required></select></label>
+        <label id="knowledgeBaseProjectField">
+          <span>选择 Codex 项目（可选）</span>
+          <select id="knowledgeBaseProjectInput"><option value="">正在读取 Codex 项目…</option></select>
+          <small class="field-hint" id="knowledgeBaseProjectHint">选择后会自动填入显示名称和根目录，也可以直接选择其他目录。</small>
+        </label>
         <label><span>显示名称</span><input id="knowledgeBaseNameInput" maxlength="60" autocomplete="off" placeholder="例如：产品文档知识库" required></label>
-        <label><span>llm-wiki 根目录</span><input id="knowledgeBaseRootInput" autocomplete="off" placeholder="/Users/name/code/llm-wiki" required><small class="field-hint">目录必须包含 wiki/，查询只读。</small></label>
-        <label><span>引擎目录（可选）</span><input id="knowledgeBaseEngineInput" autocomplete="off" placeholder="默认使用知识库根目录"><small class="field-hint">当知识数据与 llm-wiki 代码分开时，选择包含 skills/knowledge-base 的引擎项目。</small></label>
-        <label><span>状态目录（可选）</span><input id="knowledgeBaseStateInput" autocomplete="off" placeholder="默认使用根目录内 .llm-wiki"></label>
+        <div class="path-field">
+          <label for="knowledgeBaseRootInput">llm-wiki 根目录</label>
+          <div class="path-field-control"><input id="knowledgeBaseRootInput" autocomplete="off" placeholder="/Users/name/code/llm-wiki" required><button class="button button-secondary directory-picker-button" type="button" data-directory-target="knowledgeBaseRootInput" aria-label="选择 llm-wiki 根目录"><i data-lucide="folder-open"></i><span>选择</span></button></div>
+          <small class="field-hint">保存前调用 llm-wiki 只读状态检查，不按文件夹结构判断。</small>
+        </div>
+        <div class="path-field">
+          <label for="knowledgeBaseEngineInput">引擎目录（可选）</label>
+          <div class="path-field-control"><input id="knowledgeBaseEngineInput" autocomplete="off" placeholder="默认使用根目录"><button class="button button-secondary directory-picker-button" type="button" data-directory-target="knowledgeBaseEngineInput" aria-label="选择 llm-wiki 引擎目录"><i data-lucide="folder-open"></i><span>选择</span></button></div>
+          <small class="field-hint">知识与代码分开时，选择 llm-wiki 引擎项目。</small>
+        </div>
+        <div class="path-field">
+          <label for="knowledgeBaseStateInput">状态目录（可选）</label>
+          <div class="path-field-control"><input id="knowledgeBaseStateInput" autocomplete="off" placeholder="默认使用 .llm-wiki"><button class="button button-secondary directory-picker-button" type="button" data-directory-target="knowledgeBaseStateInput" aria-label="选择 llm-wiki 状态目录"><i data-lucide="folder-open"></i><span>选择</span></button></div>
+        </div>
         <p class="form-error" id="knowledgeBaseFormError" hidden></p>
       </div>
       <div class="modal-footer">

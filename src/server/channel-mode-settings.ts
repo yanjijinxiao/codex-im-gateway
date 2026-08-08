@@ -18,6 +18,14 @@ type ResolveChannelModeSettingsInput = {
   readonly settings: ChannelModeSettingsUpdate;
 };
 
+type KnowledgeBaseDirectoryInput = {
+  readonly rootPath: string;
+  readonly name?: string;
+  readonly engineRoot?: string;
+  readonly stateDir?: string;
+  readonly fallbackName?: string;
+};
+
 export async function resolveChannelModeSettings(
   input: ResolveChannelModeSettingsInput
 ): Promise<ChannelModeSettings> {
@@ -37,8 +45,15 @@ async function resolveQaKnowledgeBase(
   selection: QaKnowledgeBaseSelection
 ): Promise<string | undefined> {
   switch (selection.kind) {
-    case "project":
-      return undefined;
+    case "project": {
+      if (!selection.projectId) return undefined;
+      const project = store.listProjects().find((candidate) => candidate.id === selection.projectId);
+      if (!project) throw new Error(`Managed Codex project not found: ${selection.projectId}`);
+      return resolveDirectoryKnowledgeBase(store, llmWiki, {
+        rootPath: project.workspace,
+        fallbackName: project.name
+      });
+    }
     case "managed": {
       const knowledgeBase = store.listKnowledgeBases()
         .find((candidate) => candidate.id === selection.knowledgeBaseId);
@@ -46,35 +61,42 @@ async function resolveQaKnowledgeBase(
       await llmWiki.inspect(knowledgeBase);
       return knowledgeBase.id;
     }
-    case "directory": {
-      const rootPath = path.resolve(selection.rootPath);
-      const existing = store.listKnowledgeBases().find((candidate) => candidate.rootPath === rootPath);
-      if (existing) {
-        const update = {
-          ...(selection.name !== undefined ? { name: selection.name } : {}),
-          ...(selection.engineRoot !== undefined ? { engineRoot: path.resolve(selection.engineRoot) } : {}),
-          ...(selection.stateDir !== undefined ? { stateDir: path.resolve(selection.stateDir) } : {})
-        };
-        await llmWiki.inspect({ ...existing, ...update });
-        if (Object.keys(update).length) store.updateKnowledgeBase(existing.id, update);
-        return existing.id;
-      }
-      const now = new Date().toISOString();
-      const candidate: ManagedKnowledgeBase = {
-        id: "validation",
-        name: selection.name?.trim() || path.basename(rootPath) || "llm-wiki",
-        rootPath,
-        ...(selection.engineRoot ? { engineRoot: path.resolve(selection.engineRoot) } : {}),
-        ...(selection.stateDir ? { stateDir: path.resolve(selection.stateDir) } : {}),
-        createdAt: now,
-        updatedAt: now
-      };
-      await llmWiki.inspect(candidate);
-      return store.createKnowledgeBase(candidate.name, candidate.rootPath, candidate).id;
-    }
+    case "directory":
+      return resolveDirectoryKnowledgeBase(store, llmWiki, selection);
     default:
       return assertNever(selection);
   }
+}
+
+async function resolveDirectoryKnowledgeBase(
+  store: RuntimeStateStore,
+  llmWiki: LlmWikiInspector,
+  selection: KnowledgeBaseDirectoryInput
+): Promise<string> {
+  const rootPath = path.resolve(selection.rootPath);
+  const existing = store.listKnowledgeBases().find((candidate) => candidate.rootPath === rootPath);
+  if (existing) {
+    const update = {
+      ...(selection.name !== undefined ? { name: selection.name } : {}),
+      ...(selection.engineRoot !== undefined ? { engineRoot: path.resolve(selection.engineRoot) } : {}),
+      ...(selection.stateDir !== undefined ? { stateDir: path.resolve(selection.stateDir) } : {})
+    };
+    await llmWiki.inspect({ ...existing, ...update });
+    if (Object.keys(update).length) store.updateKnowledgeBase(existing.id, update);
+    return existing.id;
+  }
+  const now = new Date().toISOString();
+  const candidate: ManagedKnowledgeBase = {
+    id: "validation",
+    name: selection.name?.trim() || selection.fallbackName || path.basename(rootPath) || "llm-wiki",
+    rootPath,
+    ...(selection.engineRoot ? { engineRoot: path.resolve(selection.engineRoot) } : {}),
+    ...(selection.stateDir ? { stateDir: path.resolve(selection.stateDir) } : {}),
+    createdAt: now,
+    updatedAt: now
+  };
+  await llmWiki.inspect(candidate);
+  return store.createKnowledgeBase(candidate.name, candidate.rootPath, candidate).id;
 }
 
 function assertNever(value: never): never {

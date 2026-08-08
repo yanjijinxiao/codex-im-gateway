@@ -1,11 +1,20 @@
 const knowledgeBaseInspections = new Map();
+let knowledgeBaseDialogSession = 0;
 
 window.renderKnowledgeBasesPage = renderKnowledgeBasesPage;
 
 document.addEventListener("DOMContentLoaded", () => {
-  document.querySelector("#addKnowledgeBaseButton").addEventListener("click", openNewKnowledgeBaseDialog);
+  document.querySelector("#addKnowledgeBaseButton").addEventListener("click", () => {
+    openNewKnowledgeBaseDialog().catch((error) => setKnowledgeBaseFormError(String(error)));
+  });
   document.querySelector("#knowledgeBaseForm").addEventListener("submit", async (event) => {
     await saveKnowledgeBase(event);
+  });
+  document.querySelector("#knowledgeBaseProjectInput").addEventListener("change", applyKnowledgeBaseProjectSelection);
+  document.querySelector("#knowledgeBaseRootInput").addEventListener("input", syncKnowledgeBaseProjectSelection);
+  document.querySelector("#knowledgeBaseDialog").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-directory-target]");
+    if (button) await pickKnowledgeBaseDirectory(button);
   });
   document.querySelector("#knowledgeBaseList").addEventListener("click", async (event) => {
     await handleKnowledgeBaseAction(event);
@@ -23,7 +32,7 @@ function renderKnowledgeBasesPage() {
     list.innerHTML = emptyState(
       "library-big",
       "还没有 llm-wiki 知识库",
-      "添加一个包含 wiki/ 和只读检索能力的 llm-wiki 项目。",
+      "添加一个能通过只读状态检查的 llm-wiki 项目或目录。",
       '<button class="button button-primary" type="button" data-knowledge-action="add"><i data-lucide="library-big"></i><span>添加 llm-wiki</span></button>'
     );
   } else {
@@ -76,7 +85,8 @@ function renderKnowledgeBinding(project) {
   </label>`;
 }
 
-function openNewKnowledgeBaseDialog() {
+async function openNewKnowledgeBaseDialog() {
+  const dialogSession = beginKnowledgeBaseDialogSession();
   document.querySelector("#knowledgeBaseDialogTitle").textContent = "添加 llm-wiki";
   document.querySelector("#editingKnowledgeBaseId").value = "";
   document.querySelector("#editingKnowledgeBaseAccountId").value = "";
@@ -89,12 +99,18 @@ function openNewKnowledgeBaseDialog() {
   document.querySelector("#knowledgeBaseRootInput").value = "";
   document.querySelector("#knowledgeBaseEngineInput").value = "";
   document.querySelector("#knowledgeBaseStateInput").value = "";
+  document.querySelector("#knowledgeBaseNameInput").dataset.autoProjectName = "";
+  prepareKnowledgeBaseProjectOptions();
   setKnowledgeBaseFormError("");
   document.querySelector("#knowledgeBaseDialog").showModal();
-  document.querySelector("#knowledgeBaseNameInput").focus();
+  await loadKnowledgeBaseProjectOptions("", dialogSession);
+  if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
+  const projectInput = document.querySelector("#knowledgeBaseProjectInput");
+  (projectInput.disabled ? document.querySelector("#knowledgeBaseRootInput") : projectInput).focus();
 }
 
-function openEditKnowledgeBaseDialog(knowledgeBase) {
+async function openEditKnowledgeBaseDialog(knowledgeBase) {
+  const dialogSession = beginKnowledgeBaseDialogSession();
   document.querySelector("#knowledgeBaseDialogTitle").textContent = "编辑 llm-wiki";
   document.querySelector("#editingKnowledgeBaseId").value = knowledgeBase.id;
   document.querySelector("#editingKnowledgeBaseAccountId").value = knowledgeBase.accountId;
@@ -103,9 +119,122 @@ function openEditKnowledgeBaseDialog(knowledgeBase) {
   document.querySelector("#knowledgeBaseRootInput").value = knowledgeBase.rootPath;
   document.querySelector("#knowledgeBaseEngineInput").value = knowledgeBase.engineRoot || "";
   document.querySelector("#knowledgeBaseStateInput").value = knowledgeBase.stateDir || "";
+  document.querySelector("#knowledgeBaseNameInput").dataset.autoProjectName = "";
+  prepareKnowledgeBaseProjectOptions();
   setKnowledgeBaseFormError("");
   document.querySelector("#knowledgeBaseDialog").showModal();
+  await loadKnowledgeBaseProjectOptions(knowledgeBase.rootPath, dialogSession);
+  if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
   document.querySelector("#knowledgeBaseNameInput").focus();
+}
+
+function beginKnowledgeBaseDialogSession() {
+  knowledgeBaseDialogSession += 1;
+  document.querySelectorAll("#knowledgeBaseDialog [data-directory-target]").forEach((button) => {
+    button.disabled = false;
+    button.querySelector("span").textContent = "选择";
+  });
+  return knowledgeBaseDialogSession;
+}
+
+function isKnowledgeBaseDialogSessionCurrent(dialogSession) {
+  return dialogSession === knowledgeBaseDialogSession && document.querySelector("#knowledgeBaseDialog").open;
+}
+
+function prepareKnowledgeBaseProjectOptions() {
+  const input = document.querySelector("#knowledgeBaseProjectInput");
+  input.innerHTML = '<option value="">正在读取 Codex 项目…</option>';
+  input.disabled = true;
+  document.querySelector("#knowledgeBaseProjectHint").textContent = "正在读取 Codex 本地会话中的项目记录。";
+}
+
+async function loadKnowledgeBaseProjectOptions(selectedWorkspace, dialogSession) {
+  try {
+    if (!state.codexProjects.length) {
+      const result = await api("/api/codex-projects");
+      state.codexProjects = result.projects || [];
+    }
+    if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
+    renderKnowledgeBaseProjectOptions(selectedWorkspace);
+  } catch (error) {
+    if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
+    const input = document.querySelector("#knowledgeBaseProjectInput");
+    input.innerHTML = '<option value="">手动输入或选择目录</option>';
+    input.disabled = true;
+    document.querySelector("#knowledgeBaseProjectHint").textContent = "Codex 项目读取失败，仍可使用下方的目录选择按钮。";
+    setKnowledgeBaseFormError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function renderKnowledgeBaseProjectOptions(selectedWorkspace = "") {
+  const input = document.querySelector("#knowledgeBaseProjectInput");
+  input.innerHTML = [
+    '<option value="">手动输入或选择其他目录</option>',
+    ...state.codexProjects.map((project) => (
+      `<option value="${kbEscape(project.workspace)}">${kbEscape(project.name)} — ${kbEscape(project.workspace)}</option>`
+    ))
+  ].join("");
+  input.disabled = !state.codexProjects.length;
+  input.value = state.codexProjects.some((project) => project.workspace === selectedWorkspace)
+    ? selectedWorkspace
+    : "";
+  document.querySelector("#knowledgeBaseProjectHint").textContent = state.codexProjects.length
+    ? `已读取 ${state.codexProjects.length} 个 Codex 项目；选择后仍会执行 llm-wiki 状态验证。`
+    : "Codex 暂无项目记录，可使用下方的目录选择按钮。";
+}
+
+function applyKnowledgeBaseProjectSelection() {
+  const workspace = document.querySelector("#knowledgeBaseProjectInput").value;
+  const project = state.codexProjects.find((candidate) => candidate.workspace === workspace);
+  if (!project) return;
+  const nameInput = document.querySelector("#knowledgeBaseNameInput");
+  if (!nameInput.value.trim() || nameInput.value === nameInput.dataset.autoProjectName) {
+    nameInput.value = project.name;
+  }
+  nameInput.dataset.autoProjectName = project.name;
+  document.querySelector("#knowledgeBaseRootInput").value = project.workspace;
+  setKnowledgeBaseFormError("");
+}
+
+function syncKnowledgeBaseProjectSelection() {
+  const input = document.querySelector("#knowledgeBaseProjectInput");
+  const rootPath = document.querySelector("#knowledgeBaseRootInput").value.trim();
+  input.value = state.codexProjects.some((project) => project.workspace === rootPath) ? rootPath : "";
+}
+
+async function pickKnowledgeBaseDirectory(button) {
+  const allowedTargets = new Set([
+    "knowledgeBaseRootInput",
+    "knowledgeBaseEngineInput",
+    "knowledgeBaseStateInput"
+  ]);
+  const targetId = button.dataset.directoryTarget;
+  if (!allowedTargets.has(targetId)) return;
+  const dialogSession = knowledgeBaseDialogSession;
+  const input = document.querySelector(`#${targetId}`);
+  const label = button.querySelector("span");
+  try {
+    button.disabled = true;
+    label.textContent = "选择中";
+    setKnowledgeBaseFormError("");
+    const result = await api("/api/directory-picker", {
+      method: "POST",
+      body: { defaultPath: input.value.trim() || undefined }
+    });
+    if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
+    if (!result.path) return;
+    input.value = result.path;
+    if (targetId === "knowledgeBaseRootInput") syncKnowledgeBaseProjectSelection();
+    input.focus();
+  } catch (error) {
+    if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) return;
+    setKnowledgeBaseFormError(error instanceof Error ? error.message : String(error));
+  } finally {
+    if (isKnowledgeBaseDialogSessionCurrent(dialogSession)) {
+      button.disabled = false;
+      label.textContent = "选择";
+    }
+  }
 }
 
 async function saveKnowledgeBase(event) {
@@ -144,7 +273,7 @@ async function handleKnowledgeBaseAction(event) {
   const button = event.target.closest("[data-knowledge-action]");
   if (!button) return;
   if (button.dataset.knowledgeAction === "add") {
-    openNewKnowledgeBaseDialog();
+    await openNewKnowledgeBaseDialog();
     return;
   }
   const knowledgeBase = state.knowledgeBases.find((item) => (
@@ -152,7 +281,7 @@ async function handleKnowledgeBaseAction(event) {
   ));
   if (!knowledgeBase) return;
   if (button.dataset.knowledgeAction === "edit") {
-    openEditKnowledgeBaseDialog(knowledgeBase);
+    await openEditKnowledgeBaseDialog(knowledgeBase);
     return;
   }
   if (button.dataset.knowledgeAction === "inspect") {

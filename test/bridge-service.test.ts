@@ -471,7 +471,7 @@ test("lists and binds Taskboard issues to the active Codex session", async (t) =
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
     taskboard: {
-      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
+      async ensureProjectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
       async listIssues() { return [issue]; },
       async getIssue() { return issue; }
     } as never,
@@ -503,7 +503,7 @@ test("routes Taskboard workflow mutations through Codex and the manage-taskboard
     config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
     stateStore,
     taskboard: {
-      async projectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
+      async ensureProjectForWorkspace() { return { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 }; },
       async getIssue() { return { id: "task-one", identifier: "PROJECT-1", projectId: "project-one", title: "Ship integration", description: "", status: "todo", priority: "high", labels: [], threadId: null, version: 1, createdAt: "", updatedAt: "" }; }
     } as never,
     weixin: { async sendTyping() {}, async sendText() { return { messageId: "sent" }; } } as never,
@@ -561,6 +561,11 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
     stateStore,
     taskboard: {
       async projectForWorkspace(workspace: string) {
+        return workspace === secondWorkspace
+          ? { id: "project-two", name: "Project Two", workspacePath: secondWorkspace, issueCount: 0 }
+          : { id: "project-one", name: "Project One", workspacePath: tmpDir, issueCount: 1 };
+      },
+      async ensureProjectForWorkspace({ workspace }: { workspace: string }) {
         taskboardWorkspaces.push(workspace);
         return workspace === secondWorkspace
           ? { id: "project-two", name: "Project Two", workspacePath: secondWorkspace, issueCount: 0 }

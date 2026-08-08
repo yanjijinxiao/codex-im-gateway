@@ -93,6 +93,17 @@ export class TaskboardClient {
     );
   }
 
+  async ensureProjectForWorkspace(project: { readonly id: string; readonly name: string; readonly workspace: string }): Promise<TaskboardProject> {
+    const existing = await this.projectForWorkspace(project.workspace);
+    if (existing) return existing;
+    const value = await this.request("/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: project.id, name: project.name, workspacePath: path.resolve(project.workspace) })
+    });
+    return z.object({ project: projectSchema }).parse(value).project;
+  }
+
   async listIssues(filters: {
     projectId?: string;
     status?: TaskboardStatus;

@@ -247,6 +247,46 @@ test("knowledge-base APIs validate llm-wiki records and bind them to projects", 
   ]);
 });
 
+test("directory picker API returns an absolute path and preserves cancellation", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-directory-picker-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const selectedDirectory = path.join(root, "selected llm-wiki");
+  const defaults: Array<string | undefined> = [];
+  const selections = [selectedDirectory, undefined];
+  const server = await startLocalHttpServer({
+    paths: resolveStatePaths(root),
+    accountManager: {} as never,
+    directoryPicker: async (defaultPath?: string) => {
+      defaults.push(defaultPath);
+      return selections.shift();
+    },
+    port: 0
+  } as never);
+  t.after(() => server.close());
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Codex-Weixin-Token": server.requestToken,
+    Origin: server.url
+  };
+
+  const selected = await fetch(`${server.url}/api/directory-picker`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ defaultPath: root })
+  });
+  assert.equal(selected.status, 200);
+  assert.deepEqual(await selected.json(), { path: selectedDirectory });
+
+  const cancelled = await fetch(`${server.url}/api/directory-picker`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({})
+  });
+  assert.equal(cancelled.status, 200);
+  assert.deepEqual(await cancelled.json(), { path: null });
+  assert.deepEqual(defaults, [root, undefined]);
+});
+
 test("Codex project API lists session-derived projects and authorizes the selected workspace", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-codex-projects-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -439,6 +479,11 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.match(pageHtml, /id="accountDefaultModeInput"/);
   assert.match(pageHtml, /id="accountQaSourceInput"/);
   assert.match(pageHtml, /id="accountQaDirectoryRootInput"[^>]+aria-describedby="accountQaDirectoryHint accountFormError"/);
+  assert.match(pageHtml, /id="knowledgeBaseProjectInput"/);
+  assert.match(pageHtml, /data-directory-target="knowledgeBaseRootInput" aria-label="选择 llm-wiki 根目录"/);
+  assert.match(pageHtml, /data-directory-target="knowledgeBaseEngineInput" aria-label="选择 llm-wiki 引擎目录"/);
+  assert.match(pageHtml, /data-directory-target="knowledgeBaseStateInput" aria-label="选择 llm-wiki 状态目录"/);
+  assert.doesNotMatch(pageHtml, /验证 wiki\/|目录必须包含 wiki\//);
   assert.match(pageHtml, /重新扫码后恢复/);
   const appResponse = await fetch(`${server.url}/app.js`);
   const appSource = await appResponse.text();
@@ -453,7 +498,12 @@ test("local API redacts credentials and protects mutations", async (t) => {
   const knowledgeBasesResponse = await fetch(`${server.url}/knowledge-bases.js`);
   assert.equal(knowledgeBasesResponse.status, 200);
   assert.match(knowledgeBasesResponse.headers.get("content-type") ?? "", /^text\/javascript/);
-  assert.match(await knowledgeBasesResponse.text(), /openNewKnowledgeBaseDialog/);
+  const knowledgeBasesSource = await knowledgeBasesResponse.text();
+  assert.match(knowledgeBasesSource, /openNewKnowledgeBaseDialog/);
+  assert.match(knowledgeBasesSource, /renderKnowledgeBaseProjectOptions/);
+  assert.match(knowledgeBasesSource, /\/api\/directory-picker/);
+  assert.match(knowledgeBasesSource, /beginKnowledgeBaseDialogSession/);
+  assert.match(knowledgeBasesSource, /isKnowledgeBaseDialogSessionCurrent\(dialogSession\)/);
   const faviconResponse = await fetch(`${server.url}/favicon.svg`);
   assert.equal(faviconResponse.status, 200);
   assert.match(faviconResponse.headers.get("content-type") ?? "", /^image\/svg\+xml/);

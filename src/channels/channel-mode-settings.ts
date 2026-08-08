@@ -9,7 +9,7 @@ export type ChannelModeSettings = {
 };
 
 export type QaKnowledgeBaseSelection =
-  | { readonly kind: "project" }
+  | { readonly kind: "project"; readonly projectId?: string }
   | { readonly kind: "managed"; readonly knowledgeBaseId: string }
   | {
       readonly kind: "directory";

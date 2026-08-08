@@ -504,6 +504,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--focus); outline:
 .modal-header h2 { font-size: 18px; }
 .modal-body { padding: 22px 20px; }
 .modal-footer { min-height: 70px; padding: 14px 20px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: end; gap: 10px; }
+.knowledge-base-modal { overflow: hidden; }
+.knowledge-base-modal > form { max-height: min(760px, calc(100vh - 32px)); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.knowledge-base-modal .modal-body { overflow-y: auto; }
+.path-field { min-width: 0; display: grid; gap: 8px; }
+.path-field-control { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.directory-picker-button { min-width: 84px; min-height: 42px; }
 .account-removal-body { display: grid; gap: 16px; }
 .account-removal-lead { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.6; }
 .account-removal-lead strong { color: var(--ink); }

@@ -13,38 +13,53 @@
     };
   }
 
-  function summary(account, knowledgeBases) {
+  function summary(account, knowledgeBases, projects) {
     const settings = normalized(account);
     const knowledgeBase = knowledgeBases.find((candidate) => (
       candidate.accountId === account.accountId && candidate.id === settings.qaKnowledgeBaseId
+    ));
+    const project = knowledgeBase && projects.find((candidate) => (
+      candidate.accountId === account.accountId && candidate.workspace === knowledgeBase.rootPath
     ));
     return {
       defaultLabel: MODE_LABELS[settings.defaultMode],
       enabledLabel: settings.enabledModes.map((mode) => MODE_LABELS[mode]).join(" · "),
       qaLabel: settings.enabledModes.includes("qa")
-        ? knowledgeBase?.name || "跟随项目"
+        ? project ? `Codex 项目 · ${project.name}` : knowledgeBase?.name || "跟随项目绑定"
         : "问答未开启"
     };
   }
 
-  function populate(account, knowledgeBases) {
+  function populate(account, knowledgeBases, projects) {
     const settings = normalized(account);
+    const accountProjects = projects.filter((candidate) => candidate.accountId === account.accountId);
+    const configuredKnowledgeBase = knowledgeBases.find((candidate) => (
+      candidate.accountId === account.accountId && candidate.id === settings.qaKnowledgeBaseId
+    ));
+    const configuredProject = configuredKnowledgeBase && accountProjects.find((candidate) => (
+      candidate.workspace === configuredKnowledgeBase.rootPath
+    ));
     for (const mode of MODES) {
       document.querySelector(`#accountMode${capitalize(mode)}Input`).checked = settings.enabledModes.includes(mode);
     }
     const source = document.querySelector("#accountQaSourceInput");
-    source.replaceChildren(new Option("跟随当前项目绑定", "project"));
-    for (const knowledgeBase of knowledgeBases.filter((candidate) => candidate.accountId === account.accountId)) {
-      source.add(new Option(`已有知识库 · ${knowledgeBase.name}`, `managed:${knowledgeBase.id}`));
+    source.replaceChildren(new Option("不设置渠道默认（跟随当前项目绑定）", "project"));
+    if (accountProjects.length) {
+      const projectGroup = document.createElement("optgroup");
+      projectGroup.label = "当前 Codex 项目";
+      for (const project of accountProjects) {
+        projectGroup.append(new Option(`项目 · ${project.name} — ${project.workspace}`, `project:${project.id}`));
+      }
+      source.add(projectGroup);
     }
-    source.add(new Option("添加 llm-wiki 目录…", "directory"));
-    source.value = settings.qaKnowledgeBaseId ? `managed:${settings.qaKnowledgeBaseId}` : "project";
+    source.add(new Option("选择自定义 llm-wiki 目录…", "directory"));
+    source.value = configuredProject ? `project:${configuredProject.id}` : configuredKnowledgeBase ? "directory" : "project";
     if (source.selectedIndex < 0) source.value = "project";
     document.querySelector("#accountDefaultModeInput").dataset.selectedMode = settings.defaultMode;
-    document.querySelector("#accountQaDirectoryNameInput").value = "";
-    document.querySelector("#accountQaDirectoryRootInput").value = "";
-    document.querySelector("#accountQaEngineRootInput").value = "";
-    document.querySelector("#accountQaStateDirInput").value = "";
+    document.querySelector("#accountQaDirectoryNameInput").value = configuredProject ? "" : configuredKnowledgeBase?.name || "";
+    document.querySelector("#accountQaDirectoryRootInput").value = configuredProject ? "" : configuredKnowledgeBase?.rootPath || "";
+    document.querySelector("#accountQaEngineRootInput").value = configuredProject ? "" : configuredKnowledgeBase?.engineRoot || "";
+    document.querySelector("#accountQaStateDirInput").value = configuredProject ? "" : configuredKnowledgeBase?.stateDir || "";
     syncForm();
   }
 
@@ -77,8 +92,8 @@
     const qaKnowledgeBase = enabledModes.includes("qa")
       ? source === "directory"
         ? directorySelection()
-        : source.startsWith("managed:")
-          ? { kind: "managed", knowledgeBaseId: source.slice("managed:".length) }
+        : source.startsWith("project:")
+          ? { kind: "project", projectId: source.slice("project:".length) }
           : { kind: "project" }
       : { kind: "project" };
     return {

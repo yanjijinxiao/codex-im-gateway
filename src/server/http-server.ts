@@ -19,6 +19,7 @@ import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-
 import { handleTaskboardHttp } from "./taskboard-http.js";
 import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
+import { selectLocalDirectory } from "./directory-picker.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
@@ -27,7 +28,10 @@ const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
 }, "Invalid Webhook URL: HTTP or HTTPS required");
 const projectInteractionModeSchema = z.enum(PROJECT_INTERACTION_MODES);
 const qaKnowledgeBaseSelectionSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("project") }).strict(),
+  z.object({
+    kind: z.literal("project"),
+    projectId: z.string().trim().min(1).optional()
+  }).strict(),
   z.object({
     kind: z.literal("managed"),
     knowledgeBaseId: z.string().trim().min(1)
@@ -107,6 +111,9 @@ const knowledgeBasePatchSchema = z.object({
 const projectKnowledgeBaseSchema = z.object({
   knowledgeBaseId: z.string().min(1).nullable()
 });
+const directoryPickerSchema = z.object({
+  defaultPath: z.string().trim().min(1).optional()
+}).strict();
 const sessionCreateSchema = z.object({
   accountId: z.string().min(1),
   senderId: z.string().min(1),
@@ -149,6 +156,7 @@ export type LocalHttpServerOptions = {
   codexRuntimeCheck?: () => Promise<CodexRuntimeInfo>;
   codexModelsCheck?: () => Promise<CodexModelOption[]>;
   codexProjectsProvider?: () => readonly CodexProjectCandidate[];
+  directoryPicker?: (defaultPath?: string) => Promise<string | undefined>;
   updateService?: UpdateService;
   onUpdateInstalled?: (version: string) => void;
 };
@@ -293,6 +301,15 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { projects: readCodexProjects(context) });
     return;
   }
+  if (method === "POST" && url.pathname === "/api/directory-picker") {
+    const body = directoryPickerSchema.parse(await readJsonBody(request));
+    const selectedPath = await (context.directoryPicker ?? selectLocalDirectory)(body.defaultPath);
+    if (selectedPath && !path.isAbsolute(selectedPath)) {
+      throw new Error("Directory picker must return an absolute path");
+    }
+    sendJson(response, 200, { path: selectedPath ?? null });
+    return;
+  }
   if (method === "GET" && url.pathname === "/api/projects") {
     sendJson(response, 200, { projects: context.accountManager.listProjects() });
     return;
@@ -412,6 +429,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   if (method === "POST" && accountAction?.action === "stop") {
     sendJson(response, 200, await context.accountManager.stopAccount(accountAction.accountId));
+    return;
+  }
+  if (method === "POST" && accountAction?.action === "sync-feishu-menu") {
+    sendJson(response, 200, await context.accountManager.syncFeishuShortcutMenu(accountAction.accountId));
     return;
   }
   const accountMatch = matchPath(url.pathname, "/api/accounts/:accountId");

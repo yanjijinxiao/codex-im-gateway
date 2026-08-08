@@ -71,6 +71,7 @@ export type RuntimeState = {
   lastActiveActorId?: string;
   lastAuthorizedSenderId?: string;
   lastAuthorizedActorId?: string;
+  authorizedConversationsByActor: Record<string, string>;
   syncKey?: string;
   processedMessageIds: string[];
   contextTokens: Record<string, string>;
@@ -94,6 +95,7 @@ export type RuntimeState = {
 export function emptyRuntimeState(): RuntimeState {
   return {
     pairedSenderIds: [],
+    authorizedConversationsByActor: {},
     processedMessageIds: [],
     contextTokens: {},
     sessions: [],
@@ -155,8 +157,18 @@ export class RuntimeStateStore {
     if (authorized) {
       this.state.lastAuthorizedActorId = actorId;
       this.state.lastAuthorizedSenderId = conversationId;
+      this.state.authorizedConversationsByActor[actorId] = conversationId;
     }
     this.save();
+  }
+
+  getAuthorizedConversation(actorId: string): string | undefined {
+    const linkedConversation = this.state.authorizedConversationsByActor[actorId];
+    if (linkedConversation) return linkedConversation;
+    if (this.state.lastAuthorizedActorId === actorId) {
+      return this.state.lastAuthorizedSenderId;
+    }
+    return undefined;
   }
 
   getLastActiveActorId(): string | undefined {
@@ -771,6 +783,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     ...emptyRuntimeState(),
     ...value,
     pairedSenderIds: Array.isArray(value.pairedSenderIds) ? value.pairedSenderIds : [],
+    authorizedConversationsByActor: normalizeAuthorizedConversations(value.authorizedConversationsByActor),
     processedMessageIds: Array.isArray(value.processedMessageIds)
       ? value.processedMessageIds.filter((id): id is string => typeof id === "string").slice(-1_000)
       : [],
@@ -786,6 +799,13 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
     knowledgeEnabled: value.knowledgeEnabled !== false
   };
+}
+
+function normalizeAuthorizedConversations(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => (
+    Boolean(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1])
+  )));
 }
 
 function normalizeInteractionModes(value: unknown): Record<string, ProjectInteractionMode> {

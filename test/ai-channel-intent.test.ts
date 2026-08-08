@@ -129,6 +129,26 @@ test("instructs the AI to keep mode and goal product discussions in ordinary cha
   assert.match(classifierPrompt, /讨论或质疑.*模式.*目标.*计划.*ordinary_chat/);
 });
 
+test("instructs the AI to create a task for concrete work assigned in task mode", async () => {
+  let classifierPrompt = "";
+  const resolver = new AiChannelIntentResolver(async (prompt) => {
+    classifierPrompt = prompt;
+    return JSON.stringify({ schemaVersion: 2, kind: "ordinary_chat", actions: [] });
+  });
+
+  await resolver.resolve({
+    text: "相关开发文档和技术调研都移动到项目目录里",
+    actorId: "ou_actor",
+    conversationId: "oc_team",
+    conversationKind: "shared",
+    currentProjectName: "wx-claw",
+    currentMode: "task",
+    projectNames: ["wx-claw"]
+  });
+
+  assert.match(classifierPrompt, /当前模式为 task.*具体工作.*task_new/);
+});
+
 test("resolves one action compatibly and multiple actions as an ordered sequence", async () => {
   const outputs = [
     {

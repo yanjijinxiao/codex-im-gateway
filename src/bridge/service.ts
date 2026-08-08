@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -116,6 +117,7 @@ export class BridgeService {
   private readonly taskboardController: TaskboardChannelController;
   private readonly llmWiki: LlmWikiMcpClientPool;
   private readonly userInputs: ChannelUserInputController;
+  private readonly cardInteraction = new AsyncLocalStorage<NormalizedWeixinMessage["interaction"]>();
   private modeSettings: ChannelModeSettings;
 
   constructor(private readonly options: BridgeServiceOptions) {
@@ -166,6 +168,10 @@ export class BridgeService {
   }
 
   async handleMessage(message: NormalizedWeixinMessage): Promise<void> {
+    return this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message));
+  }
+
+  private async handleInboundMessage(message: NormalizedWeixinMessage): Promise<void> {
     const replyTargetId = message.replyTargetId ?? message.senderId;
     const scopedMessage = replyTargetId === message.senderId
       ? message
@@ -1710,6 +1716,24 @@ export class BridgeService {
         await this.reply(senderId, text);
       }
       return;
+    }
+    const interaction = this.cardInteraction.getStore();
+    if (interaction && this.options.weixin.updateActionCard) {
+      try {
+        console.log(`[codex-channel-bridge] updating action card "${card.title}" in ${interaction.messageId}`);
+        await this.options.weixin.updateActionCard({ messageId: interaction.messageId, card });
+        this.options.onOutboundMessage?.({
+          direction: "outbound",
+          id: interaction.messageId,
+          recipientId: senderId,
+          text: card.fallbackText,
+          attachments: []
+        });
+        console.log(`[codex-channel-bridge] updated action card "${card.title}"`);
+        return;
+      } catch (error) {
+        console.warn(`Action card update failed for ${senderId}; sending a new card: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     try {
       console.log(`[codex-channel-bridge] sending action card "${card.title}" to ${senderId}`);

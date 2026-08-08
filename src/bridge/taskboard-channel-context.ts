@@ -12,9 +12,11 @@ type ContextOptions = {
   readonly replyText: (senderId: string, text: string) => Promise<void>;
 };
 
+type TaskboardProjectContextClient = Pick<TaskboardClient, "ensureProjectForWorkspace">;
+
 export async function resolveTaskboardChannelContext(
   options: ContextOptions,
-  client: TaskboardClient,
+  client: TaskboardProjectContextClient,
   senderId: string
 ): Promise<TaskboardChannelContext | undefined> {
   const managedProject = options.stateStore.getActiveProject(senderId);
@@ -24,11 +26,11 @@ export async function resolveTaskboardChannelContext(
     await options.replyText(senderId, "请先在渠道工作台中选择一个 Codex 项目，再打开任务面板。");
     return undefined;
   }
-  const taskboardProject = await client.projectForWorkspace(managedProject.workspace);
-  if (!taskboardProject) {
-    await options.replyText(senderId, `当前 Codex 项目尚未映射到 Taskboard：${managedProject.workspace}`);
-    return undefined;
-  }
+  const taskboardProject = await client.ensureProjectForWorkspace({
+    id: managedProject.id,
+    name: managedProject.name,
+    workspace: managedProject.workspace
+  });
   return { ...(session ? { session } : {}), managedProject, taskboardProject };
 }
 

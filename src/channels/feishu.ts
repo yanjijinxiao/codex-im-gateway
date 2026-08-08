@@ -9,7 +9,8 @@ import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
 import { feishuActionCard } from "./feishu-action-card.js";
 import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
-import { feishuTaskCard } from "./feishu-task-card.js";
+import { commandForFeishuMenuEvent } from "./feishu-shortcuts.js";
+import { feishuTaskCard, type FeishuTaskCardPayload } from "./feishu-task-card.js";
 import {
   type ChannelTaskCard
 } from "./task-card.js";
@@ -101,12 +102,23 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
   }
 
+  async updateActionCard(input: { messageId: string; card: ChannelActionCard }): Promise<void> {
+    await this.patchInteractiveCard(input.messageId, feishuActionCard(input.card));
+  }
+
   async updateTaskCard(input: { messageId: string; card: ChannelTaskCard }): Promise<void> {
+    await this.patchInteractiveCard(input.messageId, feishuTaskCard(input.card));
+  }
+
+  private async patchInteractiveCard(
+    messageId: string,
+    card: Lark.InteractiveCard | FeishuTaskCardPayload
+  ): Promise<void> {
     const patch = this.apiClient.im.v1.message.patch;
-    if (!patch) throw new FeishuTaskCardUpdateUnavailableError();
+    if (!patch) throw new FeishuCardUpdateUnavailableError();
     await patch({
-      path: { message_id: input.messageId },
-      data: { content: JSON.stringify(feishuTaskCard(input.card)) }
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(card) }
     });
   }
 
@@ -156,6 +168,30 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           text: command,
           attachments: [],
           raw: { channel: "feishu", event: rawEvent }
+        };
+        if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
+        try {
+          await options.onMessage(pendingMessage);
+        } catch (error) {
+          if (!(error instanceof Error)) throw error;
+          await reportMessageError(options, error, pendingMessage);
+        }
+      },
+      "application.bot.menu_v6": async (event) => {
+        const command = commandForFeishuMenuEvent(event.event_key);
+        const operatorId = event.operator?.operator_id?.open_id
+          ?? event.operator?.operator_id?.user_id
+          ?? event.operator?.operator_id?.union_id;
+        if (!command || !operatorId) return;
+        const eventId = event.event_id ?? event.uuid ?? crypto.randomUUID();
+        const pendingMessage: NormalizedWeixinMessage = {
+          id: `feishu-menu:${eventId}`,
+          senderId: operatorId,
+          replyTargetId: operatorId,
+          source: "native-menu",
+          text: command,
+          attachments: [],
+          raw: { channel: "feishu", event }
         };
         if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
         try {
@@ -246,8 +282,8 @@ function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-class FeishuTaskCardUpdateUnavailableError extends Error {
-  readonly name = "FeishuTaskCardUpdateUnavailableError";
+class FeishuCardUpdateUnavailableError extends Error {
+  readonly name = "FeishuCardUpdateUnavailableError";
 
   constructor() {
     super("Feishu message patch capability is unavailable");

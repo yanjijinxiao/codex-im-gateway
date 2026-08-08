@@ -483,7 +483,7 @@ function renderAccounts() {
     const channel = account.channel || "weixin";
     const channelMeta = channelInfo(channel);
     const projects = state.projects.filter((project) => project.accountId === account.accountId);
-    const modeSummary = channelModeSettings.summary(account, state.knowledgeBases);
+    const modeSummary = channelModeSettings.summary(account, state.knowledgeBases, state.projects);
     return `<article class="account-card">
       <div class="account-main">
         <div class="account-identity">
@@ -1052,7 +1052,7 @@ function openAccountSettingsDialog(account) {
   document.querySelector("#accountRemarkInput").value = account.displayName || "";
   document.querySelector("#accountWebhookInput").value = "";
   document.querySelector("#accountWebhookProviderInput").value = account.webhookProvider || "generic";
-  channelModeSettings.populate(account, state.knowledgeBases);
+  channelModeSettings.populate(account, state.knowledgeBases, state.projects);
   updateAccountWebhookProviderPresentation();
   document.querySelector("#clearAccountWebhookInput").checked = false;
   setAccountFormError("");

@@ -32,6 +32,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   }
   const starts: string[] = [];
   const inboundHandlers = new Map<string, (message: NormalizedWeixinMessage) => Promise<void>>();
+  const handledMessages: NormalizedWeixinMessage[] = [];
   const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
   const sentCards: Array<{ accountId: string; toUserId: string; card: { identifier: string; latestComment?: string; actions: readonly { label: string }[] } }> = [];
   const runs: Array<Record<string, unknown>> = [];
@@ -100,13 +101,16 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
           return { messageId: "sent" };
         }
       },
-      async monitor({ signal }) {
+      async monitor({ signal, onMessage }) {
         starts.push(account.accountId);
+        inboundHandlers.set(account.accountId, onMessage);
         await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
       }
     }),
     bridgeFactory: (input) => ({
-      handleMessage: async () => {},
+      async handleMessage(message: NormalizedWeixinMessage) {
+        handledMessages.push(message);
+      },
       async requestApproval(senderId: string, request: Record<string, unknown>) {
         channelApprovals.push({ senderId, request });
         return "accept" as const;
@@ -143,6 +147,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     manager,
     paths,
     starts,
+    handledMessages,
     root,
     runs,
     history,
@@ -331,6 +336,37 @@ test("adds redacted enterprise channels and stops them cleanly", async (t) => {
   assert.equal("appSecret" in feishu, false);
   await manager.stopAccount(wecom.accountId, false);
   await manager.stopAccount(feishu.accountId, false);
+});
+
+test("routes a native Feishu menu click through the actor's authorized conversation", async (t) => {
+  const { manager, handledMessages, emitInbound } = setup(t);
+  const account = await manager.addChannelAccount({
+    channel: "feishu",
+    appId: "cli_menu_test",
+    appSecret: "feishu-secret"
+  });
+  manager.allowSender(account.accountId, "oc_release_room");
+
+  await emitInbound(account.accountId, {
+    id: "feishu-chat-1",
+    senderId: "ou_release_owner",
+    replyTargetId: "oc_release_room",
+    text: "查看进度",
+    attachments: [],
+    raw: { channel: "feishu", event: {} }
+  });
+  await emitInbound(account.accountId, {
+    id: "feishu-menu-1",
+    senderId: "ou_release_owner",
+    replyTargetId: "ou_release_owner",
+    source: "native-menu",
+    text: "/task",
+    attachments: [],
+    raw: { channel: "feishu", event: {} }
+  });
+
+  assert.equal(handledMessages.at(-1)?.replyTargetId, "oc_release_room");
+  await manager.stopAccount(account.accountId, false);
 });
 
 test("notifies the configured channel and mirrors the outbound message to its webhook", { timeout: 2_000 }, async (t) => {
@@ -685,6 +721,36 @@ test("configures channel modes from a validated llm-wiki directory", async (t) =
     qaKnowledgeBaseId: knowledgeBase?.id
   });
   assert.deepEqual(loadAccount(paths, "account-one").modeSettings, configured.modeSettings);
+});
+
+test("configures channel Q&A from a validated managed Codex project", async (t) => {
+  // Given
+  const inspectedRoots: string[] = [];
+  const { manager, root } = setup(t, {
+    llmWiki: {
+      async inspect(knowledgeBase: { rootPath: string }) {
+        inspectedRoots.push(knowledgeBase.rootPath);
+        return { command: "llm-wiki", status: { documentCount: 2, blockCount: 8, rawArtifactCount: 1 } };
+      },
+      invalidate() {}
+    }
+  });
+  const workspace = path.join(root, "product-wiki");
+  const project = manager.createProject("account-one", "产品知识项目", workspace);
+
+  // When
+  const configured = await manager.updateAccountModeSettings("account-one", {
+    defaultMode: "qa",
+    enabledModes: ["session", "qa"],
+    qaKnowledgeBase: { kind: "project", projectId: project.id }
+  });
+
+  // Then
+  const knowledgeBase = manager.listKnowledgeBases("account-one")[0];
+  assert.equal(knowledgeBase?.name, "产品知识项目");
+  assert.equal(knowledgeBase?.rootPath, path.resolve(workspace));
+  assert.deepEqual(inspectedRoots, [path.resolve(workspace)]);
+  assert.equal(configured.modeSettings.qaKnowledgeBaseId, knowledgeBase?.id);
 });
 
 test("revalidates an existing knowledge base and applies a corrected project CLI root atomically", async (t) => {

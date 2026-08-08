@@ -27,6 +27,25 @@ test("keeps a channel actor separate from its conversation scope", (t) => {
   store.rememberChannelIdentity("ou_pending", "oc_chat", true);
   assert.equal(store.getLastAuthorizedActorId(), "ou_pending");
   assert.equal(store.getLastAuthorizedSenderId(), "oc_chat");
+  assert.equal(store.getAuthorizedConversation("ou_pending"), "oc_chat");
+  assert.equal(store.getAuthorizedConversation("ou_other"), undefined);
+});
+
+test("uses the matching legacy authorized identity until an actor link is persisted", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-session-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const paths = resolveStatePaths(root);
+  fs.mkdirSync(path.dirname(paths.statePath), { recursive: true });
+  fs.writeFileSync(paths.statePath, JSON.stringify({
+    pairedSenderIds: ["oc_legacy_room"],
+    lastAuthorizedActorId: "ou_legacy_owner",
+    lastAuthorizedSenderId: "oc_legacy_room"
+  }));
+
+  const store = new RuntimeStateStore(paths);
+
+  assert.equal(store.getAuthorizedConversation("ou_legacy_owner"), "oc_legacy_room");
+  assert.equal(store.getAuthorizedConversation("ou_other"), undefined);
 });
 
 test("creates and activates a managed session for a sender", (t) => {

@@ -21,6 +21,8 @@ export type NormalizedWeixinMessage = {
   senderId: string;
   /** The channel conversation that receives replies and owns session state. */
   replyTargetId?: string;
+  /** A channel-native interaction that does not include its conversation id. */
+  source?: "native-menu";
   contextToken?: string;
   interaction?: {
     readonly kind: "card";

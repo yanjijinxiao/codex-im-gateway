@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { z } from "zod";
+
 import { BridgeService } from "../src/bridge/service.js";
 import { createChoiceCard, type ChannelActionCard } from "../src/channels/action-card.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu.js";
@@ -81,6 +83,45 @@ test("Feishu renders a generic action card as buttons", async () => {
   });
 });
 
+test("Feishu patches a generic action card without creating another message", async () => {
+  const patches: Array<Record<string, unknown>> = [];
+  const adapter = new FeishuChannelAdapter({
+    channel: "feishu",
+    accountId: "feishu-test",
+    appId: "cli_test",
+    appSecret: "secret",
+    savedAt: new Date().toISOString(),
+    enabled: true
+  }, {
+    apiClient: {
+      im: {
+        v1: {
+          image: { async create() { return { image_key: "unused" }; } },
+          message: {
+            async create() { return { data: { message_id: "unused" } }; },
+            async patch(input: Record<string, unknown>) { patches.push(input); return { data: {} }; }
+          },
+          messageResource: { async get() { throw new Error("not used"); } }
+        }
+      }
+    },
+    wsClient: { async start() {}, close() {} }
+  });
+  const card = createChoiceCard({
+    title: "已切换项目",
+    body: "当前项目：Bridge",
+    fallbackText: "已切换到 Bridge。",
+    choices: [{ label: "会话模式", command: "mode", arg: "session", style: "primary" }]
+  });
+
+  await adapter.updateActionCard({ messageId: "om_action_card", card });
+
+  assert.equal(patches.length, 1);
+  assert.deepEqual(patches[0]?.path, { message_id: "om_action_card" });
+  const data = z.object({ content: z.string() }).parse(patches[0]?.data);
+  assert.equal(JSON.parse(data.content).header.title.content, "已切换项目");
+});
+
 test("Bridge uses channel-native cards for help and fixed selections", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-actions-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -151,6 +192,50 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
     ["1", "2", "default"]
   );
   assert.equal(texts.length, 0);
+});
+
+test("Bridge refreshes the originating native action card after a card callback", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-card-refresh-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+  stateStore.createProject("Bridge", path.join(root, "bridge"));
+  const sent: ChannelActionCard[] = [];
+  const updated: Array<{ messageId: string; card: ChannelActionCard }> = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
+    stateStore,
+    weixin: {
+      async sendText() { return { messageId: "text" }; },
+      async sendActionCard(input: { card: ChannelActionCard }) {
+        sent.push(input.card);
+        return { messageId: "new-card" };
+      },
+      async updateActionCard(input: { messageId: string; card: ChannelActionCard }) {
+        updated.push(input);
+      }
+    }
+  });
+
+  await service.handleMessage({
+    id: "help",
+    senderId: "oc_test",
+    text: "/help",
+    attachments: [],
+    raw: {}
+  });
+  await service.handleMessage({
+    id: "feishu-card:project",
+    senderId: "oc_test",
+    text: "/project",
+    attachments: [],
+    interaction: { kind: "card", messageId: "om_help_card" },
+    raw: {}
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0]?.messageId, "om_help_card");
+  assert.equal(updated[0]?.card.title, "选择 Codex 项目");
 });
 
 test("keeps project mode, plan mode, and goals on the selected project's thread", async (t) => {

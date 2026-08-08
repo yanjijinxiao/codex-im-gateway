@@ -47,7 +47,7 @@ The existing 4px-derived rhythm remains authoritative. Project groups use 8–12
 ### Channel Settings Dialog
 
 - Structure: local display name, channel work-mode controls, Q&A knowledge-source controls, Webhook notification-platform selector, optional Webhook URL replacement field, provider-specific URL guidance, current Webhook status, explicit clear switch, and cancel/save actions.
-- Work modes: three native checkbox choices control the available session, task, and Q&A modes; a native select chooses the default from the enabled set. Q&A can follow the current project's binding, select an existing account-owned llm-wiki project, or validate and register an llm-wiki directory.
+- Work modes: three native checkbox choices control the available session, task, and Q&A modes; a native select chooses the default from the enabled set. Q&A can follow the current project's binding, select a current account-owned Codex project (its workspace is validated as an llm-wiki root), or validate and register an independent llm-wiki directory.
 - States: not configured, configured, replacing, clearing, validation error, submitting.
 - Accessibility: the dialog title and close action name the channel settings task; mode choices use native checkboxes, the llm-wiki root becomes required only while directory input is visible and shares the form alert through `aria-describedby`, the platform uses a native select, the URL input uses native URL semantics, and configured state is expressed in text rather than color alone.
 - Security: Webhook URLs may contain signing secrets, so account list responses expose only `webhookConfigured`; the saved URL is never rendered back into the browser or written to logs.
@@ -118,8 +118,8 @@ The legacy workbench contract remains documented for compatibility with older bu
 
 - Structure: a peer “知识库” management view with one compact row per account-owned llm-wiki project, live inspection state, bound-project chips, and a single add/edit dialog. Project binding is edited beside the knowledge-base row rather than hidden in general settings.
 - States: empty, validating, healthy, unavailable, bound, unbound, editing, deleting, and validation error. Health text shows indexed document/block counts and the latest run status; color is supplemental.
-- Inputs: name, knowledge-base root, optional engine root, and optional state directory. Root paths remain visible and selectable. The engine root defaults to the knowledge-base root.
-- Behavior: create and edit validate the llm-wiki `wiki/` layout and read-only status contract before persistence. “重新检查” performs an explicit inspection; background refresh does not repeatedly spawn the llm-wiki runtime.
+- Inputs: an optional Codex-project selector, name, knowledge-base root, optional engine root, and optional state directory. Every path remains manually editable and has a native folder picker. The engine root defaults to the knowledge-base root.
+- Behavior: create and edit identify llm-wiki through its read-only runtime status contract rather than a guessed folder layout. “重新检查” performs an explicit inspection; background refresh does not repeatedly spawn the llm-wiki runtime.
 - Accessibility: native selects and labelled inputs own keyboard behavior. Every binding control names both the Codex project and knowledge base, focus is visible, and the mobile layout becomes one column without horizontal page scrolling.
 - Scroll ownership: the page owns vertical scrolling. Knowledge-base rows wrap internally and never create a nested primary scroll container.
 

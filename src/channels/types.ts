@@ -6,6 +6,7 @@ export type ChannelTextClient = {
   sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
   sendImage?(input: { toUserId: string; path: string }): Promise<{ messageId: string }>;
   sendActionCard?(input: { toUserId: string; card: ChannelActionCard }): Promise<{ messageId: string }>;
+  updateActionCard?(input: { messageId: string; card: ChannelActionCard }): Promise<void>;
   sendTaskCard?(input: { toUserId: string; card: ChannelTaskCard }): Promise<{ messageId: string }>;
   updateTaskCard?(input: { messageId: string; card: ChannelTaskCard }): Promise<void>;
   sendTyping?(input: { toUserId: string; contextToken?: string; typing?: boolean }): Promise<void>;
