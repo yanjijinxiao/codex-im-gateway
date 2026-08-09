@@ -9,16 +9,11 @@ import type { NormalizedWeixinMessage } from "../weixin/messages.js";
 import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
 import { feishuActionCard } from "./feishu-action-card.js";
 import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
+import { FeishuCardUpdater } from "./feishu-card-updater.js";
 import { commandForFeishuMenuEvent } from "./feishu-shortcuts.js";
-import { feishuTaskCard, type FeishuTaskCardPayload } from "./feishu-task-card.js";
-import {
-  type ChannelTaskCard
-} from "./task-card.js";
-import {
-  formatChannelActionCommand,
-  parseChannelActionValue,
-  type ChannelActionCard
-} from "./action-card.js";
+import { feishuTaskCard } from "./feishu-task-card.js";
+import type { ChannelTaskCard } from "./task-card.js";
+import { formatChannelActionCommand, parseChannelActionValue, type ChannelActionCard } from "./action-card.js";
 
 type FeishuAdapterOptions = {
   readonly apiClient?: {
@@ -39,12 +34,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   readonly client: ChannelTextClient = this;
   private readonly apiClient: NonNullable<FeishuAdapterOptions["apiClient"]>;
   private readonly wsClient: NonNullable<FeishuAdapterOptions["wsClient"]>;
+  private readonly cardUpdater: FeishuCardUpdater;
   private readonly inboundDir?: string;
 
   constructor(account: FeishuAccount, options: FeishuAdapterOptions = {}) {
     const config = { appId: account.appId, appSecret: account.appSecret };
     this.apiClient = options.apiClient ?? new Lark.Client(config);
     this.wsClient = options.wsClient ?? new Lark.WSClient(config);
+    this.cardUpdater = new FeishuCardUpdater(this.apiClient.im.v1.message.patch);
     this.inboundDir = options.inboundDir;
   }
 
@@ -103,23 +100,11 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   }
 
   async updateActionCard(input: { messageId: string; card: ChannelActionCard }): Promise<void> {
-    await this.patchInteractiveCard(input.messageId, feishuActionCard(input.card));
+    await this.cardUpdater.update(input.messageId, feishuActionCard(input.card));
   }
 
   async updateTaskCard(input: { messageId: string; card: ChannelTaskCard }): Promise<void> {
-    await this.patchInteractiveCard(input.messageId, feishuTaskCard(input.card));
-  }
-
-  private async patchInteractiveCard(
-    messageId: string,
-    card: Lark.InteractiveCard | FeishuTaskCardPayload
-  ): Promise<void> {
-    const patch = this.apiClient.im.v1.message.patch;
-    if (!patch) throw new FeishuCardUpdateUnavailableError();
-    await patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(card) }
-    });
+    await this.cardUpdater.update(input.messageId, feishuTaskCard(input.card));
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {
@@ -170,12 +155,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           raw: { channel: "feishu", event: rawEvent }
         };
         if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
-        try {
-          await options.onMessage(pendingMessage);
-        } catch (error) {
-          if (!(error instanceof Error)) throw error;
-          await reportMessageError(options, error, pendingMessage);
-        }
+        return this.cardUpdater.respondToCallback(async () => {
+          try {
+            await options.onMessage(pendingMessage);
+          } catch (error) {
+            if (!(error instanceof Error)) throw error;
+            await reportMessageError(options, error, pendingMessage);
+          }
+        });
       },
       "application.bot.menu_v6": async (event) => {
         const command = commandForFeishuMenuEvent(event.event_key);
@@ -280,12 +267,4 @@ function untilAborted(signal?: AbortSignal): Promise<void> {
 
 function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-class FeishuCardUpdateUnavailableError extends Error {
-  readonly name = "FeishuCardUpdateUnavailableError";
-
-  constructor() {
-    super("Feishu message patch capability is unavailable");
-  }
 }
