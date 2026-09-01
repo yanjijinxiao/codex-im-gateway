@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import crypto from "node:crypto";
+import path from "node:path";
 import readline from "node:readline";
 
-import { resolveCodexCommand, type CodexRunResult } from "./exec-runner.js";
+import { resolveCodexCommand } from "./exec-runner.js";
 import { parseAccountRateLimits, type CodexAccountBalance } from "./account-balance.js";
 import {
   appServerApprovalResult,
@@ -10,98 +12,57 @@ import {
   type CodexApprovalHandler
 } from "./approval.js";
 import type { CodexExecSandbox } from "./sandbox.js";
+import type { AppServerTransport } from "./app-server-transport.js";
+import {
+  APP_SERVER_BACKEND_CAPABILITIES,
+  CodexThreadStateError,
+  assertCodexThreadRunnable,
+  type CodexAppServerBackend,
+  type CodexDynamicToolCall,
+  type CodexDynamicToolHandler,
+  type CodexHistoryMessage,
+  type CodexModelOption,
+  type CodexProject,
+  type CodexProjectCatalog,
+  type CodexRunResult,
+  type CodexRunnerInput,
+  type CodexRuntimeInfo,
+  type CodexStopResult,
+  type CodexThreadActiveFlag,
+  type CodexThreadGoal,
+  type CodexThreadGoalStatus,
+  type CodexThreadListInput,
+  type CodexThreadPersistence,
+  type CodexThreadRuntimeStatus,
+  type CodexThreadState,
+  type CodexTurnStatus,
+  type CodexUserInputAnswer,
+  type CodexUserInputHandler,
+  type CodexUserInputQuestion,
+  type CodexUserInputRequest
+} from "./backend.js";
+
+export type {
+  CodexDynamicToolCall,
+  CodexDynamicToolHandler,
+  CodexHistoryMessage,
+  CodexModelOption,
+  CodexRunnerInput,
+  CodexRuntimeInfo,
+  CodexThreadGoal,
+  CodexThreadGoalStatus,
+  CodexUserInputAnswer,
+  CodexUserInputHandler,
+  CodexUserInputQuestion,
+  CodexUserInputRequest
+} from "./backend.js";
+export type { AppServerTransport } from "./app-server-transport.js";
 
 export type AppServerRunnerOptions = {
   codexBin?: string;
   requestTimeoutMs?: number;
   sandbox?: CodexExecSandbox;
-};
-
-export type CodexRunnerInput = {
-  prompt: string;
-  cwd: string;
-  threadId?: string;
-  queueKey?: string;
-  model?: string;
-  effort?: string;
-  onDelta?: (delta: string) => Promise<void> | void;
-  onProgress?: (message: string) => Promise<void> | void;
-  onApproval?: CodexApprovalHandler;
-  onDynamicToolCall?: CodexDynamicToolHandler;
-  onUserInput?: CodexUserInputHandler;
-  dynamicTools?: readonly Record<string, unknown>[];
-  collaborationMode?: "default" | "plan";
-  ephemeral?: boolean;
-  outputSchema?: Record<string, unknown>;
-  sandbox?: CodexExecSandbox;
-};
-
-export type CodexDynamicToolCall = {
-  callId: string;
-  threadId: string;
-  turnId: string;
-  namespace?: string;
-  tool: string;
-  arguments: unknown;
-};
-
-export type CodexDynamicToolHandler = (call: CodexDynamicToolCall) => Promise<string>;
-
-export type CodexUserInputQuestion = {
-  header: string;
-  id: string;
-  question: string;
-  options?: Array<{ label: string; description: string }>;
-};
-
-export type CodexUserInputRequest = {
-  itemId: string;
-  threadId: string;
-  turnId: string;
-  autoResolutionMs?: number;
-  questions: CodexUserInputQuestion[];
-};
-
-export type CodexUserInputAnswer = Record<string, { answers: string[] }>;
-export type CodexUserInputHandler = (request: CodexUserInputRequest) => Promise<CodexUserInputAnswer>;
-
-export type CodexThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
-
-export type CodexThreadGoal = {
-  threadId: string;
-  objective: string;
-  status: CodexThreadGoalStatus;
-  tokenBudget?: number;
-  tokensUsed: number;
-  timeUsedSeconds: number;
-  createdAt: number;
-  updatedAt: number;
-};
-
-export type CodexHistoryMessage = {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  kind?: "progress";
-  createdAt?: string;
-};
-
-export type CodexRuntimeInfo = {
-  model?: string;
-  effort?: string;
-  provider?: string;
-};
-
-export type CodexModelOption = {
-  model: string;
-  displayName: string;
-  description: string;
-  isDefault: boolean;
-  defaultEffort?: string;
-  supportedEfforts: Array<{
-    effort: string;
-    description: string;
-  }>;
+  transport?: AppServerTransport;
 };
 
 type JsonRpcId = number | string;
@@ -123,8 +84,6 @@ type TurnCompletion = {
 type TurnWaiter = {
   resolve: (value: CodexRunResult) => void;
   reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
-  refresh: () => void;
 };
 
 type TurnStream = {
@@ -155,7 +114,9 @@ type WireMessage = {
   };
 };
 
-export class AppServerCodexRunner {
+export class AppServerCodexRunner implements CodexAppServerBackend {
+  readonly id = "app-server" as const;
+  readonly capabilities = APP_SERVER_BACKEND_CAPABILITIES;
   private child?: ChildProcessWithoutNullStreams;
   private lines?: readline.Interface;
   private connectPromise?: Promise<void>;
@@ -175,7 +136,11 @@ export class AppServerCodexRunner {
   private readonly turnStreams = new Map<string, TurnStream>();
   private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
   private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
+  private readonly reasoningSummariesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
+  private readonly threadStates = new Map<string, CodexThreadState>();
+  private readonly projectIdsByRoot = new Map<string, string>();
+  private projectCatalogSupported?: boolean;
   private modelOptions?: CodexModelOption[];
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
@@ -184,24 +149,71 @@ export class AppServerCodexRunner {
     await this.ensureConnected();
 
     if (input.threadId) {
-      await this.waitForThreadIdle(input.threadId, input.onProgress);
+      try {
+        assertCodexThreadRunnable(await this.inspectThread(input.threadId));
+        // inspectThread intentionally recycles a private stdio app-server so a
+        // read-only probe cannot retain Desktop's writer lock. Reconnect for
+        // the actual queued turn lifecycle.
+        await this.ensureConnected();
+        await this.waitForThreadIdle(input.threadId, input.onProgress);
+      } catch (error) {
+        throw normalizeThreadOperationError(error, input.threadId);
+      }
     }
 
-    const threadResponse = await this.request(
-      input.threadId ? "thread/resume" : "thread/start",
-      compactObject({
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-        ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
-        cwd: input.cwd,
-        model: input.model,
-        approvalPolicy: "never",
-        ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
-      })
-    ) as Record<string, unknown>;
+    const nativeProjectId = input.projectId || input.projectName
+      ? await this.resolveProjectId(input.cwd, input.projectId, input.projectName)
+      : undefined;
+    let threadResponse: Record<string, unknown>;
+    try {
+      threadResponse = await this.request(
+        input.threadId ? "thread/resume" : "thread/start",
+        compactObject({
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+          ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
+          cwd: input.cwd,
+          model: input.model,
+          developerInstructions: input.developerInstructions,
+          approvalPolicy: "never",
+          ...(!input.threadId && nativeProjectId ? { projectId: nativeProjectId } : {}),
+          ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
+        })
+      ) as Record<string, unknown>;
+    } catch (error) {
+      if (input.threadId) throw normalizeThreadOperationError(error, input.threadId);
+      throw error;
+    }
     const thread = threadResponse.thread as Record<string, unknown> | undefined;
     const threadId = typeof thread?.id === "string" ? thread.id : input.threadId;
     if (!threadId) {
       throw new Error("Codex app-server did not return a thread id");
+    }
+    try {
+    const currentProjectId = typeof thread?.projectId === "string" ? thread.projectId : undefined;
+    if (input.threadId && nativeProjectId && currentProjectId !== nativeProjectId) {
+      try {
+        await this.request("thread/metadata/update", { threadId, projectId: nativeProjectId });
+      } catch (error) {
+        if (!isMissingProjectError(error)) throw error;
+        this.projectIdsByRoot.delete(path.normalize(input.cwd));
+        const refreshedProjectId = await this.resolveProjectId(input.cwd, undefined, input.projectName);
+        if (!refreshedProjectId || refreshedProjectId === currentProjectId) throw error;
+        await this.request("thread/metadata/update", { threadId, projectId: refreshedProjectId });
+      }
+    }
+    const currentName = typeof thread?.name === "string" ? thread.name : undefined;
+    const threadTitle = cleanThreadTitle(input.threadTitle);
+    if (threadTitle && (!input.threadId || shouldRepairBridgeThreadName(currentName))) {
+      await this.request("thread/name/set", { threadId, name: threadTitle });
+    }
+    if (!input.threadId) {
+      await input.onThreadCreated?.(threadId);
+    }
+    if (thread) {
+      this.threadStates.set(threadId, parseThreadState(
+        thread,
+        input.ephemeral ? "ephemeral" : persistenceFromThread(thread)
+      ));
     }
     this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
 
@@ -267,6 +279,18 @@ export class AppServerCodexRunner {
     }
 
     this.activeTurns.set(threadId, turnId);
+    const previousState = this.threadStates.get(threadId);
+    this.threadStates.set(threadId, {
+      threadId,
+      persistence: previousState?.persistence ?? (input.ephemeral ? "ephemeral" : "active"),
+      runtimeStatus: "active",
+      activeFlags: [],
+      latestTurnStatus: "inProgress",
+      activeTurnId: turnId,
+      ...(previousState?.cwd ? { cwd: previousState.cwd } : { cwd: input.cwd }),
+      ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
+      ...(previousState?.title ? { title: previousState.title } : {})
+    });
     if (input.onDelta || input.onProgress) {
       const key = turnKey(threadId, turnId);
       this.turnStreams.set(key, {
@@ -279,19 +303,339 @@ export class AppServerCodexRunner {
       }
       this.queuedTurnEvents.delete(key);
     }
-    return this.waitForTurn(threadId, turnId);
+    return await this.waitForTurn(threadId, turnId);
+    } finally {
+      await this.unsubscribeThread(threadId);
+      await this.recyclePrivateTransportIfIdle();
+    }
   }
 
-  async listSessions(): Promise<unknown> {
+  private async unsubscribeThread(threadId: string): Promise<void> {
+    try {
+      await this.request(
+        "thread/unsubscribe",
+        { threadId },
+        Math.min(this.options.requestTimeoutMs ?? 600_000, 10_000)
+      );
+    } catch (error) {
+      // Releasing ownership is best-effort and must never replace the actual
+      // turn result. A closed transport already releases all of its threads.
+      console.warn(
+        `[codex-channel-bridge] Unable to release Codex session ${threadId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * A private stdio app-server keeps an unsubscribed thread loaded for its
+   * inactivity grace period. While loaded, its OS writer lock prevents Codex
+   * Desktop from opening the same task. Once the last Bridge turn is done,
+   * close the private process so Desktop can take ownership immediately.
+   *
+   * Managed daemon and remote transports have a shared lifecycle and must not
+   * be stopped by an individual Bridge client.
+   */
+  private async recyclePrivateTransportIfIdle(): Promise<void> {
+    if (this.options.transport || this.activeTurns.size || this.pending.size) return;
+    const child = this.child;
+    if (!child || child.exitCode !== null) return;
+
+    const exited = new Promise<boolean>((resolve) => {
+      child.once("exit", () => resolve(true));
+    });
+    this.child = undefined;
+    this.initialized = false;
+    this.lines?.close();
+    this.lines = undefined;
+    try {
+      child.stdin.end();
+    } catch {
+      child.kill();
+    }
+    const graceful = await Promise.race([
+      exited,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))
+    ]);
+    if (!graceful && child.exitCode === null) child.kill();
+  }
+
+  async inspectThread(threadId: string): Promise<CodexThreadState> {
     await this.ensureConnected();
-    return this.request("thread/list", {});
+    try {
+      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
+      const thread = response.thread as Record<string, unknown> | undefined;
+      if (!thread) throw new Error(`Codex app-server returned no thread for ${threadId}`);
+      const state = parseThreadState(thread, persistenceFromThread(thread));
+      this.threadStates.set(threadId, state);
+      return state;
+    } catch (error) {
+      const archived = await this.findListedThread(threadId, true);
+      if (archived) {
+        const state = parseThreadState(archived, "archived");
+        this.threadStates.set(threadId, state);
+        return state;
+      }
+      const active = await this.findListedThread(threadId, false);
+      if (active) {
+        const state = parseThreadState(active, persistenceFromThread(active));
+        this.threadStates.set(threadId, state);
+        return state;
+      }
+      if (isMissingOrArchivedThreadError(error)) {
+        const state: CodexThreadState = {
+          threadId,
+          persistence: "missing",
+          runtimeStatus: "unknown",
+          activeFlags: []
+        };
+        this.threadStates.set(threadId, state);
+        return state;
+      }
+      throw error;
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  async listThreads(input: CodexThreadListInput = {}): Promise<CodexThreadState[]> {
+    await this.ensureConnected();
+    const persistence = input.persistence ?? "all";
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 1_000));
+    const results: CodexThreadState[] = [];
+    if (persistence === "active" || persistence === "all") {
+      results.push(...await this.listThreadsByPersistence(input, false, limit));
+    }
+    if (persistence === "archived" || persistence === "all") {
+      results.push(...await this.listThreadsByPersistence(input, true, limit));
+    }
+    const deduped = new Map<string, CodexThreadState>();
+    for (const state of results) {
+      deduped.set(state.threadId, state);
+      this.threadStates.set(state.threadId, state);
+    }
+    return [...deduped.values()]
+      .sort((left, right) => (right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""))
+      .slice(0, limit);
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    await this.ensureConnected();
+    try {
+      await this.request("thread/archive", { threadId });
+      this.threadStates.set(threadId, {
+        threadId,
+        persistence: "archived",
+        runtimeStatus: "notLoaded",
+        activeFlags: []
+      });
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  async unarchiveThread(threadId: string): Promise<CodexThreadState> {
+    await this.ensureConnected();
+    try {
+      const response = await this.request("thread/unarchive", { threadId }) as Record<string, unknown>;
+      const thread = response.thread as Record<string, unknown> | undefined;
+      const state = thread
+        ? parseThreadState(thread, "active")
+        : await this.inspectThread(threadId);
+      this.threadStates.set(threadId, state);
+      return state;
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    await this.ensureConnected();
+    try {
+      await this.request("thread/delete", { threadId });
+      this.threadStates.set(threadId, {
+        threadId,
+        persistence: "missing",
+        runtimeStatus: "unknown",
+        activeFlags: []
+      });
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  private async listThreadsByPersistence(
+    input: CodexThreadListInput,
+    archived: boolean,
+    limit: number
+  ): Promise<CodexThreadState[]> {
+    const states: CodexThreadState[] = [];
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    do {
+      const response = await this.request("thread/list", compactObject({
+        cursor,
+        limit: Math.min(100, limit - states.length),
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"],
+        archived,
+        cwd: input.cwd,
+        projectId: input.projectId
+      })) as Record<string, unknown>;
+      for (const value of Array.isArray(response.data) ? response.data : []) {
+        if (!isRecord(value)) continue;
+        states.push(parseThreadState(value, archived ? "archived" : persistenceFromThread(value)));
+        if (states.length >= limit) break;
+      }
+      const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
+        ? response.nextCursor
+        : undefined;
+      if (states.length >= limit || !nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    return states;
+  }
+
+  private async findListedThread(threadId: string, archived: boolean): Promise<Record<string, unknown> | undefined> {
+    let cursor: string | undefined;
+    const seenCursors = new Set<string>();
+    try {
+      do {
+        const response = await this.request("thread/list", compactObject({
+          cursor,
+          limit: 100,
+          sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"],
+          archived
+        })) as Record<string, unknown>;
+        for (const value of Array.isArray(response.data) ? response.data : []) {
+          if (isRecord(value) && value.id === threadId) return value;
+        }
+        const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
+          ? response.nextCursor
+          : undefined;
+        if (!nextCursor || seenCursors.has(nextCursor)) break;
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      } while (cursor);
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  private async resolveProjectId(cwd: string, projectId?: string, projectName?: string): Promise<string | undefined> {
+    const root = path.normalize(cwd);
+    const cached = this.projectIdsByRoot.get(root);
+    if (cached) return cached;
+    if (this.projectCatalogSupported === false) return undefined;
+
+    let projects: AppServerProject[];
+    try {
+      projects = await this.requestProjects();
+      this.projectCatalogSupported = true;
+    } catch (error) {
+      if (!isUnsupportedProjectCatalogError(error)) throw error;
+      // Older Desktop daemons do not expose project/list. thread/start still
+      // accepts cwd and Desktop associates the new task with its remote project.
+      this.projectCatalogSupported = false;
+      return undefined;
+    }
+    const match = projects.find((project) => (
+      project.id === projectId || project.roots.some((candidate) => path.normalize(candidate) === root)
+    ));
+    if (match) {
+      this.projectIdsByRoot.set(root, match.id);
+      return match.id;
+    }
+    if (!projectName) return undefined;
+
+    const idempotencyKey = `codex-channel-bridge:${crypto.createHash("sha256").update(root).digest("hex")}`;
+    try {
+      const response = await this.request("project/create", {
+        name: projectName,
+        roots: [{ path: root }],
+        metadata: { source: "codex-channel-bridge" },
+        idempotencyKey
+      }) as Record<string, unknown>;
+      const project = parseAppServerProject(response.project);
+      if (!project) throw new Error("Codex app-server did not return the created project");
+      this.projectIdsByRoot.set(root, project.id);
+      return project.id;
+    } catch (error) {
+      // A concurrent client may have registered the same root after our list.
+      const retry = (await this.requestProjects()).find((project) => (
+        project.roots.some((candidate) => path.normalize(candidate) === root)
+      ));
+      if (!retry) throw error;
+      this.projectIdsByRoot.set(root, retry.id);
+      return retry.id;
+    }
+  }
+
+  async warmUp(cwd: string): Promise<void> {
+    await this.getRuntimeInfo(cwd);
+  }
+
+  async listProjects(): Promise<CodexProjectCatalog> {
+    await this.ensureConnected();
+    try {
+      if (this.projectCatalogSupported === false) {
+        return { backend: "app-server", projects: [] };
+      }
+      let projects: AppServerProject[];
+      try {
+        projects = await this.requestProjects();
+        this.projectCatalogSupported = true;
+      } catch (error) {
+        if (!isUnsupportedProjectCatalogError(error)) throw error;
+        this.projectCatalogSupported = false;
+        projects = [];
+      }
+      return {
+        backend: "app-server",
+        projects
+      };
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  private async requestProjects(): Promise<AppServerProject[]> {
+    const projects: AppServerProject[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const response = await this.request("project/list", compactObject({ cursor, limit: 100 })) as Record<string, unknown>;
+      for (const value of Array.isArray(response.data) ? response.data : []) {
+        const project = parseAppServerProject(value);
+        if (project) projects.push(project);
+      }
+      const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
+        ? response.nextCursor
+        : undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+    return projects;
   }
 
   async getHistory(threadId: string): Promise<CodexHistoryMessage[]> {
     await this.ensureConnected();
-    const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
-    const thread = response.thread as Record<string, unknown> | undefined;
-    return parseThreadHistory(thread);
+    try {
+      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
+      const thread = response.thread as Record<string, unknown> | undefined;
+      if (!thread) throw new CodexThreadStateError("missing", threadId, `Codex session ${threadId} 不存在。`);
+      const state = parseThreadState(thread, persistenceFromThread(thread));
+      this.threadStates.set(threadId, state);
+      assertCodexThreadRunnable(state);
+      return parseThreadHistory(thread);
+    } catch (error) {
+      throw normalizeThreadOperationError(error, threadId);
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
   }
 
   async getRuntimeInfo(cwd: string, threadId?: string): Promise<CodexRuntimeInfo> {
@@ -371,22 +715,32 @@ export class AppServerCodexRunner {
     await this.request("thread/goal/clear", { threadId });
   }
 
-  async stop(threadId?: string): Promise<void> {
+  async stop(threadId?: string): Promise<CodexStopResult> {
     if (!this.initialized || !this.child || this.child.exitCode !== null) {
-      return;
+      return "not-active";
     }
 
-    const target = threadId && this.activeTurns.has(threadId)
+    let target = threadId && this.activeTurns.has(threadId)
       ? { threadId, turnId: this.activeTurns.get(threadId) as string }
-      : Array.from(this.activeTurns.entries(), ([activeThreadId, turnId]) => ({
+      : undefined;
+    if (threadId && !target) {
+      const state = await this.inspectThread(threadId);
+      if (state.latestTurnStatus === "inProgress" && state.activeTurnId) {
+        target = { threadId, turnId: state.activeTurnId };
+      }
+    }
+    if (!threadId) {
+      target = Array.from(this.activeTurns.entries(), ([activeThreadId, turnId]) => ({
         threadId: activeThreadId,
         turnId
       })).at(-1);
+    }
     if (!target) {
-      return;
+      return "not-active";
     }
 
     await this.request("turn/interrupt", target);
+    return "interrupted";
   }
 
   close(): void {
@@ -410,8 +764,12 @@ export class AppServerCodexRunner {
   }
 
   private async startAppServer(): Promise<void> {
-    const command = resolveCodexCommand(this.options.codexBin ?? "codex");
-    const child = spawn(command.command, [...command.argsPrefix, "app-server", "--stdio"], {
+    await this.options.transport?.prepare?.();
+    const localCommand = resolveCodexCommand(this.options.codexBin ?? "codex");
+    const command = this.options.transport?.command ?? localCommand.command;
+    const args = this.options.transport?.args
+      ?? [...localCommand.argsPrefix, "app-server", "--stdio"];
+    const child = spawn(command, [...args], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true
@@ -429,7 +787,10 @@ export class AppServerCodexRunner {
       const suffix = detail ? `: ${detail}` : "";
       this.handleChildFailure(
         child,
-        new Error(`Codex app-server exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}${suffix}`)
+        new Error(
+          `Codex app-server${this.options.transport?.label ? ` (${this.options.transport.label})` : ""} ` +
+          `exited with code ${code ?? "unknown"}${signal ? ` (${signal})` : ""}${suffix}`
+        )
       );
     });
 
@@ -437,14 +798,14 @@ export class AppServerCodexRunner {
       await this.request("initialize", {
         clientInfo: {
           name: "codex-channel-bridge",
-          title: "Codex Weixin",
-          version: "0.2.0"
+          title: "Codex Channel Bridge",
+          version: "0.4.0"
         },
         capabilities: {
           experimentalApi: true,
           requestAttestation: false
         }
-      }, Math.min(this.options.requestTimeoutMs ?? 600_000, 60_000));
+      }, Math.min(Math.max(this.options.requestTimeoutMs ?? 600_000, 5_000), 60_000));
       this.notify("initialized", {});
       this.initialized = true;
     } catch (error) {
@@ -524,6 +885,52 @@ export class AppServerCodexRunner {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (method === "thread/status/changed") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      if (threadId) {
+        const previous = this.threadStates.get(threadId);
+        this.threadStates.set(threadId, {
+          threadId,
+          persistence: previous?.persistence ?? "active",
+          ...parseRuntimeStatus(params.status),
+          ...(previous?.latestTurnStatus ? { latestTurnStatus: previous.latestTurnStatus } : {}),
+          ...(previous?.activeTurnId ? { activeTurnId: previous.activeTurnId } : {}),
+          ...(previous?.cwd ? { cwd: previous.cwd } : {}),
+          ...(previous?.projectId ? { projectId: previous.projectId } : {}),
+          ...(previous?.title ? { title: previous.title } : {}),
+          ...(previous?.preview ? { preview: previous.preview } : {}),
+          ...(previous?.updatedAt ? { updatedAt: previous.updatedAt } : {})
+        });
+      }
+      return;
+    }
+
+    if (["thread/archived", "thread/unarchived", "thread/deleted", "thread/closed"].includes(method)) {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      if (threadId) {
+        const previous = this.threadStates.get(threadId);
+        const persistence: CodexThreadPersistence = method === "thread/archived"
+          ? "archived"
+          : method === "thread/deleted"
+            ? "missing"
+            : previous?.persistence === "ephemeral"
+              ? "ephemeral"
+              : "active";
+        this.threadStates.set(threadId, {
+          threadId,
+          persistence,
+          runtimeStatus: "notLoaded",
+          activeFlags: [],
+          ...(previous?.cwd ? { cwd: previous.cwd } : {}),
+          ...(previous?.projectId ? { projectId: previous.projectId } : {}),
+          ...(previous?.title ? { title: previous.title } : {}),
+          ...(previous?.preview ? { preview: previous.preview } : {}),
+          ...(previous?.updatedAt ? { updatedAt: previous.updatedAt } : {})
+        });
+      }
+      return;
+    }
+
     if (method === "item/started") {
       const key = turnKeyFromParams(params);
       const item = params.item as Record<string, unknown> | undefined;
@@ -533,6 +940,21 @@ export class AppServerCodexRunner {
         phases.set(itemId, item.phase);
         this.itemPhasesByTurn.set(key, phases);
       }
+      const progress = describeItemProgress(item, false);
+      if (key && progress) this.emitProgress(key, progress);
+      return;
+    }
+
+    if (method === "item/reasoning/summaryTextDelta") {
+      const key = turnKeyFromParams(params);
+      const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      if (!key || !itemId || !delta) return;
+      const summaries = this.reasoningSummariesByTurn.get(key) ?? new Map<string, string>();
+      const summary = `${summaries.get(itemId) ?? ""}${delta}`.trim();
+      summaries.set(itemId, summary);
+      this.reasoningSummariesByTurn.set(key, summaries);
+      if (summary) this.emitProgress(key, `🤔 ${boundedText(summary, 600)}`);
       return;
     }
 
@@ -573,6 +995,9 @@ export class AppServerCodexRunner {
         } else {
           this.turnTexts.set(key, item.text);
         }
+      } else {
+        const progress = describeItemProgress(item, true);
+        if (progress) this.emitProgress(key, progress);
       }
       return;
     }
@@ -597,6 +1022,18 @@ export class AppServerCodexRunner {
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
     this.activeTurns.delete(threadId);
+    const previousState = this.threadStates.get(threadId);
+    this.threadStates.set(threadId, {
+      threadId,
+      persistence: previousState?.persistence ?? "active",
+      runtimeStatus: "idle",
+      activeFlags: [],
+      ...(normalizeTurnStatus(status) ? { latestTurnStatus: normalizeTurnStatus(status) } : {}),
+      ...(previousState?.cwd ? { cwd: previousState.cwd } : {}),
+      ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
+      ...(previousState?.title ? { title: previousState.title } : {}),
+      ...(previousState?.preview ? { preview: previousState.preview } : {})
+    });
     this.approvalHandlersByThread.delete(threadId);
     this.dynamicToolHandlersByThread.delete(threadId);
     this.userInputHandlersByThread.delete(threadId);
@@ -606,7 +1043,6 @@ export class AppServerCodexRunner {
       return;
     }
     this.turnWaiters.delete(key);
-    clearTimeout(waiter.timer);
     void this.finishTurn(threadId, key, completion, waiter.resolve, waiter.reject);
   }
 
@@ -620,24 +1056,11 @@ export class AppServerCodexRunner {
       });
     }
 
-    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
     return new Promise((resolve, reject) => {
-      const expire = () => {
-        this.turnWaiters.delete(key);
-        const error = new Error(`app-server turn timed out after ${timeoutMs}ms`);
-        reject(error);
-        this.failTransport(error, true);
-      };
-      const waiter: TurnWaiter = {
-        resolve,
-        reject,
-        timer: setTimeout(expire, timeoutMs),
-        refresh: () => {
-          clearTimeout(waiter.timer);
-          waiter.timer = setTimeout(expire, timeoutMs);
-        }
-      };
-      this.turnWaiters.set(key, waiter);
+      // A turn is an agent job, not a request/response RPC. Once app-server
+      // accepts it, let it run until Codex completes it, the user interrupts
+      // it, or the underlying transport actually disconnects.
+      this.turnWaiters.set(key, { resolve, reject });
     });
   }
 
@@ -645,27 +1068,24 @@ export class AppServerCodexRunner {
     threadId: string,
     onProgress?: (message: string) => Promise<void> | void
   ): Promise<void> {
-    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
-    const deadline = Date.now() + timeoutMs;
     let notified = false;
     while (true) {
       const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
       const thread = response.thread as Record<string, unknown> | undefined;
-      const turns = Array.isArray(thread?.turns) ? thread.turns : [];
-      const busy = turns.slice(-1).some((value) => {
-        const turn = value as Record<string, unknown>;
-        const status = typeof turn.status === "string"
-          ? turn.status.replace(/[_\s-]/g, "").toLowerCase()
-          : "";
-        return status === "inprogress" || status === "running" || status === "started";
-      });
+      if (!thread) throw new CodexThreadStateError("missing", threadId, `Codex session ${threadId} 不存在。`);
+      const state = parseThreadState(thread, persistenceFromThread(thread));
+      this.threadStates.set(threadId, state);
+      assertCodexThreadRunnable(state);
+      const busy = state.runtimeStatus === "active" || state.latestTurnStatus === "inProgress";
       if (!busy) return;
       if (!notified) {
         notified = true;
-        await onProgress?.("当前会话的上一条任务仍在执行，已排队等待完成。");
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`等待已有会话空闲超时（${Math.round(timeoutMs / 1_000)} 秒）`);
+        const detail = state.activeFlags.includes("waitingOnApproval")
+          ? "当前会话正在等待审批，已排队等待处理。"
+          : state.activeFlags.includes("waitingOnUserInput")
+            ? "当前会话正在等待用户输入，已排队等待处理。"
+            : "当前会话的上一条任务仍在执行，已排队等待完成。";
+        await onProgress?.(detail);
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -685,6 +1105,7 @@ export class AppServerCodexRunner {
     this.turnTexts.delete(key);
     this.queuedTurnEvents.delete(key);
     this.itemPhasesByTurn.delete(key);
+    this.reasoningSummariesByTurn.delete(key);
     if (completion.status === "completed") {
       resolve({ text: completion.text, threadId, turnId: key.slice(threadId.length + 1), raw: completion.raw });
       return;
@@ -708,6 +1129,14 @@ export class AppServerCodexRunner {
     this.queuedTurnEvents.set(key, queued);
   }
 
+  private emitProgress(key: string, text: string): void {
+    if (this.turnStreams.has(key)) {
+      this.enqueueTurnEvent(key, { type: "progress", text });
+    } else {
+      this.queueTurnEvent(key, { type: "progress", text });
+    }
+  }
+
   private enqueueTurnEvent(key: string, event: QueuedTurnEvent): void {
     const stream = this.turnStreams.get(key);
     if (!stream) return;
@@ -715,7 +1144,6 @@ export class AppServerCodexRunner {
     if (!callback) return;
     stream.chain = stream.chain
       .then(() => callback(event.text))
-      .then(() => this.turnWaiters.get(key)?.refresh())
       .then(() => undefined)
       .catch((error) => {
         console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -840,7 +1268,6 @@ export class AppServerCodexRunner {
     }
     for (const [key, waiter] of this.turnWaiters.entries()) {
       this.turnWaiters.delete(key);
-      clearTimeout(waiter.timer);
       waiter.reject(error);
     }
     this.activeTurns.clear();
@@ -853,9 +1280,106 @@ export class AppServerCodexRunner {
     this.turnStreams.clear();
     this.queuedTurnEvents.clear();
     this.itemPhasesByTurn.clear();
+    this.reasoningSummariesByTurn.clear();
     this.runtimeInfoByThread.clear();
+    this.threadStates.clear();
+    this.projectIdsByRoot.clear();
+    this.projectCatalogSupported = undefined;
     this.modelOptions = undefined;
   }
+}
+
+function describeItemProgress(item: Record<string, unknown> | undefined, completed: boolean): string | undefined {
+  if (!item || typeof item.type !== "string") return undefined;
+  const status = typeof item.status === "string" ? item.status.toLowerCase() : "";
+  const succeeded = !status || status === "completed" || status === "success" || status === "succeeded";
+  const icon = completed ? succeeded ? "✅" : "❌" : "🔎";
+  switch (item.type) {
+    case "reasoning": {
+      if (!completed) return undefined;
+      const summary = reasoningSummaryText(item.summary);
+      return summary ? `🤔 ${boundedText(summary, 600)}` : undefined;
+    }
+    case "commandExecution": {
+      const command = safeCommandPreview(item.command);
+      if (!completed) return `${icon} 正在执行命令${command ? `：${command}` : ""}`;
+      const exitCode = typeof item.exitCode === "number" ? `，退出码 ${item.exitCode}` : "";
+      const duration = formatDuration(item.durationMs);
+      return `${icon} 命令${succeeded ? "完成" : "失败"}${command ? `：${command}` : ""}${exitCode}${duration}`;
+    }
+    case "fileChange": {
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      const paths = changes.flatMap((value) => {
+        const change = value as Record<string, unknown>;
+        return typeof change.path === "string" ? [change.path] : [];
+      });
+      const suffix = paths.length ? `：${paths.slice(0, 3).map(shortPath).join("、")}${paths.length > 3 ? ` 等 ${paths.length} 个文件` : ""}` : "";
+      return `${completed ? icon : "✏️"} ${completed ? `文件修改${succeeded ? "完成" : "失败"}` : "正在修改文件"}${suffix}`;
+    }
+    case "mcpToolCall": {
+      const server = typeof item.server === "string" ? item.server : "MCP";
+      const tool = typeof item.tool === "string" ? item.tool : "工具";
+      return `${completed ? icon : "🔌"} ${completed ? `工具调用${succeeded ? "完成" : "失败"}` : "正在调用工具"}：${boundedText(`${server}/${tool}`, 120)}`;
+    }
+    case "dynamicToolCall": {
+      const tool = typeof item.tool === "string" ? item.tool : "动态工具";
+      return `${completed ? icon : "🧩"} ${completed ? `动态工具${succeeded ? "完成" : "失败"}` : "正在调用动态工具"}：${boundedText(tool, 120)}`;
+    }
+    case "collabToolCall": {
+      const tool = typeof item.tool === "string" ? item.tool : "协作任务";
+      return `${completed ? icon : "👥"} ${completed ? `协作步骤${succeeded ? "完成" : "失败"}` : "正在执行协作步骤"}：${boundedText(tool, 120)}`;
+    }
+    case "webSearch": {
+      const query = typeof item.query === "string" ? boundedText(item.query, 180) : "";
+      return `${completed ? icon : "🌐"} ${completed ? "网页检索完成" : "正在检索网页"}${query ? `：${query}` : ""}`;
+    }
+    case "imageView": {
+      const imagePath = typeof item.path === "string" ? shortPath(item.path) : "";
+      return `${completed ? icon : "🖼️"} ${completed ? "图片检查完成" : "正在检查图片"}${imagePath ? `：${imagePath}` : ""}`;
+    }
+    case "contextCompaction":
+      return completed ? "✅ 上下文整理完成" : "🧹 正在整理长会话上下文";
+    default:
+      return undefined;
+  }
+}
+
+function reasoningSummaryText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    if (!part || typeof part !== "object") return [];
+    const record = part as Record<string, unknown>;
+    return typeof record.text === "string" ? [record.text] : [];
+  }).join("\n").trim();
+}
+
+function safeCommandPreview(value: unknown): string {
+  const command = Array.isArray(value)
+    ? value.filter((part): part is string => typeof part === "string").join(" ")
+    : typeof value === "string" ? value : "";
+  if (!command) return "";
+  const redacted = command
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+\/-]+/gi, "$1 ***")
+    .replace(/\b(token|secret|password|passwd|api[_-]?key)(\s*[:=]\s*)([^\s'\"]+)/gi, "$1$2***")
+    .replace(/([?&](?:access_token|token|api_key)=)[^&\s]+/gi, "$1***");
+  return `\`${boundedText(redacted.replace(/\s+/g, " ").trim(), 220).replaceAll("`", "'")}\``;
+}
+
+function shortPath(value: string): string {
+  const normalized = value.replaceAll("\\", "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return boundedText(parts.slice(-2).join("/") || normalized, 100);
+}
+
+function boundedText(value: string, max: number): string {
+  const text = value.trim();
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+}
+
+function formatDuration(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "";
+  return value < 1_000 ? `，${Math.round(value)}ms` : `，${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`;
 }
 
 function appServerSandboxPolicy(sandbox: CodexExecSandbox | undefined): AppServerSandboxPolicy | undefined {
@@ -971,10 +1495,54 @@ function isThreadBusyError(error: unknown): boolean {
   return /already.*(active|running)|turn.*(active|in progress|running)|thread.*busy/i.test(message);
 }
 
+function isMissingProjectError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /project.*(?:not found|does not exist|missing)|(?:not found|does not exist|missing).*project/i.test(message);
+}
+
+function isUnsupportedProjectCatalogError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /project\/list/i.test(message)
+    && /unknown variant|unknown method|method not found|unsupported|not implemented|expected one of/i.test(message);
+}
+
 function turnKeyFromParams(params: Record<string, unknown>): string | undefined {
   const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
   const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
   return threadId && turnId ? turnKey(threadId, turnId) : undefined;
+}
+
+type AppServerProject = {
+  id: string;
+  name: string;
+  roots: string[];
+};
+
+function parseAppServerProject(value: unknown): AppServerProject | undefined {
+  const project = value as Record<string, unknown> | undefined;
+  if (!project || typeof project.id !== "string" || !project.id) return undefined;
+  const roots = Array.isArray(project.roots)
+    ? project.roots.flatMap((value) => {
+      const root = value as Record<string, unknown>;
+      return typeof root.path === "string" && root.path ? [root.path] : [];
+    })
+    : [];
+  return {
+    id: project.id,
+    name: typeof project.name === "string" ? project.name : project.id,
+    roots
+  };
+}
+
+function cleanThreadTitle(value?: string): string | undefined {
+  const title = value?.replace(/\s+/g, " ").trim();
+  if (!title) return undefined;
+  return title.length > 120 ? `${title.slice(0, 119)}…` : title;
+}
+
+function shouldRepairBridgeThreadName(value?: string): boolean {
+  if (!value?.trim()) return true;
+  return /^(?:WeChat|Codex channel) bridge rule:|^\[codex-(?:weixin|channel-bridge)-private-knowledge]/i.test(value.trim());
 }
 
 function parseModelOption(value: unknown): CodexModelOption | undefined {
@@ -1028,6 +1596,151 @@ function compactObject(input: Record<string, unknown>): Record<string, unknown> 
 
 function turnKey(threadId: string, turnId: string): string {
   return `${threadId}\u0000${turnId}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function persistenceFromThread(thread: Record<string, unknown>): CodexThreadPersistence {
+  if (thread.ephemeral === true) return "ephemeral";
+  const rolloutPath = typeof thread.path === "string"
+    ? thread.path.replaceAll("\\", "/").toLowerCase()
+    : "";
+  return rolloutPath.includes("/archived_sessions/") ? "archived" : "active";
+}
+
+function parseRuntimeStatus(value: unknown): {
+  runtimeStatus: CodexThreadRuntimeStatus;
+  activeFlags: CodexThreadActiveFlag[];
+} {
+  const status = isRecord(value) ? value : undefined;
+  const type = typeof value === "string"
+    ? value
+    : typeof status?.type === "string"
+      ? status.type
+      : undefined;
+  const runtimeStatus: CodexThreadRuntimeStatus = type === "notLoaded"
+    || type === "idle"
+    || type === "active"
+    || type === "systemError"
+    ? type
+    : "unknown";
+  const activeFlags = Array.isArray(status?.activeFlags)
+    ? status.activeFlags.filter((flag): flag is CodexThreadActiveFlag => (
+      flag === "waitingOnApproval" || flag === "waitingOnUserInput"
+    ))
+    : [];
+  return { runtimeStatus, activeFlags };
+}
+
+function normalizeTurnStatus(value: unknown): CodexTurnStatus | undefined {
+  if (typeof value !== "string") return undefined;
+  switch (value.replaceAll(/[-_\s]/g, "").toLowerCase()) {
+    case "inprogress":
+    case "running":
+    case "started":
+      return "inProgress";
+    case "completed":
+    case "complete":
+      return "completed";
+    case "interrupted":
+    case "aborted":
+    case "cancelled":
+    case "canceled":
+      return "interrupted";
+    case "failed":
+    case "error":
+      return "failed";
+    default:
+      return undefined;
+  }
+}
+
+function parseThreadState(
+  thread: Record<string, unknown>,
+  persistence: CodexThreadPersistence
+): CodexThreadState {
+  const threadId = typeof thread.id === "string" ? thread.id : "";
+  const turns = Array.isArray(thread.turns) ? thread.turns.filter(isRecord) : [];
+  const latestTurn = turns.at(-1);
+  const latestTurnStatus = normalizeTurnStatus(latestTurn?.status);
+  const parsedRuntime = parseRuntimeStatus(thread.status);
+  const runtimeStatus = parsedRuntime.runtimeStatus === "unknown"
+    ? latestTurnStatus === "inProgress"
+      ? "active"
+      : "idle"
+    : parsedRuntime.runtimeStatus;
+  const updatedAt = unixTimestampToIso(
+    thread.updatedAt ?? latestTurn?.completedAt ?? latestTurn?.startedAt ?? thread.createdAt
+  );
+  const preview = typeof thread.preview === "string" && thread.preview.trim()
+    ? boundedText(thread.preview.replace(/\s+/g, " "), 240)
+    : extractLastUserMessageFromTurn(latestTurn);
+  return {
+    threadId,
+    persistence,
+    runtimeStatus,
+    activeFlags: parsedRuntime.activeFlags,
+    ...(latestTurnStatus ? { latestTurnStatus } : {}),
+    ...(latestTurnStatus === "inProgress" && typeof latestTurn?.id === "string"
+      ? { activeTurnId: latestTurn.id }
+      : {}),
+    ...(typeof thread.cwd === "string" ? { cwd: thread.cwd } : {}),
+    ...(typeof thread.projectId === "string" ? { projectId: thread.projectId } : {}),
+    ...(typeof thread.name === "string" && thread.name.trim() ? { title: thread.name.trim() } : {}),
+    ...(preview ? { preview } : {}),
+    ...(updatedAt ? { updatedAt } : {})
+  };
+}
+
+function extractLastUserMessageFromTurn(turn: Record<string, unknown> | undefined): string | undefined {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item) || item.type !== "userMessage") continue;
+    const text = extractUserMessageText(item.content);
+    if (text) return boundedText(text.replace(/\s+/g, " "), 240);
+  }
+  return undefined;
+}
+
+function unixTimestampToIso(value: unknown): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  const milliseconds = value < 1_000_000_000_000 ? value * 1_000 : value;
+  return new Date(milliseconds).toISOString();
+}
+
+function normalizeThreadOperationError(error: unknown, threadId: string): Error {
+  if (error instanceof CodexThreadStateError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/archiv|unarchive|已归档/i.test(message)) {
+    return new CodexThreadStateError(
+      "archived",
+      threadId,
+      `Codex session ${threadId} 已归档。请先在 Codex App 中恢复该 session 后再重试。`
+    );
+  }
+  if (/not found|no rollout|does not exist|不存在|unknown thread|missing thread/i.test(message)) {
+    return new CodexThreadStateError(
+      "missing",
+      threadId,
+      `Codex session ${threadId} 不存在或已被删除，请重新选择 session。`
+    );
+  }
+  if (/system.?error/i.test(message)) {
+    return new CodexThreadStateError(
+      "system-error",
+      threadId,
+      `Codex session ${threadId} 当前处于系统错误状态，请先在 Codex App 中打开并修复。`
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
+}
+
+function isMissingOrArchivedThreadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /archiv|unarchive|not found|no rollout|does not exist|不存在|unknown thread|missing thread/i.test(message);
 }
 
 function extractAgentMessageFromTurn(turn: Record<string, unknown> | undefined): string {

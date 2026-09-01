@@ -22,7 +22,22 @@ export function buildPrompt(
   attachmentSource: "WeChat" | "Web" = "WeChat",
   knowledge: readonly KnowledgeEntry[] = []
 ): string {
-  const lines: string[] = [BRIDGE_ACTION_INSTRUCTIONS, buildKnowledgeContext(knowledge)];
+  const parts = buildPromptParts(text, attachments, attachmentSource, knowledge);
+  return [parts.developerInstructions, parts.prompt].filter(Boolean).join("\n\n").trim();
+}
+
+/**
+ * Keeps Bridge-only policy and private knowledge out of the user message sent
+ * to app-server. Besides producing cleaner Codex history, this prevents the
+ * automatic thread preview/title from becoming the Bridge policy block.
+ */
+export function buildPromptParts(
+  text: string,
+  attachments: PromptBufferItem[] = [],
+  attachmentSource: "WeChat" | "Web" = "WeChat",
+  knowledge: readonly KnowledgeEntry[] = []
+): { prompt: string; developerInstructions: string } {
+  const lines: string[] = [];
   if (text.trim()) {
     lines.push(text.trim());
   }
@@ -33,7 +48,10 @@ export function buildPrompt(
       lines.push(`[${attachmentSource} ${attachment.kind}: ${attachment.label} saved to ${attachment.path}]\nInspect the saved local attachment before answering.`);
     }
   }
-  return lines.join("\n\n").trim();
+  return {
+    prompt: lines.join("\n\n").trim(),
+    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS, buildKnowledgeContext(knowledge)].join("\n\n")
+  };
 }
 
 function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[]): string {
@@ -91,6 +109,7 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
     new RegExp(`^${escapeRegExp(KNOWLEDGE_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(KNOWLEDGE_CONTEXT_END)}\\s*`),
     ""
   );
+  normalized = stripCodexDesktopAttachmentEnvelope(normalized);
   const attachments: PromptAttachment[] = [];
   const visibleText = normalized.replace(
     /^\[(WeChat|Web) (file|image|video|audio): (.+) saved to (.+)]\nInspect the saved local attachment before answering\.$/gm,
@@ -98,8 +117,16 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
       attachments.push({ source, kind, label, path: filePath });
       return "";
     }
-  ).replace(/\n{3,}/g, "\n\n").trim();
+  ).replace(/<image\b[^>]*\bpath="[^"]*"[^>]*><\/image>/g, "")
+    .replace(/\n{3,}/g, "\n\n").trim();
   return { text: visibleText, attachments };
+}
+
+function stripCodexDesktopAttachmentEnvelope(value: string): string {
+  if (!value.startsWith("# Files mentioned by the user:")) return value;
+  const marker = "## My request:";
+  const requestOffset = value.indexOf(marker);
+  return requestOffset >= 0 ? value.slice(requestOffset + marker.length).trim() : value;
 }
 
 function escapeRegExp(value: string): string {

@@ -683,6 +683,7 @@ function renderSettings() {
   document.querySelector("#defaultCwdInput").value = state.config.defaultCwd || "";
   document.querySelector("#allowedWorkspacesInput").value = (state.config.allowedWorkspaces || []).join("\n");
   document.querySelector("#backendInput").value = state.config.codexBackend || "auto";
+  document.querySelector("#appServerTransportInput").value = state.config.codexAppServerTransport || "auto";
   document.querySelector("#sandboxInput").value = state.config.codexExecSandbox || "";
   document.querySelector("#streamRepliesInput").checked = Boolean(state.config.streamReplies);
   document.querySelector("#taskboardEnabledInput").checked = Boolean(state.config.taskboardEnabled);
@@ -1050,6 +1051,13 @@ async function handleAccountAction(event) {
 function openAccountSettingsDialog(account) {
   document.querySelector("#editingRemarkAccountId").value = account.accountId;
   document.querySelector("#accountRemarkInput").value = account.displayName || "";
+  const dingTalk = account.channel === "dingtalk";
+  document.querySelector("#accountDingTalkCardTemplateField").hidden = !dingTalk;
+  document.querySelector("#accountDingTalkCardTemplateInput").value = dingTalk ? account.cardTemplateId || "" : "";
+  document.querySelector("#accountDingTalkCardContentKeyField").hidden = !dingTalk;
+  document.querySelector("#accountDingTalkCardContentKeyInput").value = dingTalk ? account.cardContentKey || "content" : "";
+  document.querySelector("#accountDingTalkNetworkFamilyField").hidden = !dingTalk;
+  document.querySelector("#accountDingTalkNetworkFamilyInput").value = dingTalk ? account.networkFamily || "auto" : "auto";
   document.querySelector("#accountWebhookInput").value = "";
   document.querySelector("#accountWebhookProviderInput").value = account.webhookProvider || "generic";
   channelModeSettings.populate(account, state.knowledgeBases, state.projects);
@@ -1106,6 +1114,12 @@ async function saveAccountSettings(event) {
   const webhookProvider = document.querySelector("#accountWebhookProviderInput").value;
   const clearWebhook = document.querySelector("#clearAccountWebhookInput").checked;
   const body = { displayName, webhookProvider };
+  const account = state.accounts.find((item) => item.accountId === accountId);
+  if (account?.channel === "dingtalk") {
+    body.cardTemplateId = document.querySelector("#accountDingTalkCardTemplateInput").value.trim() || null;
+    body.cardContentKey = document.querySelector("#accountDingTalkCardContentKeyInput").value.trim() || null;
+    body.networkFamily = document.querySelector("#accountDingTalkNetworkFamilyInput").value;
+  }
   if (webhookUrl) body.webhookUrl = webhookUrl;
   else if (clearWebhook) body.webhookUrl = null;
   setAccountFormError("");
@@ -1731,15 +1745,23 @@ function renderChannelFields() {
   const channel = document.querySelector("#channelTypeInput").value;
   const wecom = channel === "wecom";
   const feishu = channel === "feishu";
+  const dingtalk = channel === "dingtalk";
   document.querySelector("#channelNameField").hidden = channel === "weixin";
   document.querySelector("#wecomBotIdField").hidden = !wecom;
   document.querySelector("#wecomSecretField").hidden = !wecom;
   document.querySelector("#feishuAppIdField").hidden = !feishu;
   document.querySelector("#feishuSecretField").hidden = !feishu;
+  document.querySelector("#dingtalkClientIdField").hidden = !dingtalk;
+  document.querySelector("#dingtalkClientSecretField").hidden = !dingtalk;
+  document.querySelector("#dingtalkCardTemplateField").hidden = !dingtalk;
+  document.querySelector("#dingtalkCardContentKeyField").hidden = !dingtalk;
+  document.querySelector("#dingtalkNetworkFamilyField").hidden = !dingtalk;
   document.querySelector("#wecomBotIdInput").required = wecom;
   document.querySelector("#wecomSecretInput").required = wecom;
   document.querySelector("#feishuAppIdInput").required = feishu;
   document.querySelector("#feishuSecretInput").required = feishu;
+  document.querySelector("#dingtalkClientIdInput").required = dingtalk;
+  document.querySelector("#dingtalkClientSecretInput").required = dingtalk;
   document.querySelectorAll("[data-channel-tutorial]").forEach((tutorial) => {
     tutorial.hidden = tutorial.dataset.channelTutorial !== channel;
   });
@@ -1747,12 +1769,16 @@ function renderChannelFields() {
     ? "扫码登录"
     : channel === "wecom"
       ? "添加企业微信"
-      : "添加飞书";
+      : channel === "feishu"
+        ? "添加飞书"
+        : "添加钉钉";
   document.querySelector("#channelSetupHint span").textContent = channel === "weixin"
     ? "个人微信通过二维码登录，不需要填写凭据。"
     : channel === "wecom"
       ? "Bot ID 与 Secret 只保存在本机，不会返回浏览器。"
-      : "App ID 与 App Secret 只保存在本机，不会返回浏览器。";
+      : channel === "feishu"
+        ? "App ID 与 App Secret 只保存在本机，不会返回浏览器。"
+        : "Client ID 与 Client Secret 只保存在本机，不会返回浏览器。";
   drawIcons();
 }
 
@@ -1765,17 +1791,32 @@ async function saveChannel(event) {
     await beginLogin();
     return;
   }
-  const body = channel === "wecom" ? {
-    channel,
-    displayName: document.querySelector("#channelNameInput").value.trim(),
-    botId: document.querySelector("#wecomBotIdInput").value.trim(),
-    secret: document.querySelector("#wecomSecretInput").value.trim()
-  } : {
-    channel,
-    displayName: document.querySelector("#channelNameInput").value.trim(),
-    appId: document.querySelector("#feishuAppIdInput").value.trim(),
-    appSecret: document.querySelector("#feishuSecretInput").value.trim()
-  };
+  let body;
+  if (channel === "wecom") {
+    body = {
+      channel,
+      displayName: document.querySelector("#channelNameInput").value.trim(),
+      botId: document.querySelector("#wecomBotIdInput").value.trim(),
+      secret: document.querySelector("#wecomSecretInput").value.trim()
+    };
+  } else if (channel === "feishu") {
+    body = {
+      channel,
+      displayName: document.querySelector("#channelNameInput").value.trim(),
+      appId: document.querySelector("#feishuAppIdInput").value.trim(),
+      appSecret: document.querySelector("#feishuSecretInput").value.trim()
+    };
+  } else {
+    body = {
+      channel,
+      displayName: document.querySelector("#channelNameInput").value.trim(),
+      clientId: document.querySelector("#dingtalkClientIdInput").value.trim(),
+      clientSecret: document.querySelector("#dingtalkClientSecretInput").value.trim(),
+      cardTemplateId: document.querySelector("#dingtalkCardTemplateInput").value.trim() || undefined,
+      cardContentKey: document.querySelector("#dingtalkCardContentKeyInput").value.trim() || undefined,
+      networkFamily: document.querySelector("#dingtalkNetworkFamilyInput").value
+    };
+  }
   try {
     button.disabled = true;
     await api("/api/accounts", { method: "POST", body });
@@ -1991,22 +2032,29 @@ function renderCodexProjectOptions() {
       .map((project) => project.workspace)
   );
   const input = document.querySelector("#projectWorkspaceInput");
-  const available = state.codexProjects.filter((project) => !managedWorkspaces.has(project.workspace));
+  const available = state.codexProjects.filter((project) => (
+    project.available !== false && !managedWorkspaces.has(project.workspace)
+  ));
   input.innerHTML = state.codexProjects.length
     ? state.codexProjects.map((project) => {
       const managed = managedWorkspaces.has(project.workspace);
-      const suffix = managed ? "（已添加）" : `（${project.sessionCount} 个 Codex 会话）`;
-      return `<option value="${escapeAttr(project.workspace)}"${managed ? " disabled" : ""}>${escapeHtml(project.name)} — ${escapeHtml(project.workspace)} ${escapeHtml(suffix)}</option>`;
+      const remote = project.projectKind === "remote";
+      const unavailable = project.available === false;
+      const suffix = remote
+        ? `（远程：${project.hostId || "未知主机"}）`
+        : unavailable ? "（当前不可用）"
+        : managed ? "（已添加）" : `（${project.sessionCount} 个 Codex 会话）`;
+      return `<option value="${escapeAttr(project.workspace)}"${managed || unavailable ? " disabled" : ""}>${escapeHtml(project.name)} — ${escapeHtml(project.workspace)} ${escapeHtml(suffix)}</option>`;
     }).join("")
     : `<option value="">Codex 暂无项目记录</option>`;
   input.disabled = !available.length;
   input.value = available[0]?.workspace || "";
   document.querySelector("#saveProjectButton").disabled = !available.length;
   document.querySelector("#projectWorkspaceHint").textContent = available.length
-    ? `共读取到 ${state.codexProjects.length} 个 Codex 项目；已添加到此微信的项目不可重复选择。`
+    ? `已从 Codex Desktop 读取 ${state.codexProjects.length} 个项目；远程项目将通过 Desktop hostId 路由到对应主机。`
     : state.codexProjects.length
       ? "Codex 记录中的项目都已添加到此微信。"
-      : "Codex 本地会话历史中暂时没有可用项目。";
+      : "Codex Desktop 中暂时没有可绑定的项目。";
   updateProjectNameFromSelection();
 }
 
@@ -2121,6 +2169,7 @@ async function saveSettings(event) {
         defaultCwd: document.querySelector("#defaultCwdInput").value.trim(),
         allowedWorkspaces: document.querySelector("#allowedWorkspacesInput").value.split("\n").map((line) => line.trim()).filter(Boolean),
         codexBackend: document.querySelector("#backendInput").value,
+        codexAppServerTransport: document.querySelector("#appServerTransportInput").value,
         codexExecSandbox: document.querySelector("#sandboxInput").value || null,
         model: document.querySelector("#modelInput").value.trim(),
         effort: document.querySelector("#effortInput").value.trim(),
@@ -2245,7 +2294,8 @@ function channelInfo(channel) {
   return ({
     weixin: { label: "个人微信接入", shortLabel: "微信", icon: "message-circle" },
     wecom: { label: "企业微信智能机器人", shortLabel: "企业微信", icon: "building-2" },
-    feishu: { label: "飞书自建应用", shortLabel: "飞书", icon: "send" }
+    feishu: { label: "飞书自建应用", shortLabel: "飞书", icon: "send" },
+    dingtalk: { label: "钉钉企业内部应用", shortLabel: "钉钉", icon: "message-square-dot" }
   })[channel] || { label: "消息渠道", shortLabel: "渠道", icon: "message-circle" };
 }
 
@@ -2259,6 +2309,9 @@ function renderChannelIdentifiers(account) {
   }
   if (channel === "feishu") {
     return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div><div><dt>最近 Chat ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
+  }
+  if (channel === "dingtalk") {
+    return `<div><dt>Client ID</dt><dd><code title="${escapeAttr(account.clientId)}">${escapeHtml(account.clientId)}</code></dd></div><div><dt>最近 Conversation ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
   }
   return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>${webhook}`;
 }

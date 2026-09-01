@@ -24,18 +24,26 @@ export function launchRestartHelper(options: RestartHelperOptions): void {
   if (!fs.existsSync(helperPath) || !fs.existsSync(options.entryPath)) {
     throw new Error("Updated service entry point is unavailable");
   }
-  const child = spawn(process.execPath, [helperPath, String(options.parentPid), options.entryPath], {
-    detached: true,
-    env: {
-      ...process.env,
-      CODEX_CHANNEL_BRIDGE_OPEN: "0",
-      CODEX_CHANNEL_BRIDGE_PORT: String(options.port),
-      CODEX_CHANNEL_BRIDGE_STATE_DIR: options.stateDir
-    },
-    shell: false,
-    stdio: "ignore",
-    windowsHide: true
-  });
+  const logPath = path.join(options.stateDir, "service-restart.log");
+  const logFd = fs.openSync(logPath, "a");
+  let child;
+  try {
+    child = spawn(process.execPath, [helperPath, String(options.parentPid), options.entryPath, logPath], {
+      cwd: path.dirname(options.entryPath),
+      detached: true,
+      env: {
+        ...process.env,
+        CODEX_CHANNEL_BRIDGE_OPEN: "0",
+        CODEX_CHANNEL_BRIDGE_PORT: String(options.port),
+        CODEX_CHANNEL_BRIDGE_STATE_DIR: options.stateDir
+      },
+      shell: false,
+      stdio: ["ignore", logFd, logFd],
+      windowsHide: true
+    });
+  } finally {
+    fs.closeSync(logFd);
+  }
   child.once("error", (error) => {
     console.error(`[codex-channel-bridge] unable to launch restart helper: ${error.message}`);
   });

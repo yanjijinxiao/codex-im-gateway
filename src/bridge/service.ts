@@ -30,7 +30,7 @@ import {
   type FriendlyChannelIntent
 } from "./channel-intent.js";
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
-import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
+import { buildPromptParts, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
 import { ChannelUserInputController } from "./user-input.js";
 import { TaskboardChannelController } from "./taskboard-channel-controller.js";
@@ -41,13 +41,15 @@ import {
 } from "./interaction-cards.js";
 import type {
   CodexDynamicToolCall,
+  CodexBridgeBackend,
   CodexModelOption,
   CodexRuntimeInfo,
+  CodexThreadState,
   CodexThreadGoal,
   CodexThreadGoalStatus
-} from "../codex/app-server-runner.js";
+} from "../codex/backend.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
-import { HybridCodexRunner } from "../codex/runner.js";
+import { CodexBackendRouter } from "../codex/runner.js";
 import {
   LlmWikiMcpClientPool,
   llmWikiDynamicTools
@@ -67,6 +69,7 @@ import {
 import {
   listCodexProjectCandidates,
   listCodexSessionCandidates,
+  mergeCodexSessionCandidates,
   type CodexProjectCandidate,
   type CodexSessionCandidate
 } from "../server/codex-projects.js";
@@ -85,10 +88,21 @@ import {
 import { createGoalFormCard } from "../channels/goal-form-card.js";
 import { formatTaskboardStatus, type ChannelTaskCard } from "../channels/task-card.js";
 import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
+import {
+  markMessageHandlingErrorReported,
+  userFacingMessageHandlingError
+} from "./errors.js";
 
 export { parseCommand } from "./channel-commands.js";
 
 const RECENT_PROJECT_SESSION_LIMIT = 10;
+
+class InboundAttachmentDownloadError extends Error {
+  constructor() {
+    super("Inbound attachment download failed");
+    this.name = "InboundAttachmentDownloadError";
+  }
+}
 
 type ProjectSessionChoice = {
   managed?: ManagedSession;
@@ -101,14 +115,15 @@ export type BridgeServiceOptions = {
   config: CodexWeixinConfig;
   stateStore: RuntimeStateStore;
   weixin: ChannelTextClient;
-  runner?: HybridCodexRunner;
+  runner?: CodexBridgeBackend;
   listCodexModels?: () => Promise<CodexModelOption[]>;
   getCodexBalance?: () => Promise<CodexAccountBalance>;
   llmWiki?: LlmWikiMcpClientPool;
   modeSettings?: ChannelModeSettings;
-  listCodexProjects?: () => readonly CodexProjectCandidate[];
-  listCodexSessions?: (workspace: string) => readonly CodexSessionCandidate[];
+  listCodexProjects?: () => readonly CodexProjectCandidate[] | Promise<readonly CodexProjectCandidate[]>;
+  listCodexSessions?: (workspace: string, desktopProjectId?: string) => readonly CodexSessionCandidate[];
   inboundDir?: string;
+  cdnBaseUrl?: string;
   mediaFetch?: FetchLike;
   taskboard?: TaskboardClient;
   intentResolver?: ChannelIntentResolver;
@@ -128,7 +143,7 @@ export type BridgeServiceOptions = {
 export class BridgeService {
   private readonly access: AccessController;
   private readonly buffers: PromptBuffer;
-  private readonly runner: HybridCodexRunner;
+  private readonly runner: CodexBridgeBackend;
   private readonly approvals: ChannelApprovalController;
   private readonly taskboardController: TaskboardChannelController;
   private readonly llmWiki: LlmWikiMcpClientPool;
@@ -151,8 +166,9 @@ export class BridgeService {
         : this.reply(senderId, notice.text),
       options.approvalTimeoutMs
     );
-    this.runner = options.runner ?? new HybridCodexRunner({
+    this.runner = options.runner ?? new CodexBackendRouter({
       backend: options.config.codexBackend,
+      appServerTransport: options.config.codexAppServerTransport,
       codexBin: options.config.codexBin,
       execSandbox: options.config.codexExecSandbox
     });
@@ -437,8 +453,15 @@ export class BridgeService {
       case "stop":
         this.approvals.declineAll(message.senderId);
         this.userInputs.cancelSender(message.senderId);
-        await this.runner.stop(this.executionSession(message.senderId)?.threadId);
-        await this.reply(message.senderId, "Stop signal sent.");
+        let stopResult: "interrupted" | "not-active";
+        {
+          const session = this.executionSession(message.senderId);
+          stopResult = await this.runner.stop(session?.threadId, this.projectHostId(session?.projectId));
+        }
+        await this.reply(
+          message.senderId,
+          stopResult === "interrupted" ? "已停止当前会话正在执行的任务。" : "当前会话没有正在执行的任务。"
+        );
         return;
       default:
         await this.replyActionCard(message.senderId, createMainMenuCard(
@@ -479,43 +502,81 @@ export class BridgeService {
   }
 
   private async handleProjectCommand(senderId: string, arg: string): Promise<void> {
+    const candidates = await this.codexProjectCandidates();
+    this.synchronizeManagedProjects(candidates);
     const input = arg.trim();
     const addMatch = /^(?:add|a)(?:\s+(.*))?$/i.exec(input);
     if (addMatch) {
-      const existingWorkspaces = new Set(
-        this.options.stateStore.listProjects().map((project) => path.resolve(project.workspace))
-      );
-      const candidates = (this.options.listCodexProjects?.() ?? listCodexProjectCandidates())
-        .filter((candidate) => !existingWorkspaces.has(path.resolve(candidate.workspace)));
+      const projects = this.options.stateStore.listProjects();
+      let nextAddIndex = 1;
+      const catalogRows = candidates.map((item) => {
+        const bound = this.boundProjectForCandidate(item, projects);
+        const projectIndex = bound ? projects.findIndex((project) => project.id === bound.id) : -1;
+        return {
+          item,
+          bound,
+          projectIndex,
+          addIndex: bound ? undefined : nextAddIndex++
+        };
+      });
+      const addableRows = catalogRows.filter((row) => row.addIndex !== undefined);
       const rawCode = addMatch[1]?.trim() ?? "";
       const match = /^c([1-9]\d*)$/i.exec(rawCode);
-      const candidate = match ? candidates[Number(match[1]) - 1] : undefined;
+      const selectedRow = match ? addableRows[Number(match[1]) - 1] : undefined;
+      const candidate = selectedRow?.item;
       if (!candidate) {
         if (candidates.length === 0) {
-          await this.reply(senderId, "没有可添加的 Codex 历史项目。请先在 Codex 中打开项目并创建任务。");
+          await this.reply(senderId, "Codex Desktop 当前没有项目。请先在 Codex App 中添加项目。");
           return;
         }
         const fallbackText = [
-          "从 Codex 历史项目中选择：",
-          ...candidates.map((item, index) =>
-            `[C${index + 1}] ${item.name}（${item.sessionCount} 个会话）\n${item.workspace}`
-          ),
+          `Codex Desktop 项目：${candidates.length} 个（已绑定 ${projects.length} 个）`,
+          ...catalogRows.map(({ item, bound, projectIndex, addIndex }) => {
+            const code = bound ? `P${projectIndex + 1}` : `C${addIndex}`;
+            const status = bound ? "【已绑定】" : "【未绑定】";
+            const detail = item.projectKind === "remote"
+              ? `远程主机：${item.hostId ?? "未知主机"}`
+              : `会话：${item.sessionCount} 个`;
+            return `[${code}] ${status} ${item.name}\n\n${detail}\n路径：${item.workspace}`;
+          }),
           "发送 /project add C编号 添加，例如：/project add C1"
-        ].join("\n");
+        ].join("\n\n");
         await this.replyActionCard(senderId, createCommandSelectionCard({
-          title: "添加 Codex 项目",
-          body: candidates.map((item) => `**${item.name}** · ${item.sessionCount} 个会话\n${item.workspace}`).join("\n\n"),
+          title: `Codex Desktop 项目（${candidates.length}）`,
+          body: catalogRows.map(({ item, bound }) => {
+            const status = bound ? "已绑定" : "未绑定";
+            return item.projectKind === "remote"
+              ? `**${status} · ${item.name}**\n\n远程主机：${item.hostId ?? "其他主机"}\n路径：${item.workspace}`
+              : `**${status} · ${item.name}**\n\n会话：${item.sessionCount} 个\n路径：${item.workspace}`;
+          }).join("\n\n"),
           command: "project",
-          choices: candidates.map((item, index) => ({
-            label: conciseButtonLabel(item.name),
-            arg: `add C${index + 1}`
-          })),
+          choices: catalogRows.map(({ item, bound, projectIndex, addIndex }) => {
+            return {
+              label: conciseButtonLabel(item.name),
+              arg: bound ? `P${projectIndex + 1}` : `add C${addIndex}`,
+              active: Boolean(bound && bound.id === this.options.stateStore.getActiveProject(senderId)?.id)
+            };
+          }),
           fallbackText
         }));
         return;
       }
-      const project = this.options.stateStore.createProject(candidate.name, candidate.workspace);
-      await this.reply(senderId, `已添加 Codex 项目：${project.name}\n${project.workspace}`);
+      if (candidate.projectKind === "remote" && !candidate.hostId) {
+        await this.reply(
+          senderId,
+          `已在 Codex Desktop 中发现远程项目「${candidate.name}」，但项目没有 hostId，暂时无法建立远程路由。`
+        );
+        return;
+      }
+      const project = this.options.stateStore.createProject(candidate.name, candidate.workspace, {
+        sourceProjectId: candidate.projectId,
+        projectKind: candidate.projectKind,
+        hostId: candidate.hostId
+      });
+      await this.reply(
+        senderId,
+        `已添加 Codex 项目：${project.name}${project.hostId ? `\n远程主机：${project.hostId}` : ""}\n${project.workspace}`
+      );
       return;
     }
     const projects = this.options.stateStore.listProjects();
@@ -550,29 +611,63 @@ export class BridgeService {
     }
     if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "l") {
       const activeProjectId = this.options.stateStore.getActiveProject(senderId)?.id;
-      const fallbackText = (projects.length
-        ? ["已绑定的 Codex 项目：", ...projects.map((project, index) =>
-          `[P${index + 1}] ${project.id === activeProjectId ? "【当前】" : ""}${project.name}\n   ${project.workspace}`
-        ), "", "发送 /project P1 切换项目。"]
-        : ["还没有绑定 Codex 项目。", "发送 /project add 查看可从 Codex 历史添加的项目。"]).join("\n");
-      if (!projects.length) {
+      let nextAddIndex = 1;
+      const catalogRows = candidates.map((candidate) => {
+        const bound = this.boundProjectForCandidate(candidate, projects);
+        const projectIndex = bound ? projects.findIndex((project) => project.id === bound.id) : -1;
+        return {
+          candidate,
+          bound,
+          projectIndex,
+          addIndex: bound ? undefined : nextAddIndex++
+        };
+      });
+      const catalogProjectIds = new Set(catalogRows.flatMap((row) => row.bound ? [row.bound.id] : []));
+      const retainedProjects = projects.filter((project) => !catalogProjectIds.has(project.id));
+      const fallbackText = [
+        `Codex Desktop 项目：${candidates.length} 个（已绑定 ${projects.length} 个）`,
+        ...catalogRows.map(({ candidate, addIndex, bound, projectIndex }) => bound
+          ? `[P${projectIndex + 1}] ${bound.id === activeProjectId ? "【当前】 " : ""}${candidate.name}\n\n路径：${candidate.workspace}`
+          : `[C${addIndex}] 【未绑定】 ${candidate.name}\n\n路径：${candidate.workspace}`),
+        ...(retainedProjects.length
+          ? ["Bridge 保留的非 Desktop 项目：", ...retainedProjects.map((project) => {
+            const projectIndex = projects.findIndex((item) => item.id === project.id);
+            return `[P${projectIndex + 1}] ${project.id === activeProjectId ? "【当前】 " : ""}${project.name}\n\n路径：${project.workspace}`;
+          })]
+          : []),
+        "发送 /project P1 切换已绑定项目；发送 /project add C编号 添加未绑定项目。"
+      ].join("\n\n");
+      if (!projects.length && !candidates.length) {
         await this.replyActionCard(senderId, createChoiceCard({
           title: "选择 Codex 项目",
-          body: "还没有绑定项目，可以从 Codex 历史记录中添加。",
+          body: "Codex Desktop 当前没有项目。请先在 Codex App 中添加项目。",
           fallbackText,
-          choices: [{ label: "添加历史项目", command: "project", arg: "add", style: "primary" }]
+          choices: [{ label: "重新读取", command: "project", arg: "list", style: "primary" }]
         }));
         return;
       }
       await this.replyActionCard(senderId, createCommandSelectionCard({
         title: "选择 Codex 项目",
-        body: projects.map((project) => `${project.id === activeProjectId ? `**当前 · ${project.name}**` : `**${project.name}**`}\n${project.workspace}`).join("\n\n"),
+        body: [
+          ...catalogRows.map(({ candidate, bound }) => `**${bound?.id === activeProjectId ? "当前" : bound ? "已绑定" : "未绑定"} · ${candidate.name}**\n\n路径：${candidate.workspace}`),
+          ...retainedProjects.map((project) => `**${project.id === activeProjectId ? "当前" : "Bridge 保留"} · ${project.name}**\n\n路径：${project.workspace}`)
+        ].join("\n\n"),
         command: "project",
-        choices: projects.map((project, index) => ({
-          label: conciseButtonLabel(project.name),
-          arg: `P${index + 1}`,
-          active: project.id === activeProjectId
-        })),
+        choices: [
+          ...catalogRows.map(({ candidate, addIndex, bound, projectIndex }) => ({
+            label: conciseButtonLabel(candidate.name),
+            arg: bound ? `P${projectIndex + 1}` : `add C${addIndex}`,
+            active: bound?.id === activeProjectId
+          })),
+          ...retainedProjects.map((project) => {
+            const projectIndex = projects.findIndex((item) => item.id === project.id);
+            return {
+              label: conciseButtonLabel(project.name),
+              arg: `P${projectIndex + 1}`,
+              active: project.id === activeProjectId
+            };
+          })
+        ],
         fallbackText
       }));
       return;
@@ -826,7 +921,7 @@ export class BridgeService {
       return;
     }
     if (/^clear$/i.test(input)) {
-      await this.runner.clearGoal(session.threadId);
+      await this.runner.clearGoal(session.threadId, this.projectHostId(session.projectId));
       await this.reply(senderId, "已清除当前 Codex 目标。");
       return;
     }
@@ -835,18 +930,22 @@ export class BridgeService {
       const status = ({ pause: "paused", resume: "active", complete: "complete" } as const)[
         statusMatch[1].toLowerCase() as "pause" | "resume" | "complete"
       ];
-      const goal = await this.runner.setGoal(session.threadId, { status });
+      const goal = await this.runner.setGoal(session.threadId, { status }, this.projectHostId(session.projectId));
       await this.replyGoalCard(message, goal);
       return;
     }
     const setMatch = /^(?:set\s+)?(.+)$/is.exec(input);
     if (setMatch && input) {
       const objective = setMatch[1].trim();
-      const goal = await this.runner.setGoal(session.threadId, { objective, status: "active" });
+      const goal = await this.runner.setGoal(
+        session.threadId,
+        { objective, status: "active" },
+        this.projectHostId(session.projectId)
+      );
       await this.replyGoalCard(message, goal);
       return;
     }
-    await this.replyGoalCard(message, await this.runner.getGoal(session.threadId));
+    await this.replyGoalCard(message, await this.runner.getGoal(session.threadId, this.projectHostId(session.projectId)));
   }
 
   private async replyGoalCard(message: NormalizedWeixinMessage, goal: CodexThreadGoal | undefined): Promise<void> {
@@ -924,28 +1023,37 @@ export class BridgeService {
       }));
       return;
     }
-    const sessions = this.recentProjectSessionChoices(senderId, project);
+    const sessions = await this.recentProjectSessionChoices(senderId, project);
     const input = arg.trim();
     if (!input) {
       const activeId = activeSession?.projectId === project.id ? activeSession.id : undefined;
-      const previews = await Promise.all(sessions.map((session) => this.projectSessionChoicePreview(session)));
-      const lines = [`项目“${project.name}”最近活跃的会话（最多 ${RECENT_PROJECT_SESSION_LIMIT} 个）：`];
-      for (const [index, session] of sessions.entries()) {
-        lines.push(
-          `[R${index + 1}] ${session.managed?.id === activeId ? "【当前】" : ""}${session.title}`,
-          `   最近内容：${previews[index]}（${formatSessionTime(session.updatedAt)}）`
-        );
-      }
-      lines.push("", "发送 /session R1 绑定并继续对应会话。发送 /new 可在当前项目新建会话。");
+      const previews = await Promise.all(sessions.map((session) => this.projectSessionChoicePreview(session, project)));
+      const fallbackText = sessions.length
+        ? [
+            `项目“${project.name}”最近活跃的会话（最多 ${RECENT_PROJECT_SESSION_LIMIT} 个）：`,
+            ...sessions.map((session, index) => [
+              `[R${index + 1}] ${session.managed?.id === activeId ? "【当前】 " : ""}${session.title}`,
+              `状态：${projectSessionChoiceStateLabel(session)}`,
+              `时间：${formatSessionTime(session.updatedAt)}`,
+              `最近内容：${previews[index]}`
+            ].join("\n")),
+            "发送 /session R1 绑定并继续对应会话。\n发送 /new 可在当前项目新建会话。"
+          ].join("\n\n")
+        : [
+            `项目“${project.name}”还没有可恢复的会话。`,
+            "发送 /new 可在当前项目新建会话。"
+          ].join("\n\n");
       await this.replyActionCard(senderId, createChoiceCard({
         title: "选择会话",
         body: sessions.length
           ? sessions.map((session, index) => [
             session.managed?.id === activeId ? `**当前 · ${session.title}**` : `**${session.title}**`,
-            `${previews[index]}（${formatSessionTime(session.updatedAt)}）`
+            `状态：${projectSessionChoiceStateLabel(session)}`,
+            `时间：${formatSessionTime(session.updatedAt)}`,
+            `最近内容：${previews[index]}`
           ].join("\n")).join("\n\n")
           : `项目“${project.name}”还没有可恢复的会话。`,
-        fallbackText: lines.join("\n"),
+        fallbackText,
         choices: [
           ...sessions.map((session, index): ChannelChoice => ({
             label: conciseButtonLabel(session.title),
@@ -990,31 +1098,83 @@ export class BridgeService {
       }));
       return;
     }
-    const preview = await this.projectSessionChoicePreview(selected);
+    const unavailableReason = unavailableProjectSessionChoiceReason(selected);
+    if (unavailableReason) {
+      await this.replyActionCard(senderId, createChoiceCard({
+        title: "无法继续这个会话",
+        body: unavailableReason,
+        fallbackText: unavailableReason,
+        choices: [
+          { label: "重新选择会话", command: "sessions", arg: "", style: "primary" },
+          { label: "新建会话", command: "new", arg: "", style: "default" }
+        ]
+      }));
+      return;
+    }
+    const preview = await this.projectSessionChoicePreview(selected, project);
     const bound = this.bindProjectSessionChoice(senderId, project, selected);
     this.options.stateStore.setInteractionMode(senderId, "session");
     await this.reply(senderId, [
       `已绑定项目“${project.name}”的会话：${bound.title}`,
       `最近内容：${preview}`,
       bound.threadId ? "下一条消息将继续该历史会话。" : "该会话尚无历史内容，下一条消息将创建新上下文。"
-    ].join("\n"));
+    ].join("\n\n"));
   }
 
-  private recentProjectSessionChoices(senderId: string, project: ManagedProject): ProjectSessionChoice[] {
+  private async recentProjectSessionChoices(senderId: string, project: ManagedProject): Promise<ProjectSessionChoice[]> {
     const managed = this.options.stateStore.listSessions()
       .filter((session) => (
         session.senderId === senderId && session.projectId === project.id && session.mode !== "qa"
       ));
-    const candidates = [...(this.options.listCodexSessions?.(project.workspace)
-      ?? listCodexSessionCandidates(project.workspace))];
+    let authoritative = false;
+    let candidates: CodexSessionCandidate[];
+    if (this.options.listCodexSessions) {
+      candidates = [...this.options.listCodexSessions(project.workspace, project.sourceProjectId)];
+    } else {
+      try {
+        const states = await this.runner.listThreads({
+          cwd: project.workspace,
+          persistence: "all",
+          limit: 100
+        }, project.hostId);
+        const appServerCandidates = states.map((state) => codexThreadStateCandidate(state, project.workspace));
+        const desktopCandidates = listCodexSessionCandidates(
+          project.workspace,
+          undefined,
+          100,
+          project.sourceProjectId
+        );
+        candidates = [...mergeCodexSessionCandidates(appServerCandidates, desktopCandidates, 100)];
+        authoritative = true;
+      } catch (error) {
+        console.warn(
+          `Unable to list Codex app-server sessions for ${project.workspace}; falling back to local rollouts: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+        candidates = [...listCodexSessionCandidates(
+          project.workspace,
+          undefined,
+          RECENT_PROJECT_SESSION_LIMIT,
+          project.sourceProjectId
+        )];
+      }
+    }
     const candidatesByThread = new Map(candidates.map((candidate) => [candidate.threadId, candidate]));
     const choices: ProjectSessionChoice[] = managed.map((session) => {
-      const candidate = session.threadId ? candidatesByThread.get(session.threadId) : undefined;
+      const candidate = session.threadId
+        ? candidatesByThread.get(session.threadId) ?? (authoritative ? {
+          threadId: session.threadId,
+          workspace: session.workspace,
+          lastUsedAt: session.updatedAt,
+          persistence: "missing" as const,
+          runtimeStatus: "unknown" as const
+        } : undefined)
+        : undefined;
       if (candidate) candidatesByThread.delete(candidate.threadId);
       return {
         managed: session,
         ...(candidate ? { candidate } : {}),
-        title: session.title,
+        title: candidate?.title || session.title,
         updatedAt: candidate && candidate.lastUsedAt > session.updatedAt
           ? candidate.lastUsedAt
           : session.updatedAt
@@ -1024,11 +1184,15 @@ export class BridgeService {
       const preview = codexSessionCandidatePreview(candidate);
       choices.push({
         candidate,
-        title: preview || `Codex 会话 ${candidate.threadId.slice(0, 8)}`,
+        title: candidate.title || preview || `Codex 会话 ${candidate.threadId.slice(0, 8)}`,
         updatedAt: candidate.lastUsedAt
       });
     }
     return choices
+      .filter((choice) => (
+        choice.candidate?.persistence !== "archived"
+        && choice.candidate?.persistence !== "missing"
+      ))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .slice(0, RECENT_PROJECT_SESSION_LIMIT);
   }
@@ -1048,9 +1212,28 @@ export class BridgeService {
     return this.options.stateStore.getSession(session.id) ?? session;
   }
 
-  private async projectSessionChoicePreview(choice: ProjectSessionChoice): Promise<string> {
+  private async projectSessionChoicePreview(choice: ProjectSessionChoice, project: ManagedProject): Promise<string> {
+    if (choice.candidate?.persistence === "archived") return "该会话已归档";
+    if (choice.candidate?.persistence === "missing") return "该会话已不存在";
+    if (choice.candidate?.runtimeStatus === "systemError") return "该会话处于系统错误状态";
     const candidatePreview = choice.candidate ? codexSessionCandidatePreview(choice.candidate) : undefined;
     if (candidatePreview) return candidatePreview;
+    if (choice.candidate?.threadId) {
+      try {
+        const history = await this.runner.getHistory(choice.candidate.threadId, project.hostId);
+        const lastUserMessage = [...history].reverse().find((message) => message.role === "user");
+        if (lastUserMessage) {
+          const parsed = parsePrompt(lastUserMessage.text);
+          const preview = buildPromptPreview(parsed.text, parsed.attachments);
+          if (preview) return preview;
+        }
+      } catch (error) {
+        console.warn(
+          `Unable to read Codex Desktop history for ${choice.candidate.threadId}: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
     return choice.managed ? this.sessionPromptPreview(choice.managed) : "暂无内容摘要";
   }
 
@@ -1058,7 +1241,7 @@ export class BridgeService {
     if (session.lastPromptPreview) return session.lastPromptPreview;
     if (!session.threadId) return "尚未开始对话";
     try {
-      const history = await this.runner.getHistory(session.threadId);
+      const history = await this.runner.getHistory(session.threadId, this.projectHostId(session.projectId));
       const lastUserMessage = [...history].reverse().find((message) => message.role === "user");
       if (!lastUserMessage) return "暂无内容摘要";
       const parsed = parsePrompt(lastUserMessage.text);
@@ -1346,11 +1529,10 @@ export class BridgeService {
     const fallbackText = [
       `个人知识库（自动沉淀：${status}，共 ${entries.length} 条）`,
       ...visibleEntries.map((entry, index) =>
-        `[K${index + 1}] ${formatKnowledgeKind(entry.kind)} · ${entry.scope === "project" ? `项目：${projectNames.get(entry.projectId ?? "") ?? "已移除项目"}` : "账号"}\n${entry.title}：${entry.content}`
+        `[K${index + 1}] ${formatKnowledgeKind(entry.kind)} · ${entry.scope === "project" ? `项目：${projectNames.get(entry.projectId ?? "") ?? "已移除项目"}` : "账号"}\n标题：${entry.title}\n内容：${entry.content}`
       ),
-      "",
       "删除单条：/memory forget K编号"
-    ].join("\n");
+    ].join("\n\n");
     const choices: ChannelChoice[] = [{
       label: knowledgeEnabled ? "关闭自动沉淀" : "开启自动沉淀",
       command: "memory",
@@ -1373,7 +1555,7 @@ export class BridgeService {
     await this.replyActionCard(senderId, createChoiceCard({
       title: "个人知识库",
       body: `自动沉淀：**${status}** · 共 ${entries.length} 条\n\n${visibleEntries.map((entry, index) =>
-        `**K${index + 1} · ${entry.title}**\n${entry.content}`
+        `**K${index + 1} · ${entry.title}**\n\n${entry.content}`
       ).join("\n\n")}`,
       fallbackText,
       choices
@@ -1415,6 +1597,7 @@ export class BridgeService {
         messageId: message.id,
         attachments: remoteAttachments,
         maxBytes: this.options.config.maxInboundBytes,
+        cdnBaseUrl: this.options.cdnBaseUrl,
         fetch: this.options.mediaFetch
       });
       for (const attachment of downloaded) {
@@ -1426,10 +1609,10 @@ export class BridgeService {
       }
     } catch (error) {
       if (error instanceof InboundMediaTooLargeError) throw error;
-      items.push({
-        kind: "text",
-        text: `[Attachment download failed: ${error instanceof Error ? error.message : String(error)}]`
-      });
+      console.error(
+        `[codex-channel-bridge] inbound attachment download failed for message ${message.id}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      throw new InboundAttachmentDownloadError();
     }
     return items;
   }
@@ -1438,16 +1621,26 @@ export class BridgeService {
     try {
       return await this.promptItemsFromMessage(message);
     } catch (error) {
-      if (!(error instanceof InboundMediaTooLargeError)) throw error;
-      const maxMiB = Math.floor(error.maxBytes / (1024 * 1024));
-      await this.reply(message.senderId, `附件超过 ${maxMiB} MiB 上限，请压缩或裁剪后重新发送。`);
-      return undefined;
+      if (error instanceof InboundMediaTooLargeError) {
+        const maxMiB = Math.floor(error.maxBytes / (1024 * 1024));
+        await this.reply(message.senderId, `附件超过 ${maxMiB} MiB 上限，请压缩或裁剪后重新发送。`);
+        return undefined;
+      }
+      if (error instanceof InboundAttachmentDownloadError) {
+        await this.reply(message.senderId, "收到附件，但从微信下载或解密失败。请重新发送；如果仍失败，请在管理页重新连接该微信账号。");
+        return message.text.trim() ? [{ kind: "text", text: message.text }] : undefined;
+      }
+      throw error;
     }
   }
 
   private async runCodexTurn(message: NormalizedWeixinMessage, text: string, attachments: PromptBufferItem[] = []): Promise<void> {
-    const project = this.options.stateStore.getActiveProject(message.senderId);
-    if (!project) throw new Error("No bound Codex project for this sender");
+    const activeProject = this.options.stateStore.getActiveProject(message.senderId);
+    if (!activeProject) throw new Error("No bound Codex project for this sender");
+    // Turn execution must not wait for a fresh catalog request. Account start
+    // and /project commands synchronize metadata; this cheap Desktop-registry
+    // pass only repairs an older binding before the turn is routed.
+    const project = this.synchronizeManagedProject(activeProject, listCodexProjectCandidates());
     const mode = this.options.stateStore.getInteractionMode(message.senderId);
     const qaContext = mode === "qa" ? this.resolveQaContext(project) : undefined;
     if (mode === "qa" && !qaContext) throw new Error("Current project has no available llm-wiki knowledge base");
@@ -1462,16 +1655,30 @@ export class BridgeService {
     const threadId = session.threadId || undefined;
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
     const sentProgress = new Set<string>();
+    let lastFallbackProgressAt = 0;
+    const replyStream = progressEnabled
+      ? new ChannelTurnTextStream(this.options.weixin, message.senderId)
+      : undefined;
+    let streamedAnswer = "";
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     try {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-channel-bridge] starting Codex turn for ${message.senderId} in ${workspace}`);
+        await replyStream?.progress("🤔 正在理解任务并规划下一步…");
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
-        const basePrompt = buildPrompt(text, attachments, "WeChat", knowledge);
+        const promptParts = buildPromptParts(text, attachments, "WeChat", knowledge);
         const result = await this.runner.run({
-          prompt: qaContext ? buildQaPrompt(basePrompt, project, qaContext) : basePrompt,
+          prompt: qaContext ? buildQaPrompt(promptParts.prompt, project, qaContext) : promptParts.prompt,
+          developerInstructions: promptParts.developerInstructions,
           cwd: workspace,
+          hostId: project.hostId,
+          projectId: project.sourceProjectId,
+          projectName: project.name,
           threadId,
+          threadTitle: preferredThreadTitle(session.title, promptPreview),
+          onThreadCreated: (createdThreadId) => {
+            this.options.stateStore.setSessionThread(session.id, createdThreadId);
+          },
           queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
@@ -1481,10 +1688,21 @@ export class BridgeService {
             onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
           } : {}),
           ...(progressEnabled ? {
+            ...(replyStream?.supported ? {
+              onDelta: async (delta: string) => {
+                streamedAnswer += delta;
+                const visible = visibleStreamingAnswer(streamedAnswer);
+                if (visible) await replyStream.answer(visible);
+              }
+            } : {}),
             onProgress: async (progress: string) => {
               const progressText = progress.trim();
               if (!progressText || sentProgress.has(progressText)) return;
               sentProgress.add(progressText);
+              if (sentProgress.size > 200) sentProgress.clear();
+              if (replyStream && await replyStream.progress(progressText)) return;
+              if (Date.now() - lastFallbackProgressAt < 5_000) return;
+              lastFallbackProgressAt = Date.now();
               await this.reply(message.senderId, `【进度】${progressText}`);
             }
           } : {}),
@@ -1500,7 +1718,10 @@ export class BridgeService {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
         const remaining = chunkText(parsed.visibleText);
-        if (remaining.length) {
+        const streamed = replyStream
+          ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。")
+          : false;
+        if (remaining.length && !streamed) {
           for (const chunk of remaining) {
             await this.reply(message.senderId, chunk);
           }
@@ -1517,6 +1738,10 @@ export class BridgeService {
         });
       });
     } catch (error) {
+      const failureWasReported = await replyStream?.fail(
+        stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
+      ) ?? false;
+      if (failureWasReported) markMessageHandlingErrorReported(error);
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
         sessionId: session.id,
@@ -1527,6 +1752,51 @@ export class BridgeService {
     } finally {
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
     }
+  }
+
+  private async codexProjectCandidates(): Promise<readonly CodexProjectCandidate[]> {
+    return await this.options.listCodexProjects?.() ?? listCodexProjectCandidates();
+  }
+
+  private boundProjectForCandidate(
+    candidate: CodexProjectCandidate,
+    projects = this.options.stateStore.listProjects()
+  ): ManagedProject | undefined {
+    const candidateHost = candidate.hostId ?? "local";
+    return projects.find((project) => (
+      Boolean(candidate.projectId && project.sourceProjectId === candidate.projectId)
+      && (project.hostId ?? "local") === candidateHost
+    )) ?? projects.find((project) => (
+      path.resolve(project.workspace) === path.resolve(candidate.workspace)
+      && (project.hostId ?? "local") === candidateHost
+    ));
+  }
+
+  private synchronizeManagedProjects(candidates: readonly CodexProjectCandidate[]): void {
+    for (const project of this.options.stateStore.listProjects()) {
+      this.synchronizeManagedProject(project, candidates);
+    }
+  }
+
+  private synchronizeManagedProject(
+    project: ManagedProject,
+    candidates: readonly CodexProjectCandidate[]
+  ): ManagedProject {
+    const candidate = candidates.find((item) => (
+        path.resolve(item.workspace) === path.resolve(project.workspace)
+        && (item.hostId ?? "local") === (project.hostId ?? "local")
+      ));
+    if (!candidate?.projectId) return project;
+    if (
+      project.sourceProjectId === candidate.projectId
+      && project.projectKind === candidate.projectKind
+      && project.hostId === candidate.hostId
+    ) return project;
+    return this.options.stateStore.updateProjectMetadata(project.id, {
+      sourceProjectId: candidate.projectId,
+      projectKind: candidate.projectKind,
+      hostId: candidate.hostId
+    });
   }
 
   private ensureConversationSession(senderId: string, project: ManagedProject): ManagedSession {
@@ -1689,6 +1959,7 @@ export class BridgeService {
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,
       `backend：${this.options.config.codexBackend}`,
+      `app-server transport：${this.options.config.codexAppServerTransport}`,
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
       `model: ${runtime.model ?? "(Codex default)"}`,
       `effort: ${runtime.effort ?? "(Codex default)"}`,
@@ -1720,7 +1991,7 @@ export class BridgeService {
     const workspace = session?.workspace ?? this.options.config.defaultCwd;
     let runtime: CodexRuntimeInfo = {};
     try {
-      runtime = await this.runner.getRuntimeInfo(workspace, session?.threadId);
+      runtime = await this.runner.getRuntimeInfo(workspace, session?.threadId, this.projectHostId(session?.projectId));
     } catch (error) {
       console.warn(`Codex runtime info unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1729,6 +2000,10 @@ export class BridgeService {
       effort: session?.effort ?? this.options.config.effort ?? runtime.effort,
       provider: runtime.provider
     };
+  }
+
+  private projectHostId(projectId?: string): string | undefined {
+    return projectId ? this.options.stateStore.getProject(projectId)?.hostId : undefined;
   }
 
   private async reply(senderId: string, text: string): Promise<void> {
@@ -1943,6 +2218,62 @@ function codexSessionCandidatePreview(candidate: CodexSessionCandidate): string 
   return buildPromptPreview(parsed.text, parsed.attachments);
 }
 
+function codexThreadStateCandidate(state: CodexThreadState, fallbackWorkspace: string): CodexSessionCandidate {
+  return {
+    threadId: state.threadId,
+    workspace: state.cwd ?? fallbackWorkspace,
+    lastUsedAt: state.updatedAt ?? new Date(0).toISOString(),
+    persistence: state.persistence,
+    runtimeStatus: state.runtimeStatus,
+    activeFlags: state.activeFlags,
+    ...(state.latestTurnStatus ? { latestTurnStatus: state.latestTurnStatus } : {}),
+    ...(state.title ? { title: state.title } : {}),
+    ...(state.preview ? { lastUserMessage: state.preview } : {})
+  };
+}
+
+function projectSessionChoiceStateLabel(choice: ProjectSessionChoice): string {
+  const candidate = choice.candidate;
+  if (!candidate) return choice.managed?.threadId ? "状态未知" : "尚未开始";
+  if (candidate.persistence === "archived") return "已归档";
+  if (candidate.persistence === "missing") return "已失效";
+  if (candidate.runtimeStatus === "systemError") return "系统错误";
+  if (candidate.desktopOwned) return "Desktop 已打开";
+  if (candidate.runtimeStatus === "active") {
+    if (candidate.activeFlags?.includes("waitingOnApproval")) return "等待审批";
+    if (candidate.activeFlags?.includes("waitingOnUserInput")) return "等待输入";
+    return "执行中";
+  }
+  if (candidate.latestTurnStatus === "failed") return "上次执行失败";
+  if (candidate.latestTurnStatus === "interrupted") return "上次已停止";
+  if (candidate.runtimeStatus === "notLoaded") return "未加载";
+  if (candidate.runtimeStatus === "idle") return candidate.persistence === "ephemeral" ? "临时会话" : "空闲";
+  return candidate.persistence === "ephemeral" ? "临时会话" : "状态未知";
+}
+
+function unavailableProjectSessionChoiceReason(choice: ProjectSessionChoice): string | undefined {
+  const candidate = choice.candidate;
+  if (candidate?.persistence === "archived") {
+    return "这个 Codex session 已归档。Bridge 不会静默恢复它；请先在 Codex App 中取消归档，再重新选择。";
+  }
+  if (candidate?.persistence === "missing") {
+    return "这个 Codex session 已不存在或被删除，原绑定已经失效。请重新选择其他 session，或新建一个 session。";
+  }
+  if (candidate?.runtimeStatus === "systemError") {
+    return "这个 Codex session 当前处于系统错误状态。请先在 Codex App 中打开并处理错误，再重新选择。";
+  }
+  return undefined;
+}
+
+function stripBridgeErrorPrefix(message: string): string {
+  return message.replace(/^\[codex-channel-bridge]\s*/i, "");
+}
+
+function preferredThreadTitle(sessionTitle: string, promptPreview?: string): string {
+  const genericSessionTitle = /^(?:会话\s*\d+|新会话|Codex 会话(?:\s+[\da-f-]+)?)$/i.test(sessionTitle.trim());
+  return (genericSessionTitle ? promptPreview : sessionTitle) ?? promptPreview ?? sessionTitle;
+}
+
 const fallbackEfforts = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 function selectModel(models: CodexModelOption[], input: string): CodexModelOption | undefined {
@@ -1984,4 +2315,202 @@ function formatEffort(effort?: string): string {
     ultra: "极高"
   };
   return labels[effort] ? `${labels[effort]}（${effort}）` : effort;
+}
+
+function visibleStreamingAnswer(text: string): string {
+  const actionFence = text.search(/```codex-(?:channel-bridge|weixin)-actions\b/i);
+  return (actionFence >= 0 ? text.slice(0, actionFence) : text).trim();
+}
+
+class ChannelTurnTextStream {
+  readonly supported: boolean;
+  private messageId?: string;
+  private disabled = false;
+  private latestText = "";
+  private readonly startedAt = Date.now();
+  private readonly progressEntries: string[] = [];
+  private thought = "正在理解任务并规划下一步…";
+  private answerPreview = "";
+  private updateTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
+  private chain: Promise<void> = Promise.resolve();
+  private lastUpdateAt = 0;
+
+  constructor(
+    private readonly client: ChannelTextClient,
+    private readonly toUserId: string
+  ) {
+    this.supported = Boolean(client.startTextStream && client.updateTextStream);
+  }
+
+  async progress(text: string): Promise<boolean> {
+    const content = text.trim();
+    if (!content) return false;
+    if (content.startsWith("🤔")) {
+      this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
+    } else {
+      const entry = boundedProgressText(content, 600);
+      if (entry && this.progressEntries.at(-1) !== entry) {
+        this.progressEntries.push(entry);
+        if (this.progressEntries.length > 5) this.progressEntries.shift();
+      }
+      this.thought = thinkingStatusForProgress(content);
+    }
+    return this.publish(this.render());
+  }
+
+  async answer(text: string): Promise<boolean> {
+    const content = text.trim();
+    if (!content) return false;
+    this.answerPreview = boundedProgressText(content, 2_400);
+    this.thought = "正在组织最终回复…";
+    return this.publish(this.render());
+  }
+
+  private async publish(content: string): Promise<boolean> {
+    if (!this.supported || this.disabled || !content) return false;
+    this.latestText = content;
+    if (!this.messageId) {
+      try {
+        const result = await this.client.startTextStream!({ toUserId: this.toUserId, text: content });
+        this.messageId = result.messageId;
+        this.lastUpdateAt = Date.now();
+        this.startHeartbeat();
+        return true;
+      } catch (error) {
+        this.disable(error);
+        return false;
+      }
+    }
+    this.scheduleUpdate();
+    return true;
+  }
+
+  async finalize(text: string): Promise<boolean> {
+    const content = text.trim();
+    if (!this.supported || !this.messageId || !content) return false;
+    this.stopTimers();
+    await this.chain;
+    try {
+      // A transient progress update failure disables further non-terminal
+      // frames, but it must not prevent the final frame from closing an
+      // already-created card. Otherwise the answer falls back to a separate
+      // message while the original card remains stuck in "thinking" forever.
+      await this.client.updateTextStream!({
+        toUserId: this.toUserId,
+        messageId: this.messageId,
+        text: content,
+        finalize: true
+      });
+      this.lastUpdateAt = Date.now();
+      return true;
+    } catch (error) {
+      this.disable(error);
+      return false;
+    }
+  }
+
+  async fail(text: string): Promise<boolean> {
+    if (!this.supported || !this.messageId) return false;
+    this.stopTimers();
+    await this.chain;
+    try {
+      await this.client.updateTextStream!({
+        toUserId: this.toUserId,
+        messageId: this.messageId,
+        text,
+        finalize: true
+      });
+      this.lastUpdateAt = Date.now();
+      return true;
+    } catch (error) {
+      this.disable(error);
+      return false;
+    }
+  }
+
+  private scheduleUpdate(): void {
+    if (this.updateTimer || !this.messageId) return;
+    const delay = Math.max(0, 500 - (Date.now() - this.lastUpdateAt));
+    this.updateTimer = setTimeout(() => {
+      this.updateTimer = undefined;
+      if (this.disabled || !this.messageId) return;
+      const text = this.latestText;
+      this.chain = this.chain.then(async () => {
+        await this.client.updateTextStream!({
+          toUserId: this.toUserId,
+          messageId: this.messageId!,
+          text
+        });
+        this.lastUpdateAt = Date.now();
+      }).catch((error) => this.disable(error));
+    }, delay);
+    this.updateTimer.unref?.();
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.disabled || !this.messageId) return;
+      this.latestText = this.render();
+      this.scheduleUpdate();
+    }, 30_000);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopTimers(): void {
+    if (this.updateTimer) clearTimeout(this.updateTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.updateTimer = undefined;
+    this.heartbeatTimer = undefined;
+  }
+
+  private render(): string {
+    const sections = [
+      "🤔 **正在思考**",
+      this.thought || "正在处理当前任务…"
+    ];
+    if (this.progressEntries.length) {
+      const entries = this.progressEntries.map((entry) => `- ${entry.replace(/\n/g, "\n  ")}`).join("\n");
+      sections.push(`**最近进展**\n${entries}`);
+    }
+    if (this.answerPreview) {
+      sections.push(`---\n✍️ **正在组织回复**\n\n${this.answerPreview}`);
+    }
+    sections.push(`_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行，发送 /stop 可停止_`);
+    return sections.join("\n\n");
+  }
+
+  private disable(error: unknown): void {
+    this.disabled = true;
+    this.stopTimers();
+    console.warn(`[codex-channel-bridge] channel text stream disabled for this turn: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function thinkingStatusForProgress(progress: string): string {
+  if (/命令|工具|检索|查询|检查|读取|下载/.test(progress) && !/完成|失败/.test(progress)) {
+    return "正在等待当前步骤返回结果…";
+  }
+  if (/修改|写入|补丁/.test(progress) && !/完成|失败/.test(progress)) {
+    return "正在应用并检查代码修改…";
+  }
+  if (/完成|成功/.test(progress)) return "正在分析刚完成步骤的结果并决定下一步…";
+  if (/失败|错误/.test(progress)) return "正在分析失败原因并寻找可行的下一步…";
+  return "正在处理当前步骤并决定下一步…";
+}
+
+function boundedProgressText(value: string, max: number): string {
+  const text = value.trim();
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+}
+
+function formatTurnElapsed(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours} 小时 ${remainingMinutes} 分钟` : `${hours} 小时`;
 }

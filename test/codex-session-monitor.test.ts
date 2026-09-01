@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   CodexSessionCompletionMonitor,
+  type CodexSessionActivity,
   type CodexSessionCompletion,
   type CodexSessionTask
 } from "../src/server/codex-session-monitor.js";
@@ -25,12 +26,14 @@ test("reports only new Codex task completions from existing and new sessions", a
     userMessage("服务重启前已开始的任务")
   ]);
   const completions: CodexSessionCompletion[] = [];
+  const activities: CodexSessionActivity[] = [];
   const taskChanges: CodexSessionTask[] = [];
   const monitor = new CodexSessionCompletionMonitor({
     codexHome: path.join(root, ".codex"),
     pollIntervalMs: 60_000,
     now: () => Date.parse("2026-08-01T09:00:00.000Z"),
     onCompletion: (completion) => completions.push(completion),
+    onActivity: (activity) => activities.push(activity),
     onTaskChanged: (task) => taskChanges.push(task)
   });
   monitor.start();
@@ -38,6 +41,16 @@ test("reports only new Codex task completions from existing and new sessions", a
   await monitor.ready();
 
   appendLines(existing, [
+    agentReasoning("正在分析现有实现"),
+    completedReasoning("正在兼容 Desktop 新格式"),
+    responseReasoning("正在兼容 Desktop 新格式"),
+    completedCommentary("已经找到进度丢失的位置"),
+    responseCommentary("已经找到进度丢失的位置"),
+    completedDesktopItem("CommandExecution", "new-turn"),
+    completedDesktopItem("ImageView", "new-turn"),
+    completedDesktopItem("McpToolCall", "new-turn"),
+    customToolCall("call-1", "functions.exec"),
+    customToolCallOutput("call-1"),
     taskComplete("new-turn", "修复完成")
   ]);
   const created = path.join(sessionDir, "created.jsonl");
@@ -80,6 +93,19 @@ test("reports only new Codex task completions from existing and new sessions", a
   assert.equal(taskChanges.some((task) =>
     task.turnId === "aborted-turn" && task.status === "interrupted"
   ), true);
+  assert.deepEqual(
+    activities.filter((activity) => activity.turnId === "new-turn").map((activity) => activity.text),
+    [
+      "🤔 正在分析现有实现",
+      "🤔 正在兼容 Desktop 新格式",
+      "已经找到进度丢失的位置",
+      "✅ 执行本地操作完成",
+      "✅ 检查图片完成",
+      "✅ 调用 MCP 工具完成",
+      "🔎 正在执行本地操作",
+      "✅ 执行本地操作完成"
+    ]
+  );
 });
 
 test("does not restore a seven-hour-old unfinished turn from a recently touched session file", async (t) => {
@@ -227,6 +253,70 @@ function taskComplete(turnId: string, message: string): object {
 
 function turnAborted(turnId: string): object {
   return { timestamp: "2026-08-01T08:00:04.000Z", type: "event_msg", payload: { type: "turn_aborted", turn_id: turnId, reason: "interrupted" } };
+}
+
+function agentReasoning(text: string): object {
+  return { timestamp: "2026-08-01T08:00:02.100Z", type: "event_msg", payload: { type: "agent_reasoning", text } };
+}
+
+function completedReasoning(text: string): object {
+  return {
+    timestamp: "2026-08-01T08:00:02.110Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      turn_id: "new-turn",
+      item: { type: "Reasoning", summary_text: [text], raw_content: [] }
+    }
+  };
+}
+
+function responseReasoning(text: string): object {
+  return {
+    timestamp: "2026-08-01T08:00:02.120Z",
+    type: "response_item",
+    payload: { type: "reasoning", summary: [{ type: "summary_text", text }] }
+  };
+}
+
+function completedCommentary(text: string): object {
+  return {
+    timestamp: "2026-08-01T08:00:02.130Z",
+    type: "event_msg",
+    payload: {
+      type: "item_completed",
+      turn_id: "new-turn",
+      item: { type: "AgentMessage", phase: "commentary", content: [{ type: "Text", text }] }
+    }
+  };
+}
+
+function responseCommentary(text: string): object {
+  return {
+    timestamp: "2026-08-01T08:00:02.140Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      phase: "commentary",
+      content: [{ type: "output_text", text }]
+    }
+  };
+}
+
+function completedDesktopItem(type: string, turnId: string): object {
+  return {
+    timestamp: "2026-08-01T08:00:02.150Z",
+    type: "event_msg",
+    payload: { type: "item_completed", turn_id: turnId, item: { type, status: "completed" } }
+  };
+}
+
+function customToolCall(callId: string, name: string): object {
+  return { timestamp: "2026-08-01T08:00:02.200Z", type: "response_item", payload: { type: "custom_tool_call", call_id: callId, name, input: "{}" } };
+}
+
+function customToolCallOutput(callId: string): object {
+  return { timestamp: "2026-08-01T08:00:02.300Z", type: "response_item", payload: { type: "custom_tool_call_output", call_id: callId, output: "ok" } };
 }
 
 function writeLines(filePath: string, lines: object[]): void {

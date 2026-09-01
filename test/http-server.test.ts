@@ -192,6 +192,18 @@ test("channel and project notification APIs validate and forward configuration",
     body: JSON.stringify({ channel: "wecom", botId: "bot", secret: "secret" })
   });
   assert.equal(channel.status, 201);
+  const dingtalk = await fetch(`${server.url}/api/accounts`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      channel: "dingtalk",
+      clientId: "ding-app",
+      clientSecret: "ding-secret",
+      cardTemplateId: "card-template.schema",
+      networkFamily: "ipv6"
+    })
+  });
+  assert.equal(dingtalk.status, 201);
 
   const notifications = await fetch(`${server.url}/api/projects/owner/project/notifications`, {
     method: "PUT",
@@ -201,6 +213,13 @@ test("channel and project notification APIs validate and forward configuration",
   assert.equal(notifications.status, 200);
   assert.deepEqual(calls, [
     { channel: "wecom", botId: "bot", secret: "secret" },
+    {
+      channel: "dingtalk",
+      clientId: "ding-app",
+      clientSecret: "ding-secret",
+      cardTemplateId: "card-template.schema",
+      networkFamily: "ipv6"
+    },
     {
       accountId: "owner",
       projectId: "project",
@@ -349,11 +368,21 @@ test("Codex project API lists session-derived projects and authorizes the select
     lastUsedAt: "2026-07-30T08:00:00.000Z",
     sessionCount: 3
   };
+  const remoteCandidate = {
+    name: "remote-codex-project",
+    workspace: "/home/admin/remote-codex-project",
+    lastUsedAt: "1970-01-01T00:00:00.000Z",
+    sessionCount: 2,
+    projectId: "remote-project",
+    projectKind: "remote" as const,
+    hostId: "remote-ssh-discovered:10.0.0.8",
+    available: true
+  };
   const server = await startLocalHttpServer({
     paths,
     accountManager: manager,
     port: 0,
-    codexProjectsProvider: () => [candidate]
+    codexProjectsProvider: () => [candidate, remoteCandidate]
   });
   t.after(() => server.close());
   t.after(() => manager.stopAll());
@@ -361,7 +390,37 @@ test("Codex project API lists session-derived projects and authorizes the select
   // Given Codex session history, when the picker loads
   const listResponse = await fetch(`${server.url}/api/codex-projects`);
   assert.equal(listResponse.status, 200);
-  assert.deepEqual(await listResponse.json(), { projects: [candidate] });
+  assert.deepEqual(await listResponse.json(), { projects: [candidate, remoteCandidate] });
+
+  const remoteResponse = await fetch(`${server.url}/api/projects`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Codex-Weixin-Token": server.requestToken,
+      Origin: server.url
+    },
+    body: JSON.stringify({
+      accountId: "account-one",
+      name: remoteCandidate.name,
+      workspace: remoteCandidate.workspace,
+      source: "codex-history"
+    })
+  });
+  assert.equal(remoteResponse.status, 201);
+  const remoteCreated = await remoteResponse.json() as {
+    project: { workspace: string; projectKind?: string; hostId?: string; sourceProjectId?: string };
+  };
+  assert.deepEqual({
+    workspace: remoteCreated.project.workspace,
+    projectKind: remoteCreated.project.projectKind,
+    hostId: remoteCreated.project.hostId,
+    sourceProjectId: remoteCreated.project.sourceProjectId
+  }, {
+    workspace: remoteCandidate.workspace,
+    projectKind: "remote",
+    hostId: remoteCandidate.hostId,
+    sourceProjectId: remoteCandidate.projectId
+  });
 
   // When the local admin selects that Codex project
   const createResponse = await fetch(`${server.url}/api/projects`, {
@@ -409,7 +468,7 @@ test("Codex project API lists session-derived projects and authorizes the select
     });
     assert.equal(rejected.status, 400);
   }
-  assert.equal(manager.listProjects("account-one").length, 1);
+  assert.equal(manager.listProjects("account-one").length, 2);
 });
 
 test("local API redacts credentials and protects mutations", async (t) => {

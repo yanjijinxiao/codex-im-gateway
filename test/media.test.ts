@@ -176,13 +176,14 @@ test("downloads inbound encrypted image attachments to local files", async (t) =
       }
     }],
     maxBytes: 1024 * 1024,
+    cdnBaseUrl: "https://media.weixin.example/custom/",
     fetch: async (url) => {
       urls.push(String(url));
       return new Response(new Uint8Array(ciphertext), { status: 200 });
     }
   });
 
-  assert.equal(urls[0], "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=download-token");
+  assert.equal(urls[0], "https://media.weixin.example/custom/download?encrypted_query_param=download-token");
   assert.equal(attachments.length, 1);
   assert.equal(attachments[0].kind, "image");
   assert.equal(attachments[0].label, "image.png");

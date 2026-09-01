@@ -4,6 +4,14 @@ import type { ChannelTaskCard } from "./task-card.js";
 
 export type ChannelTextClient = {
   sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
+  startTextStream?(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
+  updateTextStream?(input: {
+    toUserId: string;
+    messageId: string;
+    text: string;
+    finalize?: boolean;
+    error?: boolean;
+  }): Promise<void>;
   sendImage?(input: { toUserId: string; path: string }): Promise<{ messageId: string }>;
   sendActionCard?(input: { toUserId: string; card: ChannelActionCard }): Promise<{ messageId: string }>;
   updateActionCard?(input: { messageId: string; card: ChannelActionCard }): Promise<void>;

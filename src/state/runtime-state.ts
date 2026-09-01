@@ -35,6 +35,9 @@ export type ManagedProject = {
   id: string;
   name: string;
   workspace: string;
+  sourceProjectId?: string;
+  projectKind?: "local" | "remote";
+  hostId?: string;
   knowledgeBaseId?: string;
   notifications?: ProjectNotificationTarget[];
   createdAt: string;
@@ -301,6 +304,11 @@ export class RuntimeStateStore {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  getProject(projectId: string): ManagedProject | undefined {
+    const project = this.state.projects.find((candidate) => candidate.id === projectId);
+    return project ? structuredClone(project) : undefined;
+  }
+
   listKnowledgeBases(): ManagedKnowledgeBase[] {
     return structuredClone(this.state.knowledgeBases)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -430,9 +438,16 @@ export class RuntimeStateStore {
     this.save();
   }
 
-  createProject(name: string, workspace: string): ManagedProject {
+  createProject(
+    name: string,
+    workspace: string,
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string } = {}
+  ): ManagedProject {
     const resolvedWorkspace = path.resolve(workspace);
-    const existing = this.state.projects.find((project) => project.workspace === resolvedWorkspace);
+    const existing = this.state.projects.find((project) => (
+      project.workspace === resolvedWorkspace
+      && (project.hostId ?? "local") === (metadata.hostId ?? "local")
+    ));
     if (existing) {
       throw new Error(`Project workspace already exists: ${resolvedWorkspace}`);
     }
@@ -441,6 +456,9 @@ export class RuntimeStateStore {
       id: crypto.randomUUID(),
       name: cleanProjectName(name),
       workspace: resolvedWorkspace,
+      ...(metadata.sourceProjectId ? { sourceProjectId: metadata.sourceProjectId } : {}),
+      ...(metadata.projectKind ? { projectKind: metadata.projectKind } : {}),
+      ...(metadata.hostId ? { hostId: metadata.hostId } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -452,6 +470,19 @@ export class RuntimeStateStore {
   renameProject(projectId: string, name: string): ManagedProject {
     const project = this.mutableProject(projectId);
     project.name = cleanProjectName(name);
+    project.updatedAt = new Date().toISOString();
+    this.save();
+    return structuredClone(project);
+  }
+
+  updateProjectMetadata(
+    projectId: string,
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string }
+  ): ManagedProject {
+    const project = this.mutableProject(projectId);
+    if (metadata.sourceProjectId) project.sourceProjectId = metadata.sourceProjectId;
+    if (metadata.projectKind) project.projectKind = metadata.projectKind;
+    if (metadata.hostId) project.hostId = metadata.hostId;
     project.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(project);
@@ -592,7 +623,13 @@ export class RuntimeStateStore {
   setSessionPromptPreview(sessionId: string, preview: string): ManagedSession {
     const session = this.mutableSession(sessionId);
     const normalized = cleanPromptPreview(preview);
-    if (normalized) session.lastPromptPreview = normalized;
+    if (normalized) {
+      session.lastPromptPreview = normalized;
+      const inferredTitle = cleanTitle(normalized);
+      if (inferredTitle && shouldReplaceGeneratedSessionTitle(session.title)) {
+        session.title = inferredTitle;
+      }
+    }
     else delete session.lastPromptPreview;
     this.save();
     return structuredClone(session);
@@ -744,6 +781,10 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     if (knowledgeBase.stateDir) knowledgeBase.stateDir = path.resolve(knowledgeBase.stateDir);
   }
   for (const project of projects) {
+    project.workspace = path.resolve(project.workspace);
+    if (project.projectKind !== "local" && project.projectKind !== "remote") delete project.projectKind;
+    if (typeof project.sourceProjectId !== "string" || !project.sourceProjectId.trim()) delete project.sourceProjectId;
+    if (typeof project.hostId !== "string" || !project.hostId.trim()) delete project.hostId;
     project.notifications = Array.isArray(project.notifications)
       ? project.notifications.filter((target) => Boolean(
         target
@@ -753,7 +794,9 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
       ))
       : [];
   }
-  const projectsByWorkspace = new Map(projects.map((project) => [path.resolve(project.workspace), project]));
+  const projectsByWorkspace = new Map(projects
+    .filter((project) => project.projectKind !== "remote")
+    .map((project) => [project.workspace, project]));
   for (const session of sessions) {
     const workspace = path.resolve(session.workspace);
     let project = session.projectId ? projects.find((candidate) => candidate.id === session.projectId) : undefined;
@@ -777,6 +820,10 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     if (session.collaborationMode !== "plan") delete session.collaborationMode;
     if (session.knowledgeBaseId && !knowledgeBases.some((item) => item.id === session.knowledgeBaseId)) {
       delete session.knowledgeBaseId;
+    }
+    const inferredTitle = cleanTitle(session.lastPromptPreview);
+    if (inferredTitle && shouldReplaceGeneratedSessionTitle(session.title)) {
+      session.title = inferredTitle;
     }
   }
   return {
@@ -826,6 +873,14 @@ function cleanProjectName(value: string): string {
 function cleanTitle(value?: string): string | undefined {
   const clean = value?.trim().replace(/\s+/g, " ").slice(0, 80);
   return clean || undefined;
+}
+
+function shouldReplaceGeneratedSessionTitle(value?: string): boolean {
+  const title = value?.trim() ?? "";
+  return !title
+    || /^(?:会话\s*\d+|新会话|Codex 会话(?:\s+[\da-f-]+)?)$/i.test(title)
+    || /^(?:WeChat|Codex channel) bridge rule:/i.test(title)
+    || /^The following is the Codex agent history/i.test(title);
 }
 
 function cleanPromptPreview(value?: string): string | undefined {

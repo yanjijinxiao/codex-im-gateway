@@ -2,6 +2,33 @@
 
 All notable changes to Codex Channel Bridge are documented in this file.
 
+## Unreleased
+
+- Streamed modern Codex Desktop commentary and reasoning-summary session events into channel progress cards, with duplicate adjacent events suppressed and hidden raw reasoning excluded.
+- Correlated Desktop progress with each event's explicit turn ID and surfaced safe command, file, image, MCP, collaboration, search, and context-compaction completion statuses in channel cards.
+- Activated DingTalk AI Cards with numeric INPUTING flow status, supplied the required full-card metadata, and marked finalized cards FINISHED or FAILED so intermediate commentary is rendered by DingTalk clients.
+- Persisted restart-helper and relaunched-service output to `service-restart.log`, including the child PID or startup failure, so a failed background restart no longer looks like a hung server.
+- Updated every DingTalk AI Card progress snapshot exclusively through the card-instance API; removing the competing streaming write prevents stale asynchronous snapshots from rolling visible commentary back to the earlier Desktop-transfer placeholder.
+
+### Added
+
+- Added DingTalk internal-app robot support through the official Stream SDK, reusing project routing, managed sessions, `/sessions`, `/session R1`, and `/new`.
+- Added DingTalk account setup to the local management console with redacted credentials and session-webhook expiry handling.
+- Added DingTalk AI Card creation, group/direct delivery, throttled streaming updates, finalization, and automatic session-webhook fallback.
+- Added DingTalk `🤔思考中` emotion feedback on the original inbound message, with automatic recall after the turn finishes and non-blocking failure handling.
+- Removed the default overall execution deadline for accepted app-server, Desktop-relayed, and exec-fallback agent turns; long tasks now run until completion, explicit interruption, or transport failure.
+- Added safe partial progress rendering for command, file, MCP/tool, Web search, and readable reasoning-summary events, plus a live DingTalk AI Card thinking description and elapsed-time heartbeat.
+- Seeded DingTalk AI Card data before delivery so a failed first stream update no longer leaves an empty placeholder card.
+- Project discovery now reads Codex Desktop's real local/remote project registry and sidebar order. Remote projects can be bound locally and are routed by Desktop `hostId` over SSH to the corresponding remote Desktop app-server; session scanning remains the compatibility fallback.
+
+### Fixed
+
+- Continued Codex Desktop-owned sessions through the local follower IPC instead of failing with `already has an active writer`; busy Desktop turns now wait in order and their final reply returns to the originating channel.
+- Allowed ordinary channel turns with a user-input callback to use the Desktop relay; only turns that actually register bridge-owned dynamic tools remain unsupported.
+- Fixed personal-WeChat image handling to use the CDN endpoint returned by QR login, include images quoted through `ref_msg`, and immediately report download/decryption failures instead of silently starting an empty agent turn.
+- Fixed DingTalk `picture` and image-bearing `richText` messages being acknowledged and then silently discarded; the Bridge now resolves `downloadCode`, stores the image in the account inbound directory, passes it to the active Codex session, and reports media-download failures in-channel.
+- Upgraded HTTP temporary media URLs returned by DingTalk's authenticated `downloadCode` endpoint to HTTPS before downloading, while continuing to reject non-HTTPS direct image URLs.
+
 ## [0.4.0] - 2026-08-01
 
 ### Added

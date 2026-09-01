@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { parseCodexExecSandbox, type CodexExecSandbox } from "../codex/sandbox.js";
+import type { AppServerConnectionMode } from "../codex/app-server-daemon.js";
 import { readJsonFile, writeJsonFile } from "./json-store.js";
 import type { StatePaths } from "./paths.js";
 
@@ -14,6 +15,7 @@ export type CodexWeixinConfig = {
   allowedWorkspaces: string[];
   codexBin: string;
   codexBackend: "auto" | "app-server" | "exec";
+  codexAppServerTransport: AppServerConnectionMode;
   codexExecSandbox?: CodexExecSandbox;
   model?: string;
   effort?: string;
@@ -32,6 +34,7 @@ export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): C
     allowedWorkspaces: [path.resolve(cwd)],
     codexBin: "codex",
     codexBackend: "auto",
+    codexAppServerTransport: "auto",
     streamReplies: true,
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
@@ -48,6 +51,11 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
   return {
     ...base,
     ...loaded,
+    codexBackend: normalizeCodexBackend(loaded.codexBackend, base.codexBackend),
+    codexAppServerTransport: normalizeAppServerTransport(
+      loaded.codexAppServerTransport,
+      base.codexAppServerTransport
+    ),
     codexExecSandbox,
     streamReplies: typeof loaded.streamReplies === "boolean" ? loaded.streamReplies : base.streamReplies,
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
@@ -59,6 +67,20 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
     allowedWorkspaces: (loaded.allowedWorkspaces?.length ? loaded.allowedWorkspaces : base.allowedWorkspaces)
       .map((workspace) => path.resolve(workspace))
   };
+}
+
+function normalizeCodexBackend(
+  value: unknown,
+  fallback: CodexWeixinConfig["codexBackend"]
+): CodexWeixinConfig["codexBackend"] {
+  return value === "auto" || value === "app-server" || value === "exec" ? value : fallback;
+}
+
+function normalizeAppServerTransport(
+  value: unknown,
+  fallback: AppServerConnectionMode
+): AppServerConnectionMode {
+  return value === "auto" || value === "daemon" || value === "stdio" ? value : fallback;
 }
 
 export function saveConfig(paths: StatePaths, config: CodexWeixinConfig): void {

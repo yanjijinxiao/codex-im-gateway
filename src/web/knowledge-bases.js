@@ -168,18 +168,21 @@ async function loadKnowledgeBaseProjectOptions(selectedWorkspace, dialogSession)
 
 function renderKnowledgeBaseProjectOptions(selectedWorkspace = "") {
   const input = document.querySelector("#knowledgeBaseProjectInput");
+  const localProjects = state.codexProjects.filter((project) => (
+    project.available !== false && project.projectKind !== "remote"
+  ));
   input.innerHTML = [
     '<option value="">手动输入或选择其他目录</option>',
-    ...state.codexProjects.map((project) => (
+    ...localProjects.map((project) => (
       `<option value="${kbEscape(project.workspace)}">${kbEscape(project.name)} — ${kbEscape(project.workspace)}</option>`
     ))
   ].join("");
-  input.disabled = !state.codexProjects.length;
-  input.value = state.codexProjects.some((project) => project.workspace === selectedWorkspace)
+  input.disabled = !localProjects.length;
+  input.value = localProjects.some((project) => project.workspace === selectedWorkspace)
     ? selectedWorkspace
     : "";
-  document.querySelector("#knowledgeBaseProjectHint").textContent = state.codexProjects.length
-    ? `已读取 ${state.codexProjects.length} 个 Codex 项目；选择后仍会执行 llm-wiki 状态验证。`
+  document.querySelector("#knowledgeBaseProjectHint").textContent = localProjects.length
+    ? `已读取 ${localProjects.length} 个本机 Codex Desktop 项目；选择后仍会执行 llm-wiki 状态验证。`
     : "Codex 暂无项目记录，可使用下方的目录选择按钮。";
 }
 

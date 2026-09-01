@@ -127,13 +127,19 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
   const firstProject = stateStore.createProject("Bridge", path.join(root, "bridge"));
-  stateStore.createProject("Taskboard", path.join(root, "taskboard"));
+  const secondProject = stateStore.createProject("Taskboard", path.join(root, "taskboard"));
   stateStore.createSession("oc_test", firstProject.workspace, "交互改造", firstProject.id);
   const cards: ChannelActionCard[] = [];
   const texts: string[] = [];
   const service = new BridgeService({
     config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
     stateStore,
+    listCodexProjects: () => [firstProject, secondProject].map((project) => ({
+      name: project.name,
+      workspace: project.workspace,
+      lastUsedAt: project.updatedAt,
+      sessionCount: 0
+    })),
     listCodexModels: async () => [{
       model: "gpt-test",
       displayName: "GPT Test",
@@ -185,7 +191,9 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
   ]);
   assert.deepEqual(
     cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),
-    ["P1", "P2"]
+    [firstProject, secondProject].map((project) =>
+      `P${stateStore.listProjects().findIndex((candidate) => candidate.id === project.id) + 1}`
+    )
   );
   assert.deepEqual(
     cards[4].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),
@@ -198,12 +206,18 @@ test("Bridge refreshes the originating native action card after a card callback"
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-card-refresh-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
-  stateStore.createProject("Bridge", path.join(root, "bridge"));
+  const project = stateStore.createProject("Bridge", path.join(root, "bridge"));
   const sent: ChannelActionCard[] = [];
   const updated: Array<{ messageId: string; card: ChannelActionCard }> = [];
   const service = new BridgeService({
     config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },
     stateStore,
+    listCodexProjects: () => [{
+      name: project.name,
+      workspace: project.workspace,
+      lastUsedAt: project.updatedAt,
+      sessionCount: 0
+    }],
     weixin: {
       async sendText() { return { messageId: "text" }; },
       async sendActionCard(input: { card: ChannelActionCard }) {

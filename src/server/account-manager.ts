@@ -9,10 +9,14 @@ import type {
   ChannelCapabilityProvider
 } from "../bridge/channel-capability.js";
 import { createInstalledSkillCapabilitiesProvider } from "../bridge/installed-skill-capabilities.js";
-import { buildPrompt, buildPromptPreview, parsePrompt } from "../bridge/format.js";
+import { buildPromptParts, buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
-import { userFacingMessageHandlingError } from "../bridge/errors.js";
+import {
+  userFacingMessageHandlingError,
+  wasMessageHandlingErrorReported
+} from "../bridge/errors.js";
+import { DingTalkChannelAdapter } from "../channels/dingtalk.js";
 import { FeishuChannelAdapter } from "../channels/feishu.js";
 import {
   normalizeChannelModeSettings,
@@ -21,8 +25,14 @@ import {
 import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
 import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
 import { WeComChannelAdapter } from "../channels/wecom.js";
-import type { CodexHistoryMessage, CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
-import { HybridCodexRunner } from "../codex/runner.js";
+import type {
+  CodexBridgeBackend,
+  CodexHistoryMessage,
+  CodexModelOption,
+  CodexRuntimeInfo
+} from "../codex/backend.js";
+import { assertCodexThreadRunnable } from "../codex/backend.js";
+import { CodexBackendRouter } from "../codex/runner.js";
 import {
   LlmWikiMcpClientPool,
   type LlmWikiInspection
@@ -49,11 +59,18 @@ import {
   type SessionRuntimeOverrides
 } from "../state/runtime-state.js";
 import {
+  listCodexProjectCandidates,
+  listCodexCliProjectCandidates,
+  projectCandidatesFromBackendCatalog,
+  type CodexProjectCandidate
+} from "./codex-projects.js";
+import {
   accountChannel,
   deleteAccount,
   forgetRetainedAccount,
   listAccounts,
   loadAccount,
+  migrateLegacyDingTalkCardProfiles,
   publicAccount,
   retainAccountHistory,
   saveAccount,
@@ -63,6 +80,7 @@ import {
   normalizeAccountId,
   type ChannelAccount,
   type AccountSettingsPatch,
+  type DingTalkAccount,
   type FeishuAccount,
   type PublicWeixinAccount,
   type WeComAccount,
@@ -207,10 +225,13 @@ export type AccountManagerOptions = {
   paths: StatePaths;
   configProvider?: () => CodexWeixinConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
-  channelFactory?: (account: WeComAccount | FeishuAccount, options: { inboundDir: string }) => ChannelAdapter;
+  channelFactory?: (
+    account: WeComAccount | FeishuAccount | DingTalkAccount,
+    options: { inboundDir: string }
+  ) => ChannelAdapter;
   bridgeFactory?: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   monitor?: (options: MonitorOptions) => Promise<void>;
-  runnerFactory?: (config: CodexWeixinConfig) => HybridCodexRunner;
+  runnerFactory?: (config: CodexWeixinConfig) => CodexBridgeBackend;
   codexSessionMonitorFactory?: (
     handlers: {
       onCompletion: (completion: CodexSessionCompletion) => Promise<void>;
@@ -235,7 +256,7 @@ export class AccountManager {
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   private readonly channelFactory: NonNullable<AccountManagerOptions["channelFactory"]>;
   private readonly monitor: (options: MonitorOptions) => Promise<void>;
-  private readonly runnerFactory: (config: CodexWeixinConfig) => HybridCodexRunner;
+  private readonly runnerFactory: (config: CodexWeixinConfig) => CodexBridgeBackend;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
@@ -245,7 +266,7 @@ export class AccountManager {
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private readonly llmWiki: LlmWikiMcpClientPool;
   private readonly channelCapabilities: ChannelCapabilityProvider;
-  private runner?: HybridCodexRunner;
+  private runner?: CodexBridgeBackend;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
   private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
   private taskboard?: TaskboardClient;
@@ -259,12 +280,17 @@ export class AccountManager {
       token: account.token
     }));
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
-    this.channelFactory = options.channelFactory ?? ((account, adapterOptions) => account.channel === "wecom"
-      ? new WeComChannelAdapter(account)
-      : new FeishuChannelAdapter(account, { inboundDir: adapterOptions.inboundDir }));
+    this.channelFactory = options.channelFactory ?? ((account, adapterOptions) => {
+      if (account.channel === "wecom") return new WeComChannelAdapter(account);
+      if (account.channel === "feishu") {
+        return new FeishuChannelAdapter(account, { inboundDir: adapterOptions.inboundDir });
+      }
+      return new DingTalkChannelAdapter(account, { inboundDir: adapterOptions.inboundDir });
+    });
     this.monitor = options.monitor ?? monitorWeixin;
-    this.runnerFactory = options.runnerFactory ?? ((config) => new HybridCodexRunner({
+    this.runnerFactory = options.runnerFactory ?? ((config) => new CodexBackendRouter({
       backend: config.codexBackend,
+      appServerTransport: config.codexAppServerTransport,
       codexBin: config.codexBin,
       execSandbox: config.codexExecSandbox
     }));
@@ -282,6 +308,11 @@ export class AccountManager {
   }
 
   async startAll(): Promise<void> {
+    for (const account of migrateLegacyDingTalkCardProfiles(this.options.paths)) {
+      console.log(
+        `[codex-channel-bridge] migrated DingTalk AI Card streaming profile for account ${account.accountId}`
+      );
+    }
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => account.enabled)
       .map((account) => this.startAccount(account.accountId, false)));
@@ -344,6 +375,7 @@ export class AccountManager {
     const controller = new AbortController();
     const statePaths = accountStatePaths(this.options.paths, account.accountId);
     const store = new RuntimeStateStore(statePaths);
+    this.synchronizeManagedProjects(store);
     const channel = accountChannel(account);
     const webhook = new ChannelMessageWebhook({
       accountId: account.accountId,
@@ -352,7 +384,7 @@ export class AccountManager {
       ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
     const adapter = channel === "weixin" ? undefined : this.channelFactory(
-      account as WeComAccount | FeishuAccount,
+      account as WeComAccount | FeishuAccount | DingTalkAccount,
       { inboundDir: statePaths.inboundDir }
     );
     const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
@@ -363,6 +395,7 @@ export class AccountManager {
       stateStore: store,
       weixin: client,
       inboundDir: statePaths.inboundDir,
+      ...(channel === "weixin" ? { cdnBaseUrl: (account as WeixinAccount).cdnBaseUrl } : {}),
       runner,
       intentResolver: createCodexChannelIntentResolver({
         runner,
@@ -371,6 +404,7 @@ export class AccountManager {
       }),
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
+      listCodexProjects: () => this.listCodexProjects(runner),
       llmWiki: this.llmWiki,
       modeSettings: normalizeChannelModeSettings(account.modeSettings),
       taskboard: this.taskboardFor(config),
@@ -415,6 +449,7 @@ export class AccountManager {
       await service.handleMessage(messageWithConversation);
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      if (wasMessageHandlingErrorReported(error)) return;
       await this.sendChannelText(entry, {
         recipientId: message.replyTargetId ?? message.senderId,
         text: userFacingMessageHandlingError(error),
@@ -508,11 +543,21 @@ export class AccountManager {
   addChannelAccount(input:
     | { channel: "wecom"; botId: string; secret: string; displayName?: string }
     | { channel: "feishu"; appId: string; appSecret: string; displayName?: string }
+    | {
+        channel: "dingtalk";
+        clientId: string;
+        clientSecret: string;
+        cardTemplateId?: string;
+        cardContentKey?: string;
+        networkFamily?: "auto" | "ipv4" | "ipv6";
+        displayName?: string;
+      }
   ): Promise<AccountSummary> {
     const savedAt = new Date().toISOString();
     const displayName = input.displayName?.trim();
-    const account: WeComAccount | FeishuAccount = input.channel === "wecom"
-      ? {
+    let account: WeComAccount | FeishuAccount | DingTalkAccount;
+    if (input.channel === "wecom") {
+      account = {
         channel: "wecom",
         accountId: uniqueAccountId(this.options.paths, `wecom-${normalizeAccountId(input.botId)}`),
         botId: input.botId.trim(),
@@ -520,8 +565,9 @@ export class AccountManager {
         ...(displayName ? { displayName } : {}),
         savedAt,
         enabled: true
-      }
-      : {
+      };
+    } else if (input.channel === "feishu") {
+      account = {
         channel: "feishu",
         accountId: uniqueAccountId(this.options.paths, `feishu-${normalizeAccountId(input.appId)}`),
         appId: input.appId.trim(),
@@ -530,6 +576,20 @@ export class AccountManager {
         savedAt,
         enabled: true
       };
+    } else {
+      account = {
+        channel: "dingtalk",
+        accountId: uniqueAccountId(this.options.paths, `dingtalk-${normalizeAccountId(input.clientId)}`),
+        clientId: input.clientId.trim(),
+        clientSecret: input.clientSecret.trim(),
+        ...(input.cardTemplateId?.trim() ? { cardTemplateId: input.cardTemplateId.trim() } : {}),
+        ...(input.cardContentKey?.trim() ? { cardContentKey: input.cardContentKey.trim() } : {}),
+        ...(input.networkFamily ? { networkFamily: input.networkFamily } : {}),
+        ...(displayName ? { displayName } : {}),
+        savedAt,
+        enabled: true
+      };
+    }
     saveAccount(this.options.paths, account);
     return this.startAccount(account.accountId, false);
   }
@@ -571,6 +631,21 @@ export class AccountManager {
       const store = this.storeFor(account.accountId);
       return store.listProjects().map((project) => this.projectSummary(account.accountId, project, store));
     }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async listCodexProjects(runner = this.runnerFor(this.configProvider())): Promise<readonly CodexProjectCandidate[]> {
+    try {
+      return projectCandidatesFromBackendCatalog(await runner.listProjects());
+    } catch (error) {
+      console.warn(
+        `[codex-channel-bridge] unable to read selected backend project catalog; using local discovery fallback: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return this.configProvider().codexBackend === "exec"
+        ? listCodexCliProjectCandidates()
+        : listCodexProjectCandidates();
+    }
   }
 
   listKnowledgeBases(accountId?: string): AccountKnowledgeBase[] {
@@ -668,14 +743,19 @@ export class AccountManager {
     return this.projectSummary(accountId, project, store);
   }
 
-  createProject(accountId: string, name: string, workspace: string): AccountProject {
+  createProject(
+    accountId: string,
+    name: string,
+    workspace: string,
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string } = {}
+  ): AccountProject {
     const config = this.configProvider();
     const targetWorkspace = path.resolve(workspace);
     if (!isWorkspaceAllowed(targetWorkspace, config.allowedWorkspaces)) {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
     const store = this.storeFor(accountId);
-    const project = store.createProject(name, targetWorkspace);
+    const project = store.createProject(name, targetWorkspace, metadata);
     this.ensureCodexSessionMonitor();
     return this.projectSummary(accountId, project, store);
   }
@@ -773,8 +853,14 @@ export class AccountManager {
     return session.streamReplies ?? this.configProvider().streamReplies;
   }
 
-  activateSession(accountId: string, sessionId: string): AccountSession {
-    const session = this.storeFor(accountId).activateSession(sessionId);
+  async activateSession(accountId: string, sessionId: string): Promise<AccountSession> {
+    const store = this.storeFor(accountId);
+    const pending = requireSession(store, sessionId);
+    if (pending.threadId) {
+      const project = pending.projectId ? store.getProject(pending.projectId) : undefined;
+      assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, project?.hostId));
+    }
+    const session = store.activateSession(sessionId);
     return this.sessionSummary(accountId, session, true);
   }
 
@@ -817,7 +903,9 @@ export class AccountManager {
     if (!session.threadId) {
       return [];
     }
-    const history = await this.runnerFor().getHistory(session.threadId);
+    const storedProject = session.projectId ? store.getProject(session.projectId) : undefined;
+    const project = storedProject ? this.synchronizeManagedProject(store, storedProject) : undefined;
+    const history = await this.runnerFor().getHistory(session.threadId, project?.hostId);
     return history.flatMap((message) => {
       if (message.role === "user") {
         const parsed = parsePrompt(message.text);
@@ -850,6 +938,7 @@ export class AccountManager {
     }
     const store = this.storeFor(accountId);
     const session = requireSession(store, sessionId);
+    const project = session.projectId ? store.getProject(session.projectId) : undefined;
     const config = this.configProvider();
     const attachments = this.saveSessionUploads(accountId, session.id, uploads);
     const promptPreview = buildPromptPreview(prompt, attachments);
@@ -858,15 +947,24 @@ export class AccountManager {
     }
     this.setSessionResponding(accountId, session.id, true);
     try {
+      const promptParts = buildPromptParts(
+        prompt,
+        attachments,
+        "Web",
+        store.relevantKnowledge(promptPreview ?? prompt, session.projectId)
+      );
       const result = await this.runnerFor(config).run({
-        prompt: buildPrompt(
-          prompt,
-          attachments,
-          "Web",
-          store.relevantKnowledge(promptPreview ?? prompt, session.projectId)
-        ),
+        prompt: promptParts.prompt,
+        developerInstructions: promptParts.developerInstructions,
         cwd: session.workspace,
+        hostId: project?.hostId,
+        projectId: project?.sourceProjectId,
+        projectName: project?.name,
         threadId: session.threadId,
+        threadTitle: preferredThreadTitle(session.title, promptPreview),
+        onThreadCreated: (createdThreadId) => {
+          store.setSessionThread(session.id, createdThreadId);
+        },
         queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
@@ -910,6 +1008,30 @@ export class AccountManager {
     } finally {
       this.setSessionResponding(accountId, session.id, false);
     }
+  }
+
+  private synchronizeManagedProjects(store: RuntimeStateStore): void {
+    for (const project of store.listProjects()) {
+      this.synchronizeManagedProject(store, project);
+    }
+  }
+
+  private synchronizeManagedProject(store: RuntimeStateStore, project: ManagedProject): ManagedProject {
+    const candidate = listCodexProjectCandidates().find((item) => (
+      path.resolve(item.workspace) === path.resolve(project.workspace)
+      && (item.hostId ?? "local") === (project.hostId ?? "local")
+    ));
+    if (!candidate?.projectId) return project;
+    if (
+      project.sourceProjectId === candidate.projectId
+      && project.projectKind === candidate.projectKind
+      && project.hostId === candidate.hostId
+    ) return project;
+    return store.updateProjectMetadata(project.id, {
+      sourceProjectId: candidate.projectId,
+      projectKind: candidate.projectKind,
+      hostId: candidate.hostId
+    });
   }
 
   private saveSessionUploads(accountId: string, sessionId: string, uploads: SessionUpload[]): PromptBufferItem[] {
@@ -992,7 +1114,7 @@ export class AccountManager {
     }
   }
 
-  private runnerFor(config = this.configProvider()): HybridCodexRunner {
+  private runnerFor(config = this.configProvider()): CodexBridgeBackend {
     if (this.runner) return this.runner;
     const runner = this.runnerFactory(config);
     this.runner = runner;
@@ -1547,6 +1669,11 @@ function canonicalWorkspace(workspace: string): string {
 
 function sessionRuntimeKey(accountId: string, sessionId: string): string {
   return `${accountId}\n${sessionId}`;
+}
+
+function preferredThreadTitle(sessionTitle: string, promptPreview?: string): string {
+  const genericSessionTitle = /^(?:会话\s*\d+|新会话|Codex 会话(?:\s+[\da-f-]+)?)$/i.test(sessionTitle.trim());
+  return (genericSessionTitle ? promptPreview : sessionTitle) ?? promptPreview ?? sessionTitle;
 }
 
 function taskRuntimeKey(sessionId: string, turnId: string): string {

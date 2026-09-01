@@ -11,10 +11,44 @@ import {
   listAccounts,
   listRetainedAccounts,
   loadAccount,
+  LEGACY_HERMES_DINGTALK_CARD_TEMPLATE_ID,
+  migrateLegacyDingTalkCardProfiles,
   retainAccountHistory,
   saveAccount,
   saveScannedAccount
 } from "../src/weixin/accounts.js";
+
+test("migrates the known Hermes DingTalk card profile and leaves custom templates untouched", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-dingtalk-card-migration-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const paths = resolveStatePaths(root);
+  saveAccount(paths, {
+    channel: "dingtalk",
+    accountId: "legacy-dingtalk",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    cardTemplateId: LEGACY_HERMES_DINGTALK_CARD_TEMPLATE_ID,
+    cardContentKey: "content",
+    savedAt: "2026-08-28T00:00:00.000Z",
+    enabled: true
+  });
+  saveAccount(paths, {
+    channel: "dingtalk",
+    accountId: "custom-dingtalk",
+    clientId: "client-id",
+    clientSecret: "client-secret",
+    cardTemplateId: "custom.schema",
+    cardContentKey: "body",
+    savedAt: "2026-08-28T00:00:00.000Z",
+    enabled: true
+  });
+
+  assert.deepEqual(migrateLegacyDingTalkCardProfiles(paths).map((account) => account.accountId), ["legacy-dingtalk"]);
+  assert.equal(loadAccount(paths, "legacy-dingtalk").cardTemplateId, "02fcf2f4-5e02-4a85-b672-46d1f715543e.schema");
+  assert.equal(loadAccount(paths, "legacy-dingtalk").cardContentKey, "msgContent");
+  assert.equal(loadAccount(paths, "custom-dingtalk").cardTemplateId, "custom.schema");
+  assert.deepEqual(migrateLegacyDingTalkCardProfiles(paths), []);
+});
 
 test("reuses the existing local account when the same WeChat user scans again", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-rescan-"));

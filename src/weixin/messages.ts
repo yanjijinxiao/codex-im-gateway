@@ -73,6 +73,22 @@ export function extractTextItem(item: Record<string, unknown>): string | undefin
 }
 
 export function extractAttachments(items: Array<Record<string, unknown>>): WeixinInboundAttachment[] {
+  const direct = extractDirectAttachments(items);
+  if (direct.length) {
+    return direct;
+  }
+  for (const item of items) {
+    const referenced = referencedMessageItem(item);
+    if (!referenced) continue;
+    const attachments = extractDirectAttachments([referenced]);
+    if (attachments.length) {
+      return attachments;
+    }
+  }
+  return [];
+}
+
+function extractDirectAttachments(items: Array<Record<string, unknown>>): WeixinInboundAttachment[] {
   const attachments: WeixinInboundAttachment[] = [];
   for (const item of items) {
     const type = typeof item.type === "number" ? item.type : undefined;
@@ -99,6 +115,17 @@ export function extractAttachments(items: Array<Record<string, unknown>>): Weixi
     }
   }
   return attachments;
+}
+
+function referencedMessageItem(item: Record<string, unknown>): Record<string, unknown> | undefined {
+  const refMessage = item.ref_msg;
+  if (!refMessage || typeof refMessage !== "object" || Array.isArray(refMessage)) {
+    return undefined;
+  }
+  const referenced = (refMessage as { message_item?: unknown }).message_item;
+  return referenced && typeof referenced === "object" && !Array.isArray(referenced)
+    ? referenced as Record<string, unknown>
+    : undefined;
 }
 
 function extractVoiceTranscription(value: unknown): string | undefined {

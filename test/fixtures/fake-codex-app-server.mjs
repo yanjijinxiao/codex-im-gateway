@@ -3,6 +3,7 @@
 import readline from "node:readline";
 
 const rl = readline.createInterface({ input: process.stdin });
+const projectApiEnabled = !process.argv.includes("--without-project-api");
 let initialized = false;
 let experimentalApiEnabled = false;
 let nextTurn = 1;
@@ -11,6 +12,21 @@ const pendingApprovals = new Map();
 const pendingToolCalls = new Map();
 const pendingUserInputs = new Map();
 const goals = new Map();
+const threadNames = new Map();
+const threadProjects = new Map();
+const threadDeveloperInstructions = new Map();
+const subscribedThreads = new Set();
+const archivedThreads = new Set(["thread-archived"]);
+const deletedThreads = new Set();
+const projects = [{
+  id: "project-native",
+  name: "Fixture Project",
+  roots: [{ path: "/tmp/project" }],
+  metadata: {},
+  position: 0,
+  createdAt: 1,
+  updatedAt: 1
+}];
 let externalBusyReads = 0;
 let ephemeralThreadStarted = false;
 let dynamicToolsEnabled = false;
@@ -129,20 +145,101 @@ rl.on("line", (line) => {
     }
     ephemeralThreadStarted = message.params?.ephemeral === true;
     dynamicToolsEnabled = message.params?.dynamicTools?.[0]?.name === "knowledge";
+    if (message.params?.projectId) threadProjects.set("thread-new", message.params.projectId);
+    if (message.params?.developerInstructions) {
+      threadDeveloperInstructions.set("thread-new", message.params.developerInstructions);
+    }
     respond(message.id, {
-      thread: { id: "thread-new" },
+      thread: { id: "thread-new", projectId: message.params?.projectId ?? null, name: null },
       model: message.params.model ?? "configured-model",
       reasoningEffort: "high"
     });
+    subscribedThreads.add("thread-new");
     return;
   }
 
   if (message.method === "thread/resume") {
+    if (archivedThreads.has(message.params.threadId)) {
+      fail(message.id, `thread ${message.params.threadId} is archived; unarchive it first`);
+      return;
+    }
+    if (deletedThreads.has(message.params.threadId) || message.params.threadId === "thread-missing") {
+      fail(message.id, `thread ${message.params.threadId} not found`);
+      return;
+    }
+    if (message.params.threadId === "thread-desktop-owned") {
+      fail(message.id, "thread thread-desktop-owned already has an active writer");
+      return;
+    }
+    if (subscribedThreads.has(message.params.threadId)) {
+      fail(message.id, `thread ${message.params.threadId} is still subscribed by this client`);
+      return;
+    }
+    if (message.params?.developerInstructions) {
+      threadDeveloperInstructions.set(message.params.threadId, message.params.developerInstructions);
+    }
     respond(message.id, {
-      thread: { id: message.params.threadId },
+      thread: {
+        id: message.params.threadId,
+        projectId: threadProjects.get(message.params.threadId) ?? null,
+        name: message.params.threadId === "thread-bridge-title"
+          ? "WeChat bridge rule: internal policy"
+          : (threadNames.get(message.params.threadId) ?? null)
+      },
       model: "resumed-model",
       reasoningEffort: "medium"
     });
+    subscribedThreads.add(message.params.threadId);
+    return;
+  }
+
+  if (message.method === "thread/unsubscribe") {
+    const status = subscribedThreads.delete(message.params.threadId)
+      ? "unsubscribed"
+      : "notSubscribed";
+    respond(message.id, { status });
+    return;
+  }
+
+  if (message.method === "project/list") {
+    if (!projectApiEnabled) {
+      send({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: "Invalid request: unknown variant `project/list`, expected one of `thread/start`, `thread/resume`, `turn/start`"
+        }
+      });
+      return;
+    }
+    respond(message.id, { data: projects, nextCursor: null });
+    return;
+  }
+
+  if (message.method === "project/create") {
+    const project = {
+      id: `project-created-${projects.length}`,
+      name: message.params.name,
+      roots: message.params.roots,
+      metadata: message.params.metadata ?? {},
+      position: projects.length,
+      createdAt: 1,
+      updatedAt: 1
+    };
+    projects.push(project);
+    respond(message.id, { project });
+    return;
+  }
+
+  if (message.method === "thread/metadata/update") {
+    threadProjects.set(message.params.threadId, message.params.projectId);
+    respond(message.id, {});
+    return;
+  }
+
+  if (message.method === "thread/name/set") {
+    threadNames.set(message.params.threadId, message.params.name);
+    respond(message.id, {});
     return;
   }
 
@@ -226,18 +323,77 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/list") {
-    respond(message.id, { data: [{ id: "thread-new" }], nextCursor: null, backwardsCursor: null });
+    const data = message.params?.archived
+      ? [...archivedThreads].map((id) => ({
+        id,
+        name: "Archived fixture",
+        cwd: "/tmp/project",
+        path: `/tmp/fake-codex-home/archived_sessions/${id}.jsonl`,
+        status: { type: "notLoaded" },
+        updatedAt: 1_700_000_100
+      }))
+      : [
+        { id: "thread-new", name: "New fixture", cwd: "/tmp/project", path: "/tmp/fake-codex-home/sessions/thread-new.jsonl", status: { type: "idle" }, updatedAt: 1_700_000_200 },
+        { id: "thread-existing", name: "Existing fixture", cwd: "/tmp/project", path: "/tmp/fake-codex-home/sessions/thread-existing.jsonl", status: { type: "idle" }, updatedAt: 1_700_000_150 },
+        { id: "thread-system-error", name: "Broken fixture", cwd: "/tmp/project", path: "/tmp/fake-codex-home/sessions/thread-system-error.jsonl", status: { type: "systemError" }, updatedAt: 1_700_000_050 }
+      ].filter((thread) => !deletedThreads.has(thread.id) && !archivedThreads.has(thread.id));
+    respond(message.id, { data, nextCursor: null, backwardsCursor: null });
+    return;
+  }
+
+  if (message.method === "thread/archive") {
+    archivedThreads.add(message.params.threadId);
+    respond(message.id, {});
+    send({ method: "thread/archived", params: { threadId: message.params.threadId } });
+    return;
+  }
+
+  if (message.method === "thread/unarchive") {
+    archivedThreads.delete(message.params.threadId);
+    respond(message.id, {
+      thread: {
+        id: message.params.threadId,
+        cwd: "/tmp/project",
+        path: `/tmp/fake-codex-home/sessions/${message.params.threadId}.jsonl`,
+        status: { type: "idle" },
+        turns: []
+      }
+    });
+    send({ method: "thread/unarchived", params: { threadId: message.params.threadId } });
+    return;
+  }
+
+  if (message.method === "thread/delete") {
+    archivedThreads.delete(message.params.threadId);
+    deletedThreads.add(message.params.threadId);
+    respond(message.id, {});
+    send({ method: "thread/deleted", params: { threadId: message.params.threadId } });
     return;
   }
 
   if (message.method === "thread/read") {
+    if (archivedThreads.has(message.params.threadId)) {
+      fail(message.id, `thread ${message.params.threadId} is archived; unarchive it first`);
+      return;
+    }
+    if (deletedThreads.has(message.params.threadId) || message.params.threadId === "thread-missing") {
+      fail(message.id, `thread ${message.params.threadId} not found`);
+      return;
+    }
     const activeTurnId = activeTurns.get(message.params.threadId)
-      ?? (message.params.threadId === "thread-external-busy" && externalBusyReads++ === 0
+      ?? (message.params.threadId === "thread-external-busy" && externalBusyReads++ < 2
         ? "external-turn"
         : undefined);
     respond(message.id, {
       thread: {
         id: message.params.threadId,
+        cwd: "/tmp/project",
+        path: `/tmp/fake-codex-home/sessions/${message.params.threadId}.jsonl`,
+        status: message.params.threadId === "thread-system-error"
+          ? { type: "systemError" }
+          : activeTurnId
+            ? { type: "active", activeFlags: [] }
+            : { type: "idle" },
         turns: [
           {
             id: "history-turn-1",
@@ -310,6 +466,20 @@ rl.on("line", (line) => {
         return;
       }
     }
+    if (prompt === "verify-thread-metadata") {
+      if (threadProjects.get(message.params.threadId) !== "project-native") {
+        fail(message.id, "thread must use the native app-server project id resolved by cwd");
+        return;
+      }
+      if (threadNames.get(message.params.threadId) !== "干净的用户标题") {
+        fail(message.id, "thread/name/set must run before the first turn");
+        return;
+      }
+      if (threadDeveloperInstructions.get(message.params.threadId) !== "bridge-only-policy") {
+        fail(message.id, "Bridge policy must be sent as developerInstructions");
+        return;
+      }
+    }
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (["command", "file", "permissions"].includes(approvalKind)) {
@@ -361,6 +531,44 @@ rl.on("line", (line) => {
       return;
     }
     const sendProgress = () => {
+      if (prompt === "detailed-progress") {
+        const commandItemId = `command-${turnId}`;
+        send({
+          method: "item/started",
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            item: { type: "commandExecution", id: commandItemId, command: "npm test", cwd: "/tmp/project", status: "inProgress" }
+          }
+        });
+        send({
+          method: "item/completed",
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            item: { type: "commandExecution", id: commandItemId, command: "npm test", cwd: "/tmp/project", status: "completed", exitCode: 0, durationMs: 1250 }
+          }
+        });
+        const reasoningItemId = `reasoning-${turnId}`;
+        send({
+          method: "item/started",
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            item: { type: "reasoning", id: reasoningItemId, summary: [], content: [] }
+          }
+        });
+        send({
+          method: "item/reasoning/summaryTextDelta",
+          params: {
+            threadId: message.params.threadId,
+            turnId,
+            itemId: reasoningItemId,
+            summaryIndex: 0,
+            delta: "正在分析测试结果并决定下一步"
+          }
+        });
+      }
       const progressItemId = `progress-${turnId}`;
       send({
         method: "item/started",
@@ -415,7 +623,9 @@ rl.on("line", (line) => {
       });
       activeTurns.delete(message.params.threadId);
     };
-    if (prompt === "sliding-timeout") {
+    if (prompt === "silent-long") {
+      setTimeout(sendFinal, 260);
+    } else if (prompt === "sliding-timeout") {
       setTimeout(sendProgress, 120);
       setTimeout(sendFinal, 260);
     } else {

@@ -209,6 +209,15 @@
               </select>
             </label>
             <label>
+              <span>App server 连接</span>
+              <select id="appServerTransportInput" name="codexAppServerTransport">
+                <option value="auto">自动（优先 daemon）</option>
+                <option value="daemon">Daemon</option>
+                <option value="stdio">独立 stdio 进程</option>
+              </select>
+              <small class="field-hint">仅影响 app-server 后端；自动模式在 daemon 不可用时回退到 stdio。</small>
+            </label>
+            <label>
               <span>Codex 文件权限</span>
               <select id="sandboxInput" name="codexExecSandbox">
                 <option value="">沿用 Codex 设置</option>
@@ -321,7 +330,7 @@
         <button class="icon-button" type="button" data-close-dialog="channelDialog" title="关闭" aria-label="关闭添加渠道窗口"><i data-lucide="x"></i></button>
       </div>
       <div class="modal-body form-stack">
-        <label><span>渠道类型</span><select id="channelTypeInput"><option value="weixin">个人微信（扫码）</option><option value="wecom">企业微信智能机器人</option><option value="feishu">飞书自建应用</option></select></label>
+        <label><span>渠道类型</span><select id="channelTypeInput"><option value="weixin">个人微信（扫码）</option><option value="wecom">企业微信智能机器人</option><option value="feishu">飞书自建应用</option><option value="dingtalk">钉钉企业内部应用</option></select></label>
         <section class="channel-tutorial" data-channel-tutorial="weixin">
           <div class="channel-tutorial-head"><span><i data-lucide="book-open-check"></i></span><div><strong>个人微信添加教程</strong><small>约 1 分钟</small></div></div>
           <ol>
@@ -353,11 +362,27 @@
           </ol>
           <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开飞书开发者后台</span></a><a class="channel-doc-link" href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方长连接文档</span></a></div>
         </section>
+        <section class="channel-tutorial" data-channel-tutorial="dingtalk" hidden>
+          <div class="channel-tutorial-head"><span><i data-lucide="book-open-check"></i></span><div><strong>钉钉添加教程</strong><small>企业内部应用</small></div></div>
+          <ol>
+            <li><span>1</span><p>进入钉钉开放平台，创建 <b>企业内部应用</b>，在“凭证与基础信息”复制 Client ID 和 Client Secret。</p></li>
+            <li><span>2</span><p>在“应用能力”中添加机器人，消息接收模式选择 <b>Stream 模式</b>，无需公网回调地址。</p></li>
+            <li><span>3</span><p>可选：在卡片平台创建含 Markdown 字段的 AI Card 模板，并填写模板 ID 与对应内容字段名。</p></li>
+            <li><span>4</span><p>完成机器人配置并发布应用，再把机器人加入目标群或直接发起单聊。</p></li>
+            <li><span>5</span><p>向机器人发送一条消息以登记会话；之后即可使用 <code>/sessions</code>、<code>/session R1</code> 和 <code>/new</code>。</p></li>
+          </ol>
+          <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open-dev.dingtalk.com/" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开钉钉开发者后台</span></a><a class="channel-doc-link" href="https://opensource.dingtalk.com/developerpedia/docs/explore/tutorials/stream/overview" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方 Stream 文档</span></a></div>
+        </section>
         <label id="channelNameField" hidden><span>备注名称</span><input id="channelNameInput" maxlength="40" autocomplete="off" placeholder="例如：研发通知机器人"></label>
         <label id="wecomBotIdField" hidden><span>Bot ID</span><input id="wecomBotIdInput" maxlength="200" autocomplete="off"></label>
         <label id="wecomSecretField" hidden><span>Secret</span><input id="wecomSecretInput" type="password" maxlength="500" autocomplete="new-password"></label>
         <label id="feishuAppIdField" hidden><span>App ID</span><input id="feishuAppIdInput" maxlength="200" autocomplete="off"></label>
         <label id="feishuSecretField" hidden><span>App Secret</span><input id="feishuSecretInput" type="password" maxlength="500" autocomplete="new-password"></label>
+        <label id="dingtalkClientIdField" hidden><span>Client ID（AppKey）</span><input id="dingtalkClientIdInput" maxlength="200" autocomplete="off"></label>
+        <label id="dingtalkClientSecretField" hidden><span>Client Secret</span><input id="dingtalkClientSecretInput" type="password" maxlength="500" autocomplete="new-password"></label>
+        <label id="dingtalkCardTemplateField" hidden><span>AI Card 模板 ID（可选）</span><input id="dingtalkCardTemplateInput" maxlength="300" autocomplete="off" placeholder="配置后启用流式 AI Card"></label>
+        <label id="dingtalkCardContentKeyField" hidden><span>AI Card 内容字段</span><input id="dingtalkCardContentKeyInput" maxlength="64" autocomplete="off" value="content" placeholder="content"></label>
+        <label id="dingtalkNetworkFamilyField" hidden><span>钉钉网络协议</span><select id="dingtalkNetworkFamilyInput"><option value="auto">自动选择并在本轮固定</option><option value="ipv4">固定 IPv4</option><option value="ipv6">固定 IPv6</option></select><small class="field-hint">自动模式只在本轮第一次请求前选路，卡片创建后不会切换协议。</small></label>
         <small class="field-hint channel-security-hint" id="channelSetupHint"><i data-lucide="shield-check"></i><span>个人微信通过二维码登录，不需要填写凭据。</span></small>
       </div>
       <div class="modal-footer">
@@ -408,6 +433,20 @@
           <span>账号备注</span>
           <input id="accountRemarkInput" maxlength="40" autocomplete="off" placeholder="例如：张三、李四">
           <small class="field-hint">备注只保存在本机；清空后恢复默认名称。</small>
+        </label>
+        <label id="accountDingTalkCardTemplateField" hidden>
+          <span>钉钉 AI Card 模板 ID（可选）</span>
+          <input id="accountDingTalkCardTemplateInput" maxlength="300" autocomplete="off" placeholder="清空后恢复普通文本回复">
+          <small class="field-hint">模板需包含可流式更新的 Markdown 字段；保存后会自动重连钉钉渠道。</small>
+        </label>
+        <label id="accountDingTalkCardContentKeyField" hidden>
+          <span>钉钉 AI Card 内容字段</span>
+          <input id="accountDingTalkCardContentKeyInput" maxlength="64" autocomplete="off" placeholder="msgContent">
+        </label>
+        <label id="accountDingTalkNetworkFamilyField" hidden>
+          <span>钉钉网络协议</span>
+          <select id="accountDingTalkNetworkFamilyInput"><option value="auto">自动选择并在每轮固定</option><option value="ipv4">固定 IPv4</option><option value="ipv6">固定 IPv6</option></select>
+          <small class="field-hint">协议在一次问答开始时确定，直到最终答案或错误结束都保持不变。</small>
         </label>
         <fieldset class="channel-mode-settings">
           <legend>渠道工作模式</legend>

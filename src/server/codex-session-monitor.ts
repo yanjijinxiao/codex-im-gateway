@@ -16,6 +16,13 @@ export type CodexSessionCompletion = {
   completedAt: string;
 };
 
+export type CodexSessionActivity = {
+  sessionId: string;
+  turnId: string;
+  text: string;
+  updatedAt: string;
+};
+
 export type CodexSessionTaskStatus = "running" | "completed" | "failed" | "interrupted";
 
 export type CodexSessionTask = {
@@ -34,6 +41,7 @@ export type CodexSessionCompletionMonitorOptions = {
   now?: () => number;
   onCompletion: (completion: CodexSessionCompletion) => void | Promise<void>;
   onTaskChanged?: (task: CodexSessionTask) => void | Promise<void>;
+  onActivity?: (activity: CodexSessionActivity) => void | Promise<void>;
 };
 
 type SessionCursor = {
@@ -45,6 +53,8 @@ type SessionCursor = {
   threadSource?: string;
   activeTurnId?: string;
   activeStartedAt?: string;
+  toolNames?: Map<string, string>;
+  lastActivityByTurn?: Map<string, string>;
 };
 
 export class CodexSessionCompletionMonitor {
@@ -234,12 +244,20 @@ export class CodexSessionCompletionMonitor {
       if (typeof payload.thread_source === "string") cursor.threadSource = payload.thread_source;
       return;
     }
-    if (event.type !== "event_msg" || !payload || cursor.threadSource === "subagent") return;
+    if (!payload || cursor.threadSource === "subagent") return;
     const timestamp = eventTimestamp(event);
+    if (event.type === "response_item") {
+      await this.processResponseItem(cursor, payload, timestamp);
+      return;
+    }
+    if (event.type !== "event_msg") return;
     if (payload.type === "task_started" && typeof payload.turn_id === "string") {
       cursor.activeTurnId = payload.turn_id;
       cursor.activeStartedAt = timestamp;
       cursor.taskTitle = "";
+      cursor.toolNames = new Map();
+      cursor.lastActivityByTurn ??= new Map();
+      cursor.lastActivityByTurn.delete(payload.turn_id);
       if (shouldEmitEvent(cursor, timestamp)) await this.emitTask(cursor, "running", timestamp);
       return;
     }
@@ -248,6 +266,30 @@ export class CodexSessionCompletionMonitor {
       cursor.taskTitle = oneLine(message).slice(0, 100);
       if (cursor.activeTurnId && shouldEmitEvent(cursor, timestamp)) {
         await this.emitTask(cursor, "running", timestamp);
+      }
+      return;
+    }
+    if (payload.type === "agent_reasoning" && typeof payload.text === "string") {
+      await this.emitActivity(cursor, `🤔 ${boundedText(payload.text, 600)}`, timestamp);
+      return;
+    }
+    if (
+      payload.type === "agent_message"
+      && payload.phase === "commentary"
+      && typeof payload.message === "string"
+    ) {
+      await this.emitActivity(cursor, boundedText(payload.message, 600), timestamp);
+      return;
+    }
+    if (payload.type === "item_completed") {
+      const item = recordValue(payload.item);
+      if (item) {
+        await this.processCompletedItem(
+          cursor,
+          item,
+          timestamp,
+          typeof payload.turn_id === "string" ? payload.turn_id : undefined
+        );
       }
       return;
     }
@@ -283,6 +325,66 @@ export class CodexSessionCompletionMonitor {
     });
     cursor.activeTurnId = undefined;
     cursor.activeStartedAt = undefined;
+    cursor.toolNames = undefined;
+    cursor.lastActivityByTurn?.delete(payload.turn_id);
+  }
+
+  private async processResponseItem(
+    cursor: SessionCursor,
+    payload: Record<string, unknown>,
+    timestamp: string
+  ): Promise<void> {
+    if (!cursor.activeTurnId || !shouldEmitEvent(cursor, timestamp)) return;
+    const metadata = recordValue(payload.internal_chat_message_metadata_passthrough);
+    const itemTurnId = typeof metadata?.turn_id === "string" ? metadata.turn_id : undefined;
+    if (payload.type === "reasoning") {
+      const summary = reasoningSummaryText(payload.summary);
+      if (summary) await this.emitActivity(cursor, `🤔 ${boundedText(summary, 600)}`, timestamp, itemTurnId);
+      return;
+    }
+    if (payload.type === "message" && payload.phase === "commentary") {
+      const commentary = messageContentText(payload.content);
+      if (commentary) await this.emitActivity(cursor, boundedText(commentary, 600), timestamp, itemTurnId);
+      return;
+    }
+    if (payload.type === "custom_tool_call") {
+      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
+      const name = typeof payload.name === "string" ? payload.name : "tool";
+      if (callId) {
+        cursor.toolNames ??= new Map();
+        cursor.toolNames.set(callId, name);
+      }
+      await this.emitActivity(cursor, `🔎 ${desktopToolDescription(name, false)}`, timestamp);
+      return;
+    }
+    if (payload.type === "custom_tool_call_output") {
+      const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
+      const name = callId ? cursor.toolNames?.get(callId) : undefined;
+      await this.emitActivity(cursor, `✅ ${desktopToolDescription(name ?? "tool", true)}`, timestamp);
+    }
+  }
+
+  private async processCompletedItem(
+    cursor: SessionCursor,
+    item: Record<string, unknown>,
+    timestamp: string,
+    turnId?: string
+  ): Promise<void> {
+    const type = typeof item.type === "string"
+      ? item.type.replace(/[_-]/g, "").toLowerCase()
+      : "";
+    if (type === "reasoning") {
+      const summary = reasoningSummaryText(item.summary_text ?? item.summary);
+      if (summary) await this.emitActivity(cursor, `🤔 ${boundedText(summary, 600)}`, timestamp, turnId);
+      return;
+    }
+    if (type === "agentmessage" && String(item.phase).toLowerCase() === "commentary") {
+      const commentary = typeof item.text === "string" ? item.text : messageContentText(item.content);
+      if (commentary) await this.emitActivity(cursor, boundedText(commentary, 600), timestamp, turnId);
+      return;
+    }
+    const completed = completedDesktopItemDescription(type, item);
+    if (completed) await this.emitActivity(cursor, completed, timestamp, turnId);
   }
 
   private async emitTask(
@@ -292,6 +394,35 @@ export class CodexSessionCompletionMonitor {
   ): Promise<void> {
     const task = taskFromCursor(cursor, status, updatedAt);
     if (task) await this.options.onTaskChanged?.(task);
+  }
+
+  private async emitActivity(
+    cursor: SessionCursor,
+    text: string,
+    updatedAt: string,
+    turnId?: string
+  ): Promise<void> {
+    const content = text.trim();
+    const targetTurnId = turnId ?? cursor.activeTurnId;
+    if (
+      !this.options.onActivity
+      || !cursor.sessionId
+      || !targetTurnId
+      || !content
+      || cursor.lastActivityByTurn?.get(targetTurnId) === content
+      || !shouldEmitEvent(cursor, updatedAt)
+    ) return;
+    cursor.lastActivityByTurn ??= new Map();
+    cursor.lastActivityByTurn.set(targetTurnId, content);
+    if (cursor.lastActivityByTurn.size > 20) {
+      cursor.lastActivityByTurn.delete(cursor.lastActivityByTurn.keys().next().value as string);
+    }
+    await this.options.onActivity({
+      sessionId: cursor.sessionId,
+      turnId: targetTurnId,
+      text: content,
+      updatedAt
+    });
   }
 }
 
@@ -463,4 +594,70 @@ function eventTimestamp(event: Record<string, unknown>): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function reasoningSummaryText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    const record = recordValue(part);
+    return typeof record?.text === "string" ? [record.text] : [];
+  }).join("\n").trim();
+}
+
+function messageContentText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    const record = recordValue(part);
+    return typeof record?.text === "string" ? [record.text] : [];
+  }).join("\n").trim();
+}
+
+function completedDesktopItemDescription(type: string, item: Record<string, unknown>): string | undefined {
+  const status = typeof item.status === "string" ? item.status.toLowerCase() : "completed";
+  const failed = status === "failed" || status === "error" || status === "cancelled";
+  const icon = failed ? "❌" : "✅";
+  const result = failed ? "失败" : "完成";
+  switch (type) {
+    case "commandexecution":
+      return `${icon} 执行本地操作${result}`;
+    case "filechange":
+      return `${icon} 修改文件${result}`;
+    case "imageview":
+      return `${icon} 检查图片${result}`;
+    case "mcptoolcall":
+      return `${icon} 调用 MCP 工具${result}`;
+    case "dynamictoolcall":
+      return `${icon} 调用动态工具${result}`;
+    case "collabtoolcall":
+      return `${icon} 执行协作步骤${result}`;
+    case "websearch":
+      return `${icon} 查询网页${result}`;
+    case "contextcompaction":
+      return `${icon} 整理长会话上下文${result}`;
+    default:
+      return undefined;
+  }
+}
+
+function desktopToolDescription(name: string, completed: boolean): string {
+  const normalized = name.toLowerCase();
+  const action = normalized.includes("view_image")
+    ? "检查图片"
+    : normalized.includes("web")
+      ? "查询网页"
+      : normalized.includes("exec") || normalized.includes("command")
+        ? "执行本地操作"
+        : normalized.includes("patch") || normalized.includes("file")
+          ? "修改文件"
+          : normalized.includes("collaboration")
+            ? "执行协作步骤"
+            : `调用工具 ${boundedText(name, 80)}`;
+  return completed ? `${action}完成` : `正在${action}`;
+}
+
+function boundedText(value: string, max: number): string {
+  const text = value.trim();
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
 }

@@ -11,11 +11,11 @@ import { z } from "zod";
 import { resolveCodexCommand } from "../codex/exec-runner.js";
 import { loadConfig, saveConfig } from "../state/config.js";
 import type { StatePaths } from "../state/paths.js";
-import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
+import type { CodexModelOption, CodexRuntimeInfo } from "../codex/backend.js";
 import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, SessionUpload } from "./account-manager.js";
 import { LoginManager } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
-import { listCodexProjectCandidates, type CodexProjectCandidate } from "./codex-projects.js";
+import type { CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
 import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
@@ -60,6 +60,9 @@ const accountSettingsSchema = z.object({
   displayName: z.string().max(40),
   webhookUrl: webhookUrlSchema.nullable().optional(),
   webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional(),
+  cardTemplateId: z.string().trim().max(300).nullable().optional(),
+  cardContentKey: z.string().trim().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/).nullable().optional(),
+  networkFamily: z.enum(["auto", "ipv4", "ipv6"]).optional(),
   modeSettings: channelModeSettingsSchema.optional()
 });
 const accountDeleteSchema = z.object({
@@ -76,6 +79,15 @@ const channelAccountSchema = z.discriminatedUnion("channel", [
     channel: z.literal("feishu"),
     appId: z.string().trim().min(1).max(200),
     appSecret: z.string().trim().min(1).max(500),
+    displayName: z.string().trim().max(40).optional()
+  }),
+  z.object({
+    channel: z.literal("dingtalk"),
+    clientId: z.string().trim().min(1).max(200),
+    clientSecret: z.string().trim().min(1).max(500),
+    cardTemplateId: z.string().trim().max(300).optional(),
+    cardContentKey: z.string().trim().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/).optional(),
+    networkFamily: z.enum(["auto", "ipv4", "ipv6"]).optional(),
     displayName: z.string().trim().max(40).optional()
   })
 ]);
@@ -130,6 +142,7 @@ const configSchema = z.object({
   defaultCwd: z.string().min(1),
   allowedWorkspaces: z.array(z.string().min(1)).min(1),
   codexBackend: z.enum(["auto", "app-server", "exec"]),
+  codexAppServerTransport: z.enum(["auto", "daemon", "stdio"]).optional(),
   codexExecSandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).nullable().optional(),
   model: z.string().optional(),
   effort: z.string().optional(),
@@ -155,7 +168,7 @@ export type LocalHttpServerOptions = {
   codexCheck?: () => Promise<{ ready: boolean; version?: string; error?: string }>;
   codexRuntimeCheck?: () => Promise<CodexRuntimeInfo>;
   codexModelsCheck?: () => Promise<CodexModelOption[]>;
-  codexProjectsProvider?: () => readonly CodexProjectCandidate[];
+  codexProjectsProvider?: () => readonly CodexProjectCandidate[] | Promise<readonly CodexProjectCandidate[]>;
   directoryPicker?: (defaultPath?: string) => Promise<string | undefined>;
   updateService?: UpdateService;
   onUpdateInstalled?: (version: string) => void;
@@ -306,7 +319,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   if (method === "GET" && url.pathname === "/api/codex-projects") {
-    sendJson(response, 200, { projects: readCodexProjects(context) });
+    sendJson(response, 200, { projects: await readCodexProjects(context) });
     return;
   }
   if (method === "POST" && url.pathname === "/api/directory-picker") {
@@ -335,10 +348,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (method === "POST" && url.pathname === "/api/projects") {
     const body = projectCreateSchema.parse(await readJsonBody(request));
     const workspace = path.resolve(body.workspace);
-    const candidate = readCodexProjects(context)
+    const candidate = (await readCodexProjects(context))
       .find((project) => project.workspace === workspace);
     if (!candidate) {
       throw new Error(`Invalid Codex project workspace: ${workspace}`);
+    }
+    if (candidate.projectKind === "remote" && !candidate.hostId) {
+      throw new Error(`Remote Codex Desktop project has no routable host id: ${workspace}`);
     }
     const config = loadConfig(context.paths);
     if (!config.allowedWorkspaces.some((allowed) => path.resolve(allowed) === workspace)) {
@@ -348,7 +364,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       });
     }
     sendJson(response, 201, {
-      project: context.accountManager.createProject(body.accountId, body.name, workspace)
+      project: context.accountManager.createProject(body.accountId, body.name, workspace, {
+        sourceProjectId: candidate.projectId,
+        projectKind: candidate.projectKind,
+        hostId: candidate.hostId
+      })
     });
     return;
   }
@@ -450,9 +470,13 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       await context.accountManager.updateAccountModeSettings(accountMatch.accountId, body.modeSettings);
     }
     const { modeSettings: _modeSettings, ...accountSettings } = body;
-    sendJson(response, 200, {
-      account: context.accountManager.updateAccount(accountMatch.accountId, accountSettings)
-    });
+    let account = context.accountManager.updateAccount(accountMatch.accountId, accountSettings);
+    if ((body.cardTemplateId !== undefined || body.cardContentKey !== undefined || body.networkFamily !== undefined)
+      && account.channel === "dingtalk"
+      && (account.status === "running" || account.status === "starting")) {
+      account = await context.accountManager.refreshAccount(accountMatch.accountId);
+    }
+    sendJson(response, 200, { account });
     return;
   }
   if (method === "DELETE" && accountMatch) {
@@ -556,7 +580,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   if (method === "POST" && sessionAction?.action === "activate") {
-    sendJson(response, 200, { session: context.accountManager.activateSession(sessionAction.accountId, sessionAction.sessionId) });
+    sendJson(response, 200, {
+      session: await context.accountManager.activateSession(sessionAction.accountId, sessionAction.sessionId)
+    });
     return;
   }
   if (method === "POST" && sessionAction?.action === "reset") {
@@ -626,8 +652,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   sendJson(response, 404, { error: "Not found" });
 }
 
-function readCodexProjects(context: HandlerContext): readonly CodexProjectCandidate[] {
-  return context.codexProjectsProvider?.() ?? listCodexProjectCandidates();
+async function readCodexProjects(context: HandlerContext): Promise<readonly CodexProjectCandidate[]> {
+  return await context.codexProjectsProvider?.() ?? await context.accountManager.listCodexProjects();
 }
 
 function readProductVersion(): string {

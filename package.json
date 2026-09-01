@@ -11,7 +11,7 @@
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
-  "description": "Local OpenAI Codex bridge for WeChat, Enterprise WeChat, and Feishu.",
+  "description": "Local OpenAI Codex bridge for WeChat, Enterprise WeChat, Feishu, and DingTalk.",
   "license": "MIT",
   "author": "Xuechao Zou",
   "homepage": "https://github.com/lsiten/codex-channel-bridge#readme",
@@ -26,6 +26,7 @@
     "codex",
     "wechat",
     "weixin",
+    "dingtalk",
     "openai",
     "bridge"
   ],
@@ -52,8 +53,10 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@alicloud/dingtalk": "^2.2.46",
     "@larksuiteoapi/node-sdk": "^1.72.0",
     "@wecom/aibot-node-sdk": "^1.0.7",
+    "dingtalk-stream": "^2.1.6-beta.1",
     "dompurify": "^3.4.12",
     "lucide": "^0.468.0",
     "marked": "^18.0.6",

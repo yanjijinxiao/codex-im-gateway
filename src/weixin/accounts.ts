@@ -5,6 +5,7 @@ import {
   normalizeChannelModeSettings,
   type ChannelModeSettings
 } from "../channels/channel-mode-settings.js";
+import type { NetworkFamilyPolicy } from "../channels/network-family.js";
 import { ensureDir, readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { StatePaths } from "../state/paths.js";
 import { resolveWebhookProvider, type WebhookProvider } from "../webhooks/webhook-provider.js";
@@ -51,8 +52,24 @@ export type FeishuAccount = {
   enabled: boolean;
 };
 
-export type ChannelAccount = WeixinAccount | WeComAccount | FeishuAccount;
-export type ChannelKind = "weixin" | "wecom" | "feishu";
+export type DingTalkAccount = {
+  channel: "dingtalk";
+  accountId: string;
+  clientId: string;
+  clientSecret: string;
+  cardTemplateId?: string;
+  cardContentKey?: string;
+  networkFamily?: NetworkFamilyPolicy;
+  displayName?: string;
+  webhookUrl?: string;
+  webhookProvider?: WebhookProvider;
+  modeSettings?: ChannelModeSettings;
+  savedAt: string;
+  enabled: boolean;
+};
+
+export type ChannelAccount = WeixinAccount | WeComAccount | FeishuAccount | DingTalkAccount;
+export type ChannelKind = "weixin" | "wecom" | "feishu" | "dingtalk";
 
 export type RetainedWeixinAccount = {
   accountId: string;
@@ -64,6 +81,9 @@ export type RetainedWeixinAccount = {
 
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+export const LEGACY_HERMES_DINGTALK_CARD_TEMPLATE_ID = "2ff5856d-dfa6-443c-99de-0fc1efd32ec9.schema";
+export const STREAMING_DINGTALK_CARD_TEMPLATE_ID = "02fcf2f4-5e02-4a85-b672-46d1f715543e.schema";
+export const STREAMING_DINGTALK_CARD_CONTENT_KEY = "msgContent";
 
 export function normalizeAccountId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_.-]/g, "-");
@@ -187,6 +207,29 @@ export function listAccounts(paths: StatePaths): ChannelAccount[] {
     .sort((a, b) => a.accountId.localeCompare(b.accountId));
 }
 
+/**
+ * Hermes' legacy DingTalk template accepts the initial card payload but does
+ * not reliably apply subsequent streaming frames. Migrate only that exact
+ * known profile, leaving custom templates untouched.
+ */
+export function migrateLegacyDingTalkCardProfiles(paths: StatePaths): DingTalkAccount[] {
+  const migrated: DingTalkAccount[] = [];
+  for (const account of listAccounts(paths)) {
+    if (accountChannel(account) !== "dingtalk") continue;
+    const dingtalk = account as DingTalkAccount;
+    if (dingtalk.cardTemplateId?.trim() !== LEGACY_HERMES_DINGTALK_CARD_TEMPLATE_ID) continue;
+    if ((dingtalk.cardContentKey?.trim() || "content") !== "content") continue;
+    const updated: DingTalkAccount = {
+      ...dingtalk,
+      cardTemplateId: STREAMING_DINGTALK_CARD_TEMPLATE_ID,
+      cardContentKey: STREAMING_DINGTALK_CARD_CONTENT_KEY
+    };
+    saveAccount(paths, updated);
+    migrated.push(updated);
+  }
+  return migrated;
+}
+
 export function setAccountEnabled(paths: StatePaths, accountId: string, enabled: boolean): ChannelAccount {
   const account = loadAccount(paths, accountId);
   const updated = { ...account, enabled };
@@ -198,6 +241,9 @@ export type AccountSettingsPatch = {
   displayName: string;
   webhookUrl?: string | null;
   webhookProvider?: WebhookProvider;
+  cardTemplateId?: string | null;
+  cardContentKey?: string | null;
+  networkFamily?: NetworkFamilyPolicy;
 };
 
 export function setAccountSettings(paths: StatePaths, accountId: string, patch: AccountSettingsPatch): ChannelAccount {
@@ -215,6 +261,19 @@ export function setAccountSettings(paths: StatePaths, accountId: string, patch: 
     else delete updated.webhookUrl;
   }
   if (patch.webhookProvider !== undefined) updated.webhookProvider = patch.webhookProvider;
+  if (patch.cardTemplateId !== undefined && accountChannel(updated) === "dingtalk") {
+    const cardTemplateId = patch.cardTemplateId?.trim();
+    if (cardTemplateId) (updated as DingTalkAccount).cardTemplateId = cardTemplateId;
+    else delete (updated as DingTalkAccount).cardTemplateId;
+  }
+  if (patch.cardContentKey !== undefined && accountChannel(updated) === "dingtalk") {
+    const cardContentKey = patch.cardContentKey?.trim();
+    if (cardContentKey) (updated as DingTalkAccount).cardContentKey = cardContentKey;
+    else delete (updated as DingTalkAccount).cardContentKey;
+  }
+  if (patch.networkFamily !== undefined && accountChannel(updated) === "dingtalk") {
+    (updated as DingTalkAccount).networkFamily = patch.networkFamily;
+  }
   saveAccount(paths, updated);
   return updated;
 }
@@ -251,6 +310,10 @@ export type PublicChannelAccount =
   | (Omit<FeishuAccount, "appSecret" | "webhookUrl"> & {
       webhookConfigured: boolean;
       webhookProvider: WebhookProvider;
+    })
+  | (Omit<DingTalkAccount, "clientSecret" | "webhookUrl"> & {
+      webhookConfigured: boolean;
+      webhookProvider: WebhookProvider;
     });
 
 export type PublicWeixinAccount = PublicChannelAccount;
@@ -266,6 +329,14 @@ export function publicAccount(account: ChannelAccount): PublicChannelAccount {
   }
   if (accountChannel(account) === "feishu") {
     const { appSecret: _appSecret, webhookUrl, ...safe } = account as FeishuAccount;
+    return {
+      ...safe,
+      webhookProvider: resolveWebhookProvider(account.webhookProvider, webhookUrl),
+      webhookConfigured: Boolean(webhookUrl)
+    };
+  }
+  if (accountChannel(account) === "dingtalk") {
+    const { clientSecret: _clientSecret, webhookUrl, ...safe } = account as DingTalkAccount;
     return {
       ...safe,
       webhookProvider: resolveWebhookProvider(account.webhookProvider, webhookUrl),

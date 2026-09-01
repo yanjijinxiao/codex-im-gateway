@@ -2,7 +2,18 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  EXEC_BACKEND_CAPABILITIES,
+  type CodexRunResult,
+  type CodexProjectCatalog,
+  type CodexRunnerInput,
+  type CodexStopResult,
+  type CodexBackendAdapter
+} from "./backend.js";
+import { listCodexCliProjects } from "./cli-projects.js";
 import type { CodexExecSandbox } from "./sandbox.js";
+
+export type { CodexRunResult } from "./backend.js";
 
 export type BuildCodexExecArgsInput = {
   prompt: string;
@@ -50,23 +61,19 @@ export type CodexExecRunnerOptions = {
   codexBin?: string;
   sandbox?: CodexExecSandbox;
   timeoutMs?: number;
+  codexHome?: string;
 };
 
-export type CodexRunResult = {
-  text: string;
-  threadId?: string;
-  turnId?: string;
-  raw: string;
-};
-
-export class CodexExecRunner {
+export class CodexExecRunner implements CodexBackendAdapter {
+  readonly id = "exec" as const;
+  readonly capabilities = EXEC_BACKEND_CAPABILITIES;
   private readonly activeRuns: Array<{ child: ChildProcess; threadId?: string }> = [];
 
   constructor(private readonly options: CodexExecRunnerOptions = {}) {}
 
-  run(input: BuildCodexExecArgsInput): Promise<CodexRunResult> {
+  run(input: CodexRunnerInput): Promise<CodexRunResult> {
     const codexCommand = resolveCodexCommand(this.options.codexBin ?? "codex");
-    const timeoutMs = this.options.timeoutMs ?? 600_000;
+    const timeoutMs = this.options.timeoutMs;
     const args = buildCodexExecArgs({
       ...input,
       sandbox: this.options.sandbox ?? input.sandbox
@@ -87,7 +94,7 @@ export class CodexExecRunner {
           this.activeRuns.splice(index, 1);
         }
       };
-      const timer = setTimeout(() => {
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
         child.kill();
         reject(new Error(`codex exec timed out after ${timeoutMs}ms`));
       }, timeoutMs);
@@ -96,12 +103,12 @@ export class CodexExecRunner {
       child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.on("error", (error) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         removeActiveRun();
         reject(error);
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         removeActiveRun();
         const raw = Buffer.concat(stdout).toString("utf8");
         const err = Buffer.concat(stderr).toString("utf8");
@@ -115,11 +122,24 @@ export class CodexExecRunner {
     });
   }
 
-  async stop(threadId?: string): Promise<void> {
+  async stop(threadId?: string): Promise<CodexStopResult> {
     const target = threadId
       ? [...this.activeRuns].reverse().find((run) => run.threadId === threadId)
       : this.activeRuns.at(-1);
-    target?.child.kill();
+    if (!target) return "not-active";
+    target.child.kill();
+    return "interrupted";
+  }
+
+  async warmUp(_cwd: string): Promise<void> {
+    // codex exec is process-per-turn and has no persistent transport to warm.
+  }
+
+  async listProjects(): Promise<CodexProjectCatalog> {
+    return {
+      backend: "exec",
+      projects: listCodexCliProjects(this.options.codexHome)
+    };
   }
 
   close(): void {

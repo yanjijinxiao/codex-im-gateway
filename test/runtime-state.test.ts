@@ -58,6 +58,41 @@ test("creates and activates a managed session for a sender", (t) => {
   assert.equal(store.listSessions().length, 1);
 });
 
+test("preserves Codex Desktop routing metadata on a remote project", (t) => {
+  const store = createStore(t);
+  const project = store.createProject("Remote", "/home/admin/project", {
+    sourceProjectId: "desktop-project-id",
+    projectKind: "remote",
+    hostId: "remote-ssh-discovered:devbox"
+  });
+  const session = store.createSession("alice@im.wechat", project.workspace, "Remote session", project.id);
+
+  assert.deepEqual({
+    sourceProjectId: store.getProject(project.id)?.sourceProjectId,
+    projectKind: store.getProject(project.id)?.projectKind,
+    hostId: store.getProject(project.id)?.hostId,
+    sessionProjectId: session.projectId
+  }, {
+    sourceProjectId: "desktop-project-id",
+    projectKind: "remote",
+    hostId: "remote-ssh-discovered:devbox",
+    sessionProjectId: project.id
+  });
+});
+
+test("backfills Codex Desktop routing metadata on an existing project", (t) => {
+  const store = createStore(t);
+  const project = store.createProject("Bridge", "/work/bridge");
+
+  const updated = store.updateProjectMetadata(project.id, {
+    sourceProjectId: "desktop-project-id",
+    projectKind: "local"
+  });
+
+  assert.equal(updated.sourceProjectId, "desktop-project-id");
+  assert.equal(updated.projectKind, "local");
+});
+
 test("supports create, rename, switch, reset, and delete", (t) => {
   const store = createStore(t);
   const first = store.createSession("alice@im.wechat", "/work/one", "第一项");
@@ -87,6 +122,15 @@ test("persists a prompt preview without changing the session activity time", (t)
   const updated = store.getSession(session.id);
   assert.equal(updated?.lastPromptPreview, "分析 项目方案");
   assert.equal(updated?.updatedAt, session.updatedAt);
+});
+
+test("replaces a generated Bridge session title with the first clean user preview", (t) => {
+  const store = createStore(t);
+  const session = store.createSession("alice@im.wechat", "/work/one");
+
+  store.setSessionPromptPreview(session.id, "本机装的云壳是什么？");
+
+  assert.equal(store.getSession(session.id)?.title, "本机装的云壳是什么？");
 });
 
 test("keeps sessions for different senders independent", (t) => {

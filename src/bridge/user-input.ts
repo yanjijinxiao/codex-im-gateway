@@ -4,7 +4,7 @@ import type {
   CodexUserInputAnswer,
   CodexUserInputQuestion,
   CodexUserInputRequest
-} from "../codex/app-server-runner.js";
+} from "../codex/backend.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
 
 type PendingChoice = {

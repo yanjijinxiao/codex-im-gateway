@@ -1,4 +1,4 @@
-import type { HybridCodexRunner } from "../codex/runner.js";
+import type { CodexBridgeBackend } from "../codex/backend.js";
 import type { ChannelCommandCapability } from "./channel-capability.js";
 import type { FriendlyChannelIntent } from "./channel-intent.js";
 import {
@@ -29,7 +29,7 @@ type AiCompletion = (
 ) => Promise<string>;
 
 type CodexChannelIntentResolverOptions = {
-  readonly runner: HybridCodexRunner;
+  readonly runner: CodexBridgeBackend;
   readonly cwd: string;
   readonly model?: string;
 };

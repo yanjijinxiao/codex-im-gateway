@@ -11,10 +11,32 @@ test("uses ~/.codex-weixin as the default Codex workspace", () => {
   assert.equal(defaultConfig().defaultCwd, path.join(os.homedir(), ".codex-weixin"));
   assert.deepEqual(defaultConfig().allowedWorkspaces, [path.join(os.homedir(), ".codex-weixin")]);
   assert.equal(defaultConfig().streamReplies, true);
+  assert.equal(defaultConfig().codexBackend, "auto");
+  assert.equal(defaultConfig().codexAppServerTransport, "auto");
   assert.equal(defaultConfig().maxInboundBytes, 100 * 1024 * 1024);
   assert.equal(defaultConfig().taskboardEnabled, true);
   assert.equal(defaultConfig().taskboardUrl, "http://127.0.0.1:47823");
   assert.equal(resolveStatePaths("/tmp/codex-weixin-test").taskboardDir, "/tmp/codex-weixin-test/taskboard");
+});
+
+test("loads only supported Codex backend and app-server transport settings", (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-config-backend-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const paths = resolveStatePaths(stateDir);
+
+  fs.writeFileSync(paths.configPath, JSON.stringify({
+    codexBackend: "app-server",
+    codexAppServerTransport: "daemon"
+  }));
+  assert.equal(loadConfig(paths, "/tmp/project").codexBackend, "app-server");
+  assert.equal(loadConfig(paths, "/tmp/project").codexAppServerTransport, "daemon");
+
+  fs.writeFileSync(paths.configPath, JSON.stringify({
+    codexBackend: "hybrid",
+    codexAppServerTransport: "socket"
+  }));
+  assert.equal(loadConfig(paths, "/tmp/project").codexBackend, "auto");
+  assert.equal(loadConfig(paths, "/tmp/project").codexAppServerTransport, "auto");
 });
 
 test("migrates the legacy inbound limit and never exceeds 100 MiB", (t) => {

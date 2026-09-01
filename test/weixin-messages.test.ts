@@ -105,3 +105,29 @@ test("normalizes inbound voice media as audio when transcription is unavailable"
     { kind: "audio", label: "voice.silk" }
   ]);
 });
+
+test("normalizes an image referenced by a text message as an attachment", () => {
+  const message = normalizeWeixinMessage({
+    message_id: "msg-ref-image",
+    from_user_id: "alice@im.wechat",
+    item_list: [{
+      type: 1,
+      text_item: { text: "看看这张图" },
+      ref_msg: {
+        message_item: {
+          type: 2,
+          image_item: {
+            aeskey: "00112233445566778899aabbccddeeff",
+            media: { encrypt_query_param: "referenced-image-token" }
+          }
+        }
+      }
+    }]
+  });
+
+  assert.equal(message?.text, "看看这张图");
+  assert.deepEqual(message?.attachments.map((attachment) => ({
+    kind: attachment.kind,
+    label: attachment.label
+  })), [{ kind: "image", label: "image" }]);
+});

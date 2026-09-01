@@ -93,6 +93,7 @@ export async function downloadInboundAttachments(input: {
   messageId: string;
   attachments: WeixinInboundAttachment[];
   maxBytes: number;
+  cdnBaseUrl?: string;
   fetch?: FetchLike;
 }): Promise<DownloadedInboundAttachment[]> {
   const downloaded: DownloadedInboundAttachment[] = [];
@@ -103,6 +104,7 @@ export async function downloadInboundAttachments(input: {
       messageId: `${input.messageId}-${index + 1}`,
       attachment,
       maxBytes: input.maxBytes,
+      cdnBaseUrl: input.cdnBaseUrl,
       fetch: input.fetch
     }));
   }
@@ -115,12 +117,13 @@ async function downloadInboundAttachment(input: {
   messageId: string;
   attachment: WeixinInboundAttachment;
   maxBytes: number;
+  cdnBaseUrl?: string;
   fetch?: FetchLike;
 }): Promise<DownloadedInboundAttachment> {
   const ref = inboundMediaRef(input.attachment);
   const key = inboundAesKey(ref);
   const encrypted = await downloadMediaBuffer({
-    url: ref.fullUrl ?? downloadUrlFromParam(ref.encryptQueryParam),
+    url: ref.fullUrl ?? downloadUrlFromParam(ref.encryptQueryParam, input.cdnBaseUrl),
     maxBytes: key ? aesEcbPaddedSize(input.maxBytes) : input.maxBytes,
     plainMaxBytes: input.maxBytes,
     fetch: input.fetch
@@ -192,11 +195,11 @@ async function downloadMediaBuffer(input: {
   return buffer;
 }
 
-function downloadUrlFromParam(encryptQueryParam?: string): string {
+function downloadUrlFromParam(encryptQueryParam?: string, cdnBaseUrl = DEFAULT_WEIXIN_CDN_BASE_URL): string {
   if (!encryptQueryParam?.trim()) {
     throw new Error("Inbound media is missing download URL");
   }
-  return `${DEFAULT_WEIXIN_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  return `${cdnBaseUrl.replace(/\/+$/, "")}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
 }
 
 function labelWithExtension(label: string, kind: "image" | "file" | "video" | "audio", buffer: Buffer): string {

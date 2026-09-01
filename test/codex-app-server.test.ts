@@ -4,9 +4,22 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
+import { CodexThreadStateError } from "../src/codex/backend.js";
 import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+function pickState(state: {
+  persistence: string;
+  runtimeStatus: string;
+  latestTurnStatus?: string;
+}) {
+  return {
+    persistence: state.persistence,
+    runtimeStatus: state.runtimeStatus,
+    latestTurnStatus: state.latestTurnStatus
+  };
+}
 
 test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
   const runner = new AppServerCodexRunner({
@@ -14,6 +27,15 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
     requestTimeoutMs: 2_000
   });
   t.after(() => runner.close());
+
+  assert.deepEqual(await runner.listProjects(), {
+    backend: "app-server",
+    projects: [{
+      id: "project-native",
+      name: "Fixture Project",
+      roots: ["/tmp/project"]
+    }]
+  });
 
   const deltas: string[] = [];
   const progress: string[] = [];
@@ -52,11 +74,17 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
     effort: "medium"
   });
 
-  assert.deepEqual(await runner.listSessions(), {
-    data: [{ id: "thread-new" }],
-    nextCursor: null,
-    backwardsCursor: null
+  const resumedAgain = await runner.run({
+    prompt: "third",
+    cwd: "/tmp/project",
+    threadId: "thread-existing"
   });
+  assert.equal(resumedAgain.text, "reply:third");
+
+  const listed = await runner.listThreads({ cwd: "/tmp/project", persistence: "all" });
+  assert.equal(listed.find((thread) => thread.threadId === "thread-new")?.persistence, "active");
+  assert.equal(listed.find((thread) => thread.threadId === "thread-archived")?.persistence, "archived");
+  assert.equal(listed.find((thread) => thread.threadId === "thread-system-error")?.runtimeStatus, "systemError");
 
   assert.deepEqual(await runner.getHistory("thread-existing"), [
     {
@@ -107,6 +135,64 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
   });
 });
 
+test("binds new threads to the native app-server project and keeps Bridge policy out of the title", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const created: string[] = [];
+
+  const result = await runner.run({
+    prompt: "verify-thread-metadata",
+    developerInstructions: "bridge-only-policy",
+    cwd: "/tmp/project",
+    projectId: "desktop-project-id",
+    projectName: "Fixture Project",
+    threadTitle: "干净的用户标题",
+    onThreadCreated: (threadId) => {
+      created.push(threadId);
+    }
+  });
+
+  assert.equal(result.text, "reply:verify-thread-metadata");
+  assert.deepEqual(created, ["thread-new"]);
+
+  const repaired = await runner.run({
+    prompt: "verify-thread-metadata",
+    developerInstructions: "bridge-only-policy",
+    cwd: "/tmp/project",
+    projectId: "desktop-project-id",
+    projectName: "Fixture Project",
+    threadId: "thread-bridge-title",
+    threadTitle: "干净的用户标题"
+  });
+  assert.equal(repaired.text, "reply:verify-thread-metadata");
+});
+
+test("starts a remote thread by cwd when the daemon has no project catalog API", async (t) => {
+  const runner = new AppServerCodexRunner({
+    requestTimeoutMs: 2_000,
+    transport: {
+      command: process.execPath,
+      args: [path.join(fixturesDir, "fake-codex-app-server.mjs"), "--without-project-api"],
+      mode: "remote-daemon"
+    }
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "legacy-remote-project",
+    cwd: "/home/admin/legacy-project",
+    projectId: "desktop-remote-project",
+    projectName: "Legacy Remote Project"
+  });
+
+  assert.equal(result.threadId, "thread-new");
+  assert.equal(result.text, "reply:legacy-remote-project");
+  assert.deepEqual(await runner.listProjects(), { backend: "app-server", projects: [] });
+});
+
 test("keeps an active channel turn alive from its latest progress reply", async (t) => {
   // Given: a turn whose progress arrives before the timeout and final answer arrives after the original deadline.
   const runner = new AppServerCodexRunner({
@@ -127,6 +213,52 @@ test("keeps an active channel turn alive from its latest progress reply", async 
   // Then: the timeout is measured from that reply and the final answer completes.
   assert.deepEqual(progress, ["working:sliding-timeout"]);
   assert.equal(result.text, "reply:sliding-timeout");
+});
+
+test("lets an accepted agent turn run past the RPC timeout without requiring activity", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 100
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "silent-long",
+    cwd: "/tmp/project"
+  });
+
+  assert.equal(result.text, "reply:silent-long");
+});
+
+test("recycles a private stdio app-server after the last turn releases its thread", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  await runner.run({ prompt: "release-writer", cwd: "/tmp/project" });
+
+  assert.equal((runner as unknown as { child?: unknown }).child, undefined);
+});
+
+test("streams safe tool status and readable reasoning summaries as progress", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const progress: string[] = [];
+
+  await runner.run({
+    prompt: "detailed-progress",
+    cwd: "/tmp/project",
+    onProgress: (message) => progress.push(message)
+  });
+
+  assert.equal(progress.some((message) => /正在执行命令.*npm test/.test(message)), true);
+  assert.equal(progress.some((message) => /命令完成.*退出码 0/.test(message)), true);
+  assert.equal(progress.some((message) => message === "🤔 正在分析测试结果并决定下一步"), true);
 });
 
 test("propagates the configured sandbox to an app-server turn", async (t) => {
@@ -298,12 +430,55 @@ test("interrupts the active V2 turn with both threadId and turnId", async (t) =>
     (value) => ({ value, error: undefined }),
     (error: Error) => ({ value: undefined, error })
   );
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(await runner.stop("thread-other"), "not-active");
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 25));
-    await runner.stop("thread-stop");
+    if (await runner.stop("thread-stop") === "interrupted") break;
   }
   const result = await outcome;
   assert.match(result.error?.message ?? "", /interrupted/i);
+});
+
+test("models active, archived, missing, and system-error thread lifecycle states", async (t) => {
+  const runner = new AppServerCodexRunner({
+    requestTimeoutMs: 2_000,
+    transport: {
+      command: process.execPath,
+      args: [path.join(fixturesDir, "fake-codex-app-server.mjs")],
+      mode: "daemon-proxy"
+    }
+  });
+  t.after(() => runner.close());
+
+  assert.deepEqual(
+    pickState(await runner.inspectThread("thread-existing")),
+    { persistence: "active", runtimeStatus: "idle", latestTurnStatus: "completed" }
+  );
+  assert.deepEqual(
+    pickState(await runner.inspectThread("thread-archived")),
+    { persistence: "archived", runtimeStatus: "notLoaded", latestTurnStatus: undefined }
+  );
+  assert.deepEqual(
+    pickState(await runner.inspectThread("thread-missing")),
+    { persistence: "missing", runtimeStatus: "unknown", latestTurnStatus: undefined }
+  );
+  assert.equal((await runner.inspectThread("thread-system-error")).runtimeStatus, "systemError");
+
+  await assert.rejects(
+    runner.run({ prompt: "must-not-run", cwd: "/tmp/project", threadId: "thread-archived" }),
+    (error) => error instanceof CodexThreadStateError && error.code === "archived"
+  );
+  await assert.rejects(
+    runner.run({ prompt: "must-not-run", cwd: "/tmp/project", threadId: "thread-system-error" }),
+    (error) => error instanceof CodexThreadStateError && error.code === "system-error"
+  );
+
+  await runner.archiveThread("thread-existing");
+  assert.equal((await runner.inspectThread("thread-existing")).persistence, "archived");
+  assert.equal((await runner.unarchiveThread("thread-existing")).persistence, "active");
+  await runner.deleteThread("thread-existing");
+  assert.equal((await runner.inspectThread("thread-existing")).persistence, "missing");
 });
 
 test("serializes concurrent turns for the same managed session", async (t) => {
@@ -368,28 +543,73 @@ test("auto backend falls back to codex exec for an existing thread", async (t) =
   assert.match(result.text, /exec-resumed/);
 });
 
-test("exec backend uses app-server when true streaming is requested", async (t) => {
+test("relays a Desktop-owned thread through the Desktop follower runner", async (t) => {
+  const relayed: Array<Record<string, unknown>> = [];
+  const desktopRunner = {
+    async run(input: Record<string, unknown>) {
+      relayed.push(input);
+      return {
+        threadId: String(input.threadId),
+        turnId: "turn-desktop",
+        text: "desktop-relayed",
+        raw: "desktop"
+      };
+    },
+    async stop() {},
+    close() {}
+  };
   const runner = new HybridCodexRunner({
-    backend: "exec",
+    backend: "app-server",
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
-    timeoutMs: 2_000
+    timeoutMs: 2_000,
+    desktopRunner
   });
   t.after(() => runner.close());
-  const deltas: string[] = [];
 
   const result = await runner.run({
-    prompt: "stream",
-    cwd: fixturesDir,
-    onDelta: (delta) => {
-      deltas.push(delta);
-    }
+    prompt: "continue in Desktop",
+    cwd: "/tmp/project",
+    threadId: "thread-desktop-owned",
+    onApproval: async () => "accept"
   });
 
-  assert.deepEqual(deltas, ["reply:", "stream"]);
-  assert.equal(result.text, "reply:stream");
+  assert.equal(result.text, "desktop-relayed");
+  assert.equal(relayed.length, 1);
+  assert.equal(relayed[0]?.threadId, "thread-desktop-owned");
 });
 
-test("streaming fallback to exec sends only the final answer", async (t) => {
+test("refreshes the Desktop task list when a local app-server thread is created and completed", async (t) => {
+  const refreshedThreadIds: Array<string | undefined> = [];
+  const desktopRunner = {
+    async run() {
+      throw new Error("Desktop relay should not be used for a new thread");
+    },
+    async stop() {
+      return "not-active" as const;
+    },
+    async refreshTaskList(threadId?: string) {
+      refreshedThreadIds.push(threadId);
+    },
+    close() {}
+  };
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    timeoutMs: 2_000,
+    desktopRunner
+  });
+  t.after(() => runner.close());
+
+  const result = await runner.run({
+    prompt: "new Desktop-visible task",
+    cwd: "/tmp/project"
+  });
+
+  assert.equal(result.threadId, "thread-new");
+  assert.deepEqual(refreshedThreadIds, ["thread-new", "thread-new"]);
+});
+
+test("exec backend stays on codex exec even when streaming callbacks are present", async (t) => {
   const runner = new HybridCodexRunner({
     backend: "exec",
     codexBin: path.join(fixturesDir, "fake-codex-fallback.mjs"),
@@ -407,6 +627,18 @@ test("streaming fallback to exec sends only the final answer", async (t) => {
   });
 
   assert.deepEqual(deltas, []);
-  assert.match(result.text, /used codex exec fallback/i);
-  assert.match(result.text, /exec-new/);
+  assert.equal(result.text, "exec-new");
+});
+
+test("app-server backend never silently falls back to codex exec", async (t) => {
+  const runner = new HybridCodexRunner({
+    backend: "app-server",
+    codexBin: path.join(fixturesDir, "fake-codex-fallback.mjs"),
+    timeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  await assert.rejects(
+    runner.run({ prompt: "stream", cwd: fixturesDir }),
+    /app-server|initialize|exited|closed/i
+  );
 });

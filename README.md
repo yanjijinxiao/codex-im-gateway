@@ -9,13 +9,13 @@
 </p>
 
 <p align="center">
-  <strong>通过个人微信、企业微信和飞书连接本机 OpenAI Codex。</strong>
+  <strong>通过个人微信、企业微信、飞书和钉钉连接本机 OpenAI Codex。</strong>
 </p>
 
-`codex-channel-bridge` 是一个跨平台、本机运行的 Codex 消息桥接服务。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信或飞书渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
+`codex-channel-bridge` 是一个跨平台、本机运行的 Codex 消息桥接服务。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信、飞书或钉钉渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
 
 ```text
-个人微信 / 企业微信 / 飞书 <-> Codex Channel Bridge <-> 本机 Codex <-> 已绑定项目
+个人微信 / 企业微信 / 飞书 / 钉钉 <-> Codex Channel Bridge <-> 本机或远程 Codex Desktop <-> 已绑定项目
 ```
 
 服务与凭据都保存在本机，管理页面不会开放到局域网或公网。
@@ -48,7 +48,7 @@
 
 ### 4. 过程进度反馈
 
-过程进度默认开启。Codex 处理长任务时会持续向微信发送中间进度，Web 端则折叠显示处理过程和用时，最终答案保持完整。
+过程进度默认开启。Codex 接受任务后不设置 Agent 总时长上限，会一直运行到完成、主动停止或连接中断。Bridge 会展示可读 reasoning summary、命令/工具/文件步骤和最近结果，并定时刷新“正在思考”与累计用时；最终答案保持完整。原始隐藏推理不会发送到聊天渠道。
 
 <p align="center">
   <img src="docs/images/screenshots/wechat-process-progress.png" alt="Codex 长任务的微信过程进度反馈" width="420" />
@@ -56,9 +56,11 @@
 
 ### 5. 多消息渠道接入与管理
 
-一个服务可以并行运行多个个人微信、企业微信和飞书渠道。每个账号拥有独立的联系人授权、附件、会话、个人知识库和运行状态；移除个人微信账号时还可以选择保留历史，重新扫码后继续使用。
+一个服务可以并行运行多个个人微信、企业微信、飞书和钉钉渠道。每个账号拥有独立的联系人授权、附件、会话、个人知识库和运行状态；移除个人微信账号时还可以选择保留历史，重新扫码后继续使用。
 
-管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人和飞书企业自建应用。企业微信与飞书使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
+管理页的“添加渠道”同时支持个人微信扫码、企业微信智能机器人、飞书企业自建应用和钉钉企业内部应用。企业微信、飞书与钉钉使用官方长连接 SDK，不需要为本机服务配置公网回调地址。每个 Codex 项目都可以开启“任务结束通知”，选择任一已添加渠道和接收会话（或用户）ID；该项目下从聊天端或 Web 发起的任务，无论成功还是失败，结束后都会发送项目、任务和结果摘要。
+
+钉钉支持直接发送图片消息以及含图片的富文本消息。Bridge 会通过机器人消息文件接口解析 `downloadCode`，将图片保存到该账号独立的入站目录，再作为本机附件交给当前 Codex 会话；下载失败时会在原钉钉会话中明确提示，不会静默丢弃。
 
 聊天端任务需要运行命令、修改文件或申请额外权限时，审批请求会发回发起任务的同一账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝；10 分钟未回复会自动拒绝。审批编号按账号和联系人隔离，其他渠道或联系人不能代为处理。
 
@@ -118,7 +120,7 @@ npm run taskboard:codex
 
 这个命令会用所需的本机调试参数启动 Codex，并一次性在原生侧边栏“插件”下增加两个同级入口：
 
-- **渠道配置（消息渠道）**：打开 Codex Channel Bridge 管理页，可添加个人微信、企业微信和飞书。
+- **渠道配置（消息渠道）**：打开 Codex Channel Bridge 管理页，可添加个人微信、企业微信、飞书和钉钉。
 - **任务面板**：打开内置 Taskboard，继续使用当前项目和 Codex 会话上下文。
 
 两个入口共用 Codex 主工作区，不会额外打开浏览器侧栏。注入器负责保持入口有效，因此使用期间请保持该命令所在的终端运行；以后启动集成版 Codex 仍运行同一条命令即可。
@@ -143,8 +145,9 @@ npm run taskboard:codex
 - **个人微信**：无需外部后台配置，直接扫码登录；未知联系人仍需在管理页明确授权。
 - **企业微信**：在企业微信客户端创建智能机器人并启用 API 模式，将 Bot ID 和 Secret 填入管理页。
 - **飞书**：在飞书开放平台创建企业自建应用，启用机器人和长连接事件订阅，将 App ID 和 App Secret 填入管理页；如需同步原生快捷菜单，还要为应用身份开通 `application:application:patch` 权限。
+- **钉钉**：在钉钉开放平台创建企业内部应用，添加 Stream 模式机器人，将 Client ID（AppKey）和 Client Secret 填入管理页。收到消息后会在原消息上贴 `🤔思考中` 并在处理结束时撤回。填写可选的 AI Card 模板 ID 后，卡片会持续展示“正在思考”描述、最近命令/工具/文件步骤、可读 reasoning summary、累计用时和回答预览，并在完成时 finalize；表情或卡片接口异常不会阻断回复，卡片失败时会自动退回普通文本。网络协议可设为自动、固定 IPv4 或固定 IPv6；自动模式只在本轮开始前选路，一旦首个请求被接受，整轮问答的附件、表情、卡片进度和最终帧都会使用同一协议。
 
-企业微信和飞书都使用官方长连接 SDK，本机无需公网域名或回调地址。完整步骤、后台入口和接收 ID 获取方法见 [消息渠道与任务通知配置](./docs/channel-setup.md)。渠道凭据只保存在 `~/.codex-weixin/`，不会通过管理 API 返回浏览器。
+企业微信、飞书和钉钉都使用官方长连接 SDK，本机无需公网域名或回调地址。配置 AI Card 的钉钉渠道可以直接按 conversation/user ID 投放卡片；未配置模板或卡片投放失败时，出站回复退回入站消息携带的临时 `sessionWebhook`。完整步骤、后台入口和接收 ID 获取方法见 [消息渠道与任务通知配置](./docs/channel-setup.md)。渠道凭据只保存在 `~/.codex-weixin/`，不会通过管理 API 返回浏览器。
 
 每个渠道都可以在铅笔按钮打开的“渠道设置”中单独配置可用的会话、任务和问答模式，以及选中项目后的默认模式。问答优先使用当前项目绑定的知识库；项目未绑定时，可以不设置渠道默认，也可以直接选择该渠道已纳管的 Codex 项目，或选择一个独立 llm-wiki 目录。选择 Codex 项目时会以项目工作目录创建或复用同目录知识库；“知识库”页面还可以从 Codex 项目列表自动填入名称和根目录，并用系统原生目录选择器分别选择根目录、引擎目录和状态目录。保存时通过 llm-wiki 只读状态协议识别项目，不再依据是否存在 `wiki/` 猜测；运行时会优先自动发现所选项目内的 `.venv`、`tools/knowledge-base/.venv` 或 `skills/knowledge-base/.venv`，然后才使用显式引擎目录、`LLM_WIKI_BIN` 和服务 `PATH`，并验证只读检索能力。MCP 版 llm-wiki 直接使用 `search/get_document` 工具，只有 `status/search/trace` 的旧版 CLI 也可通过只读兼容层使用。同一设置页还可以配置可选 Webhook，并选择通用 JSON、企业微信、飞书/Lark、钉钉、Slack 或 Discord。配置后，该渠道每条成功收取或发出的消息都会按所选平台格式额外 POST 一次；未配置时不会发起请求。管理 API 只返回是否已配置和平台类型，不会把可能包含签名密钥的 Webhook 地址返回浏览器。详细格式见 [Webhook 镜像](./docs/channel-setup.md#webhook-镜像)。
 
@@ -184,7 +187,8 @@ npm run taskboard:codex
 - “删除”只删除本服务中的会话记录，不删除 Codex 自身保存的历史文件。
 - 微信中的 `/sessions` 会列出当前项目最近活跃的 10 个桥接或 Codex Desktop 会话、最近内容摘要和时间，并为每项生成 `R1`、`R2` 这类独立编号；发送 `/session R1` 会把真实 Codex thread 绑定到当前项目并继续对话。
 - 微信中的 `/new` 会立即在当前项目创建并绑定新的受管会话。
-- 同一个 Codex thread 在微信、企业微信、飞书、Web 或 Codex Desktop 中已有任务运行时，后续消息会按顺序排队并显示等待进度；前一条成功、失败、中断或超时后都会释放队列和“处理中”状态，不会并发覆盖同一会话。
+- 同一个 Codex thread 在微信、企业微信、飞书、钉钉、Web 或 Codex Desktop 中已有任务运行时，后续消息会按顺序排队并显示等待进度；已接受的 Agent 任务没有总时长上限，前一条成功、失败、中断或底层连接断开后才会释放队列和“处理中”状态，不会并发覆盖同一会话。
+- `/session R1` 绑定的是 Codex Desktop 正在持有的 thread 时，Bridge 会通过本机 Desktop follower IPC 转交消息并取回最终回复，不需要关闭桌面端任务，也不会再因 `active writer` 失败。
 
 ## 项目、运行任务与通知
 
@@ -214,6 +218,8 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 
 自然语言是默认入口：AI 以渠道认证的真实发送者、当前会话、项目、可用项目和当前 Issue 上下文做语义识别，再把通过结构化白名单校验的单一或组合意图映射到同一工作流；不依赖固定关键词，也不会直接执行模型自由生成的命令。组合意图最多包含四个有序动作，任一步低置信度或结构不合法时整组不执行；执行时每一步都会重新检查项目和渠道模式，遇到不可用步骤立即停止。斜杠命令是确定性、可脚本化且不经过 AI 识别的底层能力。Taskboard 是状态唯一事实源：聊天只维护当前项目和当前 Issue 上下文；“记录”以及阻塞、验收等里程碑会写回 Issue，普通讨论仍留在 Codex thread。飞书会把 Taskboard Issue 显示为交互卡片，并按状态提供“开始处理”“查看详情”“提交验收”“通过”“退回”等按钮；按钮回调也执行下列同一组命令。
 
+远程项目直接复用 Codex Desktop 注册的 `hostId`。Bridge 通过系统 SSH 配置连接对应主机，并把请求转发到远端 Desktop 的 app-server 控制端，因此远程新会话、历史读取和已有 thread 继续执行都保留在同一主机。请先确保 Codex Desktop 中该远程主机处于已连接状态，且终端中可用同一 SSH 主机别名免交互登录；Bridge 不保存 SSH 密码或私钥内容。
+
 ```text
 /help            /h           查看命令
 /status          /st          查看当前会话、工作目录、thread、backend、实际模型和推理强度
@@ -223,8 +229,8 @@ Taskboard 已完整内置在当前仓库的 `taskboard/` 工作区，包含本�
 /memory forget K1 /mem f K1   删除一条个人知识
 /memory clear     /mem c      清空个人知识库（需要再次确认）
 /project list    /p l         查看此微信账号已绑定的 Codex 项目
-/project add     /p a         查看可从 Codex 历史添加的项目
-/project add C1  /p a C1      按 C 编号添加 Codex 历史项目
+/project add     /p a         查看 Codex Desktop 中登记的项目
+/project add C1  /p a C1      按 C 编号添加本机或远程 Codex Desktop 项目
 /project P1      /p P1        切换已绑定项目
 /project switch 完整项目名    按名称切换已绑定项目
 /project rename P1|名称 /p rn P1|名称  重命名项目
@@ -362,9 +368,11 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 ## Codex 后端
 
-默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；如果 app-server 无法启动、握手或处理请求，会自动回退到 `codex exec` 或 `codex exec resume`。
+Bridge 只暴露两个 Codex 执行后端：`codex exec` 与 `app-server`。默认的 `codexBackend` 是 `auto`，新会话和已有会话优先使用 app-server；只有不依赖审批、动态工具、结构化输出或用户输入的 turn，才会在 app-server 不可用时降级到 `codex exec` / `codex exec resume`。固定为 `app-server` 时绝不静默降级，固定为 `exec` 时也不会因为开启过程回复而暗中切换后端。
 
-聊天端发起的 app-server turn 使用 `approvalPolicy: "on-request"`。Codex 请求运行命令、修改文件或增加权限时，桥接服务会把请求路由到原账号、原联系人并等待 `/approve` 或 `/reject`；超时、发送失败或找不到对应任务时安全拒绝。带渠道审批的任务不会回退到无法交互审批的 `codex exec`。管理页保存的 `codexExecSandbox` 是兼容旧版本保留的字段名，现在会同时应用到 app-server 主路径和 exec 回退路径；选择“完整访问”时，新建及已绑定会话的后续回合都会以 `danger-full-access` 运行。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
+`codexAppServerTransport` 控制 app-server 后端的连接方式：`auto` 优先连接 Codex managed daemon，当前安装没有 managed standalone 可执行文件时使用一个持久的 `codex app-server --stdio` 子进程；`daemon` 强制执行 `app-server daemon start` 并通过 `app-server proxy` 连接；`stdio` 强制使用独立子进程。Codex Desktop 已持有某个 thread 的写入权时，Bridge 可通过 Desktop relay 继续该 thread，但 relay 是 app-server 后端的内部续接通道，不是第三种后端。远程 Desktop 项目仅支持 `auto` 或 `app-server`。
+
+聊天端发起的 app-server turn 使用 `approvalPolicy: "on-request"`。Codex 请求运行命令、修改文件或增加权限时，桥接服务会把请求路由到原账号、原联系人并等待 `/approve` 或 `/reject`；超时、发送失败或找不到对应任务时安全拒绝。管理页保存的 `codexExecSandbox` 是兼容旧版本保留的字段名，会同时应用到两个后端；选择“完整访问”时，新建及已绑定会话的后续回合都会以 `danger-full-access` 运行。详细边界见 [Codex 后端架构](docs/codex-backends.md)。
 
 ## 模型和推理强度
 

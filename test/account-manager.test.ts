@@ -329,13 +329,25 @@ test("adds redacted enterprise channels and stops them cleanly", async (t) => {
     appId: "cli_app_123",
     appSecret: "feishu-secret"
   });
+  const dingtalk = await manager.addChannelAccount({
+    channel: "dingtalk",
+    clientId: "ding_app_123",
+    clientSecret: "dingtalk-secret",
+    cardTemplateId: "card-template.schema",
+    networkFamily: "ipv6"
+  });
 
   assert.equal(wecom.channel, "wecom");
   assert.equal("secret" in wecom, false);
   assert.equal(feishu.channel, "feishu");
   assert.equal("appSecret" in feishu, false);
+  assert.equal(dingtalk.channel, "dingtalk");
+  assert.equal("clientSecret" in dingtalk, false);
+  assert.equal(dingtalk.cardTemplateId, "card-template.schema");
+  assert.equal(dingtalk.networkFamily, "ipv6");
   await manager.stopAccount(wecom.accountId, false);
   await manager.stopAccount(feishu.accountId, false);
+  await manager.stopAccount(dingtalk.accountId, false);
 });
 
 test("routes a native Feishu menu click through the actor's authorized conversation", async (t) => {
@@ -1005,7 +1017,7 @@ test("Web turns learn and reuse the owning WeChat account knowledge", async (t) 
 
   setRunHandler(async (input) => ({ raw: "", text: "开始检查。", threadId: String(input.threadId) }));
   await manager.continueSession("account-one", session.id, "准备交付");
-  assert.match(String(runs[1].prompt), /交付前运行测试、类型检查和构建/);
+  assert.match(String(runs[1].developerInstructions), /交付前运行测试、类型检查和构建/);
 });
 
 test("uses WeChat session model overrides when continuing the same session from Web", async (t) => {
