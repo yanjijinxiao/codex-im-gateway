@@ -9,50 +9,61 @@
 </p>
 
 <p align="center">
-  <strong>Connect WeChat, Enterprise WeChat, Feishu, and DingTalk to a local OpenAI Codex installation.</strong>
+  <strong>Use local or remote OpenAI Codex from WeChat, Enterprise WeChat, Feishu, and DingTalk.</strong>
 </p>
 
-`codex-im-gateway` is a cross-platform, local-only instant-messaging gateway for Codex. Its Web console adds personal WeChat, Enterprise WeChat, Feishu, and DingTalk channels, manages projects and bound sessions, and configures task-completion notifications.
+`codex-im-gateway` is a cross-platform, local instant-messaging gateway. It connects multiple messaging channels to one project, session, and task lifecycle while supporting both Codex CLI and Codex Desktop/app-server backends.
 
 ```text
-WeChat / Enterprise WeChat / Feishu / DingTalk <-> Codex IM Gateway <-> Codex CLI or local/remote Codex Desktop <-> bound projects
+WeChat / Enterprise WeChat / Feishu / DingTalk
+                       │
+                       ▼
+               Codex IM Gateway
+               ├─ Project and session routing
+               ├─ Long-task progress and approvals
+               ├─ Attachments, notifications, knowledge
+               └─ Local Web management
+                       │
+                       ▼
+            Codex CLI / Codex Desktop
+            Local projects / remote SSH projects
 ```
 
-Service data and credentials remain local. The management page is never exposed to the LAN or public Internet.
+The service binds only to `127.0.0.1`. Channel credentials, attachments, session bindings, and personal knowledge remain local.
 
-## Feature status
+## Core capabilities
 
-Screenshots live under `docs/images/screenshots/`. The Web management screenshot is included; rows that require a phone view reserve stable filenames for later WeChat captures.
+- **One gateway for multiple channels**: Personal WeChat, Enterprise WeChat, Feishu, and DingTalk run in parallel with account-isolated projects, sessions, approvals, and notifications.
+- **Two Codex backends**: One interface covers `codex exec` and `app-server`, including Codex Desktop-owned threads and remote projects discovered from Desktop host metadata.
+- **Project and session management**: Discover local and remote projects from Codex Desktop and Codex session data; bind, switch, create, resume, queue, and validate archived or missing sessions.
+- **Long-running agent tasks**: Accepted tasks have no fixed overall timeout. Channels receive readable progress, tool state, and elapsed time while the final answer remains intact.
+- **Media, approvals, and notifications**: Handle images, voice, video, and files according to channel capabilities. Command, file-change, and permission approvals return to the originating account and conversation.
+- **Local management and extensions**: Manage channels, projects, sessions, models, and notifications from a Web console. An embedded Taskboard and declarative Skill capabilities can extend the channel workbench.
 
-| Status | Feature | Details | Screenshot |
+## Supported channels
+
+All four channels share the same project and session lifecycle. Native interaction follows each platform's capabilities.
+
+| Channel | Connection | Input and interaction | Channel-specific experience |
 | --- | --- | --- | --- |
-| ✅ | Local Web management | A `127.0.0.1`-only page manages WeChat accounts, sessions, workspaces, and Codex settings. | [Web sessions](docs/images/screenshots/web-session-management.png) |
-| ✅ | Multiple WeChat accounts | One service runs multiple accounts with local remarks and isolated authorization, attachments, sessions, and personal knowledge; account removal can retain history. | [Web sessions](docs/images/screenshots/web-session-management.png) |
-| ✅ | Enterprise channels | Enterprise WeChat, Feishu, and DingTalk bots connect through official long-connection SDKs without a public callback URL. | Pending: `docs/images/screenshots/web-channels.png` |
-| ✅ | Projects and live tasks | Projects show bound sessions and currently running tasks while monitoring Codex Desktop, Web, and chat session state. | [Web sessions](docs/images/screenshots/web-session-management.png) |
-| ✅ | Completion notifications | Each project can notify a selected channel recipient when a task succeeds, fails, or is interrupted. | Pending: `docs/images/screenshots/web-notifications.png` |
-| ✅ | Browser QR connection | Shows waiting, scanned, connected, and expired QR states. | Pending: `docs/images/screenshots/wechat-qr-login.png` |
-| ✅ | Session management | Grouped account tabs, Markdown history, continued Codex threads, and create, rename, activate, reset, and delete actions. | [Web sessions](docs/images/screenshots/web-session-management.png) |
-| ✅ | Web text and attachments | Send text with up to 10 files (100 MiB total), with media playback, preview, and download in history. | Pending: `docs/images/screenshots/web-attachments.png` |
-| ✅ | Channel chat control | Supports regular messages plus project, session, knowledge, model, progress, approval, and interruption commands across personal WeChat, Enterprise WeChat, Feishu, and DingTalk. | Pending: `docs/images/screenshots/wechat-chat.png` |
-| ✅ | Channel approvals | Command, file-change, and additional-permission approvals return to the originating account and sender with isolated approve/reject commands and a safe timeout. | Pending: `docs/images/screenshots/wechat-approval.png` |
-| ✅ | Per-account personal knowledge | Each WeChat account automatically learns reusable preferences, skills, knowledge, and workflows, then injects relevant entries into later WeChat and Web turns without sharing across accounts. | Pending: `docs/images/screenshots/wechat-memory.png` |
-| ✅ | WeChat media input | Accepts transcribed voice, images, audio, video, and files up to 100 MiB each, with a direct notice when the limit is exceeded. | Pending: `docs/images/screenshots/wechat-media-input.png` |
-| ✅ | DingTalk image input | Downloads `picture` and image-bearing `richText` messages into the account inbound directory and passes them to the active Codex session, with explicit failure feedback. | Pending: `docs/images/screenshots/dingtalk-image-input.png` |
-| ✅ | File delivery to WeChat | Codex can return local images, videos, and files as native WeChat messages. | Pending: `docs/images/screenshots/wechat-media-output.png` |
-| ✅ | Models and reasoning effort | Model-aware dropdowns loaded from app-server, including GPT-5.6 Sol, Terra, and Luna for IkunCoding. | Pending: `docs/images/screenshots/web-model-settings.png` |
-| ✅ | Process progress | Enabled by default; Codex progress reaches WeChat immediately and appears in a collapsible Web timeline with elapsed time, while final answers stay intact. | Pending: `docs/images/screenshots/web-process-progress.png` |
-| ✅ | Typing state and deduplication | Web typing state plus persistent sync cursors and message IDs prevent duplicate replies. | Pending: `docs/images/screenshots/wechat-typing.png` |
-| ✅ | Explicit Codex backends | Strict `exec` and `app-server` engines, safe `auto` fallback, and daemon/stdio app-server transports. | [Backend architecture](docs/codex-backends.md) |
-| ✅ | Local source operation | Installs locked dependencies, builds locally, and runs directly with Node.js; the project is not published as an npm package. | [Local run guide](docs/local-run.md) |
+| Personal WeChat | QR login / iLink | Text, images, voice, video, files | Voice transcription, native media transfer, typing state |
+| Enterprise WeChat | Official smart-bot long connection | Text and bot messages | No public callback, approvals, task notifications |
+| Feishu | Enterprise app long connection | Text, menus, cards, buttons, forms | Native project/task workbench and in-place card updates |
+| DingTalk | Internal app in Stream mode | Text, images, rich text, AI Cards | Thinking state, streaming card progress, text fallback |
 
-## Web management preview
+Platform capabilities and setup requirements may change with official APIs. See [channel setup](./docs/channel-setup.md).
+
+## Web management
 
 <p align="center">
   <img src="docs/images/screenshots/web-session-management.png" alt="Codex IM Gateway Web session management" width="100%" />
 </p>
 
-## Requirements
+The console adds and controls channels, authorizes senders, binds projects, displays sessions and running tasks, resumes conversations, and configures models, reasoning effort, progress, and completion notifications.
+
+## Quick start
+
+### Requirements
 
 - Node.js `>=22`
 - Git
@@ -61,12 +72,11 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 ```bash
 npm install -g @openai/codex
 codex --version
-codex
 ```
 
-## Run locally
+### Install and run
 
-This project is available only as GitHub source. It is not published as an npm package; do not run `npm install -g codex-im-gateway` or `npm publish`.
+The project is distributed as GitHub source and is not published as an npm package.
 
 ```bash
 git clone https://github.com/yanjijinxiao/codex-im-gateway.git
@@ -76,213 +86,93 @@ npm run build
 node dist/server/index.js
 ```
 
-Here npm only installs locked dependencies and runs the build; it does not install or start this service. Node.js starts the service directly and opens [http://127.0.0.1:8787](http://127.0.0.1:8787). See the [local run guide](./docs/local-run.md) for update, start, and stop instructions.
+The service opens [http://127.0.0.1:8787](http://127.0.0.1:8787) by default. npm only installs locked dependencies and builds the project; it does not globally install or publish the service.
 
-## One-command Codex integration
-
-After building locally and starting the Bridge as described above, run this command from the repository root:
-
-```bash
-npm run taskboard:codex
-```
-
-It launches Codex with the required local debugging flags and adds built-in peer entries below Plugins in the native sidebar:
-
-- **Channel Configuration (Message Channels)** opens the Codex IM Gateway console for Personal WeChat, Enterprise WeChat, Feishu, and DingTalk.
-- **Taskboard** opens the embedded board while retaining the current Codex project and conversation context.
-
-Both built-in entries and optional entries declared by installed Skills use the Codex main workspace instead of opening a separate browser side panel. Keep the command's terminal running while using the integration, because the injector keeps the entries attached. Use the same command whenever you want to launch the integrated Codex window again.
-
-If Codex was launched from the Dock or Finder and the sidebar shows only an older Taskboard entry, quit Codex completely, stop the old injector terminal, and rerun the command from the **current repository root**. An already-running Codex process cannot gain a debugging port after launch, which is the usual cause of a stale single-entry sidebar.
-
-For a first-time setup, use this sequence to build, start the Bridge, and integrate Codex:
+To prepare the embedded Taskboard, `taskctl`, and bundled Skills as well:
 
 ```bash
 npm run install:local
 node dist/server/index.js
-# In another terminal, from the same repository:
+```
+
+See the [local run guide](./docs/local-run.md) for background services, updates, and shutdown instructions.
+
+## Add a channel and start chatting
+
+1. Open the management page and select **Add Channel**.
+2. Choose Personal WeChat, Enterprise WeChat, Feishu, or DingTalk, then scan or enter the required application credentials.
+3. Send one message to the bot. If the channel requires authorization, allow the sender or conversation in the console.
+4. Send `/project add` to list Codex Desktop projects, then `/project add C1` to bind one.
+5. Send a regular message to start. Use `/new` for a new session, or `/sessions` and `/session R1` to resume an existing session.
+
+Common commands:
+
+```text
+/help                       Show all commands
+/status                     Show project, session, backend, model, and task status
+/project                    List bound projects
+/project add                List available local or remote Desktop projects
+/project add C1             Bind a project
+/project P1                 Switch project
+/sessions                   List recent sessions in the current project
+/session R1                 Bind and resume a session
+/new                        Create a session
+/model                      Inspect or switch model
+/effort                     Inspect or switch reasoning effort
+/stream                     Configure process progress
+/stop                       Interrupt the current task
+```
+
+Remote projects reuse the `hostId` stored by Codex Desktop and the local SSH configuration. The gateway never stores SSH passwords or private-key contents. See the [channel project workbench](./docs/channel-project-modes.md) for projects, modes, and Taskboard interaction.
+
+## Codex backends
+
+Channels use one project, session, execution, history, approval, and status interface backed by two implementations:
+
+| Backend | Best for | Main capabilities |
+| --- | --- | --- |
+| `app-server` | Codex Desktop, new sessions, interactive tasks, remote projects | Project registry, thread lifecycle, streamed events, approvals, dynamic tools, Desktop relay |
+| `codex exec` | Local non-interactive CLI tasks and compatible fallback | `codex exec` / `codex exec resume`, structured final results |
+
+`codexBackend: "auto"` prefers app-server. It falls back to `codex exec` only for turns that do not require approvals, dynamic tools, structured output, or user input. A pinned backend never switches silently. See [Codex backend architecture](./docs/codex-backends.md) for the full interface and routing contract.
+
+## Long tasks, progress, and session lifecycle
+
+- Once accepted, an agent task runs until completion, explicit `/stop`, or transport failure. Its total lifetime is not extended only when activity occurs.
+- The gateway shows readable Codex reasoning summaries, commentary, tool/command/file state, and recent results. Hidden raw reasoning is never forwarded.
+- Messages targeting a thread already running in another channel, the Web console, or Codex Desktop wait in order instead of writing concurrently.
+- Active, running, archived, missing, and system-error session states pass through the backend lifecycle contract. Archived sessions are omitted from the resumable list and return a clear error when addressed.
+- Native cards update in place when available. Card failures fall back to text without blocking the final reply.
+
+## Codex Desktop integration
+
+After building and starting the gateway, run this command from the repository root:
+
+```bash
 npm run taskboard:codex
 ```
 
-After a successful launch, both Channel Configuration and Taskboard should be visible. The Bridge console is at [http://127.0.0.1:8787](http://127.0.0.1:8787), and Taskboard is at [http://127.0.0.1:47823](http://127.0.0.1:47823).
+It launches Codex with local debugging flags and adds **Channel Configuration** and **Taskboard** entries to the native sidebar. It does not modify Codex application files. Keep the launcher terminal running while using the integration. See the [embedded Taskboard guide](./docs/taskboard-module.md) for installation, data, and rollback details.
 
-## Add a message channel
+## Local data and migration
 
-Select **Add Channel** in the Web console:
-
-- **Personal WeChat**: scan the QR code; unknown senders still require explicit authorization in the console.
-- **Enterprise WeChat**: create a smart bot in API mode and enter its Bot ID and Secret.
-- **Feishu**: create a custom app, enable its bot and long-connection event subscription, then enter its App ID and App Secret.
-- **DingTalk**: create an internal app, enable a Stream-mode bot, then enter its Client ID and Client Secret. Bridge attaches a `🤔 Thinking` emotion to the original message while processing and recalls it afterward. An optional AI Card template ID shows the current thinking description, recent command/tool/file steps, readable reasoning summaries, elapsed time, and answer preview in one finalized card, with automatic text fallback; emotion failures never block the reply.
-
-Enterprise WeChat, Feishu, and DingTalk use official long-connection SDKs, so the local service needs no public domain or callback URL. A DingTalk channel with AI Card enabled can deliver directly to a recorded conversation/user ID. Without a template, or when card delivery fails, replies fall back to the temporary inbound `sessionWebhook`. See [Message channel and task notification setup](./docs/channel-setup.md) for complete steps and official console links. Credentials stay under `~/.codex-weixin/` and are never returned by the management API.
-
-Each channel also has an optional Webhook under the pencil **Channel Settings** action. When configured, every successfully received or sent channel message is mirrored once as a JSON POST; no request is made when it is left unconfigured. The management API exposes only the configured status and never returns the potentially secret-bearing URL. See [Webhook mirroring](./docs/channel-setup.md#webhook-mirroring) for the event format.
-
-When a chat-started task needs permission to run a command, change files, or gain additional access, the request returns to the same channel account and sender. Reply with `/approve A1` (`/ok A1`) to approve once or `/reject A1` (`/no A1`) to decline. Unanswered requests are declined after ten minutes, and another sender or account cannot act on the request.
-
-## First personal WeChat connection
-
-1. Open Settings and confirm the default and allowed Codex workspaces.
-2. Select Add WeChat, scan the QR code, and confirm in WeChat.
-3. Send any message to the connected account.
-4. Return to WeChat Accounts and allow the pending sender.
-5. Send the message again to start a Codex turn.
-
-Repeat the QR flow to add more accounts. Every account has its own monitor, sender authorization, inbound directory, and managed-session state. A failed account does not stop the others. Scanning the same WeChat account again after an expired login refreshes the existing credentials while preserving its local remark, authorization, and sessions instead of creating an empty duplicate. Account removal can retain history: credentials are deleted immediately, while a later scan by the same WeChat user restores the previous remark, authorization, and managed sessions.
-
-## Session management
-
-The Sessions page manages conversations created and used by this server. It does not scan or take ownership of every Codex conversation created in other terminals.
-
-Selecting a session reads its user messages and final replies from Codex's own persisted thread. The controls below the chat title select a model, reasoning effort, and process-progress behavior for the current session or keep inheriting global settings; they share the same session configuration used by the WeChat `/model`, `/effort`, and `/stream` commands. Accepted agent turns have no overall execution deadline: they run until completion, explicit interruption, or transport failure. Process progress is enabled by default, shows safe tool/file status plus readable reasoning summaries (never hidden raw reasoning), appears in a collapsible Web timeline with elapsed time, and leaves the final answer as one stable response. The Web composer can submit text and multiple files as one turn and continues that same thread, so context remains shared with later WeChat messages. Uploads are isolated by account and session under `~/.codex-weixin/inbound/`, with at most 10 files and 100 MiB total per turn.
-
-The UI uses local remarks instead of treating internal IDs as account names. Expand “Account IDs” on an account card to inspect its iLink Bot ID and User ID; Codex thread IDs remain hidden from the regular UI. Each account can have a local remark edited from the WeChat Accounts page; the remark is reused by session tabs, with `WeChat Account 1` used only as a fallback. The current QR and messaging APIs do not expose WeChat nicknames, avatars, or a profile lookup endpoint, so the page uses a default icon.
-
-- Each authorized WeChat account has one active session and may own multiple named sessions.
-- Activate chooses which Codex thread receives the sender's next message.
-- Reset clears the recorded thread so the next message starts fresh context.
-- Delete removes only the bridge record, not Codex's own history files.
-- `/sessions` lists up to ten recently active bridge or Codex Desktop sessions from the current project; `/session R1` binds the real Codex thread and continues it. `/resume` remains a compatibility alias.
-- `/new` creates and binds a new managed session inside the current project.
-- When `/session R1` binds a thread owned by Codex Desktop, Bridge relays turns through the local Desktop follower IPC and returns the final reply without requiring the Desktop task to be closed or failing on `active writer`.
-
-## Projects, running tasks, and notifications
-
-- Projects are selected from local Codex history and grouped by working directory. Switching projects limits the session list to that project's ten most recently active sessions.
-- The console shows bound sessions and currently running tasks while monitoring Codex Desktop, Web, and chat session lifecycle changes.
-- Each project can send completion summaries to a selected channel recipient after success, failure, or interruption.
-- A green bell and “Notifications enabled” badge confirm the setting. The task count represents live tasks, not historical sessions.
-
-Channel users select a project once, then use native controls to enter the session, task, or Q&A modes enabled for that channel account; project selection enters the configured default mode. Task mode resolves the Taskboard project by the selected project's absolute workspace and does not require an existing Codex session. Q&A prefers the project's bound knowledge base and otherwise uses the channel account's managed knowledge base or validated llm-wiki directory while keeping the selected project as the working directory. Plan mode and goals belong to the current project's active thread and never fall through to a thread from another project. See the [channel project workbench specification](./docs/channel-project-modes.md) for the state and acceptance contract.
-
-## Taskboard integration
-
-Taskboard is fully embedded in this repository under the `taskboard/` workspace, including the local service, React management UI, `taskctl` CLI, Codex Skill, Cloud/injection scripts, and tests. The bridge starts `http://127.0.0.1:47823` with the main service and closes it during shutdown or restart; data is stored under `~/.codex-weixin/taskboard/`. Running `npm install` and `npm run build` at the repository root installs and builds both the bridge and Taskboard without an external repository or Git submodule.
-
-The management header includes a Taskboard tab that switches the current main area to the configured loopback Taskboard without opening another window. Switching back to Channels, Sessions, or Settings restores the corresponding Bridge view.
-
-The Settings page connects to `http://127.0.0.1:47823` by default and maps Codex projects to Taskboard projects by absolute workspace path. Taskboard remains the single source of truth for issue state; the bridge does not copy board issues into its own state files. Issues without a real Codex thread are read-only, blocking and review require evidence, and completion requires explicit acceptance. Only HTTP loopback origins are accepted. The configured `manage-taskboard` Skill and `taskctl` command point directly to this repository's `taskboard/` workspace.
-
-Running `npm run install:local` links every directory under `taskboard/skills/*` that contains `SKILL.md`, plus `taskboard/cli/taskctl.mjs`, into the user environment. The installer discovers bundled Skills by directory and contains no business-Skill list. `manage-weekly-report` is one declarative extension example: it collects read-only evidence from the current conversation and Taskboard, then connects the confirmed report to the local renderer and an unsent WeCom email draft. Useful commands: `npm run taskboard:start` starts a standalone local service, `npm run taskboard:taskctl -- project list --json` invokes the CLI, and `npm run taskboard:check` runs Taskboard verification.
-
-Launching the normal Codex app through `taskboard/scripts/codex-injector.mjs --launch --watch` adds native-looking peer navigation entries below Plugins. **Taskboard** and **Channel Configuration** are built in; installed Skill manifests can add optional loopback entries to the same Codex main workspace through the read-only `/api/channel-capabilities` endpoint. The injector refreshes those entries every five seconds and never opens a separate browser side panel. Current Codex Chromium builds enforce Local Network Access checks for loopback iframes, so the launcher supplies `--disable-features=LocalNetworkAccessChecks`; an already-running Dock-launched process without a debugging port cannot be injected in place. A resident background injector can add `--adopt-normal-launch`; when installed while Codex is already open, add `--defer-existing` so it preserves the current window and briefly relaunches the next normal opening with the required flags before injecting it.
-
-## Message-channel commands
-
-Natural language is the default entry point. The classifier receives the authenticated channel actor separately from the conversation that owns project and mode state, so a shared chat never turns its room ID into a user identity. It may return one action or an ordered sequence of up to four allow-listed actions, such as switching projects and then opening that project's tasks. Every action must pass the strict schema and confidence threshold; otherwise the entire decision falls back to ordinary Codex chat. During execution, project and enabled-mode guards are checked before each step and the sequence stops at the first unavailable step. Slash commands remain the deterministic, scriptable low-level interface and bypass AI classification.
-
-Remote projects reuse the `hostId` registered by Codex Desktop. Bridge connects through the matching system SSH configuration and relays requests to the remote Desktop app-server control endpoint, keeping new sessions, history reads, and resumed threads on that host. The host must already be connected in Codex Desktop and its SSH alias must support non-interactive login. Bridge does not store SSH passwords or private-key contents.
-
-```text
-/help            /h           Show commands
-/status          /st          Show session, workspace, thread, backend, effective model, and reasoning effort
-/balance         /bal         Show the current Codex login plan, remaining limits, and reset times
-/memory          /mem         Show this WeChat account's personal knowledge
-/memory <on|off>              Enable or disable automatic learning and injection
-/memory forget K1 /mem f K1   Delete one knowledge entry
-/memory clear     /mem c      Clear personal knowledge after confirmation
-/project list    /p l         List projects bound to this WeChat account
-/project add     /p a         List projects registered by Codex Desktop
-/project add C1  /p a C1      Add a local or remote Codex Desktop project by C code
-/project P1      /p P1        Switch to a bound project
-/project rename P1|name /p rn P1|name  Rename a project
-/project delete P1      /p d P1        Remove a project with no running tasks
-/mode [session|task|qa] /v    Show or switch the selected project's work mode
-/qa                /q        Enter Q&A mode with the project-bound or channel-default llm-wiki knowledge base
-/plan [on|off]               Switch the current session's native Codex plan mode
-/goal [objective|pause|resume|complete|clear] Manage the current thread's Codex goal
-/task            /tb          List unfinished Taskboard issues in the current project
-/task ISSUE                   Bind and continue the issue's Codex thread
-/task new title               Create, claim, and start a new issue
-/task start ISSUE             Claim and start an existing issue
-/task comment ISSUE text      Add a thread-attributed comment and optional attachments
-/task attach ISSUE            Upload the current message attachments
-/task block ISSUE reason      Record the blocker and mark the issue blocked
-/task review ISSUE            Verify, record evidence, and submit for review
-/task accept ISSUE            Complete only after explicit user acceptance
-/sessions        /ss          List the current project's ten most recent sessions
-/session R1      /s R1        Bind and continue a session from the current project
-/new             /n           Create and bind a session in the current project
-/resume R1       /r R1        Compatibility alias for session listing and switching
-/model           /m           Show the current and available models
-/model <number|model|default>  Switch this session's model or restore inheritance
-/effort          /e           Show reasoning efforts supported by the current model
-/effort <number|level|default> Switch this session's effort or restore inheritance
-/stream          /str         Show this session's process-progress setting
-/stream <on|off|default>       Enable, disable, or restore global process progress
-/prompt start    /pp s        Buffer multiple WeChat messages
-/prompt done     /pp d        Submit the buffer as one Codex turn
-/approve A1      /ok A1       Approve one Codex request received in this channel
-/reject A1       /no A1       Decline a Codex request received in this channel
-/stop            /x           Interrupt the current Codex task
-```
-
-### Post-installed Skill capabilities
-
-The Bridge core does not import business Skills. An installed Skill may add `channel-capability.json` next to its `SKILL.md` to declare slash-command aliases, help text, bounded operations, optional natural-language actions, and an optional loopback sidebar entry. The manifest is strict data only: it cannot name a module, script, shell command, HTML, CSS, or arbitrary filesystem path. Invocation uses the validated `name` in `SKILL.md` frontmatter rather than assuming it matches the install directory; extension iframes cannot use Taskboard's privileged thread or automation host protocol, and receive clipboard access only when `sidebar.allowClipboard` is explicitly `true`.
-
-The generic provider validates installed manifests at the beginning of each inbound message and reuses that immutable snapshot for parsing, help, the classifier output schema, post-model validation, and execution. Installing, updating, or removing a Skill therefore applies to the next message without restarting the Bridge. Built-in commands and actions always win; invalid, oversized, unsupported, remote, duplicate, or conflicting manifests fail closed. Operations marked `confirmation: "explicit"` still rely on the Skill to verify domain state and user confirmation before any external side effect.
-
-Bundled extensions need only a `taskboard/skills/<skill>/{SKILL.md,channel-capability.json}` directory. `npm run install:local` discovers and links it automatically; adding another extension must not require editing `src/`, the installer, or the Codex injector. The weekly-report package at `taskboard/skills/manage-weekly-report/channel-capability.json` is the reference manifest.
-
-Regular messages enter the active session. Images, files, videos, and voice/audio without transcription are saved under the account's inbound directory and added to the prompt by local path. WeChat voice transcription is preferred when available.
-
-After each turn, Codex may extract up to three durable entries from explicit preferences, reusable work techniques, stable domain knowledge, or repeatable workflows. Account-scoped entries work across that account's projects, while project-scoped entries stay in their project. Duplicate titles are updated instead of appended, with a maximum of 200 entries. Passwords, tokens, API keys, private keys, and transient task status are excluded. Relevant knowledge is available to both WeChat and Web turns for the same account and is never shared with another WeChat account.
-
-## Sending local files
-
-Codex can request local-file delivery in its final response:
-
-````text
-```codex-im-gateway-actions
-{
-  "send": [
-    { "type": "image", "path": "/absolute/path/chart.png" },
-    { "type": "video", "path": "/absolute/path/demo.mp4" },
-    { "type": "file", "path": "/absolute/path/report.pdf" }
-  ]
-}
-```
-````
-
-Only absolute local paths are accepted. Native outbound types are `image`, `video`, and `file`; audio is sent as a regular file. Remote URLs are not uploaded as local files.
-
-## Codex backend
-
-Bridge exposes exactly two Codex execution backends: `codex exec` and `app-server`. The default `codexBackend` is `auto`: new and resumed turns prefer app-server, and only turns that do not require approvals, dynamic tools, structured output, or user input may fall back to `codex exec` / `codex exec resume`. Pinning `app-server` disables silent fallback; pinning `exec` no longer switches to app-server merely because progress callbacks are enabled.
-
-`codexAppServerTransport` selects how the app-server backend connects. `auto` prefers the managed Codex daemon and uses one persistent `codex app-server --stdio` child when the managed standalone executable is unavailable. `daemon` requires `app-server daemon start` and connects through `app-server proxy`; `stdio` always uses a private child. When Codex Desktop already owns a thread writer, the Desktop relay may continue that thread as an internal app-server continuation path—it is not a third backend. Remote Desktop projects require `auto` or `app-server`.
-
-Chat-started app-server turns use `approvalPolicy: "on-request"`. Command, file-change, and additional-permission requests are routed back to the originating account and sender and wait for `/approve` or `/reject`; timeout, delivery failure, or a missing owning turn safely declines the request. The legacy-named `codexExecSandbox` setting applies to both engines. See [Codex backend architecture](docs/codex-backends.md) for the contract and routing boundaries.
-
-## Models and reasoning effort
-
-The Settings page loads available models and model-specific reasoning efforts from Codex app-server. Leaving a field on "Use Codex settings" preserves the Codex configuration; choosing and saving an explicit value applies it to later Web and WeChat turns.
-
-Send `/model` or `/effort` in WeChat to get a numbered list, then switch by number or exact ID. A WeChat-side selection applies only to the active managed session, without affecting other accounts, senders, or sessions. `/model default` and `/effort default` restore inheritance from Web/Codex settings. Continuing that session from the Web page uses the same session overrides.
-
-The IkunCoding provider also exposes `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. These options remain available after switching to another model in both the Web dropdown and WeChat `/model` list. Send `/status` in WeChat to inspect the effective model and reasoning effort.
-
-## Local data
-
-Service state and the default Codex workspace share this directory:
+New installations default to:
 
 ```text
 ~/.codex-im-gateway/
-  accounts/                 One credential file per WeChat account
-  retained-accounts.json    Recovery index for removed accounts; never stores tokens
-  runtime/<account-id>/     Sender authorization, managed sessions, and personal knowledge
-  inbound/<account-id>/     Inbound WeChat attachments
-  config.json               Codex and workspace configuration
-  logs/
+  accounts/                 Channel credentials
+  runtime/<account-id>/     Authorization, projects, sessions, personal knowledge
+  inbound/<account-id>/     Inbound attachments
+  config.json               Codex, backend, and workspace configuration
+  logs/                     Local service logs
+  taskboard/                Embedded Taskboard data
 ```
 
-Do not commit or share this directory. The management API never returns WeChat tokens to the browser. If the canonical directory does not exist, the service reuses an existing `~/.codex-channel-bridge/` or `~/.codex-weixin/` installation automatically.
+If the canonical directory does not exist, the gateway reuses an existing `~/.codex-channel-bridge/` or `~/.codex-weixin/` installation automatically. Legacy `CODEX_CHANNEL_BRIDGE_*`, `CODEX_WEIXIN_*`, request headers, and action blocks remain accepted compatibility interfaces.
 
-## Startup settings
+Never commit or share the state directory. The management API redacts channel secrets, tokens, and webhook URLs.
 
-The server always binds to `127.0.0.1`. Environment variables can change its port and state directory or disable automatic browser opening:
+Startup overrides:
 
 ```text
 CODEX_IM_GATEWAY_PORT=8787
@@ -290,28 +180,43 @@ CODEX_IM_GATEWAY_STATE_DIR=/absolute/private/path
 CODEX_IM_GATEWAY_OPEN=0
 ```
 
-## Security model
+## Security boundaries
 
-- Non-local Host and Origin values are rejected.
-- Every mutating API call requires an in-memory page token.
-- WeChat credentials never reach the management page.
-- Unknown senders are denied until explicitly allowed.
-- Projects can only be selected from local Codex session history; manual path binding is disabled.
-- `danger-full-access` bypasses the Codex filesystem sandbox and must be enabled only when full-machine access is acceptable.
+- The Web service binds only to loopback and validates Host, Origin, and an in-memory request token.
+- Channel credentials never reach the management page. Unknown senders and conversations are denied by default.
+- Projects come from backend discovery and cannot be injected as arbitrary paths from chat.
+- Approval IDs are isolated by channel account and conversation. Timeout, delivery failure, or turn completion safely rejects an unresolved approval.
+- `danger-full-access` bypasses the Codex filesystem sandbox and should be enabled only after accepting full-machine access risk.
 - Concurrent accounts share local compute resources and Codex quotas.
+
+## Documentation
+
+- [Channel and task-notification setup](./docs/channel-setup.md)
+- [Codex backend architecture](./docs/codex-backends.md)
+- [Channel projects, modes, and Taskboard workbench](./docs/channel-project-modes.md)
+- [Embedded Taskboard installation, migration, and rollback](./docs/taskboard-module.md)
+- [Local operation and updates](./docs/local-run.md)
+- [Changelog](./CHANGELOG.md)
 
 ## Development and verification
 
 ```bash
 npm install
-npm test
 npm run typecheck
+npm test
 npm run build
-node dist/server/index.js
 ```
 
-Project lineage: [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) → [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge) → [yanjijinxiao/codex-im-gateway](https://github.com/yanjijinxiao/codex-im-gateway). Existing copyright notices and the MIT License are preserved. The legacy `~/.codex-channel-bridge` and `~/.codex-weixin` directories, `CODEX_CHANNEL_BRIDGE_*` and `CODEX_WEIXIN_*` variables, and old action blocks remain compatibility interfaces. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public projects for Codex app-server, media-transfer, and security-boundary practices. No AGPL source code was copied. This is an unofficial community project and is not affiliated with or endorsed by OpenAI, DingTalk, Tencent, ByteDance, or the upstream maintainers.
+## Origin and license
 
-The project is never published to npm and the Web page does not install updates. Update the Git checkout, run `npm ci` and `npm run build`, then restart it with `node dist/server/index.js`.
+Project lineage:
 
-See [CHANGELOG.md](./CHANGELOG.md) for release history.
+```text
+XavierJiezou/codex-weixin
+  → lsiten/codex-channel-bridge
+  → yanjijinxiao/codex-im-gateway
+```
+
+Existing copyright notices and the [MIT License](./LICENSE) are preserved. See [NOTICE](./NOTICE) for attribution. The WeChat iLink integration shape references the MIT-licensed `Tencent/openclaw-weixin`; no AGPL source code was copied.
+
+This is an unofficial community project and is not affiliated with or endorsed by OpenAI, Tencent, WeCom, ByteDance, Feishu, Alibaba, DingTalk, or the upstream maintainers.
