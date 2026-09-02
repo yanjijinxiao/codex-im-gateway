@@ -1,5 +1,5 @@
 {
-  "name": "codex-channel-bridge",
+  "name": "codex-im-gateway",
   "version": "0.4.0",
   "private": true,
   "workspaces": [
@@ -11,22 +11,29 @@
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
-  "description": "Local OpenAI Codex bridge for WeChat, Enterprise WeChat, Feishu, and DingTalk.",
+  "description": "Local multi-channel IM gateway for OpenAI Codex CLI and Desktop.",
   "license": "MIT",
   "author": "Xuechao Zou",
-  "homepage": "https://github.com/lsiten/codex-channel-bridge#readme",
+  "contributors": [
+    "yanjijinxiao"
+  ],
+  "homepage": "https://github.com/yanjijinxiao/codex-im-gateway#readme",
   "bugs": {
-    "url": "https://github.com/lsiten/codex-channel-bridge/issues"
+    "url": "https://github.com/yanjijinxiao/codex-im-gateway/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lsiten/codex-channel-bridge.git"
+    "url": "git+https://github.com/yanjijinxiao/codex-im-gateway.git"
   },
   "keywords": [
     "codex",
     "wechat",
     "weixin",
     "dingtalk",
+    "feishu",
+    "wecom",
+    "gateway",
+    "im",
     "openai",
     "bridge"
   ],

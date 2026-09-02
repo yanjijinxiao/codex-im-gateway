@@ -1,5 +1,20 @@
-codex-weixin is a clean-room independent WeChat bridge for OpenAI Codex.
+codex-im-gateway is an independently maintained, local multi-channel gateway
+for OpenAI Codex CLI and Codex Desktop.
 
-The project structure and protocol boundaries were informed by the MIT-licensed
-Tencent/openclaw-weixin package and by public documentation in the WeChat/Codex
-bridge ecosystem. Source code from AGPL-licensed projects is not copied.
+Project lineage:
+
+  XavierJiezou/codex-weixin
+    -> lsiten/codex-channel-bridge
+    -> yanjijinxiao/codex-im-gateway
+
+The original and subsequent work is used and redistributed under the MIT
+License included in this repository. Existing copyright notices are preserved.
+
+The project structure and protocol boundaries were also informed by the
+MIT-licensed Tencent/openclaw-weixin package and by public documentation in the
+WeChat/Codex bridge ecosystem. Source code from AGPL-licensed projects is not
+copied.
+
+This is an unofficial community project. It is not affiliated with or endorsed
+by OpenAI, DingTalk, Tencent, ByteDance, Feishu, WeCom, or the upstream
+maintainers named above.

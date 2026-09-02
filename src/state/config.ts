@@ -1,15 +1,14 @@
-import os from "node:os";
 import path from "node:path";
 
 import { parseCodexExecSandbox, type CodexExecSandbox } from "../codex/sandbox.js";
 import type { AppServerConnectionMode } from "../codex/app-server-daemon.js";
 import { readJsonFile, writeJsonFile } from "./json-store.js";
-import type { StatePaths } from "./paths.js";
+import { defaultStateDir, type StatePaths } from "./paths.js";
 
 export const MAX_INBOUND_BYTES = 100 * 1024 * 1024;
 const LEGACY_DEFAULT_INBOUND_BYTES = 50 * 1024 * 1024;
 
-export type CodexWeixinConfig = {
+export type CodexImGatewayConfig = {
   defaultCwd: string;
   allowedSenderIds: string[];
   allowedWorkspaces: string[];
@@ -27,7 +26,10 @@ export type CodexWeixinConfig = {
   taskboardUrl: string;
 };
 
-export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): CodexWeixinConfig {
+/** @deprecated Use CodexImGatewayConfig. */
+export type CodexWeixinConfig = CodexImGatewayConfig;
+
+export function defaultConfig(cwd = defaultStateDir()): CodexImGatewayConfig {
   return {
     defaultCwd: path.resolve(cwd),
     allowedSenderIds: [],
@@ -44,9 +46,9 @@ export function defaultConfig(cwd = path.join(os.homedir(), ".codex-weixin")): C
   };
 }
 
-export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
-  const base = cwd ? defaultConfig(cwd) : defaultConfig();
-  const loaded = readJsonFile<Partial<CodexWeixinConfig>>(paths.configPath, {});
+export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfig {
+  const base = defaultConfig(cwd ?? paths.root);
+  const loaded = readJsonFile<Partial<CodexImGatewayConfig>>(paths.configPath, {});
   const codexExecSandbox = parseCodexExecSandbox(loaded.codexExecSandbox);
   return {
     ...base,
@@ -71,8 +73,8 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexWeixinConfig {
 
 function normalizeCodexBackend(
   value: unknown,
-  fallback: CodexWeixinConfig["codexBackend"]
-): CodexWeixinConfig["codexBackend"] {
+  fallback: CodexImGatewayConfig["codexBackend"]
+): CodexImGatewayConfig["codexBackend"] {
   return value === "auto" || value === "app-server" || value === "exec" ? value : fallback;
 }
 
@@ -83,7 +85,7 @@ function normalizeAppServerTransport(
   return value === "auto" || value === "daemon" || value === "stdio" ? value : fallback;
 }
 
-export function saveConfig(paths: StatePaths, config: CodexWeixinConfig): void {
+export function saveConfig(paths: StatePaths, config: CodexImGatewayConfig): void {
   writeJsonFile(paths.configPath, {
     ...config,
     maxInboundBytes: normalizeInboundBytes(config.maxInboundBytes, MAX_INBOUND_BYTES)

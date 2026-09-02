@@ -248,7 +248,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       sendJson(response, 403, { error: "Local origin required" });
       return;
     }
-    if (request.headers["x-codex-channel-bridge-token"] !== context.requestToken
+    if (request.headers["x-codex-im-gateway-token"] !== context.requestToken
+      && request.headers["x-codex-channel-bridge-token"] !== context.requestToken
       && request.headers["x-codex-weixin-token"] !== context.requestToken) {
       sendJson(response, 403, { error: "Invalid request token" });
       return;
@@ -263,7 +264,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       readCodexModels(context)
     ]);
     sendJson(response, 200, {
-      product: "codex-channel-bridge",
+      product: "codex-im-gateway",
       version: context.productVersion,
       requestToken: context.requestToken,
       config,
@@ -281,7 +282,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const force = url.searchParams.get("force") === "1";
     if (force && (
       !isAllowedOrigin(request.headers.origin, context.port)
-      || (request.headers["x-codex-channel-bridge-token"] !== context.requestToken
+      || (request.headers["x-codex-im-gateway-token"] !== context.requestToken
+        && request.headers["x-codex-channel-bridge-token"] !== context.requestToken
         && request.headers["x-codex-weixin-token"] !== context.requestToken)
     )) {
       sendJson(response, 403, { error: "Invalid manual update check" });
@@ -298,7 +300,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
         try {
           context.onUpdateInstalled?.(result.version);
         } catch (error) {
-          console.error(`[codex-channel-bridge] unable to schedule restart: ${error instanceof Error ? error.message : String(error)}`);
+          console.error(`[codex-im-gateway] unable to schedule restart: ${error instanceof Error ? error.message : String(error)}`);
         }
       }, 250);
       timer.unref();

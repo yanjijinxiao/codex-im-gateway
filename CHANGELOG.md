@@ -1,8 +1,11 @@
 # Changelog
 
-All notable changes to Codex Channel Bridge are documented in this file.
+All notable changes to Codex IM Gateway are documented in this file.
 
 ## Unreleased
+
+- Renamed the independently maintained project to `codex-im-gateway`, moved the canonical package, UI, protocol, environment variables, request header, and state directory to the new name, and retained compatibility with existing `codex-channel-bridge` and `codex-weixin` installations.
+- Preserved the MIT license and documented the full project lineage from `XavierJiezou/codex-weixin` through `lsiten/codex-channel-bridge` to `yanjijinxiao/codex-im-gateway`.
 
 - Streamed modern Codex Desktop commentary and reasoning-summary session events into channel progress cards, with duplicate adjacent events suppressed and hidden raw reasoning excluded.
 - Correlated Desktop progress with each event's explicit turn ID and surfaced safe command, file, image, MCP, collaboration, search, and context-compaction completion statuses in channel cards.

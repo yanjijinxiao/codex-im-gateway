@@ -40,15 +40,15 @@ export function acquireServiceProcessLock(stateRoot: string): ServiceProcessLock
       }
       const existing = readLockRecord(lockPath);
       if (!existing) {
-        throw new Error(`codex-channel-bridge lock is unreadable: ${lockPath}`);
+        throw new Error(`codex-im-gateway lock is unreadable: ${lockPath}`);
       }
       if (isProcessRunning(existing.pid)) {
-        throw new Error(`codex-channel-bridge is already running for ${stateRoot} (PID ${existing.pid})`);
+        throw new Error(`codex-im-gateway is already running for ${stateRoot} (PID ${existing.pid})`);
       }
       fs.rmSync(lockPath, { force: true });
     }
   }
-  throw new Error(`Unable to acquire codex-channel-bridge lock: ${lockPath}`);
+  throw new Error(`Unable to acquire codex-im-gateway lock: ${lockPath}`);
 }
 
 function readLockRecord(lockPath: string): LockRecord | undefined {

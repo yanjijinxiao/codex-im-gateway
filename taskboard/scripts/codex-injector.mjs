@@ -505,7 +505,7 @@ async function waitForResidentInjectorReady(port, pid, startupToken, expectedSou
             expression: `({
               token: window[${JSON.stringify(hostStartupTokenName)}],
               taskboardEntryMounted: Boolean(document.getElementById("codex-taskboard-entry")),
-              channelEntryMounted: Boolean(document.getElementById("codex-channel-bridge-entry")),
+              channelEntryMounted: Boolean(document.getElementById("codex-im-gateway-entry")),
               sourceHash: window.__codexTaskboardInjection__?.sourceHash || null
             })`,
             returnByValue: true,
@@ -1035,7 +1035,7 @@ async function readInjectionStatus(cdp) {
       sourceHash: window.__codexTaskboardInjection__?.sourceHash || null,
       scriptIdentifier: window[${JSON.stringify(injectionScriptIdentifierName)}] || null,
       entryMounted: Boolean(document.getElementById("codex-taskboard-entry")),
-      channelEntryMounted: Boolean(document.getElementById("codex-channel-bridge-entry")),
+      channelEntryMounted: Boolean(document.getElementById("codex-im-gateway-entry")),
       pageMounted: Boolean(document.getElementById("codex-taskboard-page")),
       pageVisible: document.getElementById("codex-taskboard-page")?.hidden === false,
       frameUrl: document.getElementById("codex-taskboard-frame")?.src || null

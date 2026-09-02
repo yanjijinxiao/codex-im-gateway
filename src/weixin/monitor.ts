@@ -49,40 +49,40 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
       }
     } catch (error) {
       const retryMs = retryBackoff.next();
-      console.error(`[codex-channel-bridge] monitor poll failed; retrying in ${retryMs}ms: ${errorDetail(error)}`);
+      console.error(`[codex-im-gateway] monitor poll failed; retrying in ${retryMs}ms: ${errorDetail(error)}`);
       await delay(retryMs, options.signal);
       continue;
     }
     retryBackoff.reset();
     const { messages } = batch;
     if (messages.length) {
-      console.log(`[codex-channel-bridge] received ${messages.length} update(s)`);
+      console.log(`[codex-im-gateway] received ${messages.length} update(s)`);
     }
     for (const raw of messages) {
       let normalized: NormalizedWeixinMessage | undefined;
       try {
         normalized = normalizeWeixinMessage(raw);
       } catch (error) {
-        console.error(`[codex-channel-bridge] failed to normalize message: ${errorDetail(error)}`);
+        console.error(`[codex-im-gateway] failed to normalize message: ${errorDetail(error)}`);
         continue;
       }
       if (!normalized) {
         continue;
       }
       if (options.claimMessage && !options.claimMessage(normalized)) {
-        console.log(`[codex-channel-bridge] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
+        console.log(`[codex-im-gateway] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
         continue;
       }
       const message = normalized;
-      console.log(`[codex-channel-bridge] handling message ${message.id} from ${message.senderId}`);
+      console.log(`[codex-im-gateway] handling message ${message.id} from ${message.senderId}`);
       void options.onMessage(message).then(() => {
-        console.log(`[codex-channel-bridge] handled message ${message.id} from ${message.senderId}`);
+        console.log(`[codex-im-gateway] handled message ${message.id} from ${message.senderId}`);
       }).catch(async (error) => {
-        console.error(`[codex-channel-bridge] message handling failed for ${message.senderId}: ${errorDetail(error)}`);
+        console.error(`[codex-im-gateway] message handling failed for ${message.senderId}: ${errorDetail(error)}`);
         try {
           await options.onMessageError?.(error, message);
         } catch (reportError) {
-          console.error(`[codex-channel-bridge] failed to report message error for ${message.senderId}: ${errorDetail(reportError)}`);
+          console.error(`[codex-im-gateway] failed to report message error for ${message.senderId}: ${errorDetail(reportError)}`);
         }
       });
     }

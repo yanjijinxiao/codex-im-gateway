@@ -85,11 +85,11 @@ export class CodexSessionCompletionMonitor {
     const startedWallClock = Date.now();
     for (const root of this.sessionRoots()) this.watchRoot(root);
     this.initialization = this.initialize(runId, startedAt, startedWallClock).catch((error) => {
-      console.error(`[codex-channel-bridge] unable to initialize Codex session monitor: ${String(error)}`);
+      console.error(`[codex-im-gateway] unable to initialize Codex session monitor: ${String(error)}`);
     });
     this.timer = setInterval(() => {
       this.scanNow().catch((error) => {
-        console.error(`[codex-channel-bridge] unable to scan Codex sessions: ${String(error)}`);
+        console.error(`[codex-im-gateway] unable to scan Codex sessions: ${String(error)}`);
       });
     }, this.pollIntervalMs);
     this.timer.unref();
@@ -192,7 +192,7 @@ export class CodexSessionCompletionMonitor {
       });
       this.watchers.push(watcher);
     } catch (error) {
-      console.warn(`[codex-channel-bridge] unable to watch Codex sessions under ${root}: ${String(error)}`);
+      console.warn(`[codex-im-gateway] unable to watch Codex sessions under ${root}: ${String(error)}`);
     }
   }
 
@@ -229,7 +229,7 @@ export class CodexSessionCompletionMonitor {
       }
       cursor.emitAfter = undefined;
     } catch (error) {
-      console.error(`[codex-channel-bridge] unable to read Codex session completion: ${String(error)}`);
+      console.error(`[codex-im-gateway] unable to read Codex session completion: ${String(error)}`);
     } finally {
       this.processingFiles.delete(filePath);
     }

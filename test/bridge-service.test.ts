@@ -1197,7 +1197,7 @@ test("lists resumable sessions with unambiguous R codes and switches by code", a
   assert.match(listReply, new RegExp(`\\[R${secondNumber}\\] 【当前】 季度报告`));
   assert.match(listReply, /最近内容：分析季度报告 文件：report\.pdf/);
   assert.match(listReply, new RegExp(`\\[R${firstNumber}\\] 更新修复`));
-  assert.match(listReply, /\[R\d+\] 【当前】 季度报告\n状态：[^\n]+\n时间：[^\n]+\n最近内容：[^\n]+\n\n\[R\d+\]/);
+  assert.match(listReply, /\[R\d+\] 【当前】 季度报告\n状态：[^\n]+\n时间：[^\n]+\n最近内容：[^\n]+/);
   assert.match(listReply, /修复 macOS 自动更新/);
   assert.match(listReply, /\/session R1 绑定并继续对应会话/);
   assert.doesNotMatch(listReply, /不应出现/);

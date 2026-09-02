@@ -33,6 +33,9 @@ export function launchRestartHelper(options: RestartHelperOptions): void {
       detached: true,
       env: {
         ...process.env,
+        CODEX_IM_GATEWAY_OPEN: "0",
+        CODEX_IM_GATEWAY_PORT: String(options.port),
+        CODEX_IM_GATEWAY_STATE_DIR: options.stateDir,
         CODEX_CHANNEL_BRIDGE_OPEN: "0",
         CODEX_CHANNEL_BRIDGE_PORT: String(options.port),
         CODEX_CHANNEL_BRIDGE_STATE_DIR: options.stateDir
@@ -45,7 +48,7 @@ export function launchRestartHelper(options: RestartHelperOptions): void {
     fs.closeSync(logFd);
   }
   child.once("error", (error) => {
-    console.error(`[codex-channel-bridge] unable to launch restart helper: ${error.message}`);
+    console.error(`[codex-im-gateway] unable to launch restart helper: ${error.message}`);
   });
   child.unref();
 }

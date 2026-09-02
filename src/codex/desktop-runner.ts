@@ -227,7 +227,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private handleActivity(activity: CodexSessionActivity): void {
     const key = turnKey(activity.sessionId, activity.turnId);
     console.log(
-      `[codex-channel-bridge] Desktop progress ${activity.turnId}: ${oneLineProgress(activity.text, 180)}`
+      `[codex-im-gateway] Desktop progress ${activity.turnId}: ${oneLineProgress(activity.text, 180)}`
     );
     const waiter = this.waiters.get(key);
     if (waiter) {
@@ -247,7 +247,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       .then(() => waiter.onProgress?.(text))
       .then(() => undefined)
       .catch((error) => {
-        console.warn(`[codex-channel-bridge] unable to stream Desktop progress: ${error instanceof Error ? error.message : String(error)}`);
+        console.warn(`[codex-im-gateway] unable to stream Desktop progress: ${error instanceof Error ? error.message : String(error)}`);
       });
   }
 
@@ -338,7 +338,7 @@ class DesktopIpcConnection {
   async initialize(): Promise<void> {
     await this.connect();
     const result = recordValue(await this.request("initialize", 0, {
-      clientType: "codex-channel-bridge"
+      clientType: "codex-im-gateway"
     }));
     const clientId = stringValue(result?.clientId);
     if (!clientId) throw new Error("Codex Desktop IPC initialize response did not include a client id");

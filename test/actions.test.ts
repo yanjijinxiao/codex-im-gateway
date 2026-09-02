@@ -3,10 +3,10 @@ import test from "node:test";
 
 import { parseActionBlocks } from "../src/bridge/actions.js";
 
-test("parses explicit codex-channel-bridge action blocks and ignores prose paths", () => {
+test("parses explicit codex-im-gateway action blocks and ignores prose paths", () => {
   const text = [
     "Report saved at C:/tmp/report.pdf but do not send it.",
-    "```codex-channel-bridge-actions",
+    "```codex-im-gateway-actions",
     JSON.stringify({
       send: [
         { type: "image", path: "C:/tmp/chart.png" },
@@ -26,12 +26,22 @@ test("parses explicit codex-channel-bridge action blocks and ignores prose paths
 
 test("rejects relative outbound file paths in action blocks", () => {
   const text = [
-    "```codex-channel-bridge-actions",
+    "```codex-im-gateway-actions",
     JSON.stringify({ send: [{ type: "file", path: "relative/report.pdf" }] }),
     "```"
   ].join("\n");
 
   assert.throws(() => parseActionBlocks(text), /absolute path/i);
+});
+
+test("accepts legacy codex-channel-bridge action blocks", () => {
+  const parsed = parseActionBlocks([
+    "```codex-channel-bridge-actions",
+    JSON.stringify({ send: [{ type: "file", path: "/tmp/legacy.txt" }] }),
+    "```"
+  ].join("\n"));
+
+  assert.deepEqual(parsed.actions.send, [{ type: "file", path: "/tmp/legacy.txt" }]);
 });
 
 test("extracts local markdown image links into native send actions", () => {

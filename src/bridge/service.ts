@@ -54,7 +54,7 @@ import {
   LlmWikiMcpClientPool,
   llmWikiDynamicTools
 } from "../knowledge/llm-wiki-mcp-client.js";
-import type { CodexWeixinConfig } from "../state/config.js";
+import type { CodexImGatewayConfig } from "../state/config.js";
 import {
   normalizeChannelModeSettings,
   type ChannelModeSettings,
@@ -112,7 +112,7 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
-  config: CodexWeixinConfig;
+  config: CodexImGatewayConfig;
   stateStore: RuntimeStateStore;
   weixin: ChannelTextClient;
   runner?: CodexBridgeBackend;
@@ -321,7 +321,7 @@ export class BridgeService {
       });
     } catch (error) {
       if (error instanceof Error) {
-        console.warn("[codex-channel-bridge] AI intent classification unavailable; using ordinary chat", {
+        console.warn("[codex-im-gateway] AI intent classification unavailable; using ordinary chat", {
           error: error.message
         });
         return undefined;
@@ -1610,7 +1610,7 @@ export class BridgeService {
     } catch (error) {
       if (error instanceof InboundMediaTooLargeError) throw error;
       console.error(
-        `[codex-channel-bridge] inbound attachment download failed for message ${message.id}: ${error instanceof Error ? error.message : String(error)}`
+        `[codex-im-gateway] inbound attachment download failed for message ${message.id}: ${error instanceof Error ? error.message : String(error)}`
       );
       throw new InboundAttachmentDownloadError();
     }
@@ -1663,7 +1663,7 @@ export class BridgeService {
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     try {
       await this.withTyping(message.senderId, async () => {
-        console.log(`[codex-channel-bridge] starting Codex turn for ${message.senderId} in ${workspace}`);
+        console.log(`[codex-im-gateway] starting Codex turn for ${message.senderId} in ${workspace}`);
         await replyStream?.progress("🤔 正在理解任务并规划下一步…");
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
         const promptParts = buildPromptParts(text, attachments, "WeChat", knowledge);
@@ -1709,7 +1709,7 @@ export class BridgeService {
           onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
           onUserInput: (request) => this.userInputs.request(message.senderId, request)
         });
-        console.log(`[codex-channel-bridge] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
+        console.log(`[codex-im-gateway] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
           this.options.stateStore.setSessionThread(session.id, result.threadId);
         }
@@ -1895,7 +1895,7 @@ export class BridgeService {
         attachments: [{ kind: sent.kind, label: path.basename(action.path) }]
       });
     } catch (error) {
-      await this.reply(senderId, `[codex-channel-bridge] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
+      await this.reply(senderId, `[codex-im-gateway] Failed to send ${action.type}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -2009,7 +2009,7 @@ export class BridgeService {
   private async reply(senderId: string, text: string): Promise<void> {
     const contextToken = this.options.stateStore.getContextToken(senderId);
     try {
-      console.log(`[codex-channel-bridge] sending reply to ${senderId}; text=${text.length} chars`);
+      console.log(`[codex-im-gateway] sending reply to ${senderId}; text=${text.length} chars`);
       const sent = await this.options.weixin.sendText({ toUserId: senderId, text, contextToken });
       this.options.onOutboundMessage?.({
         direction: "outbound",
@@ -2018,7 +2018,7 @@ export class BridgeService {
         text,
         attachments: []
       });
-      console.log(`[codex-channel-bridge] sent reply to ${senderId}`);
+      console.log(`[codex-im-gateway] sent reply to ${senderId}`);
     } catch (error) {
       if (isStaleContextError(error)) {
         console.warn(`WeChat context token is stale for ${senderId}; ask user to send a fresh message.`);
@@ -2038,7 +2038,7 @@ export class BridgeService {
     const interaction = this.cardInteraction.getStore();
     if (interaction && this.options.weixin.updateActionCard) {
       try {
-        console.log(`[codex-channel-bridge] updating action card "${card.title}" in ${interaction.messageId}`);
+        console.log(`[codex-im-gateway] updating action card "${card.title}" in ${interaction.messageId}`);
         await this.options.weixin.updateActionCard({ messageId: interaction.messageId, card });
         this.options.onOutboundMessage?.({
           direction: "outbound",
@@ -2047,14 +2047,14 @@ export class BridgeService {
           text: card.fallbackText,
           attachments: []
         });
-        console.log(`[codex-channel-bridge] updated action card "${card.title}"`);
+        console.log(`[codex-im-gateway] updated action card "${card.title}"`);
         return;
       } catch (error) {
         console.warn(`Action card update failed for ${senderId}; sending a new card: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     try {
-      console.log(`[codex-channel-bridge] sending action card "${card.title}" to ${senderId}`);
+      console.log(`[codex-im-gateway] sending action card "${card.title}" to ${senderId}`);
       const sent = await this.options.weixin.sendActionCard({ toUserId: senderId, card });
       this.options.onOutboundMessage?.({
         direction: "outbound",
@@ -2063,7 +2063,7 @@ export class BridgeService {
         text: card.fallbackText,
         attachments: []
       });
-      console.log(`[codex-channel-bridge] sent action card "${card.title}" to ${senderId}`);
+      console.log(`[codex-im-gateway] sent action card "${card.title}" to ${senderId}`);
     } catch (error) {
       console.warn(`Action card delivery failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
       for (const text of chunkText(card.fallbackText)) {
@@ -2080,7 +2080,7 @@ export class BridgeService {
     }
     if (message.interaction && this.options.weixin.updateTaskCard) {
       try {
-        console.log(`[codex-channel-bridge] updating Taskboard card ${card.identifier} in ${message.interaction.messageId}`);
+        console.log(`[codex-im-gateway] updating Taskboard card ${card.identifier} in ${message.interaction.messageId}`);
         await this.options.weixin.updateTaskCard({ messageId: message.interaction.messageId, card });
         this.options.onOutboundMessage?.({
           direction: "outbound",
@@ -2089,14 +2089,14 @@ export class BridgeService {
           text: card.fallbackText,
           attachments: []
         });
-        console.log(`[codex-channel-bridge] updated Taskboard card ${card.identifier}`);
+        console.log(`[codex-im-gateway] updated Taskboard card ${card.identifier}`);
         return;
       } catch (error) {
         console.warn(`Taskboard card update failed for ${senderId}; sending a new card: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     try {
-      console.log(`[codex-channel-bridge] sending Taskboard card ${card.identifier} to ${senderId}`);
+      console.log(`[codex-im-gateway] sending Taskboard card ${card.identifier} to ${senderId}`);
       const sent = await this.options.weixin.sendTaskCard({ toUserId: senderId, card });
       this.options.onOutboundMessage?.({
         direction: "outbound",
@@ -2105,7 +2105,7 @@ export class BridgeService {
         text: card.fallbackText,
         attachments: []
       });
-      console.log(`[codex-channel-bridge] sent Taskboard card ${card.identifier} to ${senderId}`);
+      console.log(`[codex-im-gateway] sent Taskboard card ${card.identifier} to ${senderId}`);
     } catch (error) {
       console.warn(`Taskboard card delivery failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
       await this.reply(senderId, card.fallbackText);
@@ -2266,7 +2266,7 @@ function unavailableProjectSessionChoiceReason(choice: ProjectSessionChoice): st
 }
 
 function stripBridgeErrorPrefix(message: string): string {
-  return message.replace(/^\[codex-channel-bridge]\s*/i, "");
+  return message.replace(/^\[(?:codex-im-gateway|codex-channel-bridge)]\s*/i, "");
 }
 
 function preferredThreadTitle(sessionTitle: string, promptPreview?: string): string {
@@ -2484,7 +2484,7 @@ class ChannelTurnTextStream {
   private disable(error: unknown): void {
     this.disabled = true;
     this.stopTimers();
-    console.warn(`[codex-channel-bridge] channel text stream disabled for this turn: ${error instanceof Error ? error.message : String(error)}`);
+    console.warn(`[codex-im-gateway] channel text stream disabled for this turn: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 

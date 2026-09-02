@@ -65,7 +65,7 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 
 function createNotificationText(channel: ChannelKind, message: ChannelMessage): string {
   const lines = [
-    `[Codex Channel Bridge] ${message.direction === "inbound" ? "收到" : "发出"}消息`,
+    `[Codex IM Gateway] ${message.direction === "inbound" ? "收到" : "发出"}消息`,
     `渠道: ${channel}`,
     ...(message.text ? [`内容: ${message.text}`] : []),
     ...(message.attachments.length
@@ -133,7 +133,7 @@ export class ChannelMessageWebhook {
       ? genericPayload
       : createProviderPayload(provider, createNotificationText(this.options.channel, message));
     this.deliver(webhookUrl, payload, provider).catch((error: unknown) => {
-      console.warn("[codex-channel-bridge] webhook delivery failed", {
+      console.warn("[codex-im-gateway] webhook delivery failed", {
         accountId: this.options.accountId,
         direction: message.direction,
         error: error instanceof Error ? error.message : String(error)

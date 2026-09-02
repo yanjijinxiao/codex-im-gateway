@@ -74,7 +74,7 @@ export class CodexDesktopApprovalMonitor {
     socket.on("data", (chunk) => this.receive(chunk));
     socket.on("error", (error) => {
       if (!isMissingSocketError(error)) {
-        console.warn(`[codex-channel-bridge] Codex Desktop approval IPC error: ${error.message}`);
+        console.warn(`[codex-im-gateway] Codex Desktop approval IPC error: ${error.message}`);
       }
     });
     socket.on("close", () => {
@@ -92,7 +92,7 @@ export class CodexDesktopApprovalMonitor {
       sourceClientId: "initializing-client",
       version: 0,
       method: "initialize",
-      params: { clientType: "codex-channel-bridge" }
+      params: { clientType: "codex-im-gateway" }
     });
   }
 
@@ -101,7 +101,7 @@ export class CodexDesktopApprovalMonitor {
     while (this.buffer.length >= 4) {
       const length = this.buffer.readUInt32LE(0);
       if (length > IPC_MESSAGE_MAX_BYTES) {
-        console.error(`[codex-channel-bridge] rejected oversized Codex Desktop IPC message: ${length} bytes`);
+        console.error(`[codex-im-gateway] rejected oversized Codex Desktop IPC message: ${length} bytes`);
         this.socket?.destroy();
         return;
       }
@@ -111,7 +111,7 @@ export class CodexDesktopApprovalMonitor {
       try {
         this.handleMessage(JSON.parse(payload.toString("utf8")) as IpcMessage);
       } catch (error) {
-        console.warn(`[codex-channel-bridge] ignored invalid Codex Desktop IPC message: ${String(error)}`);
+        console.warn(`[codex-im-gateway] ignored invalid Codex Desktop IPC message: ${String(error)}`);
       }
     }
   }
@@ -131,7 +131,7 @@ export class CodexDesktopApprovalMonitor {
       const clientId = stringValue(result?.clientId);
       if (!clientId) return;
       this.clientId = clientId;
-      console.log("[codex-channel-bridge] connected to Codex Desktop approval stream");
+      console.log("[codex-im-gateway] connected to Codex Desktop approval stream");
       for (const threadId of this.followedThreads) this.sendFollow(threadId, true);
       return;
     }
@@ -170,7 +170,7 @@ export class CodexDesktopApprovalMonitor {
       this.handledRequests.add(key);
       const normalized = { ...request, ...(request.cwd || !cwd ? {} : { cwd }) };
       void this.forwardApproval({ requestId, method, request: normalized }).catch((error) => {
-        console.error(`[codex-channel-bridge] unable to forward Codex Desktop approval: ${String(error)}`);
+        console.error(`[codex-im-gateway] unable to forward Codex Desktop approval: ${String(error)}`);
       });
     }
   }

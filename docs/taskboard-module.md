@@ -1,10 +1,10 @@
 # 内置 Taskboard 模块：安装、迁移与回滚
 
-Taskboard 已作为独立 workspace 模块放在 `taskboard/`，由 `codex-channel-bridge` 进程统一启动和关闭。管理后台仍使用 `http://127.0.0.1:8787`，完整看板与 CLI API 使用 `http://127.0.0.1:47823`；两个端口由同一个进程提供。
+Taskboard 已作为独立 workspace 模块放在 `taskboard/`，由 `codex-im-gateway` 进程统一启动和关闭。管理后台仍使用 `http://127.0.0.1:8787`，完整看板与 CLI API 使用 `http://127.0.0.1:47823`；两个端口由同一个进程提供。
 
 ## 一键安装或核验
 
-在 `codex-wx` 仓库根目录执行：
+在 `codex-im-gateway` 仓库根目录执行：
 
 ```bash
 npm run install:local
@@ -23,7 +23,7 @@ npm run install:check
 内置模式使用：
 
 ```text
-~/.codex-weixin/taskboard/
+~/.codex-im-gateway/taskboard/
   taskboard.sqlite
   attachments/
   cloud-companion.json

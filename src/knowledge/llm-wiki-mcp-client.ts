@@ -335,7 +335,7 @@ class StdioMcpSession {
     await this.request("initialize", {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: "codex-channel-bridge", version: "0.4.0" }
+      clientInfo: { name: "codex-im-gateway", version: "0.4.0" }
     });
     this.notify("notifications/initialized", {});
     const tools = await this.request("tools/list", {}) as { tools?: Array<{ name?: string }> };

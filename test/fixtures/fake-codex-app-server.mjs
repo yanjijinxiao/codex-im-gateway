@@ -64,8 +64,8 @@ rl.on("line", (line) => {
       fail(message.id, "jsonrpc header must be omitted");
       return;
     }
-    if (message.params?.clientInfo?.name !== "codex-channel-bridge") {
-      fail(message.id, "missing codex-channel-bridge clientInfo");
+    if (message.params?.clientInfo?.name !== "codex-im-gateway") {
+      fail(message.id, "missing codex-im-gateway clientInfo");
       return;
     }
     experimentalApiEnabled = message.params?.capabilities?.experimentalApi === true;

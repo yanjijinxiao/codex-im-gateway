@@ -12,7 +12,7 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const installer = path.join(repositoryRoot, "scripts", "install-local.mjs");
 
 test("local installer links every bundled Skill without named business dependencies", async (t) => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-installer-home-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-im-gateway-installer-home-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const environment = { ...process.env, HOME: home };
 
@@ -27,7 +27,7 @@ test("local installer links every bundled Skill without named business dependenc
     mode: "install",
     projectRoot: repositoryRoot,
     taskboardRoot: path.join(repositoryRoot, "taskboard"),
-    stateDirectory: path.join(home, ".codex-weixin", "taskboard"),
+    stateDirectory: path.join(home, ".codex-im-gateway", "taskboard"),
     links: {
       taskctl: "created",
       skills: {

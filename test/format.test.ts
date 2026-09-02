@@ -12,7 +12,7 @@ import {
 test("prompt asks Codex to use native send actions for local media", () => {
   const prompt = buildPrompt("send me a random video from desktop");
 
-  assert.match(prompt, /codex-channel-bridge-actions/);
+  assert.match(prompt, /codex-im-gateway-actions/);
   assert.match(prompt, /do not use Markdown local file links/i);
   assert.match(prompt, /video/i);
   assert.match(prompt, /send me a random video from desktop/);
@@ -22,7 +22,7 @@ test("separates Bridge policy from the app-server user message", () => {
   const parts = buildPromptParts("用户真正发送的消息");
 
   assert.equal(parts.prompt, "用户真正发送的消息");
-  assert.match(parts.developerInstructions, /codex-channel-bridge-actions/);
+  assert.match(parts.developerInstructions, /codex-im-gateway-actions/);
   assert.doesNotMatch(parts.prompt, /WeChat bridge rule/);
 });
 

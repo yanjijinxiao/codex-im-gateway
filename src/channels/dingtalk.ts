@@ -160,7 +160,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       try {
         return await this.createTextCard(this.cardTarget(input.toUserId), input.text, true);
       } catch (error) {
-        console.warn(`[codex-channel-bridge] DingTalk AI Card unavailable, falling back to text: ${errorDetail(error)}`);
+        console.warn(`[codex-im-gateway] DingTalk AI Card unavailable, falling back to text: ${errorDetail(error)}`);
       }
     }
     const target = this.requireReplyTarget(input.toUserId);
@@ -210,7 +210,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       try {
         body = JSON.parse(frame.data) as DingTalkRobotMessage;
       } catch (error) {
-        console.warn(`[codex-channel-bridge] ignored malformed DingTalk message: ${errorDetail(error)}`);
+        console.warn(`[codex-im-gateway] ignored malformed DingTalk message: ${errorDetail(error)}`);
         return;
       }
       const actorId = body.senderStaffId?.trim() || body.senderId?.trim();
@@ -220,7 +220,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
 
       const content = dingTalkMessageContent(body);
       if (!content) {
-        console.log(`[codex-channel-bridge] ignored unsupported DingTalk message type ${body.msgtype}`);
+        console.log(`[codex-im-gateway] ignored unsupported DingTalk message type ${body.msgtype}`);
         return;
       }
 
@@ -268,7 +268,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     const thinking = this.sendThinkingEmotion("reply", target)
       .then(() => true)
       .catch((error) => {
-        console.warn(`[codex-channel-bridge] DingTalk thinking emotion unavailable: ${errorDetail(error)}`);
+        console.warn(`[codex-im-gateway] DingTalk thinking emotion unavailable: ${errorDetail(error)}`);
         return false;
     });
     try {
@@ -278,17 +278,17 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       await options.onMessage({ ...message, attachments });
     } catch (error) {
       console.error(
-        `[codex-channel-bridge] DingTalk message handling failed for ${message.senderId}: ${errorDetail(error)}`
+        `[codex-im-gateway] DingTalk message handling failed for ${message.senderId}: ${errorDetail(error)}`
       );
       try {
         await options.onMessageError?.(error, message);
       } catch (reportError) {
-        console.error(`[codex-channel-bridge] failed to report DingTalk message error: ${errorDetail(reportError)}`);
+        console.error(`[codex-im-gateway] failed to report DingTalk message error: ${errorDetail(reportError)}`);
       }
     } finally {
       if (await thinking) {
         await this.sendThinkingEmotion("recall", target).catch((error) => {
-          console.warn(`[codex-channel-bridge] DingTalk thinking emotion recall failed: ${errorDetail(error)}`);
+          console.warn(`[codex-im-gateway] DingTalk thinking emotion recall failed: ${errorDetail(error)}`);
         });
       }
       this.activeNetworkLifecycles.delete(target.messageId);
@@ -545,7 +545,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     });
     await this.mutateWithRetry(lifecycleId, "stream", "/v1.0/card/streaming", input.accessToken, streamBody);
     console.log(
-      `[codex-channel-bridge] DingTalk AI Card HTTPS streamed finalize=${input.finalize} `
+      `[codex-im-gateway] DingTalk AI Card HTTPS streamed finalize=${input.finalize} `
       + `error=${input.error} outTrackId=${input.outTrackId} content=${oneLineCardPreview(content, 180)}`
     );
     if (input.finalize) {
@@ -579,7 +579,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       ...(updateByKey ? { cardUpdateOptions: { updateCardDataByKey: true } } : {})
     });
     console.log(
-      `[codex-channel-bridge] DingTalk AI Card HTTPS state updated flowStatus=${flowStatus} `
+      `[codex-im-gateway] DingTalk AI Card HTTPS state updated flowStatus=${flowStatus} `
       + `outTrackId=${input.outTrackId}`
     );
   }
@@ -601,7 +601,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
         lastError = error;
         if (attempt + 1 < this.retryDelaysMs.length) {
           console.warn(
-            `[codex-channel-bridge] DingTalk AI Card HTTPS ${operation} attempt ${attempt + 1} failed; retrying: `
+            `[codex-im-gateway] DingTalk AI Card HTTPS ${operation} attempt ${attempt + 1} failed; retrying: `
             + errorDetail(error)
           );
         }
@@ -775,7 +775,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         const response = await this.client.streamingUpdateWithOptions(request, headers, this.runtime);
         assertDingTalkCardMutationSucceeded("stream", response);
         console.log(
-          `[codex-channel-bridge] DingTalk AI Card streamed attempt=${attempt + 1} `
+          `[codex-im-gateway] DingTalk AI Card streamed attempt=${attempt + 1} `
           + `finalize=${input.finalize} error=${input.error} outTrackId=${input.outTrackId} guid=${guid} `
           + `content=${oneLineCardPreview(content, 180)}`
         );
@@ -788,7 +788,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         lastError = error;
         if (attempt + 1 < this.retryDelaysMs.length) {
           console.warn(
-            `[codex-channel-bridge] DingTalk AI Card stream attempt ${attempt + 1} failed; retrying: `
+            `[codex-im-gateway] DingTalk AI Card stream attempt ${attempt + 1} failed; retrying: `
             + errorDetail(error)
           );
         }
@@ -832,7 +832,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         const response = await this.client.updateCardWithOptions(request, headers, this.runtime);
         assertDingTalkCardMutationSucceeded("state", response);
         console.log(
-          `[codex-channel-bridge] DingTalk AI Card state updated attempt=${attempt + 1} `
+          `[codex-im-gateway] DingTalk AI Card state updated attempt=${attempt + 1} `
           + `flowStatus=${flowStatus} outTrackId=${input.outTrackId}`
         );
         return;
@@ -840,7 +840,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         lastError = error;
         if (attempt + 1 < this.retryDelaysMs.length) {
           console.warn(
-            `[codex-channel-bridge] DingTalk AI Card state attempt ${attempt + 1} failed; retrying: `
+            `[codex-im-gateway] DingTalk AI Card state attempt ${attempt + 1} failed; retrying: `
             + errorDetail(error)
           );
         }
@@ -1257,7 +1257,7 @@ function acknowledge(client: DingTalkStreamClient, frame: DWClientDownStream): v
   try {
     client.socketCallBackResponse(frame.headers.messageId, {});
   } catch (error) {
-    console.warn(`[codex-channel-bridge] unable to acknowledge DingTalk message: ${errorDetail(error)}`);
+    console.warn(`[codex-im-gateway] unable to acknowledge DingTalk message: ${errorDetail(error)}`);
   }
 }
 

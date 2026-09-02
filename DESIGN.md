@@ -1,4 +1,4 @@
-# Codex Channel Bridge Design System
+# Codex IM Gateway Design System
 
 ## 0. Research Log
 

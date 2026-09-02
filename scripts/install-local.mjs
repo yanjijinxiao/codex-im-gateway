@@ -122,15 +122,15 @@ async function main() {
     skills: await ensureBundledSkillLinks(home, options.check)
   };
   const linkStatuses = [links.taskctl, ...Object.values(links.skills)];
-  const ok = await dependenciesAreCurrent()
-    && await buildIsCurrent()
+  const ok = (options.skipDependencies || await dependenciesAreCurrent())
+    && (options.skipBuild || await buildIsCurrent())
     && linkStatuses.every((value) => value === "current" || value === "created" || value === "migrated");
   console.log(JSON.stringify({
     ok,
     mode: options.check ? "check" : "install",
     projectRoot,
     taskboardRoot,
-    stateDirectory: path.join(home, ".codex-weixin", "taskboard"),
+    stateDirectory: path.join(home, ".codex-im-gateway", "taskboard"),
     links,
     urls: { admin: "http://127.0.0.1:8787", taskboard: "http://127.0.0.1:47823" }
   }, null, 2));

@@ -108,7 +108,7 @@ export async function createQrLoginSession(options: CreateQrLoginOptions = {}): 
 export async function loginWithQr(options: LoginOptions): Promise<WeixinAccount> {
   const session = await createQrLoginSession(options);
   console.log(session.qrContent);
-  console.log("Open the Codex Channel Bridge management page and scan this QR content with WeChat.");
+  console.log("Open the Codex IM Gateway management page and scan this QR content with WeChat.");
   while (true) {
     await delay(options.pollMs ?? 2_000);
     const update = await session.poll();

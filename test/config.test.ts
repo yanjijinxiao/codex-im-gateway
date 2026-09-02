@@ -7,9 +7,9 @@ import test from "node:test";
 import { defaultConfig, loadConfig, MAX_INBOUND_BYTES, saveConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 
-test("uses ~/.codex-weixin as the default Codex workspace", () => {
-  assert.equal(defaultConfig().defaultCwd, path.join(os.homedir(), ".codex-weixin"));
-  assert.deepEqual(defaultConfig().allowedWorkspaces, [path.join(os.homedir(), ".codex-weixin")]);
+test("uses ~/.codex-im-gateway as the default Codex workspace", () => {
+  assert.equal(defaultConfig().defaultCwd, path.join(os.homedir(), ".codex-im-gateway"));
+  assert.deepEqual(defaultConfig().allowedWorkspaces, [path.join(os.homedir(), ".codex-im-gateway")]);
   assert.equal(defaultConfig().streamReplies, true);
   assert.equal(defaultConfig().codexBackend, "auto");
   assert.equal(defaultConfig().codexAppServerTransport, "auto");
@@ -17,6 +17,15 @@ test("uses ~/.codex-weixin as the default Codex workspace", () => {
   assert.equal(defaultConfig().taskboardEnabled, true);
   assert.equal(defaultConfig().taskboardUrl, "http://127.0.0.1:47823");
   assert.equal(resolveStatePaths("/tmp/codex-weixin-test").taskboardDir, "/tmp/codex-weixin-test/taskboard");
+});
+
+test("uses the selected legacy state root as the workspace fallback", (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-bridge-config-legacy-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+
+  const config = loadConfig(resolveStatePaths(stateDir));
+  assert.equal(config.defaultCwd, stateDir);
+  assert.deepEqual(config.allowedWorkspaces, [stateDir]);
 });
 
 test("loads only supported Codex backend and app-server transport settings", (t) => {

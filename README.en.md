@@ -1,7 +1,7 @@
-<h1 align="center">Codex Channel Bridge</h1>
+<h1 align="center">Codex IM Gateway</h1>
 
 <p align="center">
-  <img src="src/web/favicon.svg" alt="Codex Channel Bridge logo" width="128" height="128" />
+  <img src="src/web/favicon.svg" alt="Codex IM Gateway logo" width="128" height="128" />
 </p>
 
 <p align="center">
@@ -12,10 +12,10 @@
   <strong>Connect WeChat, Enterprise WeChat, Feishu, and DingTalk to a local OpenAI Codex installation.</strong>
 </p>
 
-`codex-channel-bridge` is a cross-platform, local-only messaging bridge for Codex. Its Web console adds personal WeChat, Enterprise WeChat, Feishu, and DingTalk channels, manages projects and bound sessions, and configures task-completion notifications.
+`codex-im-gateway` is a cross-platform, local-only instant-messaging gateway for Codex. Its Web console adds personal WeChat, Enterprise WeChat, Feishu, and DingTalk channels, manages projects and bound sessions, and configures task-completion notifications.
 
 ```text
-WeChat / Enterprise WeChat / Feishu / DingTalk <-> Codex Channel Bridge <-> local or remote Codex Desktop <-> bound projects
+WeChat / Enterprise WeChat / Feishu / DingTalk <-> Codex IM Gateway <-> Codex CLI or local/remote Codex Desktop <-> bound projects
 ```
 
 Service data and credentials remain local. The management page is never exposed to the LAN or public Internet.
@@ -49,7 +49,7 @@ Screenshots live under `docs/images/screenshots/`. The Web management screenshot
 ## Web management preview
 
 <p align="center">
-  <img src="docs/images/screenshots/web-session-management.png" alt="Codex Channel Bridge Web session management" width="100%" />
+  <img src="docs/images/screenshots/web-session-management.png" alt="Codex IM Gateway Web session management" width="100%" />
 </p>
 
 ## Requirements
@@ -66,11 +66,11 @@ codex
 
 ## Run locally
 
-This project is available only as GitHub source. It is not published as an npm package; do not run `npm install -g codex-channel-bridge` or `npm publish`.
+This project is available only as GitHub source. It is not published as an npm package; do not run `npm install -g codex-im-gateway` or `npm publish`.
 
 ```bash
-git clone https://github.com/lsiten/codex-channel-bridge.git
-cd codex-channel-bridge
+git clone https://github.com/yanjijinxiao/codex-im-gateway.git
+cd codex-im-gateway
 npm ci
 npm run build
 node dist/server/index.js
@@ -88,7 +88,7 @@ npm run taskboard:codex
 
 It launches Codex with the required local debugging flags and adds built-in peer entries below Plugins in the native sidebar:
 
-- **Channel Configuration (Message Channels)** opens the Codex Channel Bridge console for Personal WeChat, Enterprise WeChat, Feishu, and DingTalk.
+- **Channel Configuration (Message Channels)** opens the Codex IM Gateway console for Personal WeChat, Enterprise WeChat, Feishu, and DingTalk.
 - **Taskboard** opens the embedded board while retaining the current Codex project and conversation context.
 
 Both built-in entries and optional entries declared by installed Skills use the Codex main workspace instead of opening a separate browser side panel. Keep the command's terminal running while using the integration, because the injector keeps the entries attached. Use the same command whenever you want to launch the integrated Codex window again.
@@ -235,7 +235,7 @@ After each turn, Codex may extract up to three durable entries from explicit pre
 Codex can request local-file delivery in its final response:
 
 ````text
-```codex-channel-bridge-actions
+```codex-im-gateway-actions
 {
   "send": [
     { "type": "image", "path": "/absolute/path/chart.png" },
@@ -269,7 +269,7 @@ The IkunCoding provider also exposes `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.
 Service state and the default Codex workspace share this directory:
 
 ```text
-~/.codex-weixin/
+~/.codex-im-gateway/
   accounts/                 One credential file per WeChat account
   retained-accounts.json    Recovery index for removed accounts; never stores tokens
   runtime/<account-id>/     Sender authorization, managed sessions, and personal knowledge
@@ -278,16 +278,16 @@ Service state and the default Codex workspace share this directory:
   logs/
 ```
 
-Do not commit or share this directory. The management API never returns WeChat tokens to the browser.
+Do not commit or share this directory. The management API never returns WeChat tokens to the browser. If the canonical directory does not exist, the service reuses an existing `~/.codex-channel-bridge/` or `~/.codex-weixin/` installation automatically.
 
 ## Startup settings
 
 The server always binds to `127.0.0.1`. Environment variables can change its port and state directory or disable automatic browser opening:
 
 ```text
-CODEX_CHANNEL_BRIDGE_PORT=8787
-CODEX_CHANNEL_BRIDGE_STATE_DIR=/absolute/private/path
-CODEX_CHANNEL_BRIDGE_OPEN=0
+CODEX_IM_GATEWAY_PORT=8787
+CODEX_IM_GATEWAY_STATE_DIR=/absolute/private/path
+CODEX_IM_GATEWAY_OPEN=0
 ```
 
 ## Security model
@@ -310,7 +310,7 @@ npm run build
 node dist/server/index.js
 ```
 
-The project originated from [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) and is now independently maintained as [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge). The legacy `~/.codex-weixin` directory, `CODEX_WEIXIN_*` variables, and old action blocks remain compatibility interfaces for existing installations. It is distributed under the MIT License. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public Codex/WeChat projects for app-server, media-transfer, and security-boundary practices. No AGPL source code was copied.
+Project lineage: [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) → [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge) → [yanjijinxiao/codex-im-gateway](https://github.com/yanjijinxiao/codex-im-gateway). Existing copyright notices and the MIT License are preserved. The legacy `~/.codex-channel-bridge` and `~/.codex-weixin` directories, `CODEX_CHANNEL_BRIDGE_*` and `CODEX_WEIXIN_*` variables, and old action blocks remain compatibility interfaces. Its iLink integration shape references `Tencent/openclaw-weixin`, along with public projects for Codex app-server, media-transfer, and security-boundary practices. No AGPL source code was copied. This is an unofficial community project and is not affiliated with or endorsed by OpenAI, DingTalk, Tencent, ByteDance, or the upstream maintainers.
 
 The project is never published to npm and the Web page does not install updates. Update the Git checkout, run `npm ci` and `npm run build`, then restart it with `node dist/server/index.js`.
 

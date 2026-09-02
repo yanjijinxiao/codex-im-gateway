@@ -9,7 +9,7 @@
   const DEFAULT_CHANNEL_BRIDGE_URL = "http://127.0.0.1:8787/";
   const ENTRY_ID = "codex-taskboard-entry";
   const SUB2API_ENTRY_ID = "codex-sub2api-entry";
-  const CHANNEL_ENTRY_ID = "codex-channel-bridge-entry";
+  const CHANNEL_ENTRY_ID = "codex-im-gateway-entry";
   const CAPABILITY_ENTRY_PREFIX = "codex-capability-entry-";
   const CAPABILITY_ENTRY_ATTRIBUTE = "data-codex-capability-entry";
   const PAGE_ID = "codex-taskboard-page";
@@ -122,16 +122,18 @@
   }
 
   function resolveChannelBridgeUrl() {
-    const configured = typeof window.__CODEX_CHANNEL_BRIDGE_URL__ === "string"
-      ? window.__CODEX_CHANNEL_BRIDGE_URL__.trim()
-      : "";
+    const configured = typeof window.__CODEX_IM_GATEWAY_URL__ === "string"
+      ? window.__CODEX_IM_GATEWAY_URL__.trim()
+      : typeof window.__CODEX_CHANNEL_BRIDGE_URL__ === "string"
+        ? window.__CODEX_CHANNEL_BRIDGE_URL__.trim()
+        : "";
     try {
       const url = new URL(configured || DEFAULT_CHANNEL_BRIDGE_URL);
       if (
         (url.protocol !== "http:" && url.protocol !== "https:")
         || (url.hostname !== "127.0.0.1" && url.hostname !== "localhost")
       ) {
-        throw new Error("Unsupported Codex Channel Bridge URL");
+        throw new Error("Unsupported Codex IM Gateway URL");
       }
       return url;
     } catch (_) {

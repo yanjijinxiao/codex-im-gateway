@@ -227,7 +227,7 @@ async function reportMessageError(
     await options.onMessageError?.(error, message);
   } catch (reportError) {
     if (!(reportError instanceof Error)) throw reportError;
-    console.error(`[codex-channel-bridge] failed to report Feishu message error: ${errorDetail(reportError)}`);
+    console.error(`[codex-im-gateway] failed to report Feishu message error: ${errorDetail(reportError)}`);
   }
 }
 

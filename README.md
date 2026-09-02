@@ -1,7 +1,7 @@
-<h1 align="center">Codex Channel Bridge</h1>
+<h1 align="center">Codex IM Gateway</h1>
 
 <p align="center">
-  <img src="src/web/favicon.svg" alt="Codex Channel Bridge logo" width="128" height="128" />
+  <img src="src/web/favicon.svg" alt="Codex IM Gateway logo" width="128" height="128" />
 </p>
 
 <p align="center">
@@ -12,10 +12,10 @@
   <strong>通过个人微信、企业微信、飞书和钉钉连接本机 OpenAI Codex。</strong>
 </p>
 
-`codex-channel-bridge` 是一个跨平台、本机运行的 Codex 消息桥接服务。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信、飞书或钉钉渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
+`codex-im-gateway` 是一个跨平台、本机运行的 Codex 即时通信网关。启动后会打开 Web 管理页；用户可以添加个人微信、企业微信、飞书或钉钉渠道，从聊天窗口控制本机 Codex、管理项目、绑定会话并接收任务结束通知。
 
 ```text
-个人微信 / 企业微信 / 飞书 / 钉钉 <-> Codex Channel Bridge <-> 本机或远程 Codex Desktop <-> 已绑定项目
+个人微信 / 企业微信 / 飞书 / 钉钉 <-> Codex IM Gateway <-> Codex CLI 或本机/远程 Codex Desktop <-> 已绑定项目
 ```
 
 服务与凭据都保存在本机，管理页面不会开放到局域网或公网。
@@ -65,7 +65,7 @@
 聊天端任务需要运行命令、修改文件或申请额外权限时，审批请求会发回发起任务的同一账号和联系人。回复 `/approve A1`（短写 `/ok A1`）批准一次，或 `/reject A1`（短写 `/no A1`）拒绝；10 分钟未回复会自动拒绝。审批编号按账号和联系人隔离，其他渠道或联系人不能代为处理。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-multi-account.png" alt="Codex Channel Bridge 多账号管理" width="100%" />
+  <img src="docs/images/screenshots/web-multi-account.png" alt="Codex IM Gateway 多账号管理" width="100%" />
 </p>
 
 ### 6. Web 会话管理
@@ -73,7 +73,7 @@
 Web 端可以按微信账号查看 Markdown 历史、继续同一个 Codex thread，并支持新建、重命名、切换、重置和删除会话。页面也支持直接发送文本和附件，每次最多 10 个文件、合计 100 MiB。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-session-management.png" alt="Codex Channel Bridge Web 会话管理" width="100%" />
+  <img src="docs/images/screenshots/web-session-management.png" alt="Codex IM Gateway Web 会话管理" width="100%" />
 </p>
 
 ### 7. Web 全局设置
@@ -81,7 +81,7 @@ Web 端可以按微信账号查看 Markdown 历史、继续同一个 Codex threa
 Web 端可以配置工作目录、Codex 后端、模型、推理强度和过程进度。项目只从 GitHub 获取源码并在本机运行，不通过 npm 发布或安装。
 
 <p align="center">
-  <img src="docs/images/screenshots/web-global-settings.png" alt="Codex Channel Bridge Web 全局设置" width="100%" />
+  <img src="docs/images/screenshots/web-global-settings.png" alt="Codex IM Gateway Web 全局设置" width="100%" />
 </p>
 
 ## 环境要求
@@ -98,11 +98,11 @@ codex
 
 ## 本地运行
 
-项目只支持从 GitHub 获取源码后在本机运行，不提供 npm 包，也不要执行 `npm install -g codex-channel-bridge` 或 `npm publish`。
+项目只支持从 GitHub 获取源码后在本机运行，不提供 npm 包，也不要执行 `npm install -g codex-im-gateway` 或 `npm publish`。
 
 ```bash
-git clone https://github.com/lsiten/codex-channel-bridge.git
-cd codex-channel-bridge
+git clone https://github.com/yanjijinxiao/codex-im-gateway.git
+cd codex-im-gateway
 npm ci
 npm run build
 node dist/server/index.js
@@ -120,7 +120,7 @@ npm run taskboard:codex
 
 这个命令会用所需的本机调试参数启动 Codex，并一次性在原生侧边栏“插件”下增加两个同级入口：
 
-- **渠道配置（消息渠道）**：打开 Codex Channel Bridge 管理页，可添加个人微信、企业微信、飞书和钉钉。
+- **渠道配置（消息渠道）**：打开 Codex IM Gateway 管理页，可添加个人微信、企业微信、飞书和钉钉。
 - **任务面板**：打开内置 Taskboard，继续使用当前项目和 Codex 会话上下文。
 
 两个入口共用 Codex 主工作区，不会额外打开浏览器侧栏。注入器负责保持入口有效，因此使用期间请保持该命令所在的终端运行；以后启动集成版 Codex 仍运行同一条命令即可。
@@ -336,7 +336,7 @@ Bridge 项目与模式门禁
 
 ```bash
 npm run install:local
-launchctl kickstart -k gui/$(id -u)/com.lsiten.codex-channel-bridge
+# 重启当前运行 node dist/server/index.js 的终端或你已配置的系统服务
 npm run install:check
 curl http://127.0.0.1:47823/health
 curl http://127.0.0.1:8787/api/taskboard
@@ -353,7 +353,7 @@ curl http://127.0.0.1:8787/api/taskboard
 Codex 可以在最终回复中声明需要发送的本机文件：
 
 ````text
-```codex-channel-bridge-actions
+```codex-im-gateway-actions
 {
   "send": [
     { "type": "image", "path": "/absolute/path/chart.png" },
@@ -387,7 +387,7 @@ IkunCoding 提供方会额外显示 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6
 服务状态和默认 Codex 工作目录统一放在：
 
 ```text
-~/.codex-weixin/
+~/.codex-im-gateway/
   accounts/                 微信账号凭据，每个账号一个文件
   retained-accounts.json    已移除账号的恢复索引，不包含 token
   runtime/<account-id>/     联系人授权、受管会话和个人知识库状态
@@ -397,22 +397,22 @@ IkunCoding 提供方会额外显示 `gpt-5.6-sol`、`gpt-5.6-terra` 和 `gpt-5.6
   taskboard/                内置 Taskboard 的 SQLite、附件与本地云伴侣配置
 ```
 
-不要提交或分享该目录。管理 API 不会把微信 token 返回给浏览器。
+不要提交或分享该目录。管理 API 不会把微信 token 返回给浏览器。若新目录尚不存在，服务会自动复用已有的 `~/.codex-channel-bridge/` 或 `~/.codex-weixin/`，无需搬迁现有账号与钉钉配置。
 
 ## 启动设置
 
 服务始终只绑定 `127.0.0.1`。可以通过环境变量改变端口、状态目录或关闭自动打开浏览器：
 
 ```text
-CODEX_CHANNEL_BRIDGE_PORT=8787
-CODEX_CHANNEL_BRIDGE_STATE_DIR=/absolute/private/path
-CODEX_CHANNEL_BRIDGE_OPEN=0
+CODEX_IM_GATEWAY_PORT=8787
+CODEX_IM_GATEWAY_STATE_DIR=/absolute/private/path
+CODEX_IM_GATEWAY_OPEN=0
 ```
 
 Windows PowerShell 示例：
 
 ```powershell
-$env:CODEX_CHANNEL_BRIDGE_OPEN="0"
+$env:CODEX_IM_GATEWAY_OPEN="0"
 node dist/server/index.js
 ```
 
@@ -442,7 +442,7 @@ node dist/server/index.js
 
 ## 参考与许可
 
-项目最初来自 [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin)，当前以独立名称维护于 [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge)。`~/.codex-weixin`、`CODEX_WEIXIN_*` 和旧 action block 仅作为现有安装的兼容接口保留。微信 iLink 接入形态参考 `Tencent/openclaw-weixin`，并参考了公开的 Codex/微信桥接项目在 Codex app-server、媒体传输和安全边界方面的实践。项目未复制 AGPL 项目源码，使用 MIT License。
+项目沿革为 [XavierJiezou/codex-weixin](https://github.com/XavierJiezou/codex-weixin) → [lsiten/codex-channel-bridge](https://github.com/lsiten/codex-channel-bridge) → [yanjijinxiao/codex-im-gateway](https://github.com/yanjijinxiao/codex-im-gateway)。原作者版权声明与 MIT License 均完整保留。`~/.codex-channel-bridge`、`~/.codex-weixin`、`CODEX_CHANNEL_BRIDGE_*`、`CODEX_WEIXIN_*` 和旧 action block 仅作为现有安装的兼容接口保留。微信 iLink 接入形态参考 `Tencent/openclaw-weixin`，并参考了公开项目在 Codex app-server、媒体传输和安全边界方面的实践；项目未复制 AGPL 项目源码。本项目是非官方社区项目，与 OpenAI、钉钉、腾讯、字节跳动及上述上游维护者不存在隶属或背书关系。
 
 版本变更见 [CHANGELOG.md](./CHANGELOG.md)。
 

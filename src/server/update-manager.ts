@@ -9,7 +9,7 @@ const UPDATE_REGISTRY_URLS = {
   npmmirror: "https://registry.npmmirror.com"
 } as const;
 const UPDATE_REGISTRY_IDS = Object.keys(UPDATE_REGISTRY_URLS) as UpdateRegistryId[];
-const PACKAGE_NAME = "codex-channel-bridge";
+const PACKAGE_NAME = "codex-im-gateway";
 const MAX_REGISTRY_RESPONSE_BYTES = 64 * 1024;
 const MAX_INSTALL_OUTPUT_BYTES = 20 * 1024;
 const STABLE_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;

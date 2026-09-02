@@ -1,10 +1,25 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { normalizeAccountId } from "../weixin/accounts.js";
 
 export function defaultStateDir(): string {
-  return path.join(os.homedir(), ".codex-weixin");
+  return path.join(os.homedir(), ".codex-im-gateway");
+}
+
+/**
+ * Reuses an existing installation before choosing the new canonical path.
+ * Explicit CODEX_IM_GATEWAY_STATE_DIR / legacy environment variables still
+ * take precedence in the server entry point.
+ */
+export function preferredStateDir(home = os.homedir()): string {
+  const candidates = [
+    path.join(home, ".codex-im-gateway"),
+    path.join(home, ".codex-channel-bridge"),
+    path.join(home, ".codex-weixin")
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
 }
 
 export type StatePaths = {

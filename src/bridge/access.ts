@@ -30,7 +30,7 @@ export class AccessController {
 
     return {
       allowed: false,
-      message: `Access denied. Open the Codex Channel Bridge management page and allow actor ${senderId} or conversation ${conversationId}`
+      message: `Access denied. Open the Codex IM Gateway management page and allow actor ${senderId} or conversation ${conversationId}`
     };
   }
 

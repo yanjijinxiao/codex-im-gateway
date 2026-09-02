@@ -58,7 +58,7 @@ test("omits the sender when adapting inbound events for an Enterprise WeChat web
     msgtype: "text",
     text: {
       content: [
-        "[Codex Channel Bridge] 收到消息",
+        "[Codex IM Gateway] 收到消息",
         "渠道: feishu",
         "内容: hello",
         "附件: photo.png"
@@ -77,7 +77,7 @@ test("omits the recipient when adapting outbound events for each selectable webh
     attachments: [{ kind: "file" as const, label: "report.txt" }]
   };
   const expectedText = [
-    "[Codex Channel Bridge] 发出消息",
+    "[Codex IM Gateway] 发出消息",
     "渠道: weixin",
     "内容: build passed",
     "附件: report.txt"
@@ -148,7 +148,7 @@ test("auto-detects known webhook providers for saved configurations without a pr
     msg_type: "text",
     content: {
       text: [
-        "[Codex Channel Bridge] 收到消息",
+        "[Codex IM Gateway] 收到消息",
         "渠道: weixin",
         "内容: hello"
       ].join("\n")

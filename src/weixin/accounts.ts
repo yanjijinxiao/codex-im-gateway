@@ -355,7 +355,7 @@ export function publicAccount(account: ChannelAccount): PublicChannelAccount {
 export function loadAccount(paths: StatePaths, accountId?: string): ChannelAccount {
   const accounts = listAccounts(paths);
   if (accounts.length === 0) {
-    throw new Error("No WeChat account found. Open Codex Channel Bridge and add an account.");
+    throw new Error("No WeChat account found. Open Codex IM Gateway and add an account.");
   }
   if (!accountId) {
     if (accounts.length > 1) {

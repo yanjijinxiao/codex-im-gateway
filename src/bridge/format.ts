@@ -4,14 +4,15 @@ import type { KnowledgeEntry } from "../state/knowledge.js";
 const BRIDGE_ACTION_INSTRUCTIONS = [
   "WeChat bridge rule: when you need to send a local image, video, or file to the user, do not use Markdown local file links.",
   "When a WeChat attachment line includes a local path, inspect the saved local attachment with available tools before answering.",
-  "Use a fenced codex-channel-bridge-actions JSON block instead, for example:",
-  "```codex-channel-bridge-actions",
+  "Use a fenced codex-im-gateway-actions JSON block instead, for example:",
+  "```codex-im-gateway-actions",
   "{\"send\":[{\"type\":\"image\",\"path\":\"C:/absolute/path/image.png\"},{\"type\":\"video\",\"path\":\"C:/absolute/path/video.mp4\"}]}",
   "```"
 ].join("\n");
 const LEGACY_BRIDGE_ACTION_INSTRUCTIONS = [
-  BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-channel-bridge-actions", "codex-weixin-actions"),
-  BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-channel-bridge-actions", "codex-weixin-server-actions")
+  BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-channel-bridge-actions"),
+  BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-actions"),
+  BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-server-actions")
 ];
 const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
 const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
@@ -62,7 +63,7 @@ function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[]): string {
     KNOWLEDGE_CONTEXT_START,
     "Private knowledge belongs only to this WeChat account. Use relevant entries to personalize the answer.",
     ...(entries.length ? ["Known reusable knowledge:", ...entries] : ["Known reusable knowledge: none yet."]),
-    "After answering, add at most 3 stable reusable facts to the codex-channel-bridge-actions JSON under remember.",
+    "After answering, add at most 3 stable reusable facts to the codex-im-gateway-actions JSON under remember.",
     "Each item must be {\"kind\":\"preference|skill|knowledge|workflow\",\"scope\":\"account|project\",\"title\":\"...\",\"content\":\"...\"}.",
     "Remember explicit preferences, repeatable work methods, durable domain knowledge, or reusable workflows only.",
     "Never remember secrets, credentials, private keys, access tokens, transient task status, or guesses. Omit remember when nothing qualifies.",

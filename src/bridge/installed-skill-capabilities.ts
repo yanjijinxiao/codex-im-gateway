@@ -33,7 +33,7 @@ export function createInstalledSkillCapabilitiesProvider(
   const warn = (message: string): void => {
     if (warned.has(message)) return;
     warned.add(message);
-    (options.warn ?? console.warn)(`[codex-channel-bridge] ${message}`);
+    (options.warn ?? console.warn)(`[codex-im-gateway] ${message}`);
   };
 
   return async () => {

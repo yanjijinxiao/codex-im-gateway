@@ -25,7 +25,7 @@ export type ParsedActionBlocks = {
   actions: BridgeActions;
 };
 
-const ACTION_BLOCK_RE = /```(?:codex-channel-bridge|codex-weixin(?:-server)?)-actions\s*([\s\S]*?)```/gi;
+const ACTION_BLOCK_RE = /```(?:codex-im-gateway|codex-channel-bridge|codex-weixin(?:-server)?)-actions\s*([\s\S]*?)```/gi;
 const MARKDOWN_LINK_RE = /(!)?\[[^\]]*]\(([^)]+)\)/g;
 
 function isAbsoluteLocalPath(value: string): boolean {

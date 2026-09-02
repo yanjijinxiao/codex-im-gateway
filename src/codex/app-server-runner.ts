@@ -321,7 +321,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       // Releasing ownership is best-effort and must never replace the actual
       // turn result. A closed transport already releases all of its threads.
       console.warn(
-        `[codex-channel-bridge] Unable to release Codex session ${threadId}: ${error instanceof Error ? error.message : String(error)}`
+        `[codex-im-gateway] Unable to release Codex session ${threadId}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -550,12 +550,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
     if (!projectName) return undefined;
 
-    const idempotencyKey = `codex-channel-bridge:${crypto.createHash("sha256").update(root).digest("hex")}`;
+    const idempotencyKey = `codex-im-gateway:${crypto.createHash("sha256").update(root).digest("hex")}`;
     try {
       const response = await this.request("project/create", {
         name: projectName,
         roots: [{ path: root }],
-        metadata: { source: "codex-channel-bridge" },
+        metadata: { source: "codex-im-gateway" },
         idempotencyKey
       }) as Record<string, unknown>;
       const project = parseAppServerProject(response.project);
@@ -797,8 +797,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     try {
       await this.request("initialize", {
         clientInfo: {
-          name: "codex-channel-bridge",
-          title: "Codex Channel Bridge",
+          name: "codex-im-gateway",
+          title: "Codex IM Gateway",
           version: "0.4.0"
         },
         capabilities: {

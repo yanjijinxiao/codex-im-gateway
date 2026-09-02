@@ -50,7 +50,7 @@ export async function resolveTaskboardTarget(input: {
       : await input.client.getIssue(input.identifier);
   } catch (error) {
     console.warn(
-      `[codex-channel-bridge] Taskboard target lookup failed for ${input.identifier}: ${error instanceof Error ? error.message : String(error)}`
+      `[codex-im-gateway] Taskboard target lookup failed for ${input.identifier}: ${error instanceof Error ? error.message : String(error)}`
     );
     await input.replyText(
       input.senderId,

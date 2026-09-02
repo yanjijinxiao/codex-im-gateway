@@ -187,7 +187,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       return await this.appServer.listProjects();
     } catch (error) {
       console.warn(
-        `[codex-channel-bridge] app-server project catalog unavailable; using CLI catalog: ${
+        `[codex-im-gateway] app-server project catalog unavailable; using CLI catalog: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
@@ -285,7 +285,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       // Codex Desktop may be closed. Task persistence must not depend on the
       // renderer being present; the task will be discovered on its next load.
       console.warn(
-        `[codex-channel-bridge] unable to refresh Codex Desktop task list: ${error instanceof Error ? error.message : String(error)}`
+        `[codex-im-gateway] unable to refresh Codex Desktop task list: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }

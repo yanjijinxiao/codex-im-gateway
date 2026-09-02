@@ -547,7 +547,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
     codexRuntime: { model: string; effort: string };
     codexModels: Array<{ model: string }>;
   };
-  assert.equal(bootstrap.product, "codex-channel-bridge");
+  assert.equal(bootstrap.product, "codex-im-gateway");
   assert.equal(bootstrap.version, "9.8.7");
   assert.equal(bootstrap.accounts[0].token, undefined);
   assert.deepEqual(bootstrap.codex, { ready: true, version: "codex-cli test" });
@@ -562,7 +562,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
   assert.match(pageHtml, /<link rel="icon" href="\/favicon\.svg" type="image\/svg\+xml">/);
   assert.match(
     pageHtml,
-    /href="https:\/\/github\.com\/lsiten\/codex-channel-bridge" target="_blank" rel="noopener noreferrer"/
+    /href="https:\/\/github\.com\/yanjijinxiao\/codex-im-gateway" target="_blank" rel="noopener noreferrer"/
   );
   assert.match(pageHtml, /id="updateCheckButton"/);
   assert.match(pageHtml, /id="removeAccountDialog"/);
@@ -600,7 +600,7 @@ test("local API redacts credentials and protects mutations", async (t) => {
   const faviconResponse = await fetch(`${server.url}/favicon.svg`);
   assert.equal(faviconResponse.status, 200);
   assert.match(faviconResponse.headers.get("content-type") ?? "", /^image\/svg\+xml/);
-  assert.match(await faviconResponse.text(), /<title>Codex Channel Bridge<\/title>/);
+  assert.match(await faviconResponse.text(), /<title>Codex IM Gateway<\/title>/);
 
   const updateResponse = await fetch(`${server.url}/api/update`);
   assert.deepEqual(await updateResponse.json(), {

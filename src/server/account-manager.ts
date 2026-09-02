@@ -39,7 +39,7 @@ import {
 } from "../knowledge/llm-wiki-mcp-client.js";
 import type { CodexAccountBalance } from "../codex/account-balance.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
-import { isWorkspaceAllowed, loadConfig, type CodexWeixinConfig } from "../state/config.js";
+import { isWorkspaceAllowed, loadConfig, type CodexImGatewayConfig } from "../state/config.js";
 import { accountStatePaths, type StatePaths } from "../state/paths.js";
 import {
   CodexSessionCompletionMonitor,
@@ -223,7 +223,7 @@ type DirectChannelText = {
 
 export type AccountManagerOptions = {
   paths: StatePaths;
-  configProvider?: () => CodexWeixinConfig;
+  configProvider?: () => CodexImGatewayConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
   channelFactory?: (
     account: WeComAccount | FeishuAccount | DingTalkAccount,
@@ -231,7 +231,7 @@ export type AccountManagerOptions = {
   ) => ChannelAdapter;
   bridgeFactory?: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   monitor?: (options: MonitorOptions) => Promise<void>;
-  runnerFactory?: (config: CodexWeixinConfig) => CodexBridgeBackend;
+  runnerFactory?: (config: CodexImGatewayConfig) => CodexBridgeBackend;
   codexSessionMonitorFactory?: (
     handlers: {
       onCompletion: (completion: CodexSessionCompletion) => Promise<void>;
@@ -251,12 +251,12 @@ export type AccountManagerOptions = {
 export class AccountManager {
   private readonly entries = new Map<string, RuntimeEntry>();
   private readonly respondingSessions = new Map<string, number>();
-  private readonly configProvider: () => CodexWeixinConfig;
+  private readonly configProvider: () => CodexImGatewayConfig;
   private readonly clientFactory: (account: WeixinAccount) => WeixinApiClient;
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   private readonly channelFactory: NonNullable<AccountManagerOptions["channelFactory"]>;
   private readonly monitor: (options: MonitorOptions) => Promise<void>;
-  private readonly runnerFactory: (config: CodexWeixinConfig) => CodexBridgeBackend;
+  private readonly runnerFactory: (config: CodexImGatewayConfig) => CodexBridgeBackend;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
@@ -310,7 +310,7 @@ export class AccountManager {
   async startAll(): Promise<void> {
     for (const account of migrateLegacyDingTalkCardProfiles(this.options.paths)) {
       console.log(
-        `[codex-channel-bridge] migrated DingTalk AI Card streaming profile for account ${account.accountId}`
+        `[codex-im-gateway] migrated DingTalk AI Card streaming profile for account ${account.accountId}`
       );
     }
     await Promise.all(listAccounts(this.options.paths)
@@ -638,7 +638,7 @@ export class AccountManager {
       return projectCandidatesFromBackendCatalog(await runner.listProjects());
     } catch (error) {
       console.warn(
-        `[codex-channel-bridge] unable to read selected backend project catalog; using local discovery fallback: ${
+        `[codex-im-gateway] unable to read selected backend project catalog; using local discovery fallback: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
@@ -1119,7 +1119,7 @@ export class AccountManager {
     const runner = this.runnerFactory(config);
     this.runner = runner;
     runner.warmUp(this.options.paths.root).catch((error: unknown) => {
-      console.warn("[codex-channel-bridge] Codex app-server warm-up failed", {
+      console.warn("[codex-im-gateway] Codex app-server warm-up failed", {
         error: error instanceof Error ? error.message : String(error)
       });
     });
@@ -1189,7 +1189,7 @@ export class AccountManager {
   private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
     const project = this.projectForExternalThread(approval.request.threadId, approval.request.cwd);
     if (!project) {
-      console.warn(`[codex-channel-bridge] no managed project found for Codex Desktop approval ${approval.requestId}`);
+      console.warn(`[codex-im-gateway] no managed project found for Codex Desktop approval ${approval.requestId}`);
       return undefined;
     }
     return this.requestProjectApproval(project, approval.request);
@@ -1218,7 +1218,7 @@ export class AccountManager {
         return entry?.status === "running" && Boolean(entry.service);
       });
     if (!target) {
-      console.warn(`[codex-channel-bridge] no running notification channel for approval in project ${project.name}`);
+      console.warn(`[codex-im-gateway] no running notification channel for approval in project ${project.name}`);
       return undefined;
     }
     const entry = this.entries.get(target.accountId);
@@ -1442,7 +1442,7 @@ export class AccountManager {
     this.taskboardController = controller;
     this.taskboardTask = this.runTaskboardMonitor(client, controller.signal).catch((error) => {
       if (!controller.signal.aborted) {
-        console.error(`[codex-channel-bridge] Taskboard monitor stopped: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`[codex-im-gateway] Taskboard monitor stopped: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
   }
@@ -1455,7 +1455,7 @@ export class AccountManager {
         retryMs = 2_000;
       } catch (error) {
         if (signal.aborted) return;
-        console.warn(`[codex-channel-bridge] Taskboard event stream unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        console.warn(`[codex-im-gateway] Taskboard event stream unavailable: ${error instanceof Error ? error.message : String(error)}`);
       }
       await waitForAbortOrTimeout(signal, retryMs);
       retryMs = Math.min(retryMs * 2, 30_000);
@@ -1524,7 +1524,7 @@ export class AccountManager {
       else await this.sendChannelText(entry, message);
     }));
     for (const result of results) {
-      if (result.status === "rejected") console.error(`[codex-channel-bridge] channel notification failed: ${String(result.reason)}`);
+      if (result.status === "rejected") console.error(`[codex-im-gateway] channel notification failed: ${String(result.reason)}`);
     }
   }
 

@@ -77,8 +77,8 @@ test("uses the first valid registry and installs from that same registry", async
   assert.deepEqual(await manager.installLatest(), { version: "1.2.4", registry: "npmmirror" });
   assert.deepEqual(installed, [{ version: "1.2.4", registry: "npmmirror" }]);
   assert.deepEqual(requested.sort(), [
-    "https://registry.npmjs.org/codex-channel-bridge/latest",
-    "https://registry.npmmirror.com/codex-channel-bridge/latest"
+    "https://registry.npmjs.org/codex-im-gateway/latest",
+    "https://registry.npmmirror.com/codex-im-gateway/latest"
   ].sort());
 });
 
@@ -155,17 +155,17 @@ test("builds fixed cross-platform npm install commands", () => {
     nodePath: "/node"
   }), {
     command: "npm",
-    args: ["install", "--global", "--prefix", "/opt/homebrew", "--no-save", "--package-lock=false", "codex-channel-bridge@1.2.4", "--registry=https://registry.npmmirror.com", "--no-audit", "--no-fund"]
+    args: ["install", "--global", "--prefix", "/opt/homebrew", "--no-save", "--package-lock=false", "codex-im-gateway@1.2.4", "--registry=https://registry.npmmirror.com", "--no-audit", "--no-fund"]
   });
   assert.deepEqual(buildNpmInstallCommand("1.2.4", "official", {
-    installPrefix: "/Users/tester/codex-channel-bridge-runtime",
+    installPrefix: "/Users/tester/codex-im-gateway-runtime",
     global: false,
     platform: "darwin",
     env: {},
     nodePath: "/node"
   }), {
     command: "npm",
-    args: ["install", "--prefix", "/Users/tester/codex-channel-bridge-runtime", "--no-save", "--package-lock=false", "codex-channel-bridge@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
+    args: ["install", "--prefix", "/Users/tester/codex-im-gateway-runtime", "--no-save", "--package-lock=false", "codex-im-gateway@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
   });
   assert.deepEqual(buildNpmInstallCommand("1.2.4", "official", {
     installPrefix: "/opt/homebrew",
@@ -176,27 +176,27 @@ test("builds fixed cross-platform npm install commands", () => {
     npmPath: "/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"
   }), {
     command: "/opt/homebrew/bin/node",
-    args: ["/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js", "install", "--global", "--prefix", "/opt/homebrew", "--no-save", "--package-lock=false", "codex-channel-bridge@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
+    args: ["/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js", "install", "--global", "--prefix", "/opt/homebrew", "--no-save", "--package-lock=false", "codex-im-gateway@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
   });
   assert.deepEqual(buildNpmInstallCommand("1.2.4", "official", {
-    installPrefix: "C:\\Users\\THU\\codex-channel-bridge-runtime",
+    installPrefix: "C:\\Users\\THU\\codex-im-gateway-runtime",
     global: true,
     platform: "win32",
     env: { ComSpec: "C:\\Windows\\cmd.exe" },
     nodePath: "C:\\node.exe"
   }), {
     command: "C:\\Windows\\cmd.exe",
-    args: ["/d", "/s", "/c", "npm", "install", "--global", "--prefix", "C:\\Users\\THU\\codex-channel-bridge-runtime", "--no-save", "--package-lock=false", "codex-channel-bridge@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
+    args: ["/d", "/s", "/c", "npm", "install", "--global", "--prefix", "C:\\Users\\THU\\codex-im-gateway-runtime", "--no-save", "--package-lock=false", "codex-im-gateway@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
   });
   assert.deepEqual(buildNpmInstallCommand("1.2.4", "official", {
-    installPrefix: "C:\\Users\\THU\\codex-channel-bridge-runtime",
+    installPrefix: "C:\\Users\\THU\\codex-im-gateway-runtime",
     global: true,
     platform: "win32",
     env: { npm_execpath: "C:\\npm\\npm-cli.js" },
     nodePath: "C:\\node.exe"
   }), {
     command: "C:\\node.exe",
-    args: ["C:\\npm\\npm-cli.js", "install", "--global", "--prefix", "C:\\Users\\THU\\codex-channel-bridge-runtime", "--no-save", "--package-lock=false", "codex-channel-bridge@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
+    args: ["C:\\npm\\npm-cli.js", "install", "--global", "--prefix", "C:\\Users\\THU\\codex-im-gateway-runtime", "--no-save", "--package-lock=false", "codex-im-gateway@1.2.4", "--registry=https://registry.npmjs.org", "--no-audit", "--no-fund"]
   });
   assert.throws(
     () => buildNpmInstallCommand("latest", "official", { installPrefix: "/runtime" }),
@@ -213,7 +213,7 @@ test("builds fixed cross-platform npm install commands", () => {
 });
 
 test("finds Homebrew npm-cli outside a background service PATH", (t) => {
-  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-bridge-npm-path-"));
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "codex-im-gateway-npm-path-"));
   t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
   const nodeRoot = path.join(prefix, "Cellar", "node", "1.0.0");
   const nodePath = path.join(nodeRoot, "bin", "node");
@@ -246,9 +246,9 @@ test("prefers the npm CLI bundled beside node.exe on Windows", {
 });
 
 test("installs through an absolute npm CLI when PATH has no npm", async (t) => {
-  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-bridge-npm-install-"));
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "codex-im-gateway-npm-install-"));
   t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
-  const packageRoot = path.join(prefix, "node_modules", "codex-channel-bridge");
+  const packageRoot = path.join(prefix, "node_modules", "codex-im-gateway");
   const entryPath = path.join(packageRoot, "dist", "server", "index.js");
   const npmCliPath = path.join(prefix, "fake-npm-cli.mjs");
   fs.mkdirSync(path.dirname(entryPath), { recursive: true });
@@ -259,9 +259,9 @@ test("installs through an absolute npm CLI when PATH has no npm", async (t) => {
     'import path from "node:path";',
     'const args = process.argv.slice(2);',
     'const prefix = args[args.indexOf("--prefix") + 1];',
-    'const spec = args.find((arg) => arg.startsWith("codex-channel-bridge@"));',
-    'const version = spec.slice("codex-channel-bridge@".length);',
-    'const root = path.join(prefix, "node_modules", "codex-channel-bridge");',
+    'const spec = args.find((arg) => arg.startsWith("codex-im-gateway@"));',
+    'const version = spec.slice("codex-im-gateway@".length);',
+    'const root = path.join(prefix, "node_modules", "codex-im-gateway");',
     'fs.mkdirSync(path.join(root, "dist", "server"), { recursive: true });',
     'fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ version }));',
     'fs.writeFileSync(path.join(root, "dist", "server", "index.js"), "export {};\\n");'
@@ -282,51 +282,51 @@ test("installs through an absolute npm CLI when PATH has no npm", async (t) => {
 
 test("resolves global and isolated npm install targets on macOS and Windows", () => {
   assert.deepEqual(
-    resolveNpmInstallTarget("/opt/homebrew/lib/node_modules/codex-channel-bridge", "darwin"),
+    resolveNpmInstallTarget("/opt/homebrew/lib/node_modules/codex-im-gateway", "darwin"),
     {
       installPrefix: "/opt/homebrew",
-      packageRoot: "/opt/homebrew/lib/node_modules/codex-channel-bridge",
+      packageRoot: "/opt/homebrew/lib/node_modules/codex-im-gateway",
       global: true
     }
   );
   assert.deepEqual(
-    resolveNpmInstallTarget("/Users/tester/codex-channel-bridge-runtime/node_modules/codex-channel-bridge", "darwin"),
+    resolveNpmInstallTarget("/Users/tester/codex-im-gateway-runtime/node_modules/codex-im-gateway", "darwin"),
     {
-      installPrefix: "/Users/tester/codex-channel-bridge-runtime",
-      packageRoot: "/Users/tester/codex-channel-bridge-runtime/node_modules/codex-channel-bridge",
+      installPrefix: "/Users/tester/codex-im-gateway-runtime",
+      packageRoot: "/Users/tester/codex-im-gateway-runtime/node_modules/codex-im-gateway",
       global: false
     }
   );
   assert.deepEqual(
-    resolveNpmInstallTarget("C:\\Users\\THU\\AppData\\Roaming\\npm\\node_modules\\codex-channel-bridge", "win32"),
+    resolveNpmInstallTarget("C:\\Users\\THU\\AppData\\Roaming\\npm\\node_modules\\codex-im-gateway", "win32"),
     {
       installPrefix: "C:\\Users\\THU\\AppData\\Roaming\\npm",
-      packageRoot: "C:\\Users\\THU\\AppData\\Roaming\\npm\\node_modules\\codex-channel-bridge",
+      packageRoot: "C:\\Users\\THU\\AppData\\Roaming\\npm\\node_modules\\codex-im-gateway",
       global: true
     }
   );
   assert.equal(
-    resolveNpmInstallPrefix("/opt/homebrew/lib/node_modules/codex-channel-bridge", "darwin"),
+    resolveNpmInstallPrefix("/opt/homebrew/lib/node_modules/codex-im-gateway", "darwin"),
     "/opt/homebrew"
   );
   assert.equal(
-    resolveNpmInstallPrefix("C:\\Users\\THU\\work\\codex-channel-bridge-runtime\\node_modules\\codex-channel-bridge", "win32"),
-    "C:\\Users\\THU\\work\\codex-channel-bridge-runtime"
+    resolveNpmInstallPrefix("C:\\Users\\THU\\work\\codex-im-gateway-runtime\\node_modules\\codex-im-gateway", "win32"),
+    "C:\\Users\\THU\\work\\codex-im-gateway-runtime"
   );
-  assert.equal(resolveNpmInstallPrefix("/workspace/codex-channel-bridge", "darwin"), undefined);
-  assert.equal(resolveNpmInstallTarget("/workspace/codex-channel-bridge", "darwin"), undefined);
+  assert.equal(resolveNpmInstallPrefix("/workspace/codex-im-gateway", "darwin"), undefined);
+  assert.equal(resolveNpmInstallTarget("/workspace/codex-im-gateway", "darwin"), undefined);
 });
 
 test("releases a Windows cwd lock only when the service runs inside its package", () => {
   const changedDirectories: string[] = [];
-  assert.equal(releaseRuntimeDirectoryLock("C:\\Users\\THU\\work\\codex-channel-bridge-runtime", {
-    currentWorkingDirectory: "C:\\Users\\THU\\work\\codex-channel-bridge-runtime\\node_modules\\codex-channel-bridge\\dist\\server",
+  assert.equal(releaseRuntimeDirectoryLock("C:\\Users\\THU\\work\\codex-im-gateway-runtime", {
+    currentWorkingDirectory: "C:\\Users\\THU\\work\\codex-im-gateway-runtime\\node_modules\\codex-im-gateway\\dist\\server",
     platform: "win32",
     chdir: (directory) => changedDirectories.push(directory)
   }), true);
-  assert.deepEqual(changedDirectories, ["C:\\Users\\THU\\work\\codex-channel-bridge-runtime"]);
+  assert.deepEqual(changedDirectories, ["C:\\Users\\THU\\work\\codex-im-gateway-runtime"]);
 
-  assert.equal(releaseRuntimeDirectoryLock("C:\\Users\\THU\\work\\codex-channel-bridge-runtime", {
+  assert.equal(releaseRuntimeDirectoryLock("C:\\Users\\THU\\work\\codex-im-gateway-runtime", {
     currentWorkingDirectory: "C:\\Users\\THU\\.codex-weixin",
     platform: "win32",
     chdir: (directory) => changedDirectories.push(directory)
@@ -337,8 +337,8 @@ test("releases a Windows cwd lock only when the service runs inside its package"
 test("releases a macOS global package cwd lock using its actual package root", () => {
   const changedDirectories: string[] = [];
   assert.equal(releaseRuntimeDirectoryLock("/opt/homebrew", {
-    packageRoot: "/opt/homebrew/lib/node_modules/codex-channel-bridge",
-    currentWorkingDirectory: "/opt/homebrew/lib/node_modules/codex-channel-bridge/dist/server",
+    packageRoot: "/opt/homebrew/lib/node_modules/codex-im-gateway",
+    currentWorkingDirectory: "/opt/homebrew/lib/node_modules/codex-im-gateway/dist/server",
     platform: "darwin",
     chdir: (directory) => changedDirectories.push(directory)
   }), true);
@@ -361,7 +361,7 @@ test("converts unsigned Windows npm exit codes back to signed libuv errors", () 
 test("rejects Web installation when running from a source checkout", async () => {
   const manager = new UpdateManager({
     currentVersion: "1.2.3",
-    packageRoot: "/workspace/codex-channel-bridge",
+    packageRoot: "/workspace/codex-im-gateway",
     platform: "darwin",
     fetch: async () => new Response(JSON.stringify({ version: "1.2.4" }), { status: 200 })
   });
