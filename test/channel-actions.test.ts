@@ -200,6 +200,14 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
     ["1", "2", "default"]
   );
   assert.equal(texts.length, 0);
+  assert.equal(cards[0].body, cards[0].fallbackText, "native help must not hide its command guide in fallbackText");
+  for (const command of ["history", "follow", "policy", "role"]) {
+    assert.ok(cards[0].actionGroups.flat().some((action) => action.value.command === command));
+  }
+  assert.ok(cards[0].actionGroups.flat().some((action) => action.value.command === "help" && action.value.arg === "session"));
+  await send("session-help", "/h session");
+  assert.match(cards.at(-1)!.body, /会话介入与跟随[\s\S]*\/history more[\s\S]*\/follow[\s\S]*\/leave[\s\S]*\/policy[\s\S]*\/role/);
+  assert.doesNotMatch(cards.at(-1)!.body, /\/task new|\/project rename/);
 });
 
 test("Bridge refreshes the originating native action card after a card callback", async (t) => {

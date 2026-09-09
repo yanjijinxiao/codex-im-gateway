@@ -185,6 +185,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     return this.createTextCard(this.cardTarget(input.toUserId), input.text, false);
   }
 
+  readonly resumableTextStream = true;
+
   async updateTextStream(input: {
     toUserId: string;
     messageId: string;

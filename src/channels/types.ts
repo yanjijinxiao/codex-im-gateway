@@ -3,6 +3,8 @@ import type { ChannelActionCard } from "./action-card.js";
 import type { ChannelTaskCard } from "./task-card.js";
 
 export type ChannelTextClient = {
+  /** Can update an existing stream using only its persisted message ID. */
+  resumableTextStream?: boolean;
   sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
   startTextStream?(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
   updateTextStream?(input: {

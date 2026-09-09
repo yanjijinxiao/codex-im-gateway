@@ -269,14 +269,16 @@ test("lists every built-in command and reports the current Codex account balance
   });
 
   await send("help", "/help");
-  const help = replies.at(-1) ?? "";
+  const help = replies.join("\n\n");
   for (const command of [
     "/help", "/status", "/balance", "/memory", "/project", "/task", "/new", "/sessions", "/session",
-    "/model", "/effort", "/stream", "/prompt start", "/prompt done", "/approve", "/reject", "/stop"
+    "/history", "/history more", "/help session", "/follow", "/leave", "/policy", "/role", "/intervene",
+    "/steer", "/queue", "/model", "/effort", "/stream", "/prompt start", "/prompt done",
+    "/approve", "/reject", "/stop"
   ]) {
     assert.match(help, new RegExp(command.replace("/", "\\/")));
   }
-  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/tb", "/ss", "/s", "/n", "/m", "/e", "/str", "/pp", "/ok", "/no", "/x"]) {
+  for (const alias of ["/h", "/st", "/bal", "/mem", "/p", "/tb", "/ss", "/s", "/hist", "/iv", "/n", "/m", "/e", "/str", "/pp", "/ok", "/no", "/x"]) {
     assert.match(help, new RegExp(alias.replace("/", "\\/")));
   }
   assert.doesNotMatch(help, /\/bind|\/resume|\/b\b|\/r\b/);
@@ -1312,6 +1314,110 @@ test("binds a Codex Desktop session from the current project and continues its t
   await send("continue", "接着完成");
   assert.equal(runs.at(-1)?.threadId, "desktop-thread");
   assert.equal(runs.at(-1)?.queueKey, "desktop-thread");
+});
+
+test("replays clean session history and steers the exact active Codex turn", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-intervene-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const project = stateStore.createProject("介入项目", tmpDir);
+  stateStore.createSession("ding-user", project.workspace, "桥接入口", project.id);
+  const replies: string[] = [];
+  const steerCalls: Array<Record<string, unknown>> = [];
+  const history = [
+    {
+      id: "user-history",
+      role: "user" as const,
+      text: buildPrompt("检查历史实现", [{
+        kind: "image",
+        label: "screen.png",
+        path: "/private/secret/screen.png"
+      }]),
+      createdAt: "2026-09-09T08:00:00.000Z"
+    },
+    {
+      id: "progress-history",
+      role: "assistant" as const,
+      kind: "progress" as const,
+      text: "不应作为历史答案显示"
+    },
+    {
+      id: "assistant-history",
+      role: "assistant" as const,
+      text: "历史结论\n\n```codex-channel-bridge-actions\n{\"send\":[]}\n```",
+      createdAt: "2026-09-09T08:01:00.000Z"
+    }
+  ];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["ding-user"] },
+    stateStore,
+    listCodexSessions: () => [{
+      threadId: "desktop-active-thread",
+      workspace: tmpDir,
+      title: "桌面运行中会话",
+      lastUsedAt: "2026-09-09T08:02:00.000Z",
+      persistence: "active",
+      runtimeStatus: "active"
+    }],
+    weixin: {
+      async sendText(input: { text: string }) {
+        replies.push(input.text);
+        return { messageId: `reply-${replies.length}` };
+      }
+    } as never,
+    runner: {
+      async getHistory() { return history; },
+      async inspectThread() {
+        return {
+          threadId: "desktop-active-thread",
+          persistence: "active",
+          runtimeStatus: "active",
+          activeFlags: [],
+          latestTurnStatus: "inProgress",
+          activeTurnId: "desktop-active-turn",
+          cwd: tmpDir
+        };
+      },
+      async steer(input: Record<string, unknown>) {
+        steerCalls.push(input);
+        return {
+          status: "accepted" as const,
+          threadId: String(input.threadId),
+          turnId: String(input.expectedTurnId)
+        };
+      },
+      async stop() { return "not-active" as const; }
+    } as never
+  });
+  const send = (id: string, text: string) => service.handleMessage({
+    id,
+    senderId: "ding-user",
+    text,
+    attachments: [],
+    raw: {}
+  });
+
+  await send("list", "/sessions");
+  const activeRef = replies.at(-1)?.match(/\[(R\d+)\] 桌面运行中会话/);
+  assert.ok(activeRef, "select the listed backend session without depending on the wall clock");
+  await send("bind", `/session ${activeRef[1]}`);
+  assert.match(replies.at(-1) ?? "", /\/steer <补充要求>/);
+  assert.match(replies.at(-1) ?? "", /检查历史实现[\s\S]*图片：screen\.png[\s\S]*历史结论/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /WeChat bridge rule|private\/secret|不应作为历史答案|codex-channel-bridge-actions/);
+
+  await send("history", "/history 10");
+  assert.match(replies.at(-1) ?? "", /👤 用户[\s\S]*🤖 Codex/);
+  assert.doesNotMatch(replies.at(-1) ?? "", /WeChat bridge rule|private\/secret|不应作为历史答案|codex-channel-bridge-actions/);
+
+  await send("dingtalk-message-1", "/steer 先修复活动任务的测试");
+  assert.deepEqual(steerCalls, [{
+    threadId: "desktop-active-thread",
+    expectedTurnId: "desktop-active-turn",
+    prompt: "先修复活动任务的测试",
+    cwd: tmpDir,
+    clientUserMessageId: "dingtalk-message-1"
+  }]);
+  assert.match(replies.at(-1) ?? "", /已介入当前正在执行的 Codex 任务/);
 });
 
 test("hides archived and missing sessions from the resumable session list", async (t) => {

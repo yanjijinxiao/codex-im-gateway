@@ -20,6 +20,8 @@ import {
   type CodexAppServerBackend,
   type CodexDynamicToolCall,
   type CodexDynamicToolHandler,
+  type CodexHistoryPage,
+  type CodexHistoryPageInput,
   type CodexHistoryMessage,
   type CodexModelOption,
   type CodexProject,
@@ -27,6 +29,8 @@ import {
   type CodexRunResult,
   type CodexRunnerInput,
   type CodexRuntimeInfo,
+  type CodexSteerInput,
+  type CodexSteerResult,
   type CodexStopResult,
   type CodexThreadActiveFlag,
   type CodexThreadGoal,
@@ -140,12 +144,23 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
   private readonly threadStates = new Map<string, CodexThreadState>();
   private readonly projectIdsByRoot = new Map<string, string>();
+  private operationLeases = 0;
   private projectCatalogSupported?: boolean;
   private modelOptions?: CodexModelOption[];
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    this.operationLeases += 1;
+    try {
+      return await this.runWithLease(input);
+    } finally {
+      this.operationLeases -= 1;
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  private async runWithLease(input: CodexRunnerInput): Promise<CodexRunResult> {
     await this.ensureConnected();
 
     if (input.threadId) {
@@ -303,6 +318,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }
       this.queuedTurnEvents.delete(key);
     }
+    await input.onTurnStarted?.({ threadId, turnId });
     return await this.waitForTurn(threadId, turnId);
     } finally {
       await this.unsubscribeThread(threadId);
@@ -336,7 +352,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
    * be stopped by an individual Bridge client.
    */
   private async recyclePrivateTransportIfIdle(): Promise<void> {
-    if (this.options.transport || this.activeTurns.size || this.pending.size) return;
+    if (this.options.transport || this.operationLeases || this.activeTurns.size || this.pending.size) return;
     const child = this.child;
     if (!child || child.exitCode !== null) return;
 
@@ -359,13 +375,25 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!graceful && child.exitCode === null) child.kill();
   }
 
-  async inspectThread(threadId: string): Promise<CodexThreadState> {
+  async inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState> {
     await this.ensureConnected();
     try {
-      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
+      let response: Record<string, unknown>;
+      try {
+        response = await this.request("thread/read", { threadId, includeTurns: observation?.includeTurns ?? true }, observation?.timeoutMs) as Record<string, unknown>;
+      } catch (error) {
+        if (!/ephemeral threads do not support includeTurns/i.test(String(error))) throw error;
+        response = await this.request("thread/read", { threadId, includeTurns: false }) as Record<string, unknown>;
+      }
       const thread = response.thread as Record<string, unknown> | undefined;
       if (!thread) throw new Error(`Codex app-server returned no thread for ${threadId}`);
       const state = parseThreadState(thread, persistenceFromThread(thread));
+      const activeTurnId = this.activeTurns.get(threadId);
+      if (activeTurnId) {
+        state.activeTurnId = activeTurnId;
+        state.latestTurnStatus = "inProgress";
+        state.runtimeStatus = "active";
+      }
       this.threadStates.set(threadId, state);
       return state;
     } catch (error) {
@@ -638,6 +666,87 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
   }
 
+  async readThreadSnapshot(threadId: string): Promise<import("./backend.js").CodexThreadSnapshot> {
+    // Keep both observation reads on one connection and bound their payload.
+    // A five-second follow tick must not reload an entire long-lived history.
+    this.operationLeases++;
+    try {
+      const timeoutMs = Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000);
+      const state = await this.inspectThread(threadId, { includeTurns: false, timeoutMs });
+      if (state.persistence === "missing" || state.persistence === "archived") return { state, turns: [] };
+      await this.ensureConnected();
+      const response = await this.request("thread/turns/list", {
+        threadId, limit: 20, sortDirection: "desc", itemsView: "full"
+      }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus }> };
+      return { state, turns: (response.data ?? []).slice().reverse().map((turn) => ({
+        id: turn.id, status: turn.status, messages: parseThreadHistory({ turns: [turn] })
+      })) };
+    } finally {
+      this.operationLeases--;
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  async getHistoryPage(
+    threadId: string,
+    input: CodexHistoryPageInput = {}
+  ): Promise<CodexHistoryPage> {
+    await this.ensureConnected();
+    try {
+      const response = await this.request("thread/turns/list", compactObject({
+        threadId,
+        cursor: input.cursor,
+        limit: Math.max(1, Math.min(input.limit ?? 20, 100)),
+        sortDirection: input.sortDirection ?? "desc",
+        itemsView: "full"
+      })) as Record<string, unknown>;
+      const turns = Array.isArray(response.data) ? response.data.slice() : [];
+      if ((input.sortDirection ?? "desc") === "desc") turns.reverse();
+      return {
+        messages: parseThreadHistory({ turns }),
+        ...(typeof response.nextCursor === "string" && response.nextCursor
+          ? { nextCursor: response.nextCursor }
+          : {}),
+        ...(typeof response.backwardsCursor === "string" && response.backwardsCursor
+          ? { backwardsCursor: response.backwardsCursor }
+          : {})
+      };
+    } catch (error) {
+      throw normalizeThreadOperationError(error, threadId);
+    } finally {
+      await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  async steer(input: CodexSteerInput): Promise<CodexSteerResult> {
+    const prompt = input.prompt.trim();
+    if (!prompt) throw new Error("介入内容不能为空。");
+    await this.ensureConnected();
+
+    let turnId = input.expectedTurnId ?? this.activeTurns.get(input.threadId);
+    if (!turnId) {
+      const state = await this.inspectThread(input.threadId);
+      assertCodexThreadRunnable(state);
+      turnId = state.activeTurnId;
+      await this.ensureConnected();
+    }
+    if (!turnId) {
+      throw new Error(`Codex session ${input.threadId} 当前没有正在执行的任务，无法介入。`);
+    }
+
+    try {
+      const response = await this.request("turn/steer", {
+        threadId: input.threadId,
+        input: [{ type: "text", text: prompt, text_elements: [] }],
+        expectedTurnId: turnId
+      }) as Record<string, unknown>;
+      const acceptedTurnId = typeof response.turnId === "string" ? response.turnId : turnId;
+      return { status: "accepted", threadId: input.threadId, turnId: acceptedTurnId };
+    } catch (error) {
+      throw normalizeSteerError(error, input.threadId, turnId);
+    }
+  }
+
   async getRuntimeInfo(cwd: string, threadId?: string): Promise<CodexRuntimeInfo> {
     const active = threadId ? this.runtimeInfoByThread.get(threadId) : undefined;
     if (active?.model || active?.effort) {
@@ -716,6 +825,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   async stop(threadId?: string): Promise<CodexStopResult> {
+    if (threadId) await this.ensureConnected();
     if (!this.initialized || !this.child || this.child.exitCode !== null) {
       return "not-active";
     }
@@ -725,9 +835,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       : undefined;
     if (threadId && !target) {
       const state = await this.inspectThread(threadId);
+      assertCodexThreadRunnable(state);
       if (state.latestTurnStatus === "inProgress" && state.activeTurnId) {
         target = { threadId, turnId: state.activeTurnId };
       }
+      await this.ensureConnected();
     }
     if (!threadId) {
       target = Array.from(this.activeTurns.entries(), ([activeThreadId, turnId]) => ({
@@ -1736,6 +1848,22 @@ function normalizeThreadOperationError(error: unknown, threadId: string): Error 
     );
   }
   return error instanceof Error ? error : new Error(message);
+}
+
+function normalizeSteerError(error: unknown, threadId: string, expectedTurnId: string): Error {
+  const normalized = normalizeThreadOperationError(error, threadId);
+  if (normalized instanceof CodexThreadStateError) return normalized;
+  const message = normalized.message;
+  if (/no active turn|not.*active|没有.*(?:任务|turn)|already completed/i.test(message)) {
+    return new Error(`Codex session ${threadId} 的任务已经结束，无法介入；请把消息作为下一轮发送。`);
+  }
+  if (/expectedTurnId|expected turn|different turn|mismatch/i.test(message)) {
+    return new Error(`Codex session ${threadId} 的活动任务已变化（原 turn ${expectedTurnId}），请刷新后重试。`);
+  }
+  if (/not steerable|review turn|compact turn|active_turn_not_steerable/i.test(message)) {
+    return new Error(`Codex session ${threadId} 当前任务类型不支持运行中介入，请等待完成或先停止任务。`);
+  }
+  return normalized;
 }
 
 function isMissingOrArchivedThreadError(error: unknown): boolean {

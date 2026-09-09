@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { rolloutIdentity } from "../codex/rollout-identity.js";
 
 const RESTORED_TASK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const SESSION_CONTEXT_TAIL_BYTES = 8 * 1024 * 1024;
@@ -42,6 +43,8 @@ export type CodexSessionCompletionMonitorOptions = {
   onCompletion: (completion: CodexSessionCompletion) => void | Promise<void>;
   onTaskChanged?: (task: CodexSessionTask) => void | Promise<void>;
   onActivity?: (activity: CodexSessionActivity) => void | Promise<void>;
+  /** Startup recovery only; consumers must check their persisted pending turn. */
+  onRecoveredCompletion?: (completion: CodexSessionCompletion) => void | Promise<void>;
 };
 
 type SessionCursor = {
@@ -50,11 +53,12 @@ type SessionCursor = {
   workspace?: string;
   sessionId?: string;
   taskTitle?: string;
-  threadSource?: string;
+  internal?: boolean;
   activeTurnId?: string;
   activeStartedAt?: string;
   toolNames?: Map<string, string>;
   lastActivityByTurn?: Map<string, string>;
+  recoveredCompletion?: CodexSessionCompletion;
 };
 
 export class CodexSessionCompletionMonitor {
@@ -147,6 +151,7 @@ export class CodexSessionCompletionMonitor {
         ...initialContext
       };
       this.cursors.set(filePath, cursor);
+      if (cursor.recoveredCompletion) await this.options.onRecoveredCompletion?.(cursor.recoveredCompletion);
       if (replayStartupWrite) await this.processFile(filePath, runId);
       if (!this.isActiveRun(runId)) return;
       const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
@@ -189,6 +194,15 @@ export class CodexSessionCompletionMonitor {
         if (!isWithin(root, filePath)) return;
         this.pendingFiles.add(filePath);
         setTimeout(() => void this.scanNow(), 150).unref();
+      });
+      watcher.on("error", (error) => {
+        // Recursive watching may exhaust or be denied by the host (EMFILE is
+        // commonly reported by sandboxed macOS runners). Polling remains the
+        // authoritative fallback, so a watcher failure must not stop Bridge.
+        console.warn(`[codex-im-gateway] Codex session watcher unavailable under ${root}: ${String(error)}`);
+        watcher.close();
+        const index = this.watchers.indexOf(watcher);
+        if (index >= 0) this.watchers.splice(index, 1);
       });
       this.watchers.push(watcher);
     } catch (error) {
@@ -238,13 +252,13 @@ export class CodexSessionCompletionMonitor {
   private async processEvent(cursor: SessionCursor, event: Record<string, unknown>): Promise<void> {
     const payload = recordValue(event.payload);
     if (event.type === "session_meta" && payload) {
+      const identity = rolloutIdentity(payload);
       if (typeof payload.cwd === "string") cursor.workspace = path.resolve(payload.cwd);
-      if (typeof payload.session_id === "string") cursor.sessionId = payload.session_id;
-      else if (typeof payload.id === "string") cursor.sessionId = payload.id;
-      if (typeof payload.thread_source === "string") cursor.threadSource = payload.thread_source;
+      cursor.sessionId = identity.threadId;
+      cursor.internal = identity.internal;
       return;
     }
-    if (!payload || cursor.threadSource === "subagent") return;
+    if (!payload || cursor.internal || !cursor.sessionId) return;
     const timestamp = eventTimestamp(event);
     if (event.type === "response_item") {
       await this.processResponseItem(cursor, payload, timestamp);
@@ -295,6 +309,7 @@ export class CodexSessionCompletionMonitor {
     }
     if (payload.type !== "task_complete" && payload.type !== "turn_aborted") return;
     if (!cursor.workspace || !cursor.sessionId || typeof payload.turn_id !== "string") return;
+    if (cursor.activeTurnId && payload.turn_id !== cursor.activeTurnId) return;
     const error = recordValue(payload.error);
     const status: CodexSessionTaskStatus = payload.type === "turn_aborted"
       ? "interrupted"
@@ -407,7 +422,9 @@ export class CodexSessionCompletionMonitor {
     if (
       !this.options.onActivity
       || !cursor.sessionId
+      || !cursor.activeTurnId
       || !targetTurnId
+      || targetTurnId !== cursor.activeTurnId
       || !content
       || cursor.lastActivityByTurn?.get(targetTurnId) === content
       || !shouldEmitEvent(cursor, updatedAt)
@@ -432,7 +449,7 @@ function taskFromCursor(
   updatedAt = new Date().toISOString()
 ): CodexSessionTask | undefined {
   if (
-    cursor.threadSource === "subagent"
+    cursor.internal
     || !cursor.workspace
     || !cursor.sessionId
     || !cursor.activeTurnId
@@ -492,22 +509,25 @@ async function readInitialSessionContext(
     const event = parseRecord(firstLine);
     const payload = event?.type === "session_meta" ? recordValue(event.payload) : undefined;
     if (!payload || typeof payload.cwd !== "string") return {};
-    const sessionId = typeof payload.session_id === "string"
-      ? payload.session_id
-      : typeof payload.id === "string"
-        ? payload.id
-        : undefined;
+    const identity = rolloutIdentity(payload);
     const context: Omit<SessionCursor, "offset"> = {
       workspace: path.resolve(payload.cwd),
-      ...(sessionId ? { sessionId } : {}),
-      ...(typeof payload.thread_source === "string" ? { threadSource: payload.thread_source } : {})
+      ...(identity.threadId ? { sessionId: identity.threadId } : {}),
+      internal: identity.internal
     };
-    if (context.threadSource === "subagent" || nowMs - file.mtimeMs > 24 * 60 * 60 * 1000) {
+    if (context.internal || nowMs - file.mtimeMs > 24 * 60 * 60 * 1000) {
       return context;
     }
     const tailOffset = Math.max(0, fileSize - SESSION_CONTEXT_TAIL_BYTES);
+    const ended = new Set<string>();
     for (const line of (await readFileRange(filePath, tailOffset, fileSize - tailOffset)).toString("utf8").split("\n")) {
       const tailEvent = parseRecord(line);
+      const explicit = recordValue(tailEvent?.payload);
+      if ((tailEvent?.type === "turn_context" || tailEvent?.type === "token_usage_record")
+        && typeof explicit?.turn_id === "string" && !ended.has(explicit.turn_id)) {
+        context.activeTurnId = explicit.turn_id;
+        context.activeStartedAt = eventTimestamp(tailEvent);
+      }
       const tailPayload = tailEvent?.type === "event_msg" ? recordValue(tailEvent.payload) : undefined;
       if (!tailPayload) continue;
       if (tailPayload.type === "task_started" && typeof tailPayload.turn_id === "string") {
@@ -522,10 +542,23 @@ async function readInitialSessionContext(
         context.taskTitle = oneLine(tailPayload.message).slice(0, 100);
       } else if (
         (tailPayload.type === "task_complete" || tailPayload.type === "turn_aborted")
-        && tailPayload.turn_id === context.activeTurnId
+        && typeof tailPayload.turn_id === "string"
       ) {
-        context.activeTurnId = undefined;
-        context.activeStartedAt = undefined;
+        ended.add(tailPayload.turn_id);
+        if (tailPayload.turn_id === context.activeTurnId) {
+          context.activeTurnId = undefined;
+          context.activeStartedAt = undefined;
+        }
+        if (context.sessionId && context.workspace) {
+          const success = tailPayload.type === "task_complete" && !tailPayload.error;
+          context.recoveredCompletion = {
+            sessionId: context.sessionId, workspace: context.workspace,
+            turnId: tailPayload.turn_id, taskTitle: context.taskTitle ?? "Codex 客户端会话",
+            text: success && typeof tailPayload.last_agent_message === "string"
+              ? tailPayload.last_agent_message : "Codex 任务已停止或执行失败。",
+            success, completedAt: eventTimestamp(tailEvent!)
+          };
+        }
       }
     }
     const startedAtMs = context.activeStartedAt ? Date.parse(context.activeStartedAt) : Number.NaN;

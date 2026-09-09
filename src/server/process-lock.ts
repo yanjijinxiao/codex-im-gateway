@@ -66,7 +66,10 @@ function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+  } catch {
+    // The gateway runs as the current account. EPERM means that the PID now
+    // belongs to another account (most commonly after a stale PID was reused),
+    // so it cannot be the process that created this lock.
+    return false;
   }
 }

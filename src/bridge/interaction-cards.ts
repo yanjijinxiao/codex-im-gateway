@@ -26,9 +26,16 @@ type CommandSelectionCardInput = {
 export function createMainMenuCard(fallbackText: string): ChannelActionCard {
   return createChoiceCard({
     title: "Codex 渠道工作台",
-    body: "请选择要查看或切换的能力。",
+    // Native cards and text-only channels must expose the same command guide.
+    body: fallbackText,
     fallbackText,
     choices: [
+      { label: "介入与跟随说明", command: "help", arg: "session", style: "primary" },
+      { label: "全部命令", command: "help", arg: "" },
+      { label: "对话历史", command: "history", arg: "" },
+      { label: "跟随状态", command: "follow", arg: "" },
+      { label: "介入策略", command: "policy", arg: "" },
+      { label: "聊天权限", command: "role", arg: "" },
       { label: "当前状态", command: "status", arg: "", style: "primary" },
       { label: "Taskboard", command: "task", arg: "list" },
       { label: "项目", command: "project", arg: "list" },

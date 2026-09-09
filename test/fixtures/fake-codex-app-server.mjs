@@ -56,6 +56,41 @@ function completedTurn(id, status, error = null) {
   };
 }
 
+function historyTurns(activeTurnId) {
+  return [
+    {
+      id: "history-turn-1",
+      status: "completed",
+      startedAt: 1_700_000_000,
+      completedAt: 1_700_000_002,
+      items: [
+        {
+          type: "userMessage",
+          id: "history-user-1",
+          clientId: null,
+          content: [{ type: "text", text: "hello history", text_elements: [] }]
+        },
+        {
+          type: "agentMessage",
+          id: "history-commentary-1",
+          text: "working",
+          phase: "commentary",
+          memoryCitation: null
+        },
+        {
+          type: "agentMessage",
+          id: "history-assistant-1",
+          text: "history reply",
+          phase: "final_answer",
+          memoryCitation: null
+        },
+        { type: "reasoning", id: "history-reasoning-1", summary: [], content: ["hidden"] }
+      ]
+    },
+    ...(activeTurnId ? [completedTurn(activeTurnId, "inProgress")] : [])
+  ];
+}
+
 rl.on("line", (line) => {
   const message = JSON.parse(line);
 
@@ -394,39 +429,22 @@ rl.on("line", (line) => {
           : activeTurnId
             ? { type: "active", activeFlags: [] }
             : { type: "idle" },
-        turns: [
-          {
-            id: "history-turn-1",
-            status: "completed",
-            startedAt: 1_700_000_000,
-            completedAt: 1_700_000_002,
-            items: [
-              {
-                type: "userMessage",
-                id: "history-user-1",
-                clientId: null,
-                content: [{ type: "text", text: "hello history", text_elements: [] }]
-              },
-              {
-                type: "agentMessage",
-                id: "history-commentary-1",
-                text: "working",
-                phase: "commentary",
-                memoryCitation: null
-              },
-              {
-                type: "agentMessage",
-                id: "history-assistant-1",
-                text: "history reply",
-                phase: "final_answer",
-                memoryCitation: null
-              },
-              { type: "reasoning", id: "history-reasoning-1", summary: [], content: ["hidden"] }
-            ]
-          },
-          ...(activeTurnId ? [completedTurn(activeTurnId, "inProgress")] : [])
-        ]
+        turns: historyTurns(activeTurnId)
       }
+    });
+    return;
+  }
+
+  if (message.method === "thread/turns/list") {
+    if (message.params?.itemsView !== "full") {
+      fail(message.id, "thread/turns/list requires full itemsView");
+      return;
+    }
+    const turns = historyTurns(activeTurns.get(message.params.threadId));
+    respond(message.id, {
+      data: message.params?.sortDirection === "asc" ? turns : [...turns].reverse(),
+      nextCursor: "older-page",
+      backwardsCursor: "newer-page"
     });
     return;
   }
@@ -647,6 +665,46 @@ rl.on("line", (line) => {
     send({
       method: "turn/completed",
       params: { threadId: message.params.threadId, turn: completedTurn(activeTurnId, "interrupted") }
+    });
+    activeTurns.delete(message.params.threadId);
+    return;
+  }
+
+  if (message.method === "turn/steer") {
+    const activeTurnId = activeTurns.get(message.params.threadId);
+    if (!activeTurnId) {
+      fail(message.id, `thread ${message.params.threadId} has no active turn`);
+      return;
+    }
+    if (activeTurnId !== message.params.expectedTurnId) {
+      fail(message.id, `expectedTurnId ${message.params.expectedTurnId} does not match ${activeTurnId}`);
+      return;
+    }
+    const prompt = message.params?.input?.[0]?.text;
+    if (message.params?.input?.[0]?.type !== "text" || typeof prompt !== "string") {
+      fail(message.id, "turn/steer requires text input");
+      return;
+    }
+    respond(message.id, { turnId: activeTurnId });
+    const itemId = `steered-${activeTurnId}`;
+    send({
+      method: "item/completed",
+      params: {
+        threadId: message.params.threadId,
+        turnId: activeTurnId,
+        completedAtMs: Date.now(),
+        item: {
+          type: "agentMessage",
+          id: itemId,
+          text: `steered:${prompt}`,
+          phase: "final_answer",
+          memoryCitation: null
+        }
+      }
+    });
+    send({
+      method: "turn/completed",
+      params: { threadId: message.params.threadId, turn: completedTurn(activeTurnId, "completed") }
     });
     activeTurns.delete(message.params.threadId);
     return;

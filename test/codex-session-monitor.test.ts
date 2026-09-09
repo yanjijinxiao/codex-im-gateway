@@ -11,6 +11,93 @@ import {
   type CodexSessionTask
 } from "../src/server/codex-session-monitor.js";
 
+test("excludes internal reviews at startup, live append and new-file discovery without suppressing the main task", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-isolation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, "sessions");
+  fs.mkdirSync(dir);
+  const main = path.join(dir, "main.jsonl");
+  const meta = (id: string, extra = {}) => ({ type: "session_meta", payload: {
+    id, session_id: "parent", cwd: root, ...extra
+  } });
+  writeLines(main, [meta("main", { source: "cli" }), taskStarted("main-turn")]);
+  const variants = [{ thread_source: "guardian_review" }, { thread_source: "subagent" },
+    { source: { subagent: { other: "guardian" } } }];
+  for (const [i, source] of variants.entries()) writeLines(path.join(dir, `internal-${i}.jsonl`), [
+    meta(`internal-${i}`, source), taskStarted(`review-${i}`), taskComplete(`review-${i}`, "INTERNAL_REVIEW")
+  ]);
+  const activities: CodexSessionActivity[] = [];
+  const completions: CodexSessionCompletion[] = [];
+  const recovered: CodexSessionCompletion[] = [];
+  const tasks: CodexSessionTask[] = [];
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"),
+    onActivity: (x) => { activities.push(x); }, onCompletion: (x) => { completions.push(x); },
+    onTaskChanged: (x) => { tasks.push(x); }, onRecoveredCompletion: (x) => { recovered.push(x); }
+  });
+  monitor.start();
+  t.after(() => monitor.stop());
+  await monitor.ready();
+  for (const [i, source] of variants.entries()) {
+    const events = [taskStarted(`fresh-${i}`), responseCommentary("INTERNAL_PROGRESS"), taskComplete(`fresh-${i}`, "INTERNAL_REVIEW")];
+    appendLines(path.join(dir, `internal-${i}.jsonl`), events);
+    writeLines(path.join(dir, `new-internal-${i}.jsonl`), [meta(`new-internal-${i}`, source), ...events]);
+  }
+  appendLines(main, [completedDesktopItem("CommandExecution", "foreign-turn"),
+    taskComplete("foreign-turn", "FOREIGN_COMPLETION"), responseCommentary("正常进展"),
+    taskComplete("main-turn", '{"outcome":"allow"}')]);
+  await monitor.scanNow();
+  await monitor.scanNow();
+  assert.deepEqual(activities.map((x) => [x.sessionId, x.turnId, x.text]), [["main", "main-turn", "正常进展"]]);
+  assert.deepEqual(completions.map((x) => [x.sessionId, x.turnId, x.text]), [["main", "main-turn", '{"outcome":"allow"}']]);
+  assert.equal(recovered.length, 0);
+  assert.ok(tasks.length > 0 && tasks.every((x) => x.sessionId === "main" && x.turnId === "main-turn"));
+});
+
+test("restores progress when a long turn start is outside the bounded tail", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-long-turn-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, "sessions");
+  fs.mkdirSync(dir);
+  const file = path.join(dir, "long.jsonl");
+  writeLines(file, [sessionMeta("long-session", root), taskStarted("long-turn"),
+    { type: "padding", payload: "x".repeat(9 * 1024 * 1024) },
+    { type: "turn_context", timestamp: "2026-08-01T08:59:00.000Z", payload: { turn_id: "long-turn" } },
+    { type: "token_usage_record", timestamp: "2026-08-01T08:59:01.000Z", payload: { turn_id: "long-turn" } }
+  ]);
+  const activities: CodexSessionActivity[] = [];
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"), onCompletion: () => undefined,
+    onActivity: (activity) => { activities.push(activity); }
+  });
+  monitor.start();
+  t.after(() => monitor.stop());
+  await monitor.ready();
+  appendLines(file, [responseCommentary("重启后的真实进展")]);
+  await monitor.scanNow();
+  assert.equal(activities.at(-1)?.turnId, "long-turn");
+  assert.equal(activities.at(-1)?.text, "重启后的真实进展");
+});
+
+test("offers persisted terminal evidence only to the recovery callback", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-recovered-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "sessions"));
+  writeLines(path.join(root, "sessions", "complete.jsonl"), [sessionMeta("session", root),
+    taskStarted("turn"), taskComplete("turn", "已在停机期间完成")]);
+  const recovered: CodexSessionCompletion[] = [];
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"),
+    onCompletion: () => { throw new Error("must not replay old completion notifications"); },
+    onRecoveredCompletion: (completion) => { recovered.push(completion); }
+  });
+  monitor.start();
+  t.after(() => monitor.stop());
+  await monitor.ready();
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].text, "已在停机期间完成");
+});
+
 test("reports only new Codex task completions from existing and new sessions", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

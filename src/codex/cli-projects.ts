@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import type { CodexProject } from "./backend.js";
+import { rolloutIdentity, type RolloutMetadata } from "./rollout-identity.js";
 
 type SessionMetaLine = {
   readonly type?: string;
   readonly timestamp?: string;
-  readonly payload?: {
+  readonly payload?: RolloutMetadata & {
     readonly cwd?: string;
     readonly timestamp?: string;
     readonly thread_source?: string;
@@ -34,7 +35,7 @@ export function listCodexCliProjects(
 
   for (const file of files) {
     const meta = readSessionMeta(file.path);
-    if (meta?.payload?.thread_source === "subagent") continue;
+    if (rolloutIdentity(meta?.payload ?? {}).internal) continue;
     const workspace = typeof meta?.payload?.cwd === "string"
       ? resolveDirectory(meta.payload.cwd)
       : undefined;

@@ -27,6 +27,8 @@ export type ManagedSession = {
   effort?: string;
   streamReplies?: boolean;
   collaborationMode?: "default" | "plan";
+  follow?: boolean;
+  activeMessagePolicy?: "ask" | "steer" | "queue";
   createdAt: string;
   updatedAt: string;
 };
@@ -69,6 +71,7 @@ export type SessionRuntimeOverrides = {
 };
 
 export type RuntimeState = {
+  conversationRoles: Record<string, Record<string, "viewer" | "participant" | "controller">>;
   pairedSenderIds: string[];
   lastActiveSenderId?: string;
   lastActiveActorId?: string;
@@ -97,6 +100,7 @@ export type RuntimeState = {
 
 export function emptyRuntimeState(): RuntimeState {
   return {
+    conversationRoles: {},
     pairedSenderIds: [],
     authorizedConversationsByActor: {},
     processedMessageIds: [],
@@ -124,6 +128,39 @@ export class RuntimeStateStore {
 
   get snapshot(): RuntimeState {
     return structuredClone(this.state);
+  }
+
+  get controlJournalPath(): string { return path.join(this.paths.runtimeDir, "session-controls.json"); }
+
+  roleFor(conversationId: string, actorId: string): "viewer" | "participant" | "controller" | undefined {
+    const roles = this.state.conversationRoles[conversationId];
+    return roles && Object.hasOwn(roles, actorId) ? roles[actorId] : undefined;
+  }
+
+  setRole(conversationId: string, actorId: string, role: "viewer" | "participant" | "controller"): void {
+    if (!Object.hasOwn(this.state.conversationRoles, conversationId)) {
+      Object.defineProperty(this.state.conversationRoles, conversationId, { value: {}, enumerable: true, writable: true, configurable: true });
+    }
+    const roles = this.state.conversationRoles[conversationId];
+    Object.defineProperty(roles, actorId, { value: role, enumerable: true, configurable: true, writable: true });
+    this.save();
+  }
+
+  setSessionFollow(sessionId: string, follow: boolean): void {
+    this.mutableSession(sessionId).follow = follow;
+    this.save();
+  }
+
+  setActiveMessagePolicy(sessionId: string, policy: "ask" | "steer" | "queue"): void {
+    this.mutableSession(sessionId).activeMessagePolicy = policy;
+    this.save();
+  }
+
+  leaveSession(senderId: string): void {
+    const session = this.mutableActiveSession(senderId);
+    if (session) session.follow = false;
+    delete this.state.activeSessionIds[senderId];
+    this.save();
   }
 
   save(): void {
@@ -830,6 +867,10 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     ...emptyRuntimeState(),
     ...value,
     pairedSenderIds: Array.isArray(value.pairedSenderIds) ? value.pairedSenderIds : [],
+    conversationRoles: Object.fromEntries(Object.entries(value.conversationRoles ?? {}).map(([chat, roles]) => [
+      chat, Object.fromEntries(Object.entries(roles ?? {}).filter(([, role]) =>
+        role === "viewer" || role === "participant" || role === "controller"))
+    ])),
     authorizedConversationsByActor: normalizeAuthorizedConversations(value.authorizedConversationsByActor),
     processedMessageIds: Array.isArray(value.processedMessageIds)
       ? value.processedMessageIds.filter((id): id is string => typeof id === "string").slice(-1_000)

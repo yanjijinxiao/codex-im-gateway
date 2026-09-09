@@ -14,6 +14,23 @@ import {
   readCodexDesktopProjects
 } from "../src/server/codex-projects.js";
 
+test("internal reviewers cannot replace a main session or inflate the CLI project catalog", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-catalog-isolation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, "sessions");
+  fs.mkdirSync(dir);
+  for (const [name, metadata] of Object.entries({
+    main: { id: "main", source: "cli" },
+    guardian: { id: "reviewer", session_id: "main", thread_source: "guardian_review" },
+    nested: { id: "subagent", session_id: "main", source: { subagent: { other: "guardian" } } },
+    fork: { id: "fork", session_id: "main", source: "cli" }
+  })) fs.writeFileSync(path.join(dir, `${name}.jsonl`), JSON.stringify({
+    type: "session_meta", payload: { ...metadata, cwd: root }
+  }) + "\n");
+  assert.deepEqual(listCodexSessionCandidates(root, root).map((x) => x.threadId).sort(), ["fork", "main"]);
+  assert.equal(listCodexCliProjects(root)[0].sessionCount, 2);
+});
+
 test("keeps a Desktop-owned active session when app-server omits it", () => {
   const merged = mergeCodexSessionCandidates([{
     threadId: "shared-thread",

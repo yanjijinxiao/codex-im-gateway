@@ -2,6 +2,21 @@ export type AccessDecision =
   | { allowed: true; message: string }
   | { allowed: false; message: string };
 
+export type SessionRole = "viewer" | "participant" | "controller";
+const ROLE_LEVEL: Record<SessionRole, number> = { viewer: 0, participant: 1, controller: 2 };
+export function roleAllows(actual: SessionRole, required: SessionRole): boolean {
+  return ROLE_LEVEL[actual] >= ROLE_LEVEL[required];
+}
+
+export function requiredCommandRole(name: string, arg = ""): SessionRole {
+  if (["stop", "approve", "reject"].includes(name)) return "controller";
+  if (name === "role") return arg.trim() ? "controller" : "viewer";
+  if (name === "project" && /^(?:add|a|rename|rn|delete|d)\b/i.test(arg)) return "controller";
+  if (["help", "status", "balance", "sessions", "history"].includes(name)) return "viewer";
+  if (["project", "session", "model", "effort", "memory", "goal", "mode", "policy", "follow"].includes(name) && !arg.trim()) return "viewer";
+  return "participant";
+}
+
 export type AccessControllerOptions = {
   allowedSenderIds?: string[];
   pairedSenderIds?: string[];

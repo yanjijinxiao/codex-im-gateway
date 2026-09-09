@@ -30,3 +30,30 @@ test("replaces a stale service process lock", (t) => {
   const lock = acquireServiceProcessLock(root);
   lock.release();
 });
+
+test("replaces a stale lock whose PID belongs to another account", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-eperm-lock-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const lockPath = path.join(root, "service.lock");
+  fs.writeFileSync(lockPath, JSON.stringify({
+    pid: 424_242,
+    startedAt: "2026-01-01T00:00:00.000Z"
+  }));
+  const originalKill = process.kill;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid === 424_242 && signal === 0) {
+      const error = new Error("operation not permitted") as NodeJS.ErrnoException;
+      error.code = "EPERM";
+      throw error;
+    }
+    return originalKill(pid, signal);
+  }) as typeof process.kill;
+
+  try {
+    const lock = acquireServiceProcessLock(root);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).pid, process.pid);
+    lock.release();
+  } finally {
+    process.kill = originalKill;
+  }
+});

@@ -3,10 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  CodexBackendCapabilityError,
   EXEC_BACKEND_CAPABILITIES,
   type CodexRunResult,
   type CodexProjectCatalog,
   type CodexRunnerInput,
+  type CodexSteerInput,
+  type CodexSteerResult,
   type CodexStopResult,
   type CodexBackendAdapter
 } from "./backend.js";
@@ -120,6 +123,10 @@ export class CodexExecRunner implements CodexBackendAdapter {
         resolve({ raw, text: parsed.text, threadId: parsed.threadId });
       });
     });
+  }
+
+  async steer(_input: CodexSteerInput): Promise<CodexSteerResult> {
+    throw new CodexBackendCapabilityError("turnSteering", this.id);
   }
 
   async stop(threadId?: string): Promise<CodexStopResult> {

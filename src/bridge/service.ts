@@ -2,7 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 
-import { AccessController } from "./access.js";
+import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
+import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import { ChannelApprovalController } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
@@ -42,6 +43,7 @@ import {
 import type {
   CodexDynamicToolCall,
   CodexBridgeBackend,
+  CodexHistoryMessage,
   CodexModelOption,
   CodexRuntimeInfo,
   CodexThreadState,
@@ -112,6 +114,10 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
+  sessionControls?: SessionControlJournal;
+  createTextStream?: (session: ManagedSession) => ChannelTurnTextStream;
+  onSubscriptionsChanged?: () => Promise<void>;
+  onTurnStarted?: (session: ManagedSession, turnId: string) => Promise<void> | void;
   config: CodexImGatewayConfig;
   stateStore: RuntimeStateStore;
   weixin: ChannelTextClient;
@@ -141,6 +147,12 @@ export type BridgeServiceOptions = {
 };
 
 export class BridgeService {
+  private readonly actor = new AsyncLocalStorage<string>();
+  private readonly controls: SessionControlJournal;
+  private readonly turnDeliveries = new SessionControlQueue();
+  private readonly historyPages = new Map<string, {
+    threadId: string; hostId: string; cursor?: string; exhausted: boolean; pending: CodexHistoryMessage[];
+  }>();
   private readonly access: AccessController;
   private readonly buffers: PromptBuffer;
   private readonly runner: CodexBridgeBackend;
@@ -152,6 +164,7 @@ export class BridgeService {
   private modeSettings: ChannelModeSettings;
 
   constructor(private readonly options: BridgeServiceOptions) {
+    this.controls = options.sessionControls ?? new SessionControlJournal(options.stateStore.controlJournalPath);
     this.access = new AccessController({
       allowedSenderIds: options.config.allowedSenderIds,
       pairedSenderIds: options.stateStore.listPairedSenderIds()
@@ -200,7 +213,20 @@ export class BridgeService {
   }
 
   async handleMessage(message: NormalizedWeixinMessage): Promise<void> {
-    return this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message));
+    return this.actor.run(message.senderId, () =>
+      this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message)));
+  }
+
+  private role(conversationId: string): SessionRole {
+    const actorId = this.actor.getStore() ?? conversationId;
+    return this.options.stateStore.roleFor(conversationId, actorId)
+      ?? (this.access.isAllowed(actorId) ? "controller" : this.options.stateStore.roleFor(conversationId, "*") ?? "participant");
+  }
+
+  private async requireRole(conversationId: string, required: SessionRole): Promise<boolean> {
+    if (roleAllows(this.role(conversationId), required)) return true;
+    await this.reply(conversationId, `当前权限为 ${this.role(conversationId)}，此操作需要 ${required} 权限。`);
+    return false;
   }
 
   private async handleInboundMessage(message: NormalizedWeixinMessage): Promise<void> {
@@ -242,6 +268,7 @@ export class BridgeService {
     const deferredCommands: ChannelCommand[] = [];
     if (commands) {
       for (const command of commands) {
+        if (!await this.requireRole(replyTargetId, requiredCommandRole(command.name, command.arg))) return;
         const requiredMode = requiredModeForCommand(command);
         if (requiredMode && !this.modeSettings.enabledModes.includes(requiredMode)) {
           await this.replyModeUnavailable(replyTargetId, requiredMode);
@@ -272,6 +299,7 @@ export class BridgeService {
       return;
     }
 
+    if (!await this.requireRole(replyTargetId, "participant")) return;
     const items = await this.promptItemsFromMessageWithNotice(scopedMessage);
     if (!items) return;
 
@@ -288,6 +316,7 @@ export class BridgeService {
       return;
     }
 
+    if (await this.handleActiveMessage(scopedMessage, items)) return;
     await this.runCodexTurn(scopedMessage, "", items);
     for (const command of deferredCommands) {
       await this.handleCommand(scopedMessage, command, channelCapabilities);
@@ -353,7 +382,7 @@ export class BridgeService {
     switch (command.name) {
       case "help":
       case "h":
-        await this.replyActionCard(message.senderId, createMainMenuCard(channelHelpText(channelCapabilities)));
+        await this.replyActionCard(message.senderId, createMainMenuCard(channelHelpText(channelCapabilities, command.arg)));
         return;
       case "status":
       case "where":
@@ -432,6 +461,28 @@ export class BridgeService {
       case "sessions":
         await this.handleSessionCommand(message.senderId, command.arg);
         return;
+      case "history":
+        await this.handleHistoryCommand(message.senderId, command.arg);
+        return;
+      case "follow":
+      case "policy":
+      case "leave":
+      case "role":
+        await this.handleInterventionSetting(message.senderId, command);
+        return;
+      case "intervene":
+        await this.handleInterventionChoice(message, command.arg);
+        return;
+      case "steer":
+        await this.handleSteerCommand(message, command.arg);
+        return;
+      case "queue":
+        if (!command.arg.trim()) {
+          await this.reply(message.senderId, "用法：/queue <下一轮要发送的内容>");
+          return;
+        }
+        await this.runCodexTurn(message, command.arg.trim());
+        return;
       case "model":
         await this.handleModelCommand(message.senderId, command.arg);
         return;
@@ -456,7 +507,9 @@ export class BridgeService {
         let stopResult: "interrupted" | "not-active";
         {
           const session = this.executionSession(message.senderId);
-          stopResult = await this.runner.stop(session?.threadId, this.projectHostId(session?.projectId));
+          stopResult = session?.threadId
+            ? await this.runner.stop(session.threadId, this.projectHostId(session.projectId))
+            : "not-active";
         }
         await this.reply(
           message.senderId,
@@ -1113,12 +1166,227 @@ export class BridgeService {
     }
     const preview = await this.projectSessionChoicePreview(selected, project);
     const bound = this.bindProjectSessionChoice(senderId, project, selected);
+    this.options.stateStore.setSessionFollow(bound.id, true);
+    await this.options.onSubscriptionsChanged?.();
     this.options.stateStore.setInteractionMode(senderId, "session");
     await this.reply(senderId, [
       `已绑定项目“${project.name}”的会话：${bound.title}`,
       `最近内容：${preview}`,
-      bound.threadId ? "下一条消息将继续该历史会话。" : "该会话尚无历史内容，下一条消息将创建新上下文。"
+      ...await this.boundSessionHistoryLines(bound, project),
+      bound.threadId
+        ? selected.candidate?.runtimeStatus === "active"
+          ? "该会话正在执行：发送 /steer <补充要求> 可立即介入当前任务；发送 /queue <下一轮要求> 可排队。"
+          : "下一条消息将继续该历史会话。"
+        : "该会话尚无历史内容，下一条消息将创建新上下文。"
     ].join("\n\n"));
+  }
+
+  private async handleHistoryCommand(senderId: string, arg: string): Promise<void> {
+    const session = this.executionSession(senderId);
+    if (!session?.threadId) {
+      await this.reply(senderId, "当前会话还没有 Codex 历史。先发送一条消息，或使用 /sessions 绑定已有会话。");
+      return;
+    }
+    const more = arg.trim().toLowerCase() === "more";
+    const requested = more || !arg.trim() ? 8 : Number(arg.trim());
+    if (!Number.isInteger(requested) || requested < 1 || requested > 20) {
+      await this.reply(senderId, "用法：/history [1-20|more]，例如 /history 10；/history more 查看更早的对话。");
+      return;
+    }
+    const hostId = this.projectHostId(session.projectId) ?? "local";
+    let page = this.historyPages.get(senderId);
+    if (!more || !page || page.threadId !== session.threadId || page.hostId !== hostId) {
+      page = { threadId: session.threadId, hostId, exhausted: false, pending: [] };
+      this.historyPages.set(senderId, page);
+    }
+    for (let reads = 0; page.pending.length < requested && !page.exhausted && reads < 10; reads++) {
+      if (typeof this.runner.getHistoryPage === "function") {
+        try {
+          const response = await this.runner.getHistoryPage(session.threadId, {
+            cursor: page.cursor, limit: 10, sortDirection: "desc"
+          }, hostId);
+          page.pending.push(...visibleConversationHistory(response.messages).reverse());
+          page.exhausted = !response.nextCursor || response.nextCursor === page.cursor;
+          page.cursor = response.nextCursor;
+          continue;
+        } catch (error) {
+          if (!/unsupported|method not found|unknown method|not implemented/i.test(String(error))) throw error;
+        }
+      }
+      page.pending.push(...visibleConversationHistory(await this.runner.getHistory(session.threadId, hostId)).reverse());
+      page.exhausted = true;
+    }
+    const visible = page.pending.splice(0, requested).reverse();
+    await this.reply(senderId, visible.length
+      ? [`会话“${session.title}”${more ? "更早的" : "最近"} ${visible.length} 条对话：`,
+          formatConversationHistory(visible),
+          !page.exhausted || page.pending.length ? "发送 /history more 查看更早的对话。" : "已到达最早的对话。"].join("\n\n")
+      : "没有更早的可显示对话。");
+  }
+
+  private async handleSteerCommand(message: NormalizedWeixinMessage, arg: string, expectedTurnId?: string): Promise<void> {
+    const prompt = arg.trim();
+    if (!prompt) {
+      await this.reply(message.senderId, "用法：/steer <要补充或纠正的要求>");
+      return;
+    }
+    const session = this.executionSession(message.senderId);
+    if (!session?.threadId) {
+      await this.reply(message.senderId, "当前会话还没有正在运行的 Codex 任务，直接发送消息即可开始。");
+      return;
+    }
+    const hostId = this.projectHostId(session.projectId);
+    const state = await this.runner.inspectThread(session.threadId, hostId);
+    if (state.persistence !== "active" || state.runtimeStatus === "systemError") {
+      const reason = unavailableProjectSessionChoiceReason({
+        managed: session,
+        title: session.title,
+        updatedAt: session.updatedAt,
+        candidate: codexThreadStateCandidate(state, session.workspace)
+      });
+      await this.reply(message.senderId, reason ?? "当前 Codex 会话不可介入，请重新选择会话。");
+      return;
+    }
+    if (state.runtimeStatus !== "active" || !state.activeTurnId) {
+      await this.replyActionCard(message.senderId, createChoiceCard({
+        title: "当前没有运行中的任务",
+        body: "这条补充无法介入已经结束的任务，可以作为下一轮消息发送。",
+        fallbackText: `当前任务已经结束。可发送：/queue ${prompt}`,
+        choices: [{ label: "作为下一轮发送", command: "queue", arg: prompt, style: "primary" }]
+      }));
+      return;
+    }
+    if (expectedTurnId && state.activeTurnId !== expectedTurnId) {
+      await this.reply(message.senderId, "目标任务已结束或发生切换，未发送这条介入。请查看 /history 后重新发送。");
+      return;
+    }
+    const result = await this.controls.steer(
+      JSON.stringify([hostId ?? "local", session.threadId]),
+      JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
+      () => this.runner.steer({
+      threadId: session.threadId!,
+      expectedTurnId: state.activeTurnId,
+      prompt,
+      cwd: session.workspace,
+      clientUserMessageId: message.id
+    }, hostId));
+    this.options.stateStore.setSessionPromptPreview(session.id, prompt);
+    await this.reply(message.senderId, [
+      "已介入当前正在执行的 Codex 任务。",
+      `Turn：${result.turnId}`,
+      `补充要求：${boundedProgressText(prompt, 800)}`
+    ].join("\n"));
+  }
+
+  private async handleInterventionSetting(senderId: string, command: ChannelCommand): Promise<void> {
+    const arg = command.arg.trim();
+    if (command.name === "role") {
+      if (!arg) {
+        await this.reply(senderId, [
+          "你的权限：" + this.role(senderId),
+          "viewer：查看；participant：续聊与介入；controller：另可停止、审批和管理权限。",
+          "设置：/role <用户ID|*> <viewer|participant|controller>（* 表示群默认权限）"
+        ].join("\n\n"));
+        return;
+      }
+      const [target, role, extra] = arg.split(/\s+/);
+      if (!target || extra || !["viewer", "participant", "controller"].includes(role)) {
+        await this.reply(senderId, "用法：/role <用户ID|*> <viewer|participant|controller>");
+        return;
+      }
+      this.options.stateStore.setRole(senderId, target, role as SessionRole);
+      await this.reply(senderId, "已设置 " + target + " 的权限为 " + role + "。");
+      return;
+    }
+    const session = this.options.stateStore.getActiveSession(senderId);
+    if (!session) { await this.reply(senderId, "请先使用 /sessions 选择会话。"); return; }
+    if (command.name === "leave") {
+      this.options.stateStore.leaveSession(senderId);
+      this.historyPages.delete(senderId);
+      await this.options.onSubscriptionsChanged?.();
+      await this.reply(senderId, "已退出会话并停止跟随；任务继续运行。");
+      return;
+    }
+    if (command.name === "follow") {
+      if (arg && arg !== "on" && arg !== "off") {
+        await this.reply(senderId, "用法：/follow [on|off]");
+        return;
+      }
+      if (arg) this.options.stateStore.setSessionFollow(session.id, arg === "on");
+      await this.options.onSubscriptionsChanged?.();
+      await this.reply(senderId, "实时跟随：" + (arg ? arg === "on" ? "已开启" : "已关闭" : session.follow === false ? "已关闭" : "已开启") + "。");
+      return;
+    }
+    if (arg && !["ask", "steer", "queue"].includes(arg)) {
+      await this.reply(senderId, "用法：/policy [ask|steer|queue]");
+      return;
+    }
+    if (arg) this.options.stateStore.setActiveMessagePolicy(session.id, arg as "ask" | "steer" | "queue");
+    await this.reply(senderId, "运行中消息处理方式：" + (arg || session.activeMessagePolicy || "ask") + "（ask 询问，steer 介入，queue 排队）。");
+  }
+
+  private async handleActiveMessage(message: NormalizedWeixinMessage, items: PromptBufferItem[]): Promise<boolean> {
+    const session = this.executionSession(message.senderId);
+    if (!session?.threadId || session.mode === "qa" || session.activeMessagePolicy === "queue") return false;
+    if (this.options.config.codexBackend === "exec" || typeof this.runner.inspectThread !== "function") return false;
+    const hostId = this.projectHostId(session.projectId);
+    const state = await this.runner.inspectThread(session.threadId, hostId);
+    if (state.runtimeStatus !== "active" || !state.activeTurnId) return false;
+    const prompt = buildPromptParts("", items, "WeChat", []).prompt;
+    if (session.activeMessagePolicy === "steer") {
+      await this.handleSteerCommand(message, prompt, state.activeTurnId);
+      return true;
+    }
+    const choice = this.controls.createChoice({
+      actorId: this.actor.getStore() ?? message.senderId, conversationId: message.senderId,
+      sessionId: session.id, threadId: session.threadId, hostId: hostId ?? "local",
+      turnId: state.activeTurnId, prompt, items
+    });
+    await this.replyActionCard(message.senderId, createChoiceCard({
+      title: "当前任务正在执行",
+      body: "如何处理这条新消息？\n\n" + boundedProgressText(buildPromptPreview("", items) ?? "", 500),
+      choices: [
+        { label: "介入当前任务", command: "intervene", arg: choice.id + " steer", style: "primary" },
+        { label: "排到下一轮", command: "intervene", arg: choice.id + " queue" },
+        { label: "取消", command: "intervene", arg: choice.id + " cancel" }
+      ],
+      fallbackText: "发送 /intervene " + choice.id + " steer 介入，queue 排队，cancel 取消。"
+    }));
+    return true;
+  }
+
+  private async handleInterventionChoice(message: NormalizedWeixinMessage, arg: string): Promise<void> {
+    const [id, action, extra] = arg.trim().split(/\s+/);
+    if (!id || extra || !["steer", "queue", "cancel"].includes(action)) {
+      await this.reply(message.senderId, "用法：/intervene <编号> <steer|queue|cancel>");
+      return;
+    }
+    const choice = this.controls.claimChoice(id, this.actor.getStore() ?? message.senderId, message.senderId, action === "cancel");
+    if (action === "cancel") { await this.reply(message.senderId, "已取消这条消息。"); return; }
+    const session = this.executionSession(message.senderId);
+    if (session?.id !== choice.sessionId || session.threadId !== choice.threadId
+      || (this.projectHostId(session.projectId) ?? "local") !== choice.hostId) {
+      await this.reply(message.senderId, "绑定的会话已切换，未发送旧卡片中的消息。请重新发送。");
+      return;
+    }
+    if (action === "steer") await this.handleSteerCommand({ ...message, id: choice.id }, choice.prompt, choice.turnId);
+    else await this.runCodexTurn({ ...message, id: choice.id }, "", choice.items);
+  }
+
+  private async boundSessionHistoryLines(
+    session: ManagedSession,
+    project: ManagedProject
+  ): Promise<string[]> {
+    if (!session.threadId) return [];
+    try {
+      const history = visibleConversationHistory(await this.runner.getHistory(session.threadId, project.hostId)).slice(-6);
+      return history.length ? [`最近对话：\n${formatConversationHistory(history)}`] : [];
+    } catch (error) {
+      console.warn(
+        `Unable to replay Codex history for session ${session.id}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return [];
+    }
   }
 
   private async recentProjectSessionChoices(senderId: string, project: ManagedProject): Promise<ProjectSessionChoice[]> {
@@ -1647,6 +1915,11 @@ export class BridgeService {
     const session = mode === "qa"
       ? this.ensureQaSession(message.senderId, project, qaContext as ManagedKnowledgeBase)
       : this.ensureConversationSession(message.senderId, project);
+    return this.turnDeliveries.run(JSON.stringify([project.hostId ?? "local", session.id]), async () => {
+    // The preceding queued turn may have created this session's first thread.
+    const fresh = this.options.stateStore.listSessions().find((item) => item.id === session.id);
+    if (!fresh) throw new Error("The queued session was removed");
+    session.threadId = fresh.threadId;
     const promptPreview = buildPromptPreview(text, attachments);
     if (promptPreview) {
       this.options.stateStore.setSessionPromptPreview(session.id, promptPreview);
@@ -1657,7 +1930,7 @@ export class BridgeService {
     const sentProgress = new Set<string>();
     let lastFallbackProgressAt = 0;
     const replyStream = progressEnabled
-      ? new ChannelTurnTextStream(this.options.weixin, message.senderId)
+      ? this.options.createTextStream?.(session) ?? new ChannelTurnTextStream(this.options.weixin, message.senderId)
       : undefined;
     let streamedAnswer = "";
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
@@ -1678,6 +1951,11 @@ export class BridgeService {
           threadTitle: preferredThreadTitle(session.title, promptPreview),
           onThreadCreated: (createdThreadId) => {
             this.options.stateStore.setSessionThread(session.id, createdThreadId);
+          },
+          onTurnStarted: ({ threadId: startedThreadId, turnId }) => {
+            session.threadId = startedThreadId;
+            this.options.stateStore.setSessionThread(session.id, startedThreadId);
+            return this.options.onTurnStarted?.(session, turnId);
           },
           queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
@@ -1752,6 +2030,7 @@ export class BridgeService {
     } finally {
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
     }
+    });
   }
 
   private async codexProjectCandidates(): Promise<readonly CodexProjectCandidate[]> {
@@ -2212,6 +2491,52 @@ function formatSessionTime(value: string): string {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function visibleConversationHistory(messages: readonly CodexHistoryMessage[]): CodexHistoryMessage[] {
+  return messages.flatMap((message) => {
+    if (message.kind === "progress") return [];
+    const text = message.role === "user"
+      ? visibleHistoryUserText(message.text)
+      : visibleHistoryAssistantText(message.text);
+    if (!text) return [];
+    return [{ ...message, text: boundedProgressText(text, 1_600) }];
+  });
+}
+
+function visibleHistoryUserText(value: string): string {
+  const parsed = parsePrompt(value);
+  const labels: Record<string, string> = {
+    file: "文件",
+    image: "图片",
+    video: "视频",
+    audio: "音频"
+  };
+  return [
+    parsed.text,
+    ...parsed.attachments.map((attachment) => `[${labels[attachment.kind] ?? "附件"}：${attachment.label}]`)
+  ].filter(Boolean).join("\n").trim();
+}
+
+function visibleHistoryAssistantText(value: string): string {
+  try {
+    return parseActionBlocks(value).visibleText.trim();
+  } catch {
+    // A malformed action block in old history must not make the whole history
+    // command fail. Hide the block and retain the user-visible answer around it.
+    return value.replace(
+      /```(?:codex-im-gateway|codex-channel-bridge|codex-weixin(?:-server)?)-actions\s*[\s\S]*?```/gi,
+      ""
+    ).trim();
+  }
+}
+
+function formatConversationHistory(messages: readonly CodexHistoryMessage[]): string {
+  return messages.map((message) => {
+    const role = message.role === "user" ? "👤 用户" : "🤖 Codex";
+    const time = message.createdAt ? ` · ${formatSessionTime(message.createdAt)}` : "";
+    return `${role}${time}\n${message.text}`;
+  }).join("\n\n");
+}
+
 function codexSessionCandidatePreview(candidate: CodexSessionCandidate): string | undefined {
   if (!candidate.lastUserMessage) return undefined;
   const parsed = parsePrompt(candidate.lastUserMessage);
@@ -2322,12 +2647,23 @@ function visibleStreamingAnswer(text: string): string {
   return (actionFence >= 0 ? text.slice(0, actionFence) : text).trim();
 }
 
-class ChannelTurnTextStream {
+export type ChannelStreamCheckpoint = {
+  messageId?: string;
+  startedAt: number;
+  progressEntries: string[];
+  thought: string;
+  answerPreview: string;
+  finished: boolean;
+};
+
+export class ChannelTurnTextStream {
   readonly supported: boolean;
   private messageId?: string;
   private disabled = false;
   private latestText = "";
-  private readonly startedAt = Date.now();
+  private startedAt = Date.now();
+  private finished = false;
+  private opening?: Promise<boolean>;
   private readonly progressEntries: string[] = [];
   private thought = "正在理解任务并规划下一步…";
   private answerPreview = "";
@@ -2338,9 +2674,40 @@ class ChannelTurnTextStream {
 
   constructor(
     private readonly client: ChannelTextClient,
-    private readonly toUserId: string
+    private readonly toUserId: string,
+    private readonly persistence?: {
+      restore?: ChannelStreamCheckpoint;
+      save: (checkpoint: ChannelStreamCheckpoint) => void;
+    }
   ) {
     this.supported = Boolean(client.startTextStream && client.updateTextStream);
+    const saved = persistence?.restore;
+    if (saved) {
+      this.messageId = saved.messageId;
+      this.startedAt = saved.startedAt;
+      this.progressEntries.push(...saved.progressEntries);
+      this.thought = saved.thought;
+      this.answerPreview = saved.answerPreview;
+      this.finished = saved.finished;
+    }
+  }
+
+  checkpoint(): ChannelStreamCheckpoint {
+    return { messageId: this.messageId, startedAt: this.startedAt,
+      progressEntries: [...this.progressEntries], thought: this.thought,
+      answerPreview: this.answerPreview, finished: this.finished };
+  }
+
+  /** Stop local timers without marking a remote card completed during shutdown. */
+  async suspend(): Promise<void> { this.stopTimers(); await this.opening; await this.chain.catch(() => undefined); }
+
+  async flush(): Promise<void> {
+    if (this.updateTimer) {
+      clearTimeout(this.updateTimer);
+      this.updateTimer = undefined;
+      await this.updateNow();
+    }
+    await this.chain;
   }
 
   async progress(text: string): Promise<boolean> {
@@ -2368,29 +2735,36 @@ class ChannelTurnTextStream {
   }
 
   private async publish(content: string): Promise<boolean> {
-    if (!this.supported || this.disabled || !content) return false;
+    if (!this.supported || this.disabled || this.finished || !content) return false;
     this.latestText = content;
+    if (this.opening) await this.opening;
     if (!this.messageId) {
-      try {
+      this.opening = (async () => { try {
         const result = await this.client.startTextStream!({ toUserId: this.toUserId, text: content });
         this.messageId = result.messageId;
+        this.persistence?.save(this.checkpoint());
         this.lastUpdateAt = Date.now();
         this.startHeartbeat();
         return true;
       } catch (error) {
         this.disable(error);
         return false;
-      }
+      } })();
+      try { return await this.opening; } finally { this.opening = undefined; }
     }
+    this.startHeartbeat();
     this.scheduleUpdate();
     return true;
   }
 
   async finalize(text: string): Promise<boolean> {
     const content = text.trim();
+    await this.opening;
+    if (this.finished) return true;
     if (!this.supported || !this.messageId || !content) return false;
+    this.finished = true;
     this.stopTimers();
-    await this.chain;
+    await this.chain.catch(() => undefined);
     try {
       // A transient progress update failure disables further non-terminal
       // frames, but it must not prevent the final frame from closing an
@@ -2403,30 +2777,31 @@ class ChannelTurnTextStream {
         finalize: true
       });
       this.lastUpdateAt = Date.now();
+      this.persistence?.save(this.checkpoint());
       return true;
     } catch (error) {
+      this.finished = false;
       this.disable(error);
       return false;
     }
   }
 
   async fail(text: string): Promise<boolean> {
-    if (!this.supported || !this.messageId) return false;
-    this.stopTimers();
-    await this.chain;
-    try {
+    return this.finalize(text);
+  }
+
+  private async updateNow(): Promise<void> {
+    if (this.disabled || this.finished || !this.messageId) return;
+    const text = this.latestText;
+    this.chain = this.chain.then(async () => {
+      if (this.finished) return;
       await this.client.updateTextStream!({
-        toUserId: this.toUserId,
-        messageId: this.messageId,
-        text,
-        finalize: true
+        toUserId: this.toUserId, messageId: this.messageId!, text
       });
       this.lastUpdateAt = Date.now();
-      return true;
-    } catch (error) {
-      this.disable(error);
-      return false;
-    }
+      this.persistence?.save(this.checkpoint());
+    });
+    await this.chain;
   }
 
   private scheduleUpdate(): void {
@@ -2434,16 +2809,7 @@ class ChannelTurnTextStream {
     const delay = Math.max(0, 500 - (Date.now() - this.lastUpdateAt));
     this.updateTimer = setTimeout(() => {
       this.updateTimer = undefined;
-      if (this.disabled || !this.messageId) return;
-      const text = this.latestText;
-      this.chain = this.chain.then(async () => {
-        await this.client.updateTextStream!({
-          toUserId: this.toUserId,
-          messageId: this.messageId!,
-          text
-        });
-        this.lastUpdateAt = Date.now();
-      }).catch((error) => this.disable(error));
+      void this.updateNow().catch((error) => this.disable(error));
     }, delay);
     this.updateTimer.unref?.();
   }

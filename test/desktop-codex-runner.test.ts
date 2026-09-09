@@ -69,6 +69,8 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
           }, 80);
         } else if (message.method === "thread-follower-interrupt-turn") {
           writeFrame(socket, response(message, { ok: true }));
+        } else if (message.method === "thread-follower-steer-turn") {
+          writeFrame(socket, response(message, { result: { turnId: "turn-desktop" } }));
         }
       }
     });
@@ -98,6 +100,13 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
     onProgress: (message) => progress.push(message)
   });
   await startAccepted;
+  await assert.rejects(runner.steer({
+    threadId: "thread-desktop",
+    expectedTurnId: "turn-desktop",
+    prompt: "先验证介入链路",
+    cwd: "/tmp/project",
+    clientUserMessageId: "dingtalk-message-1"
+  }), /不支持指定任务的安全介入/);
   await runner.stop("thread-desktop");
   const result = await outcome;
 
@@ -128,6 +137,8 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
   const interrupt = received.find((message) => message.method === "thread-follower-interrupt-turn");
   assert.equal(interrupt?.version, 3);
   assert.deepEqual(interrupt?.params, { conversationId: "thread-desktop" });
+  const steer = received.find((message) => message.method === "thread-follower-steer-turn");
+  assert.equal(steer, undefined, "an unguarded Desktop write must never be sent");
   const start = received.find((message) => message.method === "thread-follower-start-turn");
   assert.equal(start?.version, 2);
   assert.deepEqual(

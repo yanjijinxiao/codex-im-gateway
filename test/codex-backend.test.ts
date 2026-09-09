@@ -12,12 +12,18 @@ import { CodexBackendRouter } from "../src/codex/runner.js";
 test("declares the protocol capabilities of the two Codex backends explicitly", () => {
   assert.equal(EXEC_BACKEND_CAPABILITIES.streaming, false);
   assert.equal(EXEC_BACKEND_CAPABILITIES.history, false);
+  assert.equal(EXEC_BACKEND_CAPABILITIES.historyPaging, false);
+  assert.equal(EXEC_BACKEND_CAPABILITIES.turnSteering, false);
+  assert.equal(EXEC_BACKEND_CAPABILITIES.liveFollow, false);
   assert.equal(EXEC_BACKEND_CAPABILITIES.structuredOutput, false);
   assert.equal(EXEC_BACKEND_CAPABILITIES.projectCatalog, true);
   assert.equal(EXEC_BACKEND_CAPABILITIES.projects, false);
   assert.equal(EXEC_BACKEND_CAPABILITIES.threadNaming, false);
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.streaming, true);
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.history, true);
+  assert.equal(APP_SERVER_BACKEND_CAPABILITIES.historyPaging, true);
+  assert.equal(APP_SERVER_BACKEND_CAPABILITIES.turnSteering, true);
+  assert.equal(APP_SERVER_BACKEND_CAPABILITIES.liveFollow, true);
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.approvals, true);
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.collaborationModes, true);
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.projectCatalog, true);

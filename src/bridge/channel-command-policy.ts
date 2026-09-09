@@ -11,7 +11,8 @@ const PROJECT_OPTIONAL_COMMANDS = new Set<string>([
   "projects",
   "approve",
   "reject",
-  "answer"
+  "answer",
+  "role"
 ]);
 
 export function commandProjectRequirement(command: ChannelCommand): "optional" | "required" {
@@ -32,6 +33,15 @@ export function requiredModeForCommand(command: ChannelCommand): ProjectInteract
     case "sessions":
     case "s":
     case "ss":
+    case "history":
+    case "hist":
+    case "steer":
+    case "iv":
+    case "queue":
+    case "follow":
+    case "leave":
+    case "policy":
+    case "intervene":
       return "session";
     case "mode":
     case "view":

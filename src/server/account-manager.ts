@@ -12,6 +12,8 @@ import { createInstalledSkillCapabilitiesProvider } from "../bridge/installed-sk
 import { buildPromptParts, buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
+import { SessionControlJournal } from "../bridge/session-control.js";
+import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import {
   userFacingMessageHandlingError,
   wasMessageHandlingErrorReported
@@ -43,6 +45,7 @@ import { isWorkspaceAllowed, loadConfig, type CodexImGatewayConfig } from "../st
 import { accountStatePaths, type StatePaths } from "../state/paths.js";
 import {
   CodexSessionCompletionMonitor,
+  type CodexSessionActivity,
   type CodexSessionCompletion,
   type CodexSessionTask
 } from "./codex-session-monitor.js";
@@ -235,7 +238,9 @@ export type AccountManagerOptions = {
   codexSessionMonitorFactory?: (
     handlers: {
       onCompletion: (completion: CodexSessionCompletion) => Promise<void>;
-      onTaskChanged: (task: CodexSessionTask) => void;
+      onTaskChanged: (task: CodexSessionTask) => void | Promise<void>;
+      onActivity: (activity: CodexSessionActivity) => Promise<void>;
+      onRecoveredCompletion?: (completion: CodexSessionCompletion) => Promise<void>;
     }
   ) => CodexSessionCompletionMonitor;
   codexDesktopApprovalMonitorFactory?: (
@@ -261,6 +266,8 @@ export class AccountManager {
   private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
+  private readonly threadEvents: ThreadEventHub;
+  private readonly sessionControls: SessionControlJournal;
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
   private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
@@ -274,6 +281,12 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
+    this.threadEvents = new ThreadEventHub({
+      filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
+      subscriptions: () => this.threadSubscriptions(),
+      backend: () => this.runnerFor(this.configProvider())
+    });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
     this.clientFactory = options.clientFactory ?? ((account) => new WeixinApiClient({
       baseUrl: account.baseUrl,
@@ -318,6 +331,7 @@ export class AccountManager {
       .map((account) => this.startAccount(account.accountId, false)));
     this.ensureCodexDesktopApprovalMonitor();
     this.ensureCodexSessionMonitor();
+    this.threadEvents.start();
     this.startTaskboardMonitor();
   }
 
@@ -328,6 +342,7 @@ export class AccountManager {
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
     this.managedTurnCompletions.clear();
+    await this.threadEvents.stop();
     this.taskboardController?.abort();
     await this.taskboardTask;
     this.taskboardController = undefined;
@@ -391,6 +406,18 @@ export class AccountManager {
     const config = this.configProvider();
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
+      sessionControls: this.sessionControls,
+      onSubscriptionsChanged: () => this.threadEvents.refresh(),
+      onTurnStarted: (session, turnId) => this.threadEvents.managedStarted({
+        key: JSON.stringify([account.accountId, session.id]),
+        hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
+        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
+      }, turnId),
+      createTextStream: (session) => this.threadEvents.managedStream({
+        key: JSON.stringify([account.accountId, session.id]),
+        hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
+        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
+      }),
       config,
       stateStore: store,
       weixin: client,
@@ -1155,7 +1182,11 @@ export class AccountManager {
     this.ensureCodexDesktopApprovalMonitor();
     this.codexSessionMonitor = this.codexSessionMonitorFactory({
       onCompletion: (completion) => this.notifyExternalCodexCompletion(completion),
-      onTaskChanged: (task) => this.updateExternalCodexTask(task)
+      onTaskChanged: (task) => this.updateExternalCodexTask(task),
+      onActivity: (activity) => this.notifyExternalCodexActivity(activity),
+      onRecoveredCompletion: (completion) => this.threadEvents.recoverCompletion(
+        "local", completion.sessionId, completion.turnId, completion.text
+      )
     });
     this.codexSessionMonitor.start();
   }
@@ -1166,16 +1197,42 @@ export class AccountManager {
     );
   }
 
-  private updateExternalCodexTask(task: CodexSessionTask): void {
+  private async updateExternalCodexTask(task: CodexSessionTask): Promise<void> {
     const key = `${task.sessionId}\n${task.turnId}`;
     if (task.status === "running") {
       this.externalCodexTasks.set(key, task);
       if (this.projectForExternalThread(task.sessionId, task.workspace)) {
         this.codexDesktopApprovalMonitor?.followThread(task.sessionId);
       }
+      await this.threadEvents.started("local", task.sessionId, task.turnId, task.startedAt);
     } else {
       this.externalCodexTasks.delete(key);
     }
+  }
+
+  private async notifyExternalCodexActivity(activity: CodexSessionActivity): Promise<void> {
+    await this.threadEvents.activity("local", activity.sessionId, activity.turnId, activity.text);
+  }
+
+  private threadSubscriptions(): ThreadSubscription[] {
+    const result: ThreadSubscription[] = [];
+    for (const [accountId, entry] of this.entries) {
+      if (entry.status !== "running" || !entry.client || !entry.store) continue;
+      const store = entry.store;
+      for (const session of store.listSessions()) {
+        const managed = this.isSessionResponding(accountId, session.id);
+        if (!session.threadId && !managed) continue;
+        result.push({
+          key: JSON.stringify([accountId, session.id]), threadId: session.threadId ?? "",
+          hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
+          recipientId: session.senderId, client: entry.client,
+          managed,
+          enabled: managed || (session.follow !== false && store.getActiveSession(session.senderId)?.id === session.id),
+          contextToken: store.getContextToken(session.senderId)
+        });
+      }
+    }
+    return result;
   }
 
   private ensureCodexDesktopApprovalMonitor(): void {
@@ -1312,6 +1369,7 @@ export class AccountManager {
     );
     const completionKey = taskRuntimeKey(completion.sessionId, completion.turnId);
     if (managedByService || this.managedTurnCompletions.delete(completionKey)) return;
+    await this.finalizeExternalActivityStreams(completion);
     const workspace = path.resolve(completion.workspace);
     const boundProjects = new Set(stores.flatMap(({ account, store }) =>
       store.listSessions().flatMap((session) =>
@@ -1334,6 +1392,13 @@ export class AccountManager {
           completion.sessionId
         ))
     ));
+  }
+
+  private async finalizeExternalActivityStreams(completion: CodexSessionCompletion): Promise<void> {
+    const finalText = completion.success
+      ? completion.text
+      : `Codex 任务执行失败：${completion.text}`;
+    await this.threadEvents.completion("local", completion.sessionId, completion.turnId, finalText);
   }
 
   private async sendProjectCompletion(

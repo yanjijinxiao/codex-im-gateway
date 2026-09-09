@@ -8,7 +8,11 @@ import test from "node:test";
 import { buildPrompt } from "../src/bridge/format.js";
 import { AccountManager } from "../src/server/account-manager.js";
 import type { CodexDesktopApproval } from "../src/server/codex-desktop-approval-monitor.js";
-import type { CodexSessionCompletion, CodexSessionTask } from "../src/server/codex-session-monitor.js";
+import type {
+  CodexSessionActivity,
+  CodexSessionCompletion,
+  CodexSessionTask
+} from "../src/server/codex-session-monitor.js";
 import { defaultConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
@@ -34,6 +38,14 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   const inboundHandlers = new Map<string, (message: NormalizedWeixinMessage) => Promise<void>>();
   const handledMessages: NormalizedWeixinMessage[] = [];
   const sent: Array<{ accountId: string; toUserId: string; text: string }> = [];
+  const streamStarts: Array<{ accountId: string; toUserId: string; text: string }> = [];
+  const streamUpdates: Array<{
+    accountId: string;
+    toUserId: string;
+    messageId: string;
+    text: string;
+    finalize?: boolean;
+  }> = [];
   const sentCards: Array<{ accountId: string; toUserId: string; card: { identifier: string; latestComment?: string; actions: readonly { label: string }[] } }> = [];
   const runs: Array<Record<string, unknown>> = [];
   let runtimeInfo: { model?: string; effort?: string; provider?: string } = {
@@ -43,6 +55,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   let runHandler: ((input: Record<string, unknown>) => Promise<{ raw: string; text: string; threadId?: string; turnId?: string }>) | undefined;
   let externalCompletionHandler: ((completion: CodexSessionCompletion) => Promise<void>) | undefined;
   let externalTaskHandler: ((task: CodexSessionTask) => void) | undefined;
+  let externalActivityHandler: ((activity: CodexSessionActivity) => Promise<void>) | undefined;
   let desktopApprovalHandler: ((approval: CodexDesktopApproval) => Promise<"accept" | "decline" | undefined>) | undefined;
   const followedDesktopThreads: string[] = [];
   const channelApprovals: Array<{ senderId: string; request: Record<string, unknown> }> = [];
@@ -86,6 +99,18 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       async sendText(input: { toUserId: string; text: string }) {
         sent.push({ accountId: account.accountId, ...input });
         return { messageId: "sent" };
+      },
+      async startTextStream(input: { toUserId: string; text: string }) {
+        streamStarts.push({ accountId: account.accountId, ...input });
+        return { messageId: `stream-${streamStarts.length}` };
+      },
+      async updateTextStream(input: {
+        toUserId: string;
+        messageId: string;
+        text: string;
+        finalize?: boolean;
+      }) {
+        streamUpdates.push({ accountId: account.accountId, ...input });
       },
       ...(options.taskCards ? {
         async sendTaskCard(input: { toUserId: string; card: typeof sentCards[number]["card"] }) {
@@ -132,6 +157,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     codexSessionMonitorFactory: (handlers) => {
       externalCompletionHandler = handlers.onCompletion;
       externalTaskHandler = handlers.onTaskChanged;
+      externalActivityHandler = handlers.onActivity;
       return { start() {}, stop() {} } as never;
     },
     codexDesktopApprovalMonitorFactory: (handlers) => {
@@ -152,6 +178,8 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     runs,
     history,
     sent,
+    streamStarts,
+    streamUpdates,
     sentCards,
     async emitInbound(accountId: string, message: NormalizedWeixinMessage) {
       const handler = inboundHandlers.get(accountId);
@@ -165,6 +193,10 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     emitCodexTask(task: CodexSessionTask) {
       assert.ok(externalTaskHandler, "Codex task status monitor should be active");
       externalTaskHandler(task);
+    },
+    async emitCodexActivity(activity: CodexSessionActivity) {
+      assert.ok(externalActivityHandler, "Codex activity monitor should be active");
+      await externalActivityHandler(activity);
     },
     async emitDesktopApproval(approval: CodexDesktopApproval) {
       assert.ok(desktopApprovalHandler, "Codex Desktop approval monitor should be active");
@@ -497,6 +529,63 @@ test("notifies the configured channel when an existing Codex client task ends", 
     completedAt: "2026-08-01T08:01:00.000Z"
   });
   assert.equal(sent.length, 3, "managed sessions should not send a duplicate filesystem notification");
+  await manager.stopAll();
+});
+
+test("streams externally owned Codex progress into a bound channel session and finalizes it", async (t) => {
+  const {
+    manager,
+    root,
+    streamStarts,
+    streamUpdates,
+    emitCodexActivity,
+    emitCodexCompletion,
+    setRunHandler
+  } = setup(t);
+  await manager.startAll();
+  const workspace = path.join(root, "desktop-live-project");
+  const project = manager.createProject("account-one", "桌面实时项目", workspace);
+  const session = manager.createSession(
+    "account-one",
+    "alice@im.wechat",
+    undefined,
+    "桌面实时会话",
+    project.id
+  );
+  setRunHandler(async () => ({
+    raw: "",
+    text: "已绑定",
+    threadId: "desktop-live-thread",
+    turnId: "binding-turn"
+  }));
+  await manager.continueSession("account-one", session.id, "绑定桌面会话");
+
+  await emitCodexActivity({
+    sessionId: "desktop-live-thread",
+    turnId: "desktop-live-turn",
+    text: "正在核对测试结果",
+    updatedAt: "2026-08-01T08:00:01.000Z"
+  });
+  assert.equal(streamStarts.length, 1);
+  assert.equal(streamStarts[0]?.toUserId, "alice@im.wechat");
+  assert.match(streamStarts[0]?.text ?? "", /最近进展[\s\S]*正在核对测试结果/);
+
+  await emitCodexCompletion({
+    sessionId: "desktop-live-thread",
+    turnId: "desktop-live-turn",
+    workspace,
+    taskTitle: "桌面实时任务",
+    text: "介入链路完成",
+    success: true,
+    completedAt: "2026-08-01T08:00:02.000Z"
+  });
+  assert.deepEqual(streamUpdates.at(-1), {
+    accountId: "account-one",
+    toUserId: "alice@im.wechat",
+    messageId: "stream-1",
+    text: "介入链路完成",
+    finalize: true
+  });
   await manager.stopAll();
 });
 

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { rolloutIdentity, type RolloutMetadata } from "../codex/rollout-identity.js";
 import os from "node:os";
 import path from "node:path";
 
@@ -70,7 +71,7 @@ export function mergeCodexSessionCandidates(
 type SessionMetaLine = {
   readonly type?: string;
   readonly timestamp?: string;
-  readonly payload?: {
+  readonly payload?: RolloutMetadata & {
     readonly id?: string;
     readonly session_id?: string;
     readonly cwd?: string;
@@ -101,12 +102,17 @@ export function listCodexSessionCandidates(
   ].sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, 2_000);
   const candidates = new Map<string, CodexSessionCandidate>();
   const titles = readDesktopSessionTitles(codexHome);
+  const internalThreadIds = new Set<string>();
 
   for (const file of files) {
     const meta = readSessionMeta(file.path);
-    if (meta?.payload?.thread_source === "subagent") continue;
+    const identity = rolloutIdentity(meta?.payload ?? {});
+    if (identity.internal) {
+      if (identity.threadId) internalThreadIds.add(identity.threadId);
+      continue;
+    }
     const candidateWorkspace = meta?.payload?.cwd ? resolveDirectory(meta.payload.cwd) : "";
-    const threadId = meta?.payload?.session_id ?? meta?.payload?.id;
+    const threadId = identity.threadId;
     if (!threadId) continue;
     const desktopAssigned = desktopProjectThreads.has(threadId);
     if (!desktopAssigned && candidateWorkspace !== resolvedWorkspace) continue;
@@ -137,7 +143,7 @@ export function listCodexSessionCandidates(
   if (desktopProjectId) {
     const now = Date.now();
     for (const [index, threadId] of desktopProjectThreadIds(codexHome, desktopProjectId).entries()) {
-      if (candidates.has(threadId)) continue;
+      if (candidates.has(threadId) || internalThreadIds.has(threadId)) continue;
       candidates.set(threadId, {
         threadId,
         workspace: resolvedWorkspace,
@@ -432,6 +438,7 @@ function readSessionMeta(filePath: string): SessionMetaLine | undefined {
       type: "session_meta",
       timestamp: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
       payload: {
+        source: parsed.payload.source,
         id: typeof parsed.payload.id === "string" ? parsed.payload.id : undefined,
         session_id: typeof parsed.payload.session_id === "string" ? parsed.payload.session_id : undefined,
         cwd: parsed.payload.cwd,

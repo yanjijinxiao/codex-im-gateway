@@ -1,4 +1,4 @@
-import { CodexThreadStateError } from "../codex/backend.js";
+import { CodexInterventionError, CodexThreadStateError, CodexBackendCapabilityError } from "../codex/backend.js";
 
 const channelReportedErrors = new WeakSet<object>();
 
@@ -13,6 +13,8 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 }
 
 export function userFacingMessageHandlingError(error: unknown): string {
+  if (error instanceof CodexInterventionError) return error.message;
+  if (error instanceof CodexBackendCapabilityError) return "当前后端不支持此操作。可以使用 /queue 排队，或切换到 App Server 后端。";
   if (error instanceof CodexThreadStateError) {
     switch (error.code) {
       case "archived":

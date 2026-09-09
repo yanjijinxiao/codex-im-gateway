@@ -14,6 +14,12 @@ export type CodexBackendCapabilities = {
   readonly structuredOutput: boolean;
   readonly collaborationModes: boolean;
   readonly history: boolean;
+  /** Pages stored thread history without resuming or taking writer ownership. */
+  readonly historyPaging: boolean;
+  /** Appends user input to the currently active turn. */
+  readonly turnSteering: boolean;
+  /** Can follow activity produced by a turn that was started elsewhere. */
+  readonly liveFollow: boolean;
   readonly runtimeInfo: boolean;
   readonly models: boolean;
   readonly accountRateLimits: boolean;
@@ -55,6 +61,43 @@ export type CodexThreadListInput = {
 };
 
 export type CodexStopResult = "interrupted" | "not-active";
+export type CodexSteerResult = {
+  status: "accepted";
+  threadId: string;
+  turnId: string;
+};
+
+export type CodexSteerInput = {
+  threadId: string;
+  prompt: string;
+  /** Compare-and-steer guard. Required by app-server when the caller knows the active turn. */
+  expectedTurnId?: string;
+  /** Used by the Codex Desktop relay to reconstruct the visible user message. */
+  cwd?: string;
+  clientUserMessageId?: string;
+};
+
+export type CodexHistoryPageInput = {
+  cursor?: string;
+  limit?: number;
+  sortDirection?: "asc" | "desc";
+};
+
+export type CodexHistoryPage = {
+  messages: CodexHistoryMessage[];
+  nextCursor?: string;
+  backwardsCursor?: string;
+};
+
+export class CodexBackendCapabilityError extends Error {
+  constructor(readonly capability: keyof CodexBackendCapabilities, backend: CodexBackendId) {
+    super(`Codex ${backend} backend does not support ${capability}`);
+    this.name = "CodexBackendCapabilityError";
+  }
+}
+export class CodexInterventionError extends Error {
+  constructor(message: string) { super(message); this.name = "CodexInterventionError"; }
+}
 export type CodexThreadStateErrorCode = "archived" | "missing" | "system-error";
 
 export class CodexThreadStateError extends Error {
@@ -139,6 +182,8 @@ export type CodexRunnerInput = {
   threadId?: string;
   threadTitle?: string;
   onThreadCreated?: (threadId: string) => Promise<void> | void;
+  /** Persist the accepted turn identity before waiting for its output. */
+  onTurnStarted?: (event: { threadId: string; turnId: string }) => Promise<void> | void;
   queueKey?: string;
   model?: string;
   effort?: string;
@@ -168,6 +213,15 @@ export type CodexHistoryMessage = {
   text: string;
   kind?: "progress";
   createdAt?: string;
+};
+
+export type CodexThreadSnapshot = {
+  state: CodexThreadState;
+  turns: Array<{
+    id: string;
+    status: CodexTurnStatus;
+    messages: CodexHistoryMessage[];
+  }>;
 };
 
 export type CodexRuntimeInfo = {
@@ -221,6 +275,7 @@ export interface CodexBackendAdapter {
   readonly id: CodexBackendId;
   readonly capabilities: CodexBackendCapabilities;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
+  steer(input: CodexSteerInput): Promise<CodexSteerResult>;
   stop(threadId?: string): Promise<CodexStopResult>;
   warmUp(cwd: string): Promise<void>;
   listProjects(): Promise<CodexProjectCatalog>;
@@ -237,6 +292,7 @@ export type CodexTurnBackend = CodexBackendAdapter;
 export interface CodexThreadContinuation {
   readonly id: "desktop-relay";
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
+  steer(input: CodexSteerInput): Promise<CodexSteerResult>;
   stop(threadId?: string): Promise<CodexStopResult>;
   close(): void;
 }
@@ -245,6 +301,8 @@ export interface CodexThreadContinuation {
 export interface CodexAppServerBackend extends CodexBackendAdapter {
   readonly id: "app-server";
   getHistory(threadId: string): Promise<CodexHistoryMessage[]>;
+  getHistoryPage(threadId: string, input?: CodexHistoryPageInput): Promise<CodexHistoryPage>;
+  readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot>;
   getRuntimeInfo(cwd: string, threadId?: string): Promise<CodexRuntimeInfo>;
   listModels(): Promise<CodexModelOption[]>;
   getAccountRateLimits(): Promise<CodexAccountBalance>;
@@ -263,12 +321,19 @@ export interface CodexAppServerBackend extends CodexBackendAdapter {
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend {
+  readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
+  steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult>;
   stop(threadId?: string, hostId?: string): Promise<CodexStopResult>;
   runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult>;
   warmUp(cwd: string, hostId?: string): Promise<void>;
   listProjects(hostId?: string): Promise<CodexProjectCatalog>;
   getHistory(threadId: string, hostId?: string): Promise<CodexHistoryMessage[]>;
+  getHistoryPage(
+    threadId: string,
+    input?: CodexHistoryPageInput,
+    hostId?: string
+  ): Promise<CodexHistoryPage>;
   getRuntimeInfo(cwd: string, threadId?: string, hostId?: string): Promise<CodexRuntimeInfo>;
   listModels(): Promise<CodexModelOption[]>;
   getAccountRateLimits(): Promise<CodexAccountBalance>;
@@ -296,6 +361,9 @@ export const EXEC_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.freeze
   structuredOutput: false,
   collaborationModes: false,
   history: false,
+  historyPaging: false,
+  turnSteering: false,
+  liveFollow: false,
   runtimeInfo: false,
   models: false,
   accountRateLimits: false,
@@ -317,6 +385,9 @@ export const APP_SERVER_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.
   structuredOutput: true,
   collaborationModes: true,
   history: true,
+  historyPaging: true,
+  turnSteering: true,
+  liveFollow: true,
   runtimeInfo: true,
   models: true,
   accountRateLimits: true,

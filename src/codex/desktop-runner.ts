@@ -2,10 +2,13 @@ import crypto from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { CodexInterventionError } from "./backend.js";
 
 import type {
   CodexRunResult,
   CodexRunnerInput,
+  CodexSteerInput,
+  CodexSteerResult,
   CodexStopResult,
   CodexThreadContinuation
 } from "./backend.js";
@@ -124,6 +127,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       if (!turnId) {
         throw new Error("Codex Desktop accepted the message but did not return a turn id");
       }
+      await input.onTurnStarted?.({ threadId: input.threadId, turnId });
       const completion = await this.waitForCompletion(input.threadId, turnId, input.onProgress);
       if (!completion.success) throw new Error(completion.text);
       return {
@@ -137,17 +141,26 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     }
   }
 
-  async stop(threadId?: string): Promise<CodexStopResult> {
+  async stop(threadId?: string, expectedTurnId?: string): Promise<CodexStopResult> {
     const target = threadId
-      ? (this.activeThreads.has(threadId) ? threadId : undefined)
+      ? (expectedTurnId || this.activeThreads.has(threadId) ? threadId : undefined)
       : [...this.activeThreads].at(-1);
     if (!target) return "not-active";
     await sendFollowerInterrupt({
       socketPath: this.socketPath,
       timeoutMs: Math.min(this.requestTimeoutMs, 30_000),
-      threadId: target
+      threadId: target,
+      expectedTurnId
     });
     return "interrupted";
+  }
+
+  async steer(input: CodexSteerInput): Promise<CodexSteerResult> {
+    if (this.closed) throw new Error("Codex Desktop runner is closed");
+    // Desktop follower v1 chooses (and may retry against) its own active turn.
+    // It ignores expectedTurnId, so even a read-before-write check is unsafe.
+    // Only the shared daemon's official turn/steer can enforce this guard.
+    throw new CodexInterventionError("当前 Desktop 转发协议不支持指定任务的安全介入。请使用 /queue 排到下一轮，或通过共享 App Server 后端介入。");
   }
 
   /**
@@ -305,14 +318,15 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   }
 }
 
-async function sendFollowerInterrupt(input: Omit<FollowerRequest, "request">): Promise<void> {
+async function sendFollowerInterrupt(input: Omit<FollowerRequest, "request"> & { expectedTurnId?: string }): Promise<void> {
   const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);
   try {
     await connection.initialize();
     // Protocol v3 is the compatibility form used when no expected turn id is
     // available. V4 requires a concrete expectedTurnId.
-    await connection.request("thread-follower-interrupt-turn", 3, {
-      conversationId: input.threadId
+    await connection.request("thread-follower-interrupt-turn", input.expectedTurnId ? 4 : 3, {
+      conversationId: input.threadId,
+      ...(input.expectedTurnId ? { expectedTurnId: input.expectedTurnId } : {})
     });
   } finally {
     connection.close();

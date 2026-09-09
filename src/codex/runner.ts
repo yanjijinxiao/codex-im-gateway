@@ -11,10 +11,14 @@ import type {
   CodexAppServerBackend,
   CodexBridgeBackend,
   CodexHistoryMessage,
+  CodexHistoryPage,
+  CodexHistoryPageInput,
   CodexModelOption,
   CodexProjectCatalog,
   CodexRunResult,
   CodexRunnerInput,
+  CodexSteerInput,
+  CodexSteerResult,
   CodexRuntimeInfo,
   CodexStopResult,
   CodexThreadListInput,
@@ -34,7 +38,7 @@ export type CodexBackendRouterOptions = {
   codexBin?: string;
   execSandbox?: CodexExecSandbox;
   timeoutMs?: number;
-  desktopRunner?: Pick<DesktopCodexRunner, "run" | "stop" | "close"> &
+  desktopRunner?: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
     Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
   appServerBackend?: CodexAppServerBackend;
   execBackend?: CodexBackendAdapter;
@@ -55,7 +59,7 @@ export type HybridCodexRunnerOptions = CodexBackendRouterOptions;
 export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly appServer: CodexAppServerBackend;
   private readonly exec: CodexBackendAdapter;
-  private readonly desktop: Pick<DesktopCodexRunner, "run" | "stop" | "close"> &
+  private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
     Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
   private readonly runTails = new Map<string, Promise<void>>();
@@ -110,6 +114,17 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     }
   }
 
+  async steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult> {
+    if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
+    if (this.options.backend === "exec") return this.exec.steer(input);
+    try {
+      return await this.appServer.steer(input);
+    } catch (error) {
+      if (!isDesktopSteerCandidateError(error)) throw error;
+      return this.desktop.steer(input);
+    }
+  }
+
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
     if (isRemoteHost(input.hostId)) {
       if (this.options.backend === "exec") {
@@ -157,7 +172,19 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   async stop(threadId?: string, hostId?: string): Promise<CodexStopResult> {
     if (isRemoteHost(hostId)) {
-      return await this.remoteAppServers.get(hostId)?.stop(threadId) ?? "not-active";
+      return this.appServerFor(hostId).stop(threadId);
+    }
+    if (threadId) {
+      if (this.options.backend === "exec") return this.exec.stop(threadId);
+      try {
+        const result = await this.appServer.stop(threadId);
+        if (result === "interrupted") return result;
+      } catch (error) {
+        if (!isDesktopSteerCandidateError(error)) throw error;
+      }
+      const state = await this.appServer.inspectThread(threadId);
+      if (!state.activeTurnId) return "not-active";
+      return this.desktop.stop(threadId, state.activeTurnId);
     }
     const results = await Promise.all([
       this.appServer.stop(threadId),
@@ -197,6 +224,18 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   async getHistory(threadId: string, hostId?: string): Promise<CodexHistoryMessage[]> {
     return this.appServerFor(hostId).getHistory(threadId);
+  }
+
+  async readThreadSnapshot(threadId: string, hostId?: string) {
+    return this.appServerFor(hostId).readThreadSnapshot(threadId);
+  }
+
+  async getHistoryPage(
+    threadId: string,
+    input?: CodexHistoryPageInput,
+    hostId?: string
+  ): Promise<CodexHistoryPage> {
+    return this.appServerFor(hostId).getHistoryPage(threadId, input);
   }
 
   async getRuntimeInfo(cwd: string, threadId?: string, hostId?: string): Promise<CodexRuntimeInfo> {
@@ -297,6 +336,11 @@ export { CodexBackendRouter as HybridCodexRunner };
 function isActiveWriterError(error: unknown): boolean {
   const detail = error instanceof Error ? error.message : String(error);
   return /already has an active writer/i.test(detail);
+}
+
+function isDesktopSteerCandidateError(error: unknown): boolean {
+  const detail = error instanceof Error ? error.message : String(error);
+  return /active writer|no active turn|当前没有正在执行|任务已经结束|not loaded|not subscribed/i.test(detail);
 }
 
 function isRemoteHost(hostId?: string): hostId is string {

@@ -107,6 +107,34 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
       createdAt: "2023-11-14T22:13:22.000Z"
     }
   ]);
+  assert.deepEqual(await runner.getHistoryPage("thread-existing", {
+    limit: 10,
+    sortDirection: "asc"
+  }), {
+    messages: [
+      {
+        id: "history-user-1",
+        role: "user",
+        text: "hello history",
+        createdAt: "2023-11-14T22:13:20.000Z"
+      },
+      {
+        id: "history-commentary-1",
+        role: "assistant",
+        text: "working",
+        kind: "progress",
+        createdAt: "2023-11-14T22:13:22.000Z"
+      },
+      {
+        id: "history-assistant-1",
+        role: "assistant",
+        text: "history reply",
+        createdAt: "2023-11-14T22:13:22.000Z"
+      }
+    ],
+    nextCursor: "older-page",
+    backwardsCursor: "newer-page"
+  });
 
   assert.deepEqual(await runner.getRuntimeInfo("/tmp/another-project"), {
     model: "configured-model",
@@ -438,6 +466,50 @@ test("interrupts the active V2 turn with both threadId and turnId", async (t) =>
   }
   const result = await outcome;
   assert.match(result.error?.message ?? "", /interrupted/i);
+});
+
+test("steers an active turn with an expected-turn compare guard", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  let started: { threadId: string; turnId: string } | undefined;
+  const outcome = runner.run({ prompt: "hold", cwd: "/tmp/project", threadId: "thread-steer",
+    onTurnStarted: (event) => { started = event; }
+  });
+  let activeTurnId: string | undefined;
+  for (let attempt = 0; attempt < 20 && !activeTurnId; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    activeTurnId = (await runner.inspectThread("thread-steer")).activeTurnId;
+  }
+  assert.equal(activeTurnId, "turn-1");
+  assert.deepEqual(started, { threadId: "thread-steer", turnId: "turn-1" });
+
+  assert.deepEqual(await runner.steer({
+    threadId: "thread-steer",
+    expectedTurnId: activeTurnId,
+    prompt: "优先修复测试"
+  }), {
+    status: "accepted",
+    threadId: "thread-steer",
+    turnId: "turn-1"
+  });
+  assert.equal((await outcome).text, "steered:优先修复测试");
+});
+
+test("rejects steering when the thread has no active turn", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+
+  await assert.rejects(
+    runner.steer({ threadId: "thread-existing", prompt: "too late" }),
+    /没有正在执行的任务|no active turn/i
+  );
 });
 
 test("models active, archived, missing, and system-error thread lifecycle states", async (t) => {
