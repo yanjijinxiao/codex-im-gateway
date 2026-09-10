@@ -9,13 +9,16 @@ const PROJECT_OPTIONAL_COMMANDS = new Set<string>([
   "knowledge",
   "project",
   "projects",
+  "new", "n",
   "approve",
   "reject",
   "answer",
-  "role"
+  "role", "session", "sessions", "s", "ss", "history", "hist",
+  "follow", "leave", "policy", "steer", "iv", "intervene", "queue", "stop", "status", "where"
 ]);
 
-export function commandProjectRequirement(command: ChannelCommand): "optional" | "required" {
+export function commandProjectRequirement(command: ChannelCommand): "optional" | "required" | "session-or-project" {
+  if (["goal", "plan", "model", "effort", "stream", "prompt"].includes(command.name)) return "session-or-project";
   return PROJECT_OPTIONAL_COMMANDS.has(command.name) ? "optional" : "required";
 }
 

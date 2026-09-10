@@ -4,6 +4,8 @@ import path from "node:path";
 
 import type { FetchLike, WeixinApiClient } from "./api.js";
 import type { WeixinInboundAttachment } from "./messages.js";
+import { InboundMediaTooLargeError } from "../channels/errors.js";
+export { InboundMediaTooLargeError } from "../channels/errors.js";
 
 const DEFAULT_WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const UPLOAD_MEDIA_TYPE = {
@@ -74,18 +76,6 @@ export type DownloadedInboundAttachment = {
   path: string;
   label: string;
 };
-
-export class InboundMediaTooLargeError extends Error {
-  readonly maxBytes: number;
-  readonly actualBytes?: number;
-
-  constructor(maxBytes: number, actualBytes?: number) {
-    super(`Inbound media exceeds max size ${maxBytes} bytes`);
-    this.name = "InboundMediaTooLargeError";
-    this.maxBytes = maxBytes;
-    this.actualBytes = actualBytes;
-  }
-}
 
 export async function downloadInboundAttachments(input: {
   rootDir: string;

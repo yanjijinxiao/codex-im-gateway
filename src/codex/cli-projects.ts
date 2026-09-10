@@ -30,7 +30,7 @@ export function listCodexCliProjects(
   const files = [
     ...listJsonlFiles(path.join(codexHome, "sessions")),
     ...listJsonlFiles(path.join(codexHome, "archived_sessions"))
-  ].sort((left, right) => right.modifiedAt - left.modifiedAt).slice(0, 2_000);
+  ].sort((left, right) => right.modifiedAt - left.modifiedAt);
   const projects = new Map<string, CodexProject>();
 
   for (const file of files) {
@@ -59,11 +59,15 @@ export function listCodexCliProjects(
   );
 }
 
-function cliProjectId(workspace: string): string {
-  return `cli-${crypto.createHash("sha256").update(workspace).digest("hex").slice(0, 32)}`;
+export function cliProjectId(workspace: string): string {
+  return `cli-${crypto.createHash("sha256").update(canonicalCliWorkspace(workspace)).digest("hex").slice(0, 32)}`;
 }
 
-function listJsonlFiles(root: string): Array<{ readonly path: string; readonly modifiedAt: number }> {
+export function canonicalCliWorkspace(workspace: string): string {
+  return resolveDirectory(workspace) ?? path.resolve(workspace);
+}
+
+export function listJsonlFiles(root: string): Array<{ readonly path: string; readonly modifiedAt: number }> {
   if (!isDirectory(root)) return [];
   const result: Array<{ path: string; modifiedAt: number }> = [];
   const pending = [root];
@@ -91,7 +95,7 @@ function listJsonlFiles(root: string): Array<{ readonly path: string; readonly m
   return result;
 }
 
-function readSessionMeta(file: string): SessionMetaLine | undefined {
+export function readSessionMeta(file: string): SessionMetaLine | undefined {
   let content: string;
   try {
     const descriptor = fs.openSync(file, "r");

@@ -16,7 +16,7 @@ export function rolloutIdentity(meta: RolloutMetadata): { threadId?: string; int
 }
 
 function internalSource(value: unknown): boolean {
-  return typeof value === "string" && /^(sub_?agent|guardian)(?:$|[_:/-])/i.test(value);
+  return typeof value === "string" && /^(sub_?agent|guardian)/i.test(value);
 }
 
 function nonempty(value: unknown): string | undefined {

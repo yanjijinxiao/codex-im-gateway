@@ -6,6 +6,7 @@ import {
 import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
+import { CodexBackendCapabilityError } from "./backend.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import type {
   CodexAppServerBackend,
@@ -15,6 +16,7 @@ import type {
   CodexHistoryPageInput,
   CodexModelOption,
   CodexProjectCatalog,
+  CodexSessionCatalog,
   CodexRunResult,
   CodexRunnerInput,
   CodexSteerInput,
@@ -38,6 +40,7 @@ export type CodexBackendRouterOptions = {
   codexBin?: string;
   execSandbox?: CodexExecSandbox;
   timeoutMs?: number;
+  codexHome?: string;
   desktopRunner?: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
     Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
   appServerBackend?: CodexAppServerBackend;
@@ -52,9 +55,8 @@ export type HybridCodexRunnerOptions = CodexBackendRouterOptions;
 /**
  * Stable Bridge facade over the two concrete Codex backends.
  *
- * Turn and shared catalog routing obey `backend` strictly. Protocol-only
- * operations (history, runtime, models and goals) use the app-server extension
- * because codex exec does not expose equivalent APIs.
+ * All command operations obey the selected backend. CLI controls use local
+ * rollouts or reject unsupported capabilities; they never borrow app-server.
  */
 export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly appServer: CodexAppServerBackend;
@@ -63,6 +65,8 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
   private readonly runTails = new Map<string, Promise<void>>();
+  private selectedAutoBackend?: "exec" | "app-server";
+  private get selectedBackend() { return this.options.backend === "auto" ? this.selectedAutoBackend ?? "app-server" : this.options.backend; }
 
   constructor(private readonly options: CodexBackendRouterOptions) {
     const requestedTransport = options.appServerTransport ?? "auto";
@@ -75,12 +79,14 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       mode: effectiveTransport
     });
     this.appServer = options.appServerBackend ?? new AppServerCodexRunner({
+      codexHome: options.codexHome,
       codexBin: options.codexBin,
       requestTimeoutMs: options.timeoutMs,
       sandbox: options.execSandbox,
       transport: appServerTransport
     });
     this.exec = options.execBackend ?? new CodexExecRunner({
+      codexHome: options.codexHome,
       codexBin: options.codexBin,
       sandbox: options.execSandbox,
       timeoutMs: options.timeoutMs
@@ -116,7 +122,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   async steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult> {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
-    if (this.options.backend === "exec") return this.exec.steer(input);
+    if (this.selectedBackend === "exec") return this.exec.steer(input);
     try {
       return await this.appServer.steer(input);
     } catch (error) {
@@ -127,7 +133,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
     if (isRemoteHost(input.hostId)) {
-      if (this.options.backend === "exec") {
+      if (this.selectedBackend === "exec") {
         throw new Error(
           "The codex exec backend cannot run a remote Codex Desktop project. " +
           "Select app-server or auto for remote projects."
@@ -135,7 +141,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       }
       return this.appServerFor(input.hostId).run(input);
     }
-    if (this.options.backend === "exec") {
+    if (this.selectedBackend === "exec") {
       return this.exec.run(withInlineDeveloperInstructions(input));
     }
     try {
@@ -150,12 +156,13 @@ export class CodexBackendRouter implements CodexBridgeBackend {
         }
       });
       await this.refreshDesktopTaskList(result.threadId);
+      if (this.options.backend === "auto") this.selectedAutoBackend = "app-server";
       return result;
     } catch (error) {
       if (input.threadId && isActiveWriterError(error)) {
         return this.desktop.run(withInlineDeveloperInstructions(input));
       }
-      if (this.options.backend === "app-server" || !canRunWithoutCapabilityLoss(this.exec, input)) {
+      if (this.options.backend === "app-server" || this.selectedAutoBackend || input.threadId || !canRunWithoutCapabilityLoss(this.exec, input)) {
         throw error;
       }
       const fallback = await this.exec.run({
@@ -163,6 +170,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
         onDelta: undefined,
         onProgress: undefined
       });
+      this.selectedAutoBackend = "exec";
       return {
         ...fallback,
         text: `Warning: Codex app-server was unavailable, used codex exec fallback.\n\n${fallback.text}`
@@ -174,6 +182,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (isRemoteHost(hostId)) {
       return this.appServerFor(hostId).stop(threadId);
     }
+    if (this.selectedBackend === "exec") return this.exec.stop(threadId);
     if (threadId) {
       if (this.options.backend === "exec") return this.exec.stop(threadId);
       try {
@@ -186,15 +195,12 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       if (!state.activeTurnId) return "not-active";
       return this.desktop.stop(threadId, state.activeTurnId);
     }
-    const results = await Promise.all([
-      this.appServer.stop(threadId),
-      this.exec.stop(threadId),
-      this.desktop.stop(threadId)
-    ]);
+    const results = await Promise.all([this.appServer.stop(threadId), this.desktop.stop(threadId)]);
     return results.includes("interrupted") ? "interrupted" : "not-active";
   }
 
   runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult> {
+    if (this.selectedBackend === "exec") return Promise.reject(new CodexBackendCapabilityError("structuredOutput", "exec"));
     return this.appServer.run({
       ...input,
       ephemeral: true,
@@ -208,26 +214,32 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   async listProjects(hostId?: string): Promise<CodexProjectCatalog> {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).listProjects();
-    if (this.options.backend === "exec") return this.exec.listProjects();
-    if (this.options.backend === "app-server") return this.appServer.listProjects();
+    if (this.selectedBackend === "exec") return this.exec.listProjects();
+    if (this.options.backend === "app-server" || this.selectedAutoBackend === "app-server") return this.appServer.listProjects();
     try {
-      return await this.appServer.listProjects();
+      const catalog = await this.appServer.listProjects();
+      this.selectedAutoBackend = "app-server";
+      return catalog;
     } catch (error) {
+      // Another discovery operation may already have selected App while this
+      // project request was in flight. Never replace that catalog with CLI.
+      if (this.selectedAutoBackend === "app-server") throw error;
       console.warn(
         `[codex-im-gateway] app-server project catalog unavailable; using CLI catalog: ${
           error instanceof Error ? error.message : String(error)
         }`
       );
+      this.selectedAutoBackend = "exec";
       return this.exec.listProjects();
     }
   }
 
   async getHistory(threadId: string, hostId?: string): Promise<CodexHistoryMessage[]> {
-    return this.appServerFor(hostId).getHistory(threadId);
+    return this.backendForSharedOperation(hostId).getHistory(threadId);
   }
 
   async readThreadSnapshot(threadId: string, hostId?: string) {
-    return this.appServerFor(hostId).readThreadSnapshot(threadId);
+    return this.backendForSharedOperation(hostId).readThreadSnapshot(threadId);
   }
 
   async getHistoryPage(
@@ -235,23 +247,23 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     input?: CodexHistoryPageInput,
     hostId?: string
   ): Promise<CodexHistoryPage> {
-    return this.appServerFor(hostId).getHistoryPage(threadId, input);
+    return this.backendForSharedOperation(hostId).getHistoryPage(threadId, input);
   }
 
   async getRuntimeInfo(cwd: string, threadId?: string, hostId?: string): Promise<CodexRuntimeInfo> {
-    return this.appServerFor(hostId).getRuntimeInfo(cwd, threadId);
+    return this.backendForSharedOperation(hostId).getRuntimeInfo(cwd, threadId);
   }
 
   async listModels(): Promise<CodexModelOption[]> {
-    return this.appServer.listModels();
+    return this.backendForSharedOperation().listModels();
   }
 
   async getAccountRateLimits(): Promise<CodexAccountBalance> {
-    return this.appServer.getAccountRateLimits();
+    return this.backendForSharedOperation().getAccountRateLimits();
   }
 
   async getGoal(threadId: string, hostId?: string): Promise<CodexThreadGoal | undefined> {
-    return this.appServerFor(hostId).getGoal(threadId);
+    return this.backendForSharedOperation(hostId).getGoal(threadId);
   }
 
   async setGoal(
@@ -259,34 +271,42 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number },
     hostId?: string
   ): Promise<CodexThreadGoal | undefined> {
-    return this.appServerFor(hostId).setGoal(threadId, input);
+    return this.backendForSharedOperation(hostId).setGoal(threadId, input);
   }
 
   async clearGoal(threadId: string, hostId?: string): Promise<void> {
-    await this.appServerFor(hostId).clearGoal(threadId);
+    await this.backendForSharedOperation(hostId).clearGoal(threadId);
   }
 
   inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
-    return this.appServerFor(hostId).inspectThread(threadId);
+    return this.backendForSharedOperation(hostId).inspectThread(threadId);
   }
 
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]> {
-    return this.appServerFor(hostId).listThreads(input);
+    return this.backendForSharedOperation(hostId).listThreads(input);
+  }
+
+  listSessionCatalog(input?: CodexThreadListInput, hostId?: string): Promise<CodexSessionCatalog> {
+    const backend = this.backendForSharedOperation(hostId);
+    // Discovery is a backend selection too. A later project-name lookup must
+    // not silently switch /sessions to CLI if the App request fails.
+    if (this.options.backend === "auto") this.selectedAutoBackend ??= backend.id;
+    return backend.listSessionCatalog(input);
   }
 
   async archiveThread(threadId: string, hostId?: string): Promise<void> {
-    await this.appServerFor(hostId).archiveThread(threadId);
+    await this.backendForSharedOperation(hostId).archiveThread(threadId);
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }
 
   async unarchiveThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
-    const state = await this.appServerFor(hostId).unarchiveThread(threadId);
+    const state = await this.backendForSharedOperation(hostId).unarchiveThread(threadId);
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList(threadId);
     return state;
   }
 
   async deleteThread(threadId: string, hostId?: string): Promise<void> {
-    await this.appServerFor(hostId).deleteThread(threadId);
+    await this.backendForSharedOperation(hostId).deleteThread(threadId);
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }
 
@@ -298,12 +318,20 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     this.remoteAppServers.clear();
   }
 
+  backendInfo(hostId?: string) {
+    const backend = this.backendForSharedOperation(hostId);
+    return { id: backend.id, capabilities: backend.capabilities };
+  }
+
   private appServerFor(hostId?: string): CodexAppServerBackend {
+    if (this.selectedBackend === "exec") throw new Error("当前为纯 CLI 后端，不支持远程主机或 App-server 操作；请切换后端配置。");
     if (!isRemoteHost(hostId)) return this.appServer;
     const existing = this.remoteAppServers.get(hostId);
     if (existing) return existing;
     const transport = (this.options.remoteTransportResolver ?? resolveRemoteCodexTransport)(hostId);
     const runner = new AppServerCodexRunner({
+      codexHome: this.options.codexHome,
+      hostId,
       transport,
       requestTimeoutMs: this.options.timeoutMs,
       sandbox: this.options.execSandbox
@@ -314,7 +342,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   private backendForSharedOperation(hostId?: string): CodexBackendAdapter {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId);
-    return this.options.backend === "exec" ? this.exec : this.appServer;
+    return this.selectedBackend === "exec" ? this.exec : this.appServer;
   }
 
   private async refreshDesktopTaskList(threadId?: string): Promise<void> {

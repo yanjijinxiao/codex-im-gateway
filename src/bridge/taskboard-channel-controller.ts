@@ -1,6 +1,6 @@
 import { createTaskCard, createTaskFormCard, createTaskOverviewCard } from "../channels/task-card.js";
 import type { TaskboardClient, TaskboardIssue } from "../taskboard/client.js";
-import type { NormalizedWeixinMessage } from "../weixin/messages.js";
+import type { ChannelMessage } from "../channels/message.js";
 import { parseTaskboardChannelCommand, type TaskboardSubmission } from "./taskboard-channel-command.js";
 import { TaskboardSubmissionDeduplicator } from "./taskboard-channel-dedup.js";
 import {
@@ -25,7 +25,7 @@ export class TaskboardChannelController {
 
   constructor(private readonly options: TaskboardChannelControllerOptions) {}
 
-  async handle(message: NormalizedWeixinMessage, raw: string): Promise<void> {
+  async handle(message: ChannelMessage, raw: string): Promise<void> {
     const client = this.options.client;
     if (!client) {
       await this.options.replyText(message.senderId, "Taskboard 未启用或当前不可用，请在管理页检查本地服务连接。");
@@ -83,7 +83,7 @@ export class TaskboardChannelController {
   }
 
   private async showForm(
-    message: NormalizedWeixinMessage,
+    message: ChannelMessage,
     context: TaskboardChannelContext,
     command: Extract<ReturnType<typeof parseTaskboardChannelCommand>, { readonly kind: "form" }>
   ): Promise<void> {
@@ -117,7 +117,7 @@ export class TaskboardChannelController {
   }
 
   private async submit(
-    message: NormalizedWeixinMessage,
+    message: ChannelMessage,
     context: TaskboardChannelContext,
     submission: TaskboardSubmission
   ): Promise<void> {
@@ -198,7 +198,7 @@ export class TaskboardChannelController {
   }
 
   private async authorizeSubmissionTarget(
-    message: NormalizedWeixinMessage,
+    message: ChannelMessage,
     context: TaskboardChannelContext,
     submission: TaskboardSubmission
   ): Promise<boolean> {
@@ -213,7 +213,7 @@ export class TaskboardChannelController {
   }
 
   private async refreshSubmissionTarget(input: {
-    readonly message: NormalizedWeixinMessage;
+    readonly message: ChannelMessage;
     readonly context: TaskboardChannelContext;
     readonly submission: TaskboardSubmission;
     readonly note: string;

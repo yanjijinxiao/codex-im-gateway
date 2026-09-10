@@ -1,8 +1,10 @@
 import type * as Lark from "@larksuiteoapi/node-sdk";
 
 import type { ChannelActionCard, ChannelCardAction } from "./action-card.js";
+import { feishuTableCard, type FeishuTableCardPayload } from "./feishu-table-card.js";
 
-export function feishuActionCard(card: ChannelActionCard): Lark.InteractiveCard {
+export function feishuActionCard(card: ChannelActionCard): Lark.InteractiveCard | FeishuTableCardPayload {
+  if (card.table?.rows.length) return feishuTableCard(card);
   const elements: Lark.InteractiveCardElement[] = [{
     tag: "div",
     text: { tag: "lark_md", content: card.body }

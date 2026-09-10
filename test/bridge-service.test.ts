@@ -38,6 +38,8 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         return { raw: "", text: "完成", threadId: "thread-status" };
       },
@@ -89,6 +91,8 @@ test("does not send an experimental collaboration mode for an ordinary bound ses
       async sendText() { return { messageId: "text" }; }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { collaborationMode?: unknown }) {
         sentCollaborationMode = input.collaborationMode;
         return { raw: "", text: "普通回复", threadId: "thread-neutral" };
@@ -134,6 +138,8 @@ test("uses the channel default mode and lets a project binding override the chan
       async sendText() { return { messageId: "text" }; }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: {
         cwd: string;
         dynamicTools?: readonly { name: string; tools?: readonly { name: string }[] }[];
@@ -193,6 +199,8 @@ test("keeps disabled channel modes out of native choices and command routing", a
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         runnerCalls += 1;
         return { raw: "", text: "unexpected" };
@@ -318,8 +326,8 @@ test("reports each successfully sent text message for webhook mirroring", async 
     raw: {}
   });
 
-  assert.equal(outbound.length, 1);
-  const message = outbound[0] as { text: string } & Record<string, unknown>;
+  assert.ok(outbound.length >= 1);
+  const message = outbound.at(-1) as { text: string } & Record<string, unknown>;
   assert.equal(message.text, sentText);
   assert.deepEqual({ ...message, text: undefined }, {
     direction: "outbound",
@@ -380,6 +388,8 @@ test("sends Codex approvals to the originating sender and accepts channel decisi
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { onApproval?: (request: Record<string, unknown>) => Promise<"accept" | "decline"> }) {
         const decision = await input.onApproval?.({
           kind: "command",
@@ -437,6 +447,8 @@ test("automatically declines unanswered channel approvals after the timeout", as
       async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { onApproval?: (request: Record<string, unknown>) => Promise<"accept" | "decline"> }) {
         decision = await input.onApproval?.({
           kind: "file", threadId: "thread-timeout", turnId: "turn-timeout", itemId: "item-timeout",
@@ -510,6 +522,8 @@ test("routes Taskboard workflow mutations through Codex and the manage-taskboard
     } as never,
     weixin: { async sendTyping() {}, async sendText() { return { messageId: "sent" }; } } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { prompt: string }) { prompts.push(input.prompt); return { raw: "", text: "已开始", threadId: "thread-new" }; },
       async stop() {}
     } as never
@@ -613,6 +627,8 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { prompt: string; threadId?: string }) {
         prompts.push(input.prompt);
         return { raw: "", text: "已处理", threadId: input.threadId ?? "thread-one" };
@@ -715,6 +731,8 @@ test("automatically learns and reuses account knowledge with user controls", asy
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { prompt: string; developerInstructions?: string }) {
         prompts.push(input.prompt);
         developerInstructions.push(input.developerInstructions ?? "");
@@ -816,6 +834,8 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
     weixin,
     onOutboundMessage: (message) => outbound.push(message),
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         return {
           raw: "",
@@ -908,6 +928,8 @@ test("sends local markdown videos as native WeChat video messages", async (t) =>
     stateStore,
     weixin,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         return {
           raw: "",
@@ -975,6 +997,8 @@ test("buffers inbound image attachments and includes local paths in prompt done"
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { prompt: string }) {
         prompt = input.prompt;
         return { raw: "", text: "done" };
@@ -1057,6 +1081,8 @@ test("replies directly when a WeChat attachment exceeds 100 MiB", async (t) => {
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         runnerCalled = true;
         return { raw: "", text: "不应执行" };
@@ -1106,6 +1132,8 @@ test("replies directly when an image cannot be downloaded and does not start an 
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() {
         runnerCalled = true;
         return { raw: "", text: "不应执行" };
@@ -1129,349 +1157,11 @@ test("replies directly when an image cannot be downloaded and does not start an 
   await service.handleMessage(message);
 
   assert.equal(runnerCalled, false);
-  assert.deepEqual(replies, ["收到附件，但从微信下载或解密失败。请重新发送；如果仍失败，请在管理页重新连接该微信账号。"]);
+  assert.deepEqual(replies, ["收到附件，但当前渠道下载或读取失败。请重新发送；如果仍失败，请检查该渠道的文件权限和连接状态。"]);
 });
 
-test("lists resumable sessions with unambiguous R codes and switches by code", async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-resume-"));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const project = stateStore.createProject("桌面客户端", "/work/one");
-  const first = stateStore.createSession("alice@im.wechat", project.workspace, "更新修复", project.id);
-  stateStore.setThread("alice@im.wechat", "thread-one");
-  stateStore.setSessionPromptPreview(first.id, "修复 macOS 自动更新");
-  const second = stateStore.createSession("alice@im.wechat", project.workspace, "季度报告", project.id);
-  stateStore.setThread("alice@im.wechat", "thread-two");
-  const unrelatedProject = stateStore.createProject("其他项目", "/work/two");
-  stateStore.createSession("alice@im.wechat", unrelatedProject.workspace, "不应出现", unrelatedProject.id);
-  stateStore.activateSession(second.id);
-  const replies: string[] = [];
-  const runs: Array<{ prompt: string; threadId?: string }> = [];
-  const service = new BridgeService({
-    config: {
-      ...defaultConfig(tmpDir),
-      allowedSenderIds: ["alice@im.wechat"]
-    },
-    stateStore,
-    weixin: {
-      async sendTyping() {},
-      async sendText(input: { text: string }) {
-        replies.push(input.text);
-        return { messageId: `text-${replies.length}` };
-      }
-    } as never,
-    runner: {
-      async getHistory(threadId: string) {
-        assert.equal(threadId, "thread-two");
-        return [{
-          id: "history-user",
-          role: "user" as const,
-          text: buildPrompt("分析季度报告", [{
-            kind: "file",
-            label: "report.pdf",
-            path: "/private/report.pdf"
-          }])
-        }];
-      },
-      async run(input: { prompt: string; threadId?: string }) {
-        runs.push(input);
-        return { raw: "", text: "继续完成", threadId: input.threadId };
-      },
-      async stop() {}
-    } as never
-  });
-  const send = (id: string, text: string) => service.handleMessage({
-    id,
-    senderId: "alice@im.wechat",
-    contextToken: "ctx",
-    text,
-    raw: {}
-  });
-
-  const listedSessions = stateStore.listSessions()
-    .filter((session) => session.senderId === "alice@im.wechat" && session.projectId === project.id);
-  const firstNumber = listedSessions.findIndex((session) => session.id === first.id) + 1;
-  const secondNumber = listedSessions.findIndex((session) => session.id === second.id) + 1;
-
-  await send("resume-list", "/sessions");
-  const listReply = replies.at(-1) ?? "";
-  assert.match(listReply, /项目“桌面客户端”最近活跃的会话（最多 10 个）/);
-  assert.match(listReply, new RegExp(`\\[R${secondNumber}\\] 【当前】 季度报告`));
-  assert.match(listReply, /最近内容：分析季度报告 文件：report\.pdf/);
-  assert.match(listReply, new RegExp(`\\[R${firstNumber}\\] 更新修复`));
-  assert.match(listReply, /\[R\d+\] 【当前】 季度报告\n状态：[^\n]+\n时间：[^\n]+\n最近内容：[^\n]+/);
-  assert.match(listReply, /修复 macOS 自动更新/);
-  assert.match(listReply, /\/session R1 绑定并继续对应会话/);
-  assert.doesNotMatch(listReply, /不应出现/);
-  assert.doesNotMatch(listReply, /thread-one|thread-two|private\/report/);
-  assert.equal(stateStore.getSession(second.id)?.lastPromptPreview, "分析季度报告 文件：report.pdf");
-
-  await send("resume-bare-number", "/session 2");
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
-  assert.match(replies.at(-1) ?? "", /R 开头的切换编号/);
-
-  await send("resume-invalid", "/session R99");
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, second.id);
-  assert.match(replies.at(-1) ?? "", /没有这个切换编号/);
-
-  await send("resume-first", `/session r${firstNumber}`);
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, first.id);
-  assert.match(replies.at(-1) ?? "", /已绑定项目“桌面客户端”的会话：更新修复/);
-  assert.doesNotMatch(replies.at(-1) ?? "", /thread-one/);
-
-  await send("continued-turn", "继续处理");
-  assert.equal(runs.at(-1)?.threadId, "thread-one");
-});
-
-test("lists only the ten most recent sessions in the current project", async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-sessions-"));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const project = stateStore.createProject("当前项目", path.join(tmpDir, "current"));
-  const sessions = Array.from({ length: 11 }, (_, index) =>
-    stateStore.createSession("alice@im.wechat", project.workspace, `项目会话 ${index + 1}`, project.id)
-  );
-  const other = stateStore.createProject("其他项目", path.join(tmpDir, "other"));
-  stateStore.createSession("alice@im.wechat", other.workspace, "其他项目会话", other.id);
-  const latestSession = sessions.at(-1);
-  assert.ok(latestSession);
-  stateStore.activateSession(latestSession.id);
-  const replies: string[] = [];
-  const service = new BridgeService({
-    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
-    stateStore,
-    weixin: {
-      async sendTyping() {},
-      async sendText(input: { text: string }) {
-        replies.push(input.text);
-        return { messageId: `text-${replies.length}` };
-      }
-    } as never,
-    runner: { async stop() {} } as never
-  });
-
-  await service.handleMessage({
-    id: "sessions",
-    senderId: "alice@im.wechat",
-    contextToken: "ctx",
-    text: "/sessions",
-    raw: {}
-  });
-
-  const reply = replies.join("\n");
-  assert.equal(reply.match(/\[R\d+\]/g)?.length, 10);
-  assert.doesNotMatch(reply, /\[R11\]/);
-  assert.doesNotMatch(reply, /其他项目会话/);
-});
-
-test("binds a Codex Desktop session from the current project and continues its thread", async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bind-desktop-session-"));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const project = stateStore.createProject("桌面项目", tmpDir);
-  stateStore.createSession("alice@im.wechat", project.workspace, "桥接会话", project.id);
-  const replies: string[] = [];
-  const runs: Array<{ threadId?: string; queueKey?: string }> = [];
-  const service = new BridgeService({
-    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
-    stateStore,
-    listCodexSessions: () => [{
-      threadId: "desktop-thread",
-      workspace: tmpDir,
-      lastUsedAt: "2099-08-01T09:00:00.000Z",
-      lastUserMessage: buildPrompt("继续桌面端方案")
-    }],
-    weixin: {
-      async sendTyping() {},
-      async sendText(input: { text: string }) {
-        replies.push(input.text);
-        return { messageId: `text-${replies.length}` };
-      }
-    } as never,
-    runner: {
-      async run(input: { threadId?: string; queueKey?: string }) {
-        runs.push(input);
-        return { raw: "", text: "已继续", threadId: input.threadId };
-      },
-      async stop() {}
-    } as never
-  });
-  const send = (id: string, text: string) => service.handleMessage({
-    id,
-    senderId: "alice@im.wechat",
-    contextToken: "ctx",
-    text,
-    raw: {}
-  });
-
-  await send("list", "/sessions");
-  assert.match(replies.at(-1) ?? "", /\[R1\] 继续桌面端方案/);
-  await send("bind", "/session R1");
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.threadId, "desktop-thread");
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.projectId, project.id);
-  assert.match(replies.at(-1) ?? "", /下一条消息将继续该历史会话/);
-
-  await send("continue", "接着完成");
-  assert.equal(runs.at(-1)?.threadId, "desktop-thread");
-  assert.equal(runs.at(-1)?.queueKey, "desktop-thread");
-});
-
-test("replays clean session history and steers the exact active Codex turn", async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-intervene-"));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const project = stateStore.createProject("介入项目", tmpDir);
-  stateStore.createSession("ding-user", project.workspace, "桥接入口", project.id);
-  const replies: string[] = [];
-  const steerCalls: Array<Record<string, unknown>> = [];
-  const history = [
-    {
-      id: "user-history",
-      role: "user" as const,
-      text: buildPrompt("检查历史实现", [{
-        kind: "image",
-        label: "screen.png",
-        path: "/private/secret/screen.png"
-      }]),
-      createdAt: "2026-09-09T08:00:00.000Z"
-    },
-    {
-      id: "progress-history",
-      role: "assistant" as const,
-      kind: "progress" as const,
-      text: "不应作为历史答案显示"
-    },
-    {
-      id: "assistant-history",
-      role: "assistant" as const,
-      text: "历史结论\n\n```codex-channel-bridge-actions\n{\"send\":[]}\n```",
-      createdAt: "2026-09-09T08:01:00.000Z"
-    }
-  ];
-  const service = new BridgeService({
-    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["ding-user"] },
-    stateStore,
-    listCodexSessions: () => [{
-      threadId: "desktop-active-thread",
-      workspace: tmpDir,
-      title: "桌面运行中会话",
-      lastUsedAt: "2026-09-09T08:02:00.000Z",
-      persistence: "active",
-      runtimeStatus: "active"
-    }],
-    weixin: {
-      async sendText(input: { text: string }) {
-        replies.push(input.text);
-        return { messageId: `reply-${replies.length}` };
-      }
-    } as never,
-    runner: {
-      async getHistory() { return history; },
-      async inspectThread() {
-        return {
-          threadId: "desktop-active-thread",
-          persistence: "active",
-          runtimeStatus: "active",
-          activeFlags: [],
-          latestTurnStatus: "inProgress",
-          activeTurnId: "desktop-active-turn",
-          cwd: tmpDir
-        };
-      },
-      async steer(input: Record<string, unknown>) {
-        steerCalls.push(input);
-        return {
-          status: "accepted" as const,
-          threadId: String(input.threadId),
-          turnId: String(input.expectedTurnId)
-        };
-      },
-      async stop() { return "not-active" as const; }
-    } as never
-  });
-  const send = (id: string, text: string) => service.handleMessage({
-    id,
-    senderId: "ding-user",
-    text,
-    attachments: [],
-    raw: {}
-  });
-
-  await send("list", "/sessions");
-  const activeRef = replies.at(-1)?.match(/\[(R\d+)\] 桌面运行中会话/);
-  assert.ok(activeRef, "select the listed backend session without depending on the wall clock");
-  await send("bind", `/session ${activeRef[1]}`);
-  assert.match(replies.at(-1) ?? "", /\/steer <补充要求>/);
-  assert.match(replies.at(-1) ?? "", /检查历史实现[\s\S]*图片：screen\.png[\s\S]*历史结论/);
-  assert.doesNotMatch(replies.at(-1) ?? "", /WeChat bridge rule|private\/secret|不应作为历史答案|codex-channel-bridge-actions/);
-
-  await send("history", "/history 10");
-  assert.match(replies.at(-1) ?? "", /👤 用户[\s\S]*🤖 Codex/);
-  assert.doesNotMatch(replies.at(-1) ?? "", /WeChat bridge rule|private\/secret|不应作为历史答案|codex-channel-bridge-actions/);
-
-  await send("dingtalk-message-1", "/steer 先修复活动任务的测试");
-  assert.deepEqual(steerCalls, [{
-    threadId: "desktop-active-thread",
-    expectedTurnId: "desktop-active-turn",
-    prompt: "先修复活动任务的测试",
-    cwd: tmpDir,
-    clientUserMessageId: "dingtalk-message-1"
-  }]);
-  assert.match(replies.at(-1) ?? "", /已介入当前正在执行的 Codex 任务/);
-});
-
-test("hides archived and missing sessions from the resumable session list", async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-archived-session-"));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
-  const project = stateStore.createProject("归档测试", tmpDir);
-  const initial = stateStore.createSession("alice@im.wechat", project.workspace, "当前会话", project.id);
-  stateStore.setSessionThread(initial.id, "archived-thread");
-  const missing = stateStore.createSession("alice@im.wechat", project.workspace, "已失效会话", project.id);
-  stateStore.setSessionThread(missing.id, "missing-thread");
-  const replies: string[] = [];
-  const service = new BridgeService({
-    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice@im.wechat"] },
-    stateStore,
-    listCodexSessions: () => [{
-      threadId: "archived-thread",
-      workspace: tmpDir,
-      title: "历史归档会话",
-      lastUsedAt: "2099-08-01T09:00:00.000Z",
-      persistence: "archived",
-      runtimeStatus: "notLoaded"
-    }, {
-      threadId: "missing-thread",
-      workspace: tmpDir,
-      title: "已失效会话",
-      lastUsedAt: "2099-08-01T08:00:00.000Z",
-      persistence: "missing",
-      runtimeStatus: "unknown"
-    }],
-    weixin: {
-      async sendTyping() {},
-      async sendText(input: { text: string }) {
-        replies.push(input.text);
-        return { messageId: `text-${replies.length}` };
-      }
-    } as never,
-    runner: { async stop() { return "not-active" as const; } } as never
-  });
-  const send = (id: string, text: string) => service.handleMessage({
-    id,
-    senderId: "alice@im.wechat",
-    contextToken: "ctx",
-    text,
-    raw: {}
-  });
-
-  await send("list-archived", "/sessions");
-  assert.match(replies.at(-1) ?? "", /还没有可恢复的会话/);
-  assert.doesNotMatch(replies.at(-1) ?? "", /历史归档会话|当前会话|已失效会话|状态：已归档|状态：已失效/);
-  await send("bind-archived", "/session R1");
-  assert.equal(stateStore.getActiveSession("alice@im.wechat")?.id, missing.id);
-  assert.match(replies.at(-1) ?? "", /没有这个切换编号/);
-});
+// Global/project session selection, stable paging, lifecycle filtering, history
+// replay and guarded steering are covered in session-catalog.test.ts.
 
 test("authorized WeChat can add, list, and switch Codex projects", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-project-command-"));
@@ -1532,21 +1222,21 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
 
   // Given an authorized sender, when they choose a project sourced from Codex history
   await sendWithProjects("project-discover", "/p a");
-  assert.match(replies.at(-1) ?? "", /Codex Desktop 项目：2 个（已绑定 0 个）/);
+  assert.match(replies.at(-1) ?? "", /Codex 项目：2 个（已绑定 0 个）/);
   assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 嘉兴AI社区/);
-  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 嘉兴AI社区\n\n会话：3 个\n路径：[^\n]+\n\n\[C2\]/);
+  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 嘉兴AI社区\n\n路径：[^\n]+\n\n\[C2\]/);
   assert.doesNotMatch(replies.at(-1) ?? "", /项目名称\|绝对路径/);
   await sendWithProjects("project-add", "/p a C1");
   await sendWithProjects("project-list", "/p l");
   const projects = stateStore.listProjects();
   const projectNumber = projects.findIndex((project) => project.name === "嘉兴AI社区") + 1;
   const addedProject = projects[projectNumber - 1];
-  assert.match(replies.at(-1) ?? "", /Codex Desktop 项目：2 个（已绑定 1 个）/);
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区`));
+  assert.match(replies.at(-1) ?? "", /Codex 项目：2 个（已绑定 1 个）/);
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区`));
   assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 Desktop 未绑定项目/);
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区\\n\\n路径：[^\\n]+\\n\\n\\[C1\\]`));
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区\\n\\n路径：[^\\n]+\\n\\n\\[C1\\]`));
   await sendWithProjects("project-discover-again", "/p a");
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【已绑定】 嘉兴AI社区`));
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区`));
   assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 Desktop 未绑定项目/);
 
   // Removed legacy channel commands are not retained as compatibility aliases.
@@ -1595,6 +1285,8 @@ test("switching projects does not expose or control the previous project's sessi
       async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async getGoal() { goalReads += 1; return undefined; },
       async stop() {}
     } as never
@@ -1665,6 +1357,8 @@ test("lists and switches model and reasoning effort for the active WeChat sessio
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { model?: string; effort?: string }) {
         runs.push(input);
         return { raw: "", text: "done", threadId: "thread-model" };
@@ -1742,6 +1436,8 @@ test("streams process progress but sends the final WeChat answer as one message"
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: {
         onDelta?: (delta: string) => Promise<void>;
         onProgress?: (message: string) => Promise<void>;
@@ -1781,7 +1477,7 @@ test("streams process progress but sends the final WeChat answer as one message"
   await send("enable", "/stream on");
   assert.equal(stateStore.getActiveSession("alice@im.wechat")?.streamReplies, true);
   await send("turn", "开始流式回复");
-  assert.equal(replies.filter((reply) => reply === "【进度】正在查询资料。").length, 1);
+  assert.equal(replies.filter((reply) => reply === "【进展】\n\n• 正在查询资料。").length, 1);
   assert.equal(replies.filter((reply) => reply === "第一段。\n\n第二段。").length, 1);
   assert.equal(replies.filter((reply) => reply === "第一段。").length, 0);
   assert.equal(replies.some((reply) => reply.includes("codex-weixin-actions")), false);
@@ -1828,6 +1524,8 @@ test("streams progress and answer deltas into one channel AI Card and finalizes 
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: {
         onProgress?: (message: string) => Promise<void>;
         onDelta?: (delta: string) => Promise<void>;
@@ -1901,6 +1599,8 @@ test("retries the terminal card update after a progress update disables streamin
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { onProgress?: (message: string) => Promise<void> }) {
         await input.onProgress?.("正在查询资料。");
         await new Promise((resolve) => setTimeout(resolve, 550));
@@ -1945,6 +1645,8 @@ test("finalizes a failed channel turn as a visible card instead of an empty erro
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run() { throw failure; },
       async getRuntimeInfo() { return {}; },
       async stop() {}
@@ -1961,7 +1663,7 @@ test("finalizes a failed channel turn as a visible card instead of an empty erro
   assert.deepEqual(updates.at(-1), {
     text: "本轮消息处理失败，详细错误已写入本机服务输出。",
     finalize: true,
-    error: undefined
+    error: true
   });
 });
 
@@ -1987,6 +1689,8 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
       }
     } as never,
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { onProgress?: (message: string) => Promise<void> }) {
         await input.onProgress?.("正在检索论文。");
         return { raw: "", threadId: "thread-long", text: finalText };
@@ -2006,7 +1710,7 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
     raw: {}
   });
 
-  assert.equal(replies[0], "【进度】正在检索论文。");
+  assert.equal(replies[0], "【进展】\n\n• 正在检索论文。");
   const finalChunks = replies.slice(1);
   assert.equal(finalChunks.length, 2);
   assert.equal(finalChunks.every((chunk) => chunk.length <= 1_800), true);

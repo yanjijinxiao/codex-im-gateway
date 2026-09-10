@@ -32,12 +32,21 @@ const COMMAND_ALIASES: Readonly<Record<string, string>> = {
 
 const SESSION_HELP_LINES = [
   "会话介入与跟随",
-  "/sessions（/ss）- 查看当前项目未归档的最近 10 个会话",
-  "/session（/s）R编号 - 绑定会话、回看历史并跟随后续进展",
+  "/sessions（/ss）- 未归档会话按项目分组，组内最近更新优先；每页 30 个",
+  "/sessions size 50 - 每页条数设为 50（5-50，自动保存）",
+  "/sessions detail R编号 - 查看完整标题、主机、目录和 ID，不切换会话",
+  "/sessions more|prev - 下一页或上一页；/sessions page 2 - 跳页",
+  "/sessions search 关键词 - 搜索标题、目录或会话 ID",
+  "/sessions unbound|project - 只看无项目会话或当前项目会话",
+  "/session（/s）R编号或会话ID [--host 主机ID] - 直接绑定并回看历史；App 后端同时跟随进展",
   "/new（/n）- 在当前项目新建并绑定会话",
+  "/new P编号|C编号|完整项目名 - 在指定项目新建并切换；未绑定项目自动绑定",
+  "/new --standalone - 新建本机无项目会话，使用独立持久目录",
+  "/new --project 项目 - 显式指定项目；/session new ... 与 /new ... 等价",
+  "新会话在下一条消息时启动 Codex；没有当前项目时 /new 会提示选择，不自动选第一个项目",
   "/history（/hist）[1-20] - 查看最近对话，例如 /history 10",
   "/history more - 继续查看更早的对话",
-  "/follow [on|off] - 查看或切换实时跟随，例如 /follow off",
+  "/follow [on|off] - 查看或切换实时跟随（App 后端），例如 /follow off",
   "/leave - 退出当前会话并停止跟随；不会停止任务",
   "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时会提示改用 /queue",
   "/queue 补充要求 - 排到当前任务之后，作为下一轮执行",
@@ -60,8 +69,8 @@ const BUILT_IN_HELP_LINES = [
   "/status（/st）- 查看当前任务、项目、模型和运行状态",
   "/balance（/bal）- 查看当前 Codex 账号剩余用量",
   "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
-  "/project（/p）[l|P编号] - 查看或切换已绑定项目",
-  "/project add（/p a）[C编号] - 查看或添加 Codex 历史项目",
+  "/project（/p）[l|P编号|C编号] - 查看项目；选择时绑定并切换（可选入口）",
+  "/project add（/p a）[C编号] - /project 的兼容别名",
   "/project rename（/p rn）P1|新名称 - 重命名项目",
   "/project delete（/p d）P1 - 移除没有任务的项目",
   "/mode（/v）[session|task|qa] - 查看或切换当前项目工作模式",
@@ -76,7 +85,7 @@ const BUILT_IN_HELP_LINES = [
   "/model（/m）[编号|模型ID|default] - 查看或切换当前任务模型",
   "/effort（/e）[编号|级别|default] - 查看或切换推理强度",
   "/stream（/str）[on|off|default] - 查看或切换流式回复",
-  "/prompt start（/pp s）- 开始合并多条微信消息",
+  "/prompt start（/pp s）- 开始合并多条渠道消息",
   "/prompt done（/pp d）- 提交已合并的消息",
   "/approve（/ok）[A编号] - 批准一次当前渠道收到的 Codex 审批",
   "/reject（/no）[A编号] - 拒绝当前渠道收到的 Codex 审批"
@@ -126,8 +135,13 @@ export function parseCommand(
   if (!trimmed.startsWith("/")) return undefined;
   const [rawName, ...rest] = trimmed.slice(1).split(/\s+/);
   const name = rawName.toLowerCase();
+  const canonicalName = COMMAND_ALIASES[name] ?? capabilityAliases[name] ?? name;
+  // Normalize before authorization and mode checks, including /s new.
+  if (canonicalName === "session" && rest[0]?.toLowerCase() === "new") {
+    return { name: "new", arg: rest.slice(1).join(" ") };
+  }
   return {
-    name: COMMAND_ALIASES[name] ?? capabilityAliases[name] ?? name,
+    name: canonicalName,
     arg: rest.join(" ")
   };
 }

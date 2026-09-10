@@ -102,21 +102,30 @@ See the [local run guide](./docs/local-run.md) for background services, updates,
 1. Open the management page and select **Add Channel**.
 2. Choose Personal WeChat, Enterprise WeChat, Feishu, or DingTalk, then scan or enter the required application credentials.
 3. Send one message to the bot. If the channel requires authorization, allow the sender or conversation in the console.
-4. Send `/project add` to list Codex Desktop projects, then `/project add C1` to bind one.
-5. Send a regular message to start. Use `/new` for a new session, or `/sessions` and `/session R1` to resume an existing session.
+4. Send `/sessions` to browse all bindable unarchived sessions, then `/session R1` (or click a card) to bind directly. No project selection is required.
+5. Send a regular message to continue. Use `/new` for the current project, `/new P2` or `/new C1` for a selected project, or `/new --standalone` for a local independent session. The next message starts Codex. `/project add` remains a compatibility alias.
 
 Common commands:
 
 ```text
 /help                       Show all commands
 /status                     Show project, session, backend, model, and task status
-/project                    List bound projects
-/project add                List available local or remote Desktop projects
-/project add C1             Bind a project
-/project P1                 Switch project
-/sessions                   List recent sessions in the current project
+/sessions                   Unarchived sessions grouped by project, newest within each group; 30 per page
+/sessions size 50           Set page size (5-50, saved per conversation and user)
+/sessions detail R1         Read title, host, workspace and ID without switching
+/sessions more              Next page (prev for previous, page 3 to jump)
+/sessions search words      Search titles, content, directories or IDs
+/sessions unbound           Only sessions without a project
+/sessions project           Only current-project sessions
 /session R1                 Bind and resume a session
-/new                        Create a session
+/session THREAD_ID          Bind directly (append --host HOST_ID for remote)
+/project                    Optional project view; selection binds and switches
+/project C1                 Select a discovered project (old add C1 still works)
+/project P1                 Switch to a bound project
+/new                        Create a session in the current project
+/new P2                     Create and switch in a selected project (also C codes or full names)
+/new --standalone           Create a local independent session with a durable workspace
+/session new ...            Alias for /new ...
 /model                      Inspect or switch model
 /effort                     Inspect or switch reasoning effort
 /stream                     Configure process progress
@@ -125,6 +134,8 @@ Common commands:
 
 Remote projects reuse the `hostId` stored by Codex Desktop and the local SSH configuration. The gateway never stores SSH passwords or private-key contents. See the [channel project workbench](./docs/channel-project-modes.md) for projects, modes, and Taskboard interaction.
 
+Session lists also hide explicitly classified probe records and report the hidden count. Normal conversations are never filtered merely for a `READY` title or CLI source, and no records are deleted or archived. See [session-purpose filtering and restoration](./docs/codex-backends.md#probe-records-versus-user-conversations).
+
 ## Codex backends
 
 Channels use one project, session, execution, history, approval, and status interface backed by two implementations:
@@ -132,9 +143,11 @@ Channels use one project, session, execution, history, approval, and status inte
 | Backend | Best for | Main capabilities |
 | --- | --- | --- |
 | `app-server` | Codex Desktop, new sessions, interactive tasks, remote projects | Project registry, thread lifecycle, streamed events, approvals, dynamic tools, Desktop relay |
-| `codex exec` | Local non-interactive CLI tasks and compatible fallback | `codex exec` / `codex exec resume`, structured final results |
+| `codex exec` | Local non-interactive CLI tasks and compatible fallback | Local session catalog, history paging, `codex exec` / `codex exec resume` |
 
-`codexBackend: "auto"` prefers app-server. It falls back to `codex exec` only for turns that do not require approvals, dynamic tools, structured output, or user input. A pinned backend never switches silently. See [Codex backend architecture](./docs/codex-backends.md) for the full interface and routing contract.
+`codexBackend: "auto"` prefers app-server and may select CLI during initial discovery or a compatible new turn. The selected backend is then pinned; existing-thread failures never switch backends. Both backends implement catalog and history APIs separately. CLI never reads Desktop's registry; unsupported live following, steering and goals fail explicitly. See [Codex backend architecture](./docs/codex-backends.md).
+
+Lists sort by recent activity. Page numbers remain stable until refresh/search or a 15-minute expiry. App includes sessions from known remote hosts, with explicit partial-results warnings for unavailable hosts. Archived, internal child and unavailable sessions are excluded.
 
 ## Long tasks, progress, and session lifecycle
 
@@ -193,6 +206,7 @@ CODEX_IM_GATEWAY_OPEN=0
 
 - [Channel and task-notification setup](./docs/channel-setup.md)
 - [Codex backend architecture](./docs/codex-backends.md)
+- [Unified IM channel interface and capability matrix](./docs/im-channel-architecture.md)
 - [Channel projects, modes, and Taskboard workbench](./docs/channel-project-modes.md)
 - [Embedded Taskboard installation, migration, and rollback](./docs/taskboard-module.md)
 - [Local operation and updates](./docs/local-run.md)

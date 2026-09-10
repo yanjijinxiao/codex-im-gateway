@@ -14,14 +14,20 @@ import {
 
 import type { DingTalkAccount } from "../weixin/accounts.js";
 import { sanitizeFileName } from "../weixin/media.js";
-import type { NormalizedWeixinMessage } from "../weixin/messages.js";
-import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import type { ChannelMessage } from "./message.js";
+import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
+import type { ChannelActionCard } from "./action-card.js";
+import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
+import { chunkText } from "../bridge/format.js";
+import { ChannelPartialDeliveryError } from "./errors.js";
+import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import {
   PinnedNetworkLifecycleTransport,
   type NetworkFamilyPolicy
 } from "./network-family.js";
 
 type DingTalkStreamClient = {
+  readonly connected?: boolean;
   registerCallbackListener(topic: string, listener: (message: DWClientDownStream) => void): unknown;
   connect(): Promise<void>;
   disconnect(): void;
@@ -92,6 +98,7 @@ type DingTalkAdapterOptions = {
   readonly emotionClient?: DingTalkEmotionClient;
   readonly mediaClient?: DingTalkInboundMediaClient;
   readonly inboundDir?: string;
+  readonly maxInboundBytes?: number;
   readonly now?: () => number;
   readonly apiTransport?: PinnedNetworkLifecycleTransport;
 };
@@ -126,7 +133,8 @@ type CardTargetContext = {
 };
 
 export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient {
-  readonly client: ChannelTextClient = this;
+  readonly client: ChannelClient;
+  private readonly maxInboundBytes: number;
   private readonly streamClient: DingTalkStreamClient;
   private readonly webhookSender: DingTalkWebhookSender;
   private readonly cardClient: DingTalkAICardClient;
@@ -151,8 +159,15 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.cardClient = options.cardClient ?? new DingTalkHttpsAICardClient({ transport: this.apiTransport });
     this.emotionClient = options.emotionClient ?? new DingTalkRestEmotionClient(this.apiTransport);
     this.mediaClient = options.mediaClient ?? new DingTalkRestInboundMediaClient(this.apiTransport);
-    this.inboundDir = options.inboundDir ?? path.join(process.cwd(), ".codex-weixin-inbound", account.accountId);
+    this.inboundDir = options.inboundDir ?? path.join(process.cwd(), ".codex-im-gateway-inbound", account.accountId);
+    this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.now = options.now ?? Date.now;
+    this.client = createChannelClient("dingtalk", {
+      ...TEXT_CAPABILITIES, inbound: { ...NO_MEDIA, image: "available" },
+      tableLayout: account.cardTemplateId ? "markdown" : "list",
+      progress: account.cardTemplateId ? "available" : "not-configured",
+      resumableProgress: Boolean(account.cardTemplateId)
+    }, this);
   }
 
   async sendText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
@@ -163,6 +178,31 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         console.warn(`[codex-im-gateway] DingTalk AI Card unavailable, falling back to text: ${errorDetail(error)}`);
       }
     }
+    return this.sendWebhookText(input);
+  }
+
+  /** Read-only table in the existing AI template; selection remains a slash command. */
+  async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<ChannelReceipt> {
+    const { card } = input;
+    if (card.table && this.account.cardTemplateId) {
+      const text = [escapeTableMarkdown(card.title), card.body, renderMarkdownTable(card.table), card.note].filter(Boolean).join("\n\n");
+      try {
+        return await this.createTextCard(this.cardTarget(input.toUserId), text, true);
+      } catch (error) {
+        console.warn(`[codex-im-gateway] DingTalk table card unavailable, falling back to a compact list: ${errorDetail(error)}`);
+      }
+    }
+    const parts: ChannelDeliveryPart[] = [];
+    try {
+      for (const text of chunkText(card.fallbackText)) {
+        const result = await this.sendWebhookText({ toUserId: input.toUserId, text });
+        parts.push({ messageId: result.messageId, text });
+      }
+    } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
+    return { messageId: parts.at(-1)!.messageId, parts };
+  }
+
+  private async sendWebhookText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
     const target = this.requireReplyTarget(input.toUserId);
     const accessToken = await this.accessToken();
     const lifecycleId = target.messageId || `dingtalk-webhook-${crypto.randomUUID()}`;
@@ -206,6 +246,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {
+    if (options.signal?.aborted) return;
+    options.onStatus?.({ state: "connecting" });
     const handle = (frame: DWClientDownStream) => {
       acknowledge(this.streamClient, frame);
       let body: DingTalkRobotMessage;
@@ -221,10 +263,6 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       if (!actorId || !conversationId || !webhookUrl) return;
 
       const content = dingTalkMessageContent(body);
-      if (!content) {
-        console.log(`[codex-im-gateway] ignored unsupported DingTalk message type ${body.msgtype}`);
-        return;
-      }
 
       const expiresAt = normalizeExpiry(body.sessionWebhookExpiredTime);
       const replyTarget: ReplyTarget = {
@@ -238,30 +276,42 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       };
       this.replyTargets.set(conversationId, replyTarget);
       this.replyTargets.set(actorId, replyTarget);
-      const message: NormalizedWeixinMessage = {
+      const message: ChannelMessage = {
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,
         replyTargetId: conversationId,
-        text: content.text,
+        text: content?.text ?? "",
+        ...(!content ? { unsupportedMessageType: body.msgtype } : {}),
         attachments: [],
         raw: { channel: "dingtalk", event: body }
       };
       if (options.claimMessage && !options.claimMessage(message)) return;
-      void this.handleMessageWithEmotion(message, replyTarget, options, content.images);
+      void this.handleMessageWithEmotion(message, replyTarget, options, content?.images);
     };
 
     this.streamClient.registerCallbackListener(TOPIC_ROBOT, handle);
+    let healthTimer: NodeJS.Timeout | undefined;
     try {
       await this.streamClient.connect();
+      let last: string | undefined;
+      const report = () => {
+        const state = this.streamClient.connected === false ? "reconnecting" : "connected";
+        if (last !== state) { last = state; options.onStatus?.({ state }); }
+      };
+      report();
+      healthTimer = setInterval(report, 5_000);
+      healthTimer.unref();
       await untilAborted(options.signal);
     } finally {
+      if (healthTimer) clearInterval(healthTimer);
       this.streamClient.off(TOPIC_ROBOT, handle);
       this.streamClient.disconnect();
+      options.onStatus?.({ state: "stopped" });
     }
   }
 
   private async handleMessageWithEmotion(
-    message: NormalizedWeixinMessage,
+    message: ChannelMessage,
     target: ReplyTarget,
     options: ChannelMonitorOptions,
     images: readonly DingTalkInboundImage[] = []
@@ -302,9 +352,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     messageId: string,
     robotCode: string,
     images: readonly DingTalkInboundImage[]
-  ): Promise<NormalizedWeixinMessage["attachments"]> {
+  ): Promise<ChannelMessage["attachments"]> {
     const accessToken = await this.accessToken();
-    const attachments: NormalizedWeixinMessage["attachments"] = [];
+    const attachments: ChannelMessage["attachments"] = [];
     fs.mkdirSync(this.inboundDir, { recursive: true });
     for (const [index, image] of images.entries()) {
       try {
@@ -313,7 +363,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
           robotCode,
           downloadCode: image.downloadCode,
           downloadUrl: image.downloadUrl,
-          maxBytes: 100 * 1024 * 1024,
+          maxBytes: this.maxInboundBytes,
           lifecycleId: messageId
         });
         const extension = dingTalkImageExtension(downloaded.buffer, downloaded.contentType);

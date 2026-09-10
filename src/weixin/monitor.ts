@@ -2,6 +2,7 @@ import { WeixinApiClient } from "./api.js";
 import { normalizeWeixinMessage, type NormalizedWeixinMessage, type WeixinRawMessage } from "./messages.js";
 
 export type MonitorOptions = {
+  onStatus?: import("../channels/types.js").ChannelMonitorOptions["onStatus"];
   client: WeixinApiClient;
   signal?: AbortSignal;
   pollIntervalMs?: number;
@@ -43,11 +44,14 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
     let batch: { syncKey?: string; messages: WeixinRawMessage[] };
     try {
       batch = parseUpdateBatch(await options.client.getUpdates(syncKey, options.signal));
+      options.onStatus?.({ state: "connected" });
       if (batch.syncKey && batch.syncKey !== syncKey) {
         syncKey = batch.syncKey;
         await options.onSyncKey?.(syncKey);
       }
     } catch (error) {
+      if (options.signal?.aborted) break;
+      options.onStatus?.({ state: "reconnecting", detail: "Polling failed; retrying" });
       const retryMs = retryBackoff.next();
       console.error(`[codex-im-gateway] monitor poll failed; retrying in ${retryMs}ms: ${errorDetail(error)}`);
       await delay(retryMs, options.signal);

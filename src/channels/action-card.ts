@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { ChannelTable } from "./table.js";
 
 const channelCommandActionValueSchema = z.object({
   version: z.literal(1),
@@ -91,6 +92,7 @@ export type ChannelActionCard = {
   readonly title: string;
   readonly template: ChannelCardTemplate;
   readonly body: string;
+  readonly table?: ChannelTable;
   readonly note?: string;
   readonly actionGroups: readonly (readonly ChannelCardAction[])[];
   readonly fallbackText: string;
@@ -107,6 +109,7 @@ export type ChannelChoice = {
 type CreateChoiceCardInput = {
   readonly title: string;
   readonly body: string;
+  readonly table?: ChannelTable;
   readonly choices: readonly ChannelChoice[];
   readonly fallbackText: string;
   readonly note?: string;
@@ -124,6 +127,7 @@ export function createChoiceCard(input: CreateChoiceCardInput): ChannelActionCar
     title: input.title,
     template: input.template ?? "blue",
     body: input.body,
+    ...(input.table ? { table: input.table } : {}),
     ...(input.note ? { note: input.note } : {}),
     actionGroups: groupActions(actions),
     fallbackText: input.fallbackText

@@ -14,7 +14,7 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 
 export function userFacingMessageHandlingError(error: unknown): string {
   if (error instanceof CodexInterventionError) return error.message;
-  if (error instanceof CodexBackendCapabilityError) return "当前后端不支持此操作。可以使用 /queue 排队，或切换到 App Server 后端。";
+  if (error instanceof CodexBackendCapabilityError) return `当前后端不支持 ${error.capability}。${error.capability === "turnSteering" ? "可以使用 /queue 排队。" : ""}此操作未转交其他后端；需要时请显式切换后端配置。`;
   if (error instanceof CodexThreadStateError) {
     switch (error.code) {
       case "archived":

@@ -12,6 +12,7 @@ import {
   type KnowledgeInput
 } from "./knowledge.js";
 import type { StatePaths } from "./paths.js";
+import { DEFAULT_SESSION_PAGE_SIZE, isSessionPageSize } from "./session-list-settings.js";
 
 export type ManagedSession = {
   id: string;
@@ -19,6 +20,9 @@ export type ManagedSession = {
   title: string;
   workspace: string;
   projectId?: string;
+  /** Explicit absence; omitted only for legacy/project-scoped records. */
+  projectBinding?: "none";
+  hostId?: string;
   mode?: "session" | "qa";
   knowledgeBaseId?: string;
   threadId?: string;
@@ -71,6 +75,7 @@ export type SessionRuntimeOverrides = {
 };
 
 export type RuntimeState = {
+  sessionPageSizes: Record<string, number>;
   conversationRoles: Record<string, Record<string, "viewer" | "participant" | "controller">>;
   pairedSenderIds: string[];
   lastActiveSenderId?: string;
@@ -100,6 +105,7 @@ export type RuntimeState = {
 
 export function emptyRuntimeState(): RuntimeState {
   return {
+    sessionPageSizes: {},
     conversationRoles: {},
     pairedSenderIds: [],
     authorizedConversationsByActor: {},
@@ -130,7 +136,23 @@ export class RuntimeStateStore {
     return structuredClone(this.state);
   }
 
+  getSessionPageSize(conversationId: string, actorId: string): number {
+    return this.state.sessionPageSizes[JSON.stringify([conversationId, actorId])] ?? DEFAULT_SESSION_PAGE_SIZE;
+  }
+
+  setSessionPageSize(conversationId: string, actorId: string, size: number): void {
+    if (!isSessionPageSize(size)) throw new Error("Invalid session page size");
+    this.state.sessionPageSizes[JSON.stringify([conversationId, actorId])] = size;
+    this.save();
+  }
+
   get controlJournalPath(): string { return path.join(this.paths.runtimeDir, "session-controls.json"); }
+
+  /** Shared by all IM accounts and backends, never stored in Codex's database. */
+  get sessionPurposeRegistryPath(): string { return path.join(this.paths.root, "session-purposes.json"); }
+
+  /** Account-local durable workspaces, separate from credentials and registered projects. */
+  get standaloneWorkspacesDir(): string { return path.join(path.dirname(this.paths.statePath), "workspaces", "standalone"); }
 
   roleFor(conversationId: string, actorId: string): "viewer" | "participant" | "controller" | undefined {
     const roles = this.state.conversationRoles[conversationId];
@@ -551,6 +573,8 @@ export class RuntimeStateStore {
   }
 
   getActiveProject(senderId: string): ManagedProject | undefined {
+    if (!this.state.activeProjectIds[senderId] && this.mutableActiveSession(senderId)?.projectBinding === "none"
+      && this.getInteractionMode(senderId) !== "qa") return undefined;
     const projectId = this.state.activeProjectIds[senderId]
       ?? this.mutableActiveSession(senderId)?.projectId
       ?? this.mutableActiveQaSession(senderId)?.projectId;
@@ -627,11 +651,12 @@ export class RuntimeStateStore {
     title?: string,
     projectId?: string,
     mode: "session" | "qa" = "session",
-    knowledgeBaseId?: string
+    knowledgeBaseId?: string,
+    context?: { standalone?: boolean; hostId?: string }
   ): ManagedSession {
     const now = new Date().toISOString();
     const resolvedWorkspace = path.resolve(workspace);
-    const project = projectId
+    const project = context?.standalone ? undefined : projectId
       ? this.mutableProject(projectId)
       : this.projectForWorkspace(resolvedWorkspace);
     if (project && project.workspace !== resolvedWorkspace) {
@@ -645,12 +670,15 @@ export class RuntimeStateStore {
       title: cleanTitle(title) ?? `会话 ${number}`,
       workspace: resolvedWorkspace,
       ...(project ? { projectId: project.id } : {}),
+      ...(context?.standalone ? { projectBinding: "none" as const } : {}),
+      ...(context?.hostId ? { hostId: context.hostId } : {}),
       ...(mode === "qa" ? { mode, ...(knowledgeBaseId ? { knowledgeBaseId } : {}) } : {}),
       createdAt: now,
       updatedAt: now
     };
     this.state.sessions.push(session);
-    this.state.activeProjectIds[senderId] = project.id;
+    if (project) this.state.activeProjectIds[senderId] = project.id;
+    else delete this.state.activeProjectIds[senderId];
     if (mode === "qa") this.state.activeQaSessionIds[senderId] = session.id;
     else this.state.activeSessionIds[senderId] = session.id;
     this.save();
@@ -689,6 +717,7 @@ export class RuntimeStateStore {
     if (session.mode === "qa") this.state.activeQaSessionIds[session.senderId] = session.id;
     else this.state.activeSessionIds[session.senderId] = session.id;
     if (session.projectId) this.state.activeProjectIds[session.senderId] = session.projectId;
+    else if (session.projectBinding === "none") delete this.state.activeProjectIds[session.senderId];
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -835,6 +864,12 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     .filter((project) => project.projectKind !== "remote")
     .map((project) => [project.workspace, project]));
   for (const session of sessions) {
+    if (session.projectBinding === "none") {
+      delete session.projectId;
+      session.mode = "session";
+      delete session.knowledgeBaseId;
+      continue;
+    }
     const workspace = path.resolve(session.workspace);
     let project = session.projectId ? projects.find((candidate) => candidate.id === session.projectId) : undefined;
     if (!project) {
@@ -866,6 +901,8 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
   return {
     ...emptyRuntimeState(),
     ...value,
+    sessionPageSizes: value.sessionPageSizes && typeof value.sessionPageSizes === "object" && !Array.isArray(value.sessionPageSizes)
+      ? Object.fromEntries(Object.entries(value.sessionPageSizes).filter(([, size]) => isSessionPageSize(size))) : {},
     pairedSenderIds: Array.isArray(value.pairedSenderIds) ? value.pairedSenderIds : [],
     conversationRoles: Object.fromEntries(Object.entries(value.conversationRoles ?? {}).map(([chat, roles]) => [
       chat, Object.fromEntries(Object.entries(roles ?? {}).filter(([, role]) =>

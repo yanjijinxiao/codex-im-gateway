@@ -41,6 +41,7 @@ export type CodexTurnStatus = "inProgress" | "completed" | "interrupted" | "fail
 
 export type CodexThreadState = {
   threadId: string;
+  internal?: boolean;
   persistence: CodexThreadPersistence;
   runtimeStatus: CodexThreadRuntimeStatus;
   activeFlags: CodexThreadActiveFlag[];
@@ -48,6 +49,8 @@ export type CodexThreadState = {
   activeTurnId?: string;
   cwd?: string;
   projectId?: string;
+  /** CLI's derived workspace catalog key, for display grouping only; not native membership. */
+  workspaceProjectId?: string;
   title?: string;
   preview?: string;
   updatedAt?: string;
@@ -56,8 +59,22 @@ export type CodexThreadState = {
 export type CodexThreadListInput = {
   cwd?: string;
   projectId?: string;
+  /** Filter by native project membership, not by matching a working directory. */
+  unassigned?: boolean;
   persistence?: "active" | "archived" | "all";
   limit?: number;
+};
+
+/** User-facing discovery is not the same operation as listing backend storage.
+ * In particular, Desktop owns its catalog, while CLI discovers local rollouts.
+ */
+export type CodexSessionCatalog = {
+  backend: CodexBackendId;
+  source: "desktop-catalog" | "app-server-storage" | "cli-rollouts";
+  threads: CodexThreadState[];
+  hostIds: string[];
+  complete: boolean;
+  warnings: string[];
 };
 
 export type CodexStopResult = "interrupted" | "not-active";
@@ -179,6 +196,8 @@ export type CodexRunnerInput = {
   /** Desktop-facing project id, used as a hint; app-server resolves its native id by cwd. */
   projectId?: string;
   projectName?: string;
+  /** Explicitly unassigned. New turns must not infer a project from the cwd. */
+  projectBinding?: "none";
   threadId?: string;
   threadTitle?: string;
   onThreadCreated?: (threadId: string) => Promise<void> | void;
@@ -198,6 +217,12 @@ export type CodexRunnerInput = {
   outputSchema?: Record<string, unknown>;
   sandbox?: CodexExecSandbox;
 };
+
+export function assertCodexProjectBinding(input: CodexRunnerInput): void {
+  if (input.projectBinding === "none" && (input.projectId || input.projectName)) {
+    throw new Error("An independent session cannot also specify a project");
+  }
+}
 
 export type EphemeralCodexRunnerInput = {
   readonly prompt: string;
@@ -271,7 +296,7 @@ export type CodexThreadGoal = {
 };
 
 /** Shared contract implemented independently by the CLI and app-server backends. */
-export interface CodexBackendAdapter {
+export interface CodexBackendAdapter extends CodexBackendControls {
   readonly id: CodexBackendId;
   readonly capabilities: CodexBackendCapabilities;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
@@ -297,9 +322,8 @@ export interface CodexThreadContinuation {
   close(): void;
 }
 
-/** Full app-server contract. CLI intentionally does not fake these protocol-only operations. */
-export interface CodexAppServerBackend extends CodexBackendAdapter {
-  readonly id: "app-server";
+/** Every backend implements this boundary; unavailable operations reject explicitly. */
+export interface CodexBackendControls {
   getHistory(threadId: string): Promise<CodexHistoryMessage[]>;
   getHistoryPage(threadId: string, input?: CodexHistoryPageInput): Promise<CodexHistoryPage>;
   readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot>;
@@ -314,13 +338,19 @@ export interface CodexAppServerBackend extends CodexBackendAdapter {
   clearGoal(threadId: string): Promise<void>;
   inspectThread(threadId: string): Promise<CodexThreadState>;
   listThreads(input?: CodexThreadListInput): Promise<CodexThreadState[]>;
+  listSessionCatalog(input?: CodexThreadListInput): Promise<CodexSessionCatalog>;
   archiveThread(threadId: string): Promise<void>;
   unarchiveThread(threadId: string): Promise<CodexThreadState>;
   deleteThread(threadId: string): Promise<void>;
 }
 
+export interface CodexAppServerBackend extends CodexBackendAdapter {
+  readonly id: "app-server";
+}
+
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend {
+  backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
   steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult>;
@@ -346,6 +376,7 @@ export interface CodexBridgeBackend {
   clearGoal(threadId: string, hostId?: string): Promise<void>;
   inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState>;
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]>;
+  listSessionCatalog(input?: CodexThreadListInput, hostId?: string): Promise<CodexSessionCatalog>;
   archiveThread(threadId: string, hostId?: string): Promise<void>;
   unarchiveThread(threadId: string, hostId?: string): Promise<CodexThreadState>;
   deleteThread(threadId: string, hostId?: string): Promise<void>;
@@ -360,8 +391,8 @@ export const EXEC_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.freeze
   userInput: false,
   structuredOutput: false,
   collaborationModes: false,
-  history: false,
-  historyPaging: false,
+  history: true,
+  historyPaging: true,
   turnSteering: false,
   liveFollow: false,
   runtimeInfo: false,
@@ -372,7 +403,7 @@ export const EXEC_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.freeze
   projects: false,
   threadNaming: false,
   developerInstructions: false,
-  threadInspection: false,
+  threadInspection: true,
   threadLifecycle: false
 });
 

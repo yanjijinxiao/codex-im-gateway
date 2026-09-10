@@ -21,6 +21,7 @@ import {
   type DingTalkInboundMediaClient
 } from "../src/channels/dingtalk.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
+import { createChoiceCard } from "../src/channels/action-card.js";
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -695,6 +696,11 @@ test("DingTalk falls back to the session webhook when AI Card creation fails", a
     messageId: "fallback-text"
   });
   assert.deepEqual(webhookTexts, ["fallback"]);
+  const tableCard = createChoiceCard({ title: "会话", body: "", table: { columns: [{ label: "编号" }, { label: "标题" }], rows: [["R1", "test"]] },
+    fallbackText: "[R1] test", choices: [] });
+  const receipt = await adapter.client.sendActionCard({ toUserId: "conversation-123", card: tableCard });
+  assert.equal(webhookTexts.at(-1), "[R1] test", "failed table is replaced with readable text, not raw Markdown");
+  assert.deepEqual(receipt.parts, [{ messageId: "fallback-text", text: "[R1] test" }]);
   controller.abort();
   await monitoring;
 });

@@ -1,11 +1,11 @@
 import { createTaskFormCard, type ChannelTaskFormCard } from "../channels/task-card.js";
 import type { TaskboardIssue } from "../taskboard/client.js";
-import type { NormalizedWeixinMessage } from "../weixin/messages.js";
+import type { ChannelMessage } from "../channels/message.js";
 import type { TaskboardChannelContext } from "./taskboard-channel-context.js";
 import type { TaskboardChannelControllerOptions } from "./taskboard-channel-types.js";
 
 type HandleLegacyTaskboardCommandInput = {
-  readonly message: NormalizedWeixinMessage;
+  readonly message: ChannelMessage;
   readonly input: string;
   readonly context: TaskboardChannelContext;
   readonly options: TaskboardChannelControllerOptions;

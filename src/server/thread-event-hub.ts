@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "../codex/backend.js";
 import type { ChannelTextClient } from "../channels/types.js";
-import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../bridge/service.js";
+import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
 import { parseActionBlocks } from "../bridge/actions.js";
 import { chunkText } from "../bridge/format.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
@@ -16,6 +16,7 @@ export type ThreadSubscription = {
   managed: boolean;
   enabled?: boolean;
   contextToken?: string;
+  onTextDelivered?: (part: { messageId: string; text: string }) => void;
 };
 type FollowState = {
   eventVersion?: number;
@@ -264,7 +265,8 @@ export class ThreadEventHub {
     const restore = saved && (sub.client.resumableTextStream || !saved.messageId)
       ? saved : undefined;
     stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
-      restore, save: (checkpoint) => { state.checkpoint = checkpoint; this.save(); }
+      restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
+      save: (checkpoint) => { state.checkpoint = checkpoint; this.save(); }
     });
     this.streams.set(sub.key, stream);
     return stream;
@@ -297,8 +299,7 @@ export class ThreadEventHub {
     if (!await this.selectTurn(sub, turnId)) return;
     state.baseline = state.baseline?.filter((id) => id !== turnId);
     const stream = this.stream(sub);
-    if (await stream.progress(clean)) await stream.flush();
-    else await this.sendText(sub, "【进展】" + clean);
+    await stream.progress(clean);
     state.delivered = [...state.delivered, id].slice(-500);
     state.sequence++;
     this.save();

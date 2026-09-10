@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,6 +15,19 @@ import {
 } from "../src/codex/exec-runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+test("independent CLI start uses the supplied cwd without invented project flags or an old thread", async t => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-independent-cli-"));
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  const runner = new CodexExecRunner({ codexBin: path.join(fixturesDir, "fake-codex-exec-context.mjs") });
+  t.after(() => runner.close());
+  const result = await runner.run({ prompt: "hello", cwd: workspace, projectBinding: "none" });
+  const observed = JSON.parse(result.text);
+  assert.equal(observed.cwd, fs.realpathSync(workspace));
+  assert.deepEqual(observed.args, ["exec", "--skip-git-repo-check", "--json", "hello"]);
+  assert.equal(result.threadId, "independent-exec");
+  assert.throws(() => runner.run({ prompt: "invalid", cwd: workspace, projectBinding: "none", projectId: "conflict" }), /independent session cannot/);
+});
 
 test("builds codex exec arguments without an explicit sandbox", () => {
   assert.deepEqual(

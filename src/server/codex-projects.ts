@@ -190,10 +190,8 @@ export function listCodexCliProjectCandidates(
 
 /**
  * Combines app-server's live project/list response with Desktop-only routing
- * metadata (notably remote projects and host ids). Session history is used
- * only when neither registry is available, so project commands represent the
- * current Codex project catalog rather than every directory ever used by a
- * task.
+ * metadata (notably remote projects and host ids). An empty App registry stays
+ * empty; it must not become the CLI's derived workspace catalog.
  */
 export function mergeCodexProjectCandidates(
   appServerProjects: readonly CodexProject[],
@@ -223,7 +221,7 @@ export function mergeCodexProjectCandidates(
     registeredLocalWorkspaces.add(workspace);
   }
 
-  return merged.length ? merged : listSessionProjectCandidates(codexHome);
+  return merged;
 }
 
 /** Converts the selected backend's catalog without silently mixing sources. */

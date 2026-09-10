@@ -4,6 +4,9 @@ import readline from "node:readline";
 
 const rl = readline.createInterface({ input: process.stdin });
 const projectApiEnabled = !process.argv.includes("--without-project-api");
+const inferNewProject = process.argv.includes("--infer-new-project");
+let lastThreadStartParams;
+let projectRequests = 0;
 let initialized = false;
 let experimentalApiEnabled = false;
 let nextTurn = 1;
@@ -174,18 +177,21 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/start") {
+    lastThreadStartParams = message.params;
     if (message.params?.approvalPolicy !== "never") {
       fail(message.id, "approvalPolicy must be never");
       return;
     }
     ephemeralThreadStarted = message.params?.ephemeral === true;
     dynamicToolsEnabled = message.params?.dynamicTools?.[0]?.name === "knowledge";
-    if (message.params?.projectId) threadProjects.set("thread-new", message.params.projectId);
+    const projectId = message.params?.projectId ?? (inferNewProject ? "project-native" : null);
+    if (projectId) threadProjects.set("thread-new", projectId);
+    else threadProjects.delete("thread-new");
     if (message.params?.developerInstructions) {
       threadDeveloperInstructions.set("thread-new", message.params.developerInstructions);
     }
     respond(message.id, {
-      thread: { id: "thread-new", projectId: message.params?.projectId ?? null, name: null },
+      thread: { id: "thread-new", projectId, name: null },
       model: message.params.model ?? "configured-model",
       reasoningEffort: "high"
     });
@@ -237,6 +243,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "project/list") {
+    projectRequests++;
     if (!projectApiEnabled) {
       send({
         id: message.id,
@@ -252,6 +259,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "project/create") {
+    projectRequests++;
     const project = {
       id: `project-created-${projects.length}`,
       name: message.params.name,
@@ -495,6 +503,12 @@ rl.on("line", (line) => {
       }
       if (threadDeveloperInstructions.get(message.params.threadId) !== "bridge-only-policy") {
         fail(message.id, "Bridge policy must be sent as developerInstructions");
+        return;
+      }
+    }
+    if (prompt === "verify-standalone") {
+      if (lastThreadStartParams.projectId !== null || threadProjects.get(message.params.threadId) || projectRequests) {
+        fail(message.id, "independent start must explicitly omit membership, never resolve/create projects, and clear inferred assignments before turning");
         return;
       }
     }

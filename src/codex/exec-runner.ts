@@ -4,9 +4,11 @@ import path from "node:path";
 
 import {
   CodexBackendCapabilityError,
+  assertCodexProjectBinding,
   EXEC_BACKEND_CAPABILITIES,
   type CodexRunResult,
   type CodexProjectCatalog,
+  type CodexSessionCatalog,
   type CodexRunnerInput,
   type CodexSteerInput,
   type CodexSteerResult,
@@ -14,6 +16,8 @@ import {
   type CodexBackendAdapter
 } from "./backend.js";
 import { listCodexCliProjects } from "./cli-projects.js";
+import { CliSessionStore } from "./cli-sessions.js";
+import type { CodexHistoryPageInput, CodexThreadListInput } from "./backend.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 
 export type { CodexRunResult } from "./backend.js";
@@ -71,10 +75,39 @@ export class CodexExecRunner implements CodexBackendAdapter {
   readonly id = "exec" as const;
   readonly capabilities = EXEC_BACKEND_CAPABILITIES;
   private readonly activeRuns: Array<{ child: ChildProcess; threadId?: string }> = [];
+  private readonly sessions: CliSessionStore;
 
-  constructor(private readonly options: CodexExecRunnerOptions = {}) {}
+  constructor(private readonly options: CodexExecRunnerOptions = {}) {
+    this.sessions = new CliSessionStore(options.codexHome);
+  }
+
+  listThreads(input?: CodexThreadListInput) { return this.sessions.list(input); }
+  async listSessionCatalog(input?: CodexThreadListInput): Promise<CodexSessionCatalog> {
+    return { backend: this.id, source: "cli-rollouts", hostIds: ["local"], complete: true,
+      threads: await this.listThreads(input), warnings: ["来源：Codex CLI 本地会话记录（不是 Codex App 目录）。"] };
+  }
+  async inspectThread(threadId: string) {
+    const state = await this.sessions.inspect(threadId);
+    return this.activeRuns.some(run => run.threadId === threadId)
+      ? { ...state, runtimeStatus: "active" as const, persistence: "active" as const, activeTurnId: `exec:${threadId}` }
+      : state;
+  }
+  async readThreadSnapshot(threadId: string) { return this.sessions.snapshot(threadId); }
+  async getHistory(threadId: string) { return (await this.sessions.snapshot(threadId)).turns.flatMap(turn => turn.messages); }
+  getHistoryPage(threadId: string, input?: CodexHistoryPageInput) { return this.sessions.historyPage(threadId, input); }
+  async getRuntimeInfo(): Promise<never> { throw new CodexBackendCapabilityError("runtimeInfo", this.id); }
+  async listModels(): Promise<never> { throw new CodexBackendCapabilityError("models", this.id); }
+  async getAccountRateLimits(): Promise<never> { throw new CodexBackendCapabilityError("accountRateLimits", this.id); }
+  async getGoal(): Promise<never> { throw new CodexBackendCapabilityError("goals", this.id); }
+  async setGoal(): Promise<never> { throw new CodexBackendCapabilityError("goals", this.id); }
+  async clearGoal(): Promise<never> { throw new CodexBackendCapabilityError("goals", this.id); }
+  async archiveThread(): Promise<never> { throw new CodexBackendCapabilityError("threadLifecycle", this.id); }
+  async unarchiveThread(): Promise<never> { throw new CodexBackendCapabilityError("threadLifecycle", this.id); }
+  async deleteThread(): Promise<never> { throw new CodexBackendCapabilityError("threadLifecycle", this.id); }
 
   run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    assertCodexProjectBinding(input);
+    // CLI has no project assignment API: independent sessions use their own cwd.
     const codexCommand = resolveCodexCommand(this.options.codexBin ?? "codex");
     const timeoutMs = this.options.timeoutMs;
     const args = buildCodexExecArgs({
@@ -85,6 +118,7 @@ export class CodexExecRunner implements CodexBackendAdapter {
     return new Promise((resolve, reject) => {
       const child = spawn(codexCommand.command, [...codexCommand.argsPrefix, ...args], {
         cwd: input.cwd,
+        ...(this.options.codexHome ? { env: { ...process.env, CODEX_HOME: this.options.codexHome } } : {}),
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
         windowsHide: true
@@ -145,7 +179,7 @@ export class CodexExecRunner implements CodexBackendAdapter {
   async listProjects(): Promise<CodexProjectCatalog> {
     return {
       backend: "exec",
-      projects: listCodexCliProjects(this.options.codexHome)
+      projects: listCodexCliProjects(this.sessions.codexHome)
     };
   }
 

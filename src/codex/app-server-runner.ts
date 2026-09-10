@@ -2,6 +2,9 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
+import { rolloutIdentity } from "./rollout-identity.js";
+import { desktopSessionMembership } from "./desktop-session-membership.js";
+import { readDesktopSessionCatalog, isDesktopCatalogThread } from "./desktop-session-catalog.js";
 
 import { resolveCodexCommand } from "./exec-runner.js";
 import { parseAccountRateLimits, type CodexAccountBalance } from "./account-balance.js";
@@ -17,6 +20,7 @@ import {
   APP_SERVER_BACKEND_CAPABILITIES,
   CodexThreadStateError,
   assertCodexThreadRunnable,
+  assertCodexProjectBinding,
   type CodexAppServerBackend,
   type CodexDynamicToolCall,
   type CodexDynamicToolHandler,
@@ -26,6 +30,7 @@ import {
   type CodexModelOption,
   type CodexProject,
   type CodexProjectCatalog,
+  type CodexSessionCatalog,
   type CodexRunResult,
   type CodexRunnerInput,
   type CodexRuntimeInfo,
@@ -63,6 +68,8 @@ export type {
 export type { AppServerTransport } from "./app-server-transport.js";
 
 export type AppServerRunnerOptions = {
+  codexHome?: string;
+  hostId?: string;
   codexBin?: string;
   requestTimeoutMs?: number;
   sandbox?: CodexExecSandbox;
@@ -151,6 +158,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    assertCodexProjectBinding(input);
     this.operationLeases += 1;
     try {
       return await this.runWithLease(input);
@@ -191,6 +199,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           developerInstructions: input.developerInstructions,
           approvalPolicy: "never",
           ...(!input.threadId && nativeProjectId ? { projectId: nativeProjectId } : {}),
+          ...(!input.threadId && input.projectBinding === "none" ? { projectId: null } : {}),
           ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
         })
       ) as Record<string, unknown>;
@@ -205,6 +214,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
     try {
     const currentProjectId = typeof thread?.projectId === "string" ? thread.projectId : undefined;
+    if (!input.threadId && input.projectBinding === "none" && currentProjectId) {
+      // Some servers may infer a project. The protocol uses an empty string (not
+      // null) to clear metadata. Never reassign an existing bound thread here.
+      await this.request("thread/metadata/update", { threadId, projectId: "" });
+      if (thread) thread.projectId = null;
+    }
     if (input.threadId && nativeProjectId && currentProjectId !== nativeProjectId) {
       try {
         await this.request("thread/metadata/update", { threadId, projectId: nativeProjectId });
@@ -376,6 +391,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   async inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState> {
+    const membership = this.sessionMembership(true);
     await this.ensureConnected();
     try {
       let response: Record<string, unknown>;
@@ -387,7 +403,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }
       const thread = response.thread as Record<string, unknown> | undefined;
       if (!thread) throw new Error(`Codex app-server returned no thread for ${threadId}`);
-      const state = parseThreadState(thread, persistenceFromThread(thread));
+      const state = membership(parseThreadState(thread, persistenceFromThread(thread)));
       const activeTurnId = this.activeTurns.get(threadId);
       if (activeTurnId) {
         state.activeTurnId = activeTurnId;
@@ -399,13 +415,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     } catch (error) {
       const archived = await this.findListedThread(threadId, true);
       if (archived) {
-        const state = parseThreadState(archived, "archived");
+        const state = membership(parseThreadState(archived, "archived"));
         this.threadStates.set(threadId, state);
         return state;
       }
       const active = await this.findListedThread(threadId, false);
       if (active) {
-        const state = parseThreadState(active, persistenceFromThread(active));
+        const state = membership(parseThreadState(active, persistenceFromThread(active)));
         this.threadStates.set(threadId, state);
         return state;
       }
@@ -425,10 +441,28 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
   }
 
+  async listSessionCatalog(input: CodexThreadListInput = {}): Promise<CodexSessionCatalog> {
+    // Do not load threads or start a second app-server just to discover what
+    // Desktop already indexes, including hosts with no saved project.
+    const catalog = readDesktopSessionCatalog(this.options.codexHome, this.options.hostId, input);
+    if (catalog) return catalog;
+    await this.ensureConnected();
+    try {
+      const threads = await this.listThreadsByPersistence(input, false, input.limit ?? Infinity, true);
+      return { backend: this.id, source: "app-server-storage", hostIds: [this.options.hostId ?? "local"], complete: true,
+        threads: threads.map(state => ({ ...state,
+          // A private reader's notLoaded/idle says nothing about Desktop.
+          runtimeStatus: this.options.transport?.mode === "remote-daemon" || state.runtimeStatus === "active" || state.runtimeStatus === "systemError"
+            ? state.runtimeStatus : "unknown"
+        })),
+        warnings: ["Codex App 目录不可用；当前显示 app-server 存储中符合 App 筛选规则的会话，不保证与 App 侧栏完全一致。ChatGPT 聊天不支持绑定。"] };
+    } finally { await this.recyclePrivateTransportIfIdle(); }
+  }
+
   async listThreads(input: CodexThreadListInput = {}): Promise<CodexThreadState[]> {
     await this.ensureConnected();
     const persistence = input.persistence ?? "all";
-    const limit = Math.max(1, Math.min(input.limit ?? 100, 1_000));
+    const limit = input.limit === undefined ? Infinity : Math.max(1, input.limit);
     const results: CodexThreadState[] = [];
     if (persistence === "active" || persistence === "all") {
       results.push(...await this.listThreadsByPersistence(input, false, limit));
@@ -467,7 +501,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const response = await this.request("thread/unarchive", { threadId }) as Record<string, unknown>;
       const thread = response.thread as Record<string, unknown> | undefined;
       const state = thread
-        ? parseThreadState(thread, "active")
+        ? this.sessionMembership()(parseThreadState(thread, "active"))
         : await this.inspectThread(threadId);
       this.threadStates.set(threadId, state);
       return state;
@@ -494,9 +528,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private async listThreadsByPersistence(
     input: CodexThreadListInput,
     archived: boolean,
-    limit: number
+    limit: number,
+    desktopCatalogOnly = false
   ): Promise<CodexThreadState[]> {
     const states: CodexThreadState[] = [];
+    const membership = this.sessionMembership(desktopCatalogOnly);
     let cursor: string | undefined;
     const seenCursors = new Set<string>();
     do {
@@ -506,13 +542,18 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         sortKey: "updated_at",
         sortDirection: "desc",
         sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"],
+        ...(desktopCatalogOnly ? { modelProviders: [], useStateDbOnly: true } : {}),
         archived,
-        cwd: input.cwd,
-        projectId: input.projectId
-      })) as Record<string, unknown>;
+        // Explicit project membership can span worktrees with different cwd.
+        cwd: input.projectId ? undefined : input.cwd
+      }), Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000)) as Record<string, unknown>;
       for (const value of Array.isArray(response.data) ? response.data : []) {
         if (!isRecord(value)) continue;
-        states.push(parseThreadState(value, archived ? "archived" : persistenceFromThread(value)));
+        if (desktopCatalogOnly && !isDesktopCatalogThread(value)) continue;
+        const state = membership(parseThreadState(value, archived ? "archived" : persistenceFromThread(value)));
+        if (state.internal || (input.unassigned && state.projectId)) continue;
+        if (input.projectId && state.projectId !== input.projectId && value.projectId !== input.projectId) continue;
+        states.push(state);
         if (states.length >= limit) break;
       }
       const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
@@ -523,6 +564,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       cursor = nextCursor;
     } while (cursor);
     return states;
+  }
+
+  private sessionMembership(legacyWorkspaceFallback = false): (state: CodexThreadState) => CodexThreadState {
+    // A remote transport without a host identity must not consume local membership.
+    if (this.options.transport?.mode === "remote-daemon" && !this.options.hostId) return (state) => state;
+    return desktopSessionMembership(this.options.codexHome, this.options.hostId, legacyWorkspaceFallback);
   }
 
   private async findListedThread(threadId: string, archived: boolean): Promise<Record<string, unknown> | undefined> {
@@ -634,7 +681,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      const response = await this.request("project/list", compactObject({ cursor, limit: 100 })) as Record<string, unknown>;
+      const response = await this.request("project/list", compactObject({ cursor, limit: 100 }), Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000)) as Record<string, unknown>;
       for (const value of Array.isArray(response.data) ? response.data : []) {
         const project = parseAppServerProject(value);
         if (project) projects.push(project);
@@ -1793,6 +1840,7 @@ function parseThreadState(
     threadId,
     persistence,
     runtimeStatus,
+    ...(rolloutIdentity({ source: thread.source, thread_source: thread.threadSource ?? thread.thread_source }).internal ? { internal: true } : {}),
     activeFlags: parsedRuntime.activeFlags,
     ...(latestTurnStatus ? { latestTurnStatus } : {}),
     ...(latestTurnStatus === "inProgress" && typeof latestTurn?.id === "string"

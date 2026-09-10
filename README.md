@@ -102,21 +102,30 @@ node dist/server/index.js
 1. 打开管理页，点击“添加渠道”。
 2. 选择个人微信、企业微信、飞书或钉钉，并按页面说明完成扫码或填写应用凭据。
 3. 从对应聊天端给机器人发送一条消息；如渠道需要授权，在管理页允许该联系人或会话。
-4. 发送 `/project add` 查看 Codex Desktop 可用项目，再发送 `/project add C1` 绑定项目。
-5. 发送普通消息开始对话；使用 `/new` 新建 Session，或使用 `/sessions` 和 `/session R1` 继续已有 Session。
+4. 发送 `/sessions` 分页查看全部可绑定的未归档会话，再发送 `/session R1`（或点击卡片）直接绑定，无需先选项目。
+5. 发送普通消息继续对话。新建会话可用 `/new`（当前项目）、`/new P2` 或 `/new C1`（指定项目），也可用 `/new --standalone`（本机独立会话）。下一条消息才会启动 Codex；旧 `/project add` 保留为兼容别名。
 
 常用命令：
 
 ```text
 /help                       查看全部命令
 /status                     查看当前项目、Session、后端、模型和任务状态
-/project                    查看已绑定项目
-/project add                查看 Codex Desktop 可添加的本机或远程项目
-/project add C1             绑定一个项目
-/project P1                 切换项目
-/sessions                   查看当前项目最近活跃的 Session
+/sessions                   未归档 Session 按项目分组，组内最近更新优先；默认每页 30 个
+/sessions size 50           每页条数设为 50（支持 5-50，按聊天和用户保存）
+/sessions detail R1         查看标题、主机、目录和 ID，不切换会话
+/sessions more              下一页（prev 上一页，page 3 跳页）
+/sessions search 关键词      按标题、内容、目录或 ID 搜索
+/sessions unbound           只看无项目 Session
+/sessions project           只看当前项目 Session
 /session R1                 绑定并继续指定 Session
-/new                        新建 Session
+/session 会话ID              不经过列表直接绑定（远程附加 --host 主机ID）
+/project                    可选：查看项目，选择时自动绑定并切换
+/project C1                 选择未绑定项目（也兼容 /project add C1）
+/project P1                 切换已绑定项目
+/new                        在当前项目新建 Session
+/new P2                     在指定项目新建并切换；也支持 C编号或完整项目名
+/new --standalone           新建本机无项目 Session，使用独立持久目录
+/session new ...            /new ... 的别名
 /model                      查看或切换模型
 /effort                     查看或切换推理强度
 /stream                     设置过程进度
@@ -125,6 +134,8 @@ node dist/server/index.js
 
 远程项目复用 Codex Desktop 保存的 `hostId` 和本机 SSH 配置；网关不保存 SSH 密码或私钥内容。项目、模式和 Taskboard 的完整交互见[渠道项目工作台](./docs/channel-project-modes.md)。
 
+会话列表也会隐藏本地用途配置中已确认的探活记录，并显示隐藏数量；不会仅凭 `READY` 标题或 CLI 来源过滤正常对话，也不会删除或归档记录。配置及恢复方式见[会话用途筛选](./docs/codex-backends.md#probe-records-versus-user-conversations)。
+
 ## Codex 后端
 
 网关对上层渠道暴露统一的项目、Session、执行、历史、审批和状态接口，并提供两个后端实现：
@@ -132,9 +143,11 @@ node dist/server/index.js
 | 后端 | 适用场景 | 主要能力 |
 | --- | --- | --- |
 | `app-server` | Codex Desktop、新 Session、交互任务、远程项目 | 项目注册表、thread 生命周期、流式事件、审批、动态工具、Desktop relay |
-| `codex exec` | 本机非交互式 CLI 任务及兼容回退 | `codex exec` / `codex exec resume`、结构化最终结果 |
+| `codex exec` | 本机非交互式 CLI 任务及兼容回退 | 本机会话目录、历史分页、`codex exec` / `codex exec resume` |
 
-`codexBackend: "auto"` 默认优先使用 app-server；只有不依赖审批、动态工具、结构化输出或用户输入的任务，才会在 app-server 不可用时降级到 `codex exec`。固定后端时不会静默切换。详细接口和路由规则见[Codex 后端架构](./docs/codex-backends.md)。
+`codexBackend: "auto"` 默认优先使用 app-server，初始目录发现或兼容的新任务可以选择 CLI；选定后端后固定路由，既有会话不会因故障临时切换后端。两种后端都有独立的目录和历史接口实现；CLI 没有原生项目归属，不读取 Desktop 注册表，实时跟随、介入和目标等不支持的操作会明确报错。详细接口和路由规则见[Codex 后端架构](./docs/codex-backends.md)。
+
+列表按最近更新时间排序，翻页期间编号不变；15 分钟后或重新搜索/刷新时需重新选择。App 后端同时列出已知远程主机的可用会话，部分主机离线会给出提示。已归档、内部子任务及不可用会话不混入普通列表。
 
 ## 长任务、进度与 Session 生命周期
 
@@ -193,6 +206,7 @@ CODEX_IM_GATEWAY_OPEN=0
 
 - [消息渠道与任务通知配置](./docs/channel-setup.md)
 - [Codex 后端架构](./docs/codex-backends.md)
+- [统一 IM 渠道接口与能力矩阵](./docs/im-channel-architecture.md)
 - [渠道项目、模式与 Taskboard 工作台](./docs/channel-project-modes.md)
 - [内置 Taskboard 安装、迁移与回滚](./docs/taskboard-module.md)
 - [本地运行与更新](./docs/local-run.md)

@@ -8,30 +8,9 @@ export type WeixinRawMessage = {
   text?: string;
 };
 
-export type WeixinInboundAttachment = {
-  kind: "image" | "file" | "video" | "audio";
-  label: string;
-  item: Record<string, unknown>;
-  path?: string;
-};
-
-export type NormalizedWeixinMessage = {
-  id: string;
-  /** The human actor who sent the message or clicked the card. */
-  senderId: string;
-  /** The channel conversation that receives replies and owns session state. */
-  replyTargetId?: string;
-  /** A channel-native interaction that does not include its conversation id. */
-  source?: "native-menu";
-  contextToken?: string;
-  interaction?: {
-    readonly kind: "card";
-    readonly messageId: string;
-  };
-  text: string;
-  attachments: WeixinInboundAttachment[];
-  raw: WeixinRawMessage;
-};
+/** Compatibility aliases for integrations using the original WeChat-only API. */
+export type WeixinInboundAttachment = import("../channels/message.js").ChannelAttachment;
+export type NormalizedWeixinMessage = import("../channels/message.js").ChannelMessage;
 
 export function normalizeWeixinMessage(raw: WeixinRawMessage): NormalizedWeixinMessage | undefined {
   const senderId = raw.from_user_id ?? raw.sender;

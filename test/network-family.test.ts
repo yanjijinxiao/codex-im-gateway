@@ -1,6 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+test("concurrent first requests negotiate once and never overwrite the pinned family", async () => {
+  const calls: number[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const transport = new PinnedNetworkLifecycleTransport("auto", async (family) => {
+    calls.push(family);
+    if (calls.length === 1) { await gate; throw Object.assign(new Error("IPv4 unavailable"), { code: "ENETUNREACH" }); }
+    return new Response("ok");
+  });
+  const first = transport.request("turn", "https://example.test");
+  const second = transport.request("turn", "https://example.test");
+  assert.deepEqual(calls, [4]);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(calls, [4, 6, 6]);
+  assert.equal(transport.resolvedFamily("turn"), 6);
+});
+
+test("a request waiting for network negotiation can be cancelled independently", async () => {
+  let release!: () => void;
+  const transport = new PinnedNetworkLifecycleTransport("auto", async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    return new Response("ok");
+  });
+  const first = transport.request("turn", "https://example.test");
+  const controller = new AbortController();
+  const second = transport.request("turn", "https://example.test", { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(second, { name: "AbortError" });
+  release(); await first;
+});
+
 import {
   PinnedNetworkLifecycleTransport,
   type ResolvedNetworkFamily

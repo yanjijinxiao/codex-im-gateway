@@ -7,7 +7,7 @@ test("identifies guardian and subagent sources without confusing their parent wi
     { thread_source: "guardian_review" }, { thread_source: "subagent" },
     { source: { subagent: { other: "guardian" } } },
     { source: { subAgent: { thread_spawn: { parent_thread_id: "parent" } } } },
-    { source: "guardian_review" }
+    { source: "guardian_review" }, { source: "subAgentReview" }, { source: "subAgentCompact" }, { source: "subAgentThreadSpawn" }
   ]) assert.deepEqual(rolloutIdentity({ id: "child", session_id: "parent", ...source }), {
     threadId: "child", internal: true
   });

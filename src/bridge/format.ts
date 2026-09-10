@@ -16,11 +16,12 @@ const LEGACY_BRIDGE_ACTION_INSTRUCTIONS = [
 ];
 const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
 const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
+export type AttachmentSource = "WeChat" | "Web" | "DingTalk" | "Feishu" | "WeCom" | "IM";
 
 export function buildPrompt(
   text: string,
   attachments: PromptBufferItem[] = [],
-  attachmentSource: "WeChat" | "Web" = "WeChat",
+  attachmentSource: AttachmentSource = "WeChat",
   knowledge: readonly KnowledgeEntry[] = []
 ): string {
   const parts = buildPromptParts(text, attachments, attachmentSource, knowledge);
@@ -35,7 +36,7 @@ export function buildPrompt(
 export function buildPromptParts(
   text: string,
   attachments: PromptBufferItem[] = [],
-  attachmentSource: "WeChat" | "Web" = "WeChat",
+  attachmentSource: AttachmentSource = "WeChat",
   knowledge: readonly KnowledgeEntry[] = []
 ): { prompt: string; developerInstructions: string } {
   const lines: string[] = [];
@@ -51,17 +52,17 @@ export function buildPromptParts(
   }
   return {
     prompt: lines.join("\n\n").trim(),
-    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS, buildKnowledgeContext(knowledge)].join("\n\n")
+    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", attachmentSource), buildKnowledgeContext(knowledge, attachmentSource)].join("\n\n")
   };
 }
 
-function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[]): string {
+function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[], source: AttachmentSource): string {
   const entries = knowledge.map((entry) =>
     `- [${entry.kind}/${entry.scope}] ${entry.title}: ${entry.content}`
   );
   return [
     KNOWLEDGE_CONTEXT_START,
-    "Private knowledge belongs only to this WeChat account. Use relevant entries to personalize the answer.",
+    `Private knowledge belongs only to this ${source} account. Use relevant entries to personalize the answer.`,
     ...(entries.length ? ["Known reusable knowledge:", ...entries] : ["Known reusable knowledge: none yet."]),
     "After answering, add at most 3 stable reusable facts to the codex-im-gateway-actions JSON under remember.",
     "Each item must be {\"kind\":\"preference|skill|knowledge|workflow\",\"scope\":\"account|project\",\"title\":\"...\",\"content\":\"...\"}.",
@@ -72,7 +73,7 @@ function buildKnowledgeContext(knowledge: readonly KnowledgeEntry[]): string {
 }
 
 export type PromptAttachment = {
-  source: "WeChat" | "Web";
+  source: AttachmentSource;
   kind: "file" | "image" | "video" | "audio";
   label: string;
   path: string;
@@ -100,7 +101,8 @@ export function buildPromptPreview(text: string, attachments: PromptPreviewItem[
 
 export function parsePrompt(text: string): { text: string; attachments: PromptAttachment[] } {
   let normalized = text.trim();
-  for (const instructions of [BRIDGE_ACTION_INSTRUCTIONS, ...LEGACY_BRIDGE_ACTION_INSTRUCTIONS]) {
+  const instructionsByChannel = ["Web", "DingTalk", "Feishu", "WeCom", "IM"].map((source) => BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", source));
+  for (const instructions of [BRIDGE_ACTION_INSTRUCTIONS, ...LEGACY_BRIDGE_ACTION_INSTRUCTIONS, ...instructionsByChannel]) {
     if (normalized.startsWith(instructions)) {
       normalized = normalized.slice(instructions.length).trim();
       break;
@@ -113,7 +115,7 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
   normalized = stripCodexDesktopAttachmentEnvelope(normalized);
   const attachments: PromptAttachment[] = [];
   const visibleText = normalized.replace(
-    /^\[(WeChat|Web) (file|image|video|audio): (.+) saved to (.+)]\nInspect the saved local attachment before answering\.$/gm,
+    /^\[(WeChat|Web|DingTalk|Feishu|WeCom|IM) (file|image|video|audio): (.+) saved to (.+)]\nInspect the saved local attachment before answering\.$/gm,
     (_match, source: PromptAttachment["source"], kind: PromptAttachment["kind"], label: string, filePath: string) => {
       attachments.push({ source, kind, label, path: filePath });
       return "";

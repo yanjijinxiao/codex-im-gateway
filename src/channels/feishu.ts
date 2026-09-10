@@ -5,8 +5,10 @@ import path from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
 
 import type { FeishuAccount } from "../weixin/accounts.js";
-import type { NormalizedWeixinMessage } from "../weixin/messages.js";
-import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import type { ChannelMessage } from "./message.js";
+import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
+import { feishuMessageReceipt, assertFeishuSuccess } from "./feishu-result.js";
 import { feishuActionCard } from "./feishu-action-card.js";
 import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
 import { FeishuCardUpdater } from "./feishu-card-updater.js";
@@ -31,7 +33,9 @@ type FeishuAdapterOptions = {
 };
 
 export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
-  readonly client: ChannelTextClient = this;
+  readonly client: ChannelClient;
+  private status?: ChannelMonitorOptions["onStatus"];
+  private readonly injectedSocket: boolean;
   private readonly apiClient: NonNullable<FeishuAdapterOptions["apiClient"]>;
   private readonly wsClient: NonNullable<FeishuAdapterOptions["wsClient"]>;
   private readonly cardUpdater: FeishuCardUpdater;
@@ -40,9 +44,23 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   constructor(account: FeishuAccount, options: FeishuAdapterOptions = {}) {
     const config = { appId: account.appId, appSecret: account.appSecret };
     this.apiClient = options.apiClient ?? new Lark.Client(config);
-    this.wsClient = options.wsClient ?? new Lark.WSClient(config);
+    this.injectedSocket = Boolean(options.wsClient);
+    this.wsClient = options.wsClient ?? new Lark.WSClient({ ...config,
+      onReady: () => this.status?.({ state: "connected" }),
+      onReconnected: () => this.status?.({ state: "connected" }),
+      onReconnecting: () => this.status?.({ state: "reconnecting" }),
+      onError: () => this.status?.({ state: "reconnecting", detail: "WebSocket connection failed" })
+    });
     this.cardUpdater = new FeishuCardUpdater(this.apiClient.im.v1.message.patch);
     this.inboundDir = options.inboundDir;
+    this.client = createChannelClient("feishu", {
+      ...TEXT_CAPABILITIES,
+      tableLayout: "native",
+      inbound: { ...NO_MEDIA, image: options.inboundDir ? "available" : "not-configured" },
+      outbound: { ...NO_MEDIA, image: "available" },
+      actions: "available", tasks: "available",
+      cardUpdates: this.apiClient.im.v1.message.patch ? "available" : "not-implemented"
+    }, this);
   }
 
   async sendText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
@@ -54,13 +72,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         content: JSON.stringify({ text: input.text })
       }
     });
-    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+    return feishuMessageReceipt(result, "sendText");
   }
 
   async sendImage(input: { toUserId: string; path: string }): Promise<{ messageId: string }> {
     const upload = await this.apiClient.im.v1.image.create({
       data: { image_type: "message", image: await fs.promises.readFile(input.path) }
     });
+    assertFeishuSuccess(upload, "uploadImage");
     if (!upload?.image_key) {
       throw new Error("Feishu image upload did not return an image_key");
     }
@@ -72,7 +91,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         content: JSON.stringify({ image_key: upload.image_key })
       }
     });
-    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+    return feishuMessageReceipt(result, "sendImage");
   }
 
   async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<{ messageId: string }> {
@@ -84,7 +103,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         content: JSON.stringify(feishuActionCard(input.card))
       }
     });
-    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+    return feishuMessageReceipt(result, "sendActionCard");
   }
 
   async sendTaskCard(input: { toUserId: string; card: ChannelTaskCard }): Promise<{ messageId: string }> {
@@ -96,7 +115,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         content: JSON.stringify(feishuTaskCard(input.card))
       }
     });
-    return { messageId: String(result.data?.message_id ?? crypto.randomUUID()) };
+    return feishuMessageReceipt(result, "sendTaskCard");
   }
 
   async updateActionCard(input: { messageId: string; card: ChannelActionCard }): Promise<void> {
@@ -108,14 +127,16 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {
+    if (options.signal?.aborted) return;
+    this.status = options.onStatus;
+    this.status?.({ state: "connecting" });
     const dispatcher = new Lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (event) => {
-        if (event.message.message_type !== "text" && event.message.message_type !== "image") return;
         const actorId = event.sender.sender_id?.open_id
           ?? event.sender.sender_id?.user_id
           ?? event.sender.sender_id?.union_id;
         if (!actorId) return;
-        const pendingMessage: NormalizedWeixinMessage = {
+        const pendingMessage: ChannelMessage = {
           id: event.message.message_id,
           senderId: actorId,
           replyTargetId: event.message.chat_id,
@@ -125,6 +146,10 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         };
         if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
         try {
+          if (event.message.message_type !== "text" && event.message.message_type !== "image") {
+            await options.onMessage({ ...pendingMessage, unsupportedMessageType: event.message.message_type });
+            return;
+          }
           await options.onMessage(await this.normalizeMessage(
             pendingMessage,
             event.message.message_type,
@@ -145,7 +170,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         const token = typeof rawEvent.token === "string" && rawEvent.token.trim()
           ? rawEvent.token.trim()
           : cardActionIdentity(event);
-        const pendingMessage: NormalizedWeixinMessage = {
+        const pendingMessage: ChannelMessage = {
           id: `feishu-card:${token}`,
           senderId: event.operator.openId,
           replyTargetId: event.chatId,
@@ -171,7 +196,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           ?? event.operator?.operator_id?.union_id;
         if (!command || !operatorId) return;
         const eventId = event.event_id ?? event.uuid ?? crypto.randomUUID();
-        const pendingMessage: NormalizedWeixinMessage = {
+        const pendingMessage: ChannelMessage = {
           id: `feishu-menu:${eventId}`,
           senderId: operatorId,
           replyTargetId: operatorId,
@@ -189,17 +214,23 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         }
       }
     });
-    const started = this.wsClient.start({ eventDispatcher: dispatcher });
-    await Promise.race([started, untilAborted(options.signal)]);
-    if (!options.signal?.aborted) await untilAborted(options.signal);
-    this.wsClient.close({ force: true });
+    try {
+      const started = this.wsClient.start({ eventDispatcher: dispatcher });
+      await Promise.race([started, untilAborted(options.signal)]);
+      if (this.injectedSocket && !options.signal?.aborted) this.status?.({ state: "connected" });
+      if (!options.signal?.aborted) await untilAborted(options.signal);
+    } finally {
+      this.wsClient.close({ force: true });
+      this.status?.({ state: "stopped" });
+      this.status = undefined;
+    }
   }
 
   private async normalizeMessage(
-    message: NormalizedWeixinMessage,
+    message: ChannelMessage,
     messageType: "text" | "image",
     content: string
-  ): Promise<NormalizedWeixinMessage> {
+  ): Promise<ChannelMessage> {
     if (messageType === "text") return { ...message, text: parseText(content) };
     const imageKey = parseImageKey(content);
     if (!imageKey) throw new Error("Feishu image message did not include an image_key");
@@ -221,7 +252,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
 async function reportMessageError(
   options: ChannelMonitorOptions,
   error: Error,
-  message: NormalizedWeixinMessage
+  message: ChannelMessage
 ): Promise<void> {
   try {
     await options.onMessageError?.(error, message);

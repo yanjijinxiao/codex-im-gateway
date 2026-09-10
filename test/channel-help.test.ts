@@ -22,6 +22,8 @@ test("focused session help describes policies, permissions and backend limits", 
   const text = channelHelpText([], command.arg);
   assert.equal(command.name, "help");
   assert.equal(chunkText(text).length, 1);
+  assert.match(text, /每页 30 个/);
+  assert.match(text, /\/sessions size 50/);
   for (const name of interventionCommands) assert.ok(text.includes(name));
   assert.match(text, /ask：先询问（默认）/);
   assert.match(text, /viewer：只读；participant：对话与插话；controller/);

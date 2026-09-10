@@ -3,15 +3,17 @@ import crypto from "node:crypto";
 import AiBot, { type TextMessage, type WsFrame } from "@wecom/aibot-node-sdk";
 
 import type { WeComAccount } from "../weixin/accounts.js";
-import type { NormalizedWeixinMessage } from "../weixin/messages.js";
-import type { ChannelAdapter, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import type { ChannelMessage } from "./message.js";
+import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
+import { createChannelClient, TEXT_CAPABILITIES } from "./client.js";
 
 export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
-  readonly client: ChannelTextClient = this;
+  readonly client: ChannelClient;
   private readonly wsClient: InstanceType<typeof AiBot.WSClient>;
 
-  constructor(account: WeComAccount) {
-    this.wsClient = new AiBot.WSClient({ botId: account.botId, secret: account.secret });
+  constructor(account: WeComAccount, options: { wsClient?: InstanceType<typeof AiBot.WSClient> } = {}) {
+    this.wsClient = options.wsClient ?? new AiBot.WSClient({ botId: account.botId, secret: account.secret });
+    this.client = createChannelClient("wecom", TEXT_CAPABILITIES, this);
   }
 
   async sendText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
@@ -23,15 +25,18 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {
+    if (options.signal?.aborted) return;
+    options.onStatus?.({ state: "connecting" });
     const handle = (frame: WsFrame<TextMessage>) => {
       const body = frame.body;
       if (!body) return;
-      const message: NormalizedWeixinMessage = {
+      const message: ChannelMessage = {
         id: body.msgid,
-        senderId: body.chatid ?? body.from.userid,
+        senderId: body.from.userid,
+        replyTargetId: body.chatid ?? body.from.userid,
         text: body.text.content.trim(),
         attachments: [],
-        raw: body as unknown as NormalizedWeixinMessage["raw"]
+        raw: { channel: "wecom", event: body }
       };
       if (options.claimMessage && !options.claimMessage(message)) return;
       void options.onMessage(message).catch(async (error) => {
@@ -42,11 +47,26 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
         }
       });
     };
+    const connected = () => options.onStatus?.({ state: "connected" });
+    const reconnecting = () => options.onStatus?.({ state: "reconnecting" });
+    const error = () => options.onStatus?.({ state: "reconnecting", detail: "WebSocket connection failed" });
     this.wsClient.on("message.text", handle);
-    this.wsClient.connect();
-    await untilAborted(options.signal);
-    this.wsClient.off("message.text", handle);
-    this.wsClient.disconnect();
+    this.wsClient.on("authenticated", connected);
+    this.wsClient.on("disconnected", reconnecting);
+    this.wsClient.on("reconnecting", reconnecting);
+    this.wsClient.on("error", error);
+    try {
+      this.wsClient.connect();
+      await untilAborted(options.signal);
+    } finally {
+      this.wsClient.off("message.text", handle);
+      this.wsClient.off("authenticated", connected);
+      this.wsClient.off("disconnected", reconnecting);
+      this.wsClient.off("reconnecting", reconnecting);
+      this.wsClient.off("error", error);
+      this.wsClient.disconnect();
+      options.onStatus?.({ state: "stopped" });
+    }
   }
 }
 

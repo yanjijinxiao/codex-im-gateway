@@ -9,6 +9,20 @@ import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
+for (const infer of [false, true]) {
+  test(`independent app-server start has no project and clears unexpected assignment: infer=${infer}`, async t => {
+    const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
+      command: process.execPath,
+      args: [path.join(fixturesDir, "fake-codex-app-server.mjs"), ...(infer ? ["--infer-new-project"] : [])],
+      mode: "remote-daemon"
+    } });
+    t.after(() => runner.close());
+    const result = await runner.run({ cwd: "/tmp/project", prompt: "verify-standalone", projectBinding: "none" });
+    assert.equal(result.text, "reply:verify-standalone");
+    await assert.rejects(runner.run({ cwd: "/tmp/project", prompt: "invalid", projectBinding: "none", projectName: "Must not bind" }), /independent session cannot/);
+  });
+}
+
 function pickState(state: {
   persistence: string;
   runtimeStatus: string;
@@ -596,7 +610,7 @@ test("waits for an existing thread turn before continuing it", async (t) => {
   assert.deepEqual(progress, ["当前会话的上一条任务仍在执行，已排队等待完成。", "working:continue"]);
 });
 
-test("auto backend falls back to codex exec for an existing thread", async (t) => {
+test("auto backend never moves an existing thread to CLI after an app-server failure", async (t) => {
   const runner = new HybridCodexRunner({
     backend: "auto",
     codexBin: path.join(fixturesDir, "fake-codex-fallback.mjs"),
@@ -604,15 +618,11 @@ test("auto backend falls back to codex exec for an existing thread", async (t) =
   });
   t.after(() => runner.close());
 
-  const result = await runner.run({
+  await assert.rejects(runner.run({
     prompt: "continue",
     cwd: fixturesDir,
     threadId: "thread-existing"
-  });
-
-  assert.equal(result.threadId, "thread-existing");
-  assert.match(result.text, /used codex exec fallback/i);
-  assert.match(result.text, /exec-resumed/);
+  }));
 });
 
 test("relays a Desktop-owned thread through the Desktop follower runner", async (t) => {

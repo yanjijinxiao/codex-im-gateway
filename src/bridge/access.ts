@@ -9,6 +9,7 @@ export function roleAllows(actual: SessionRole, required: SessionRole): boolean 
 }
 
 export function requiredCommandRole(name: string, arg = ""): SessionRole {
+  if (name === "session" && /^detail(?:\s|$)/i.test(arg.trim())) return "viewer";
   if (["stop", "approve", "reject"].includes(name)) return "controller";
   if (name === "role") return arg.trim() ? "controller" : "viewer";
   if (name === "project" && /^(?:add|a|rename|rn|delete|d)\b/i.test(arg)) return "controller";

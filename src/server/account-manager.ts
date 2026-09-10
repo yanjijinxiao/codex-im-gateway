@@ -18,15 +18,13 @@ import {
   userFacingMessageHandlingError,
   wasMessageHandlingErrorReported
 } from "../bridge/errors.js";
-import { DingTalkChannelAdapter } from "../channels/dingtalk.js";
-import { FeishuChannelAdapter } from "../channels/feishu.js";
+import { channelFactoryWithLegacyOverrides, type ChannelAdapterFactory } from "../channels/factory.js";
 import {
   normalizeChannelModeSettings,
   type ChannelModeSettingsUpdate
 } from "../channels/channel-mode-settings.js";
-import type { ChannelAdapter, ChannelTextClient } from "../channels/types.js";
+import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelCapabilities } from "../channels/types.js";
 import { createTaskCard, type ChannelTaskCard } from "../channels/task-card.js";
-import { WeComChannelAdapter } from "../channels/wecom.js";
 import type {
   CodexBridgeBackend,
   CodexHistoryMessage,
@@ -62,7 +60,7 @@ import {
   type SessionRuntimeOverrides
 } from "../state/runtime-state.js";
 import {
-  listCodexProjectCandidates,
+  readCodexDesktopProjects,
   listCodexCliProjectCandidates,
   projectCandidatesFromBackendCatalog,
   type CodexProjectCandidate
@@ -89,8 +87,8 @@ import {
   type WeComAccount,
   type WeixinAccount
 } from "../weixin/accounts.js";
-import { WeixinApiClient } from "../weixin/api.js";
-import { monitorWeixin, type MonitorOptions } from "../weixin/monitor.js";
+import type { WeixinApiClient } from "../weixin/api.js";
+import type { MonitorOptions } from "../weixin/monitor.js";
 import { inferMediaKind, sanitizeFileName } from "../weixin/media.js";
 import {
   TaskboardClient,
@@ -114,6 +112,8 @@ import { resolveChannelModeSettings } from "./channel-mode-settings.js";
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
 export type AccountSummary = PublicWeixinAccount & {
+  connection?: ChannelConnectionStatus;
+  capabilities?: ChannelCapabilities;
   status: AccountRunStatus;
   error?: string;
   pairedSenderIds: string[];
@@ -213,7 +213,8 @@ type RuntimeEntry = {
   task?: Promise<void>;
   service?: BridgeService;
   store?: RuntimeStateStore;
-  client?: ChannelTextClient;
+  client?: ChannelClient;
+  connection?: ChannelConnectionStatus;
   webhook?: ChannelMessageWebhook;
   error?: string;
 };
@@ -225,6 +226,7 @@ type DirectChannelText = {
 };
 
 export type AccountManagerOptions = {
+  adapterFactory?: ChannelAdapterFactory;
   paths: StatePaths;
   configProvider?: () => CodexImGatewayConfig;
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
@@ -257,10 +259,8 @@ export class AccountManager {
   private readonly entries = new Map<string, RuntimeEntry>();
   private readonly respondingSessions = new Map<string, number>();
   private readonly configProvider: () => CodexImGatewayConfig;
-  private readonly clientFactory: (account: WeixinAccount) => WeixinApiClient;
+  private readonly adapterFactory: ChannelAdapterFactory;
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
-  private readonly channelFactory: NonNullable<AccountManagerOptions["channelFactory"]>;
-  private readonly monitor: (options: MonitorOptions) => Promise<void>;
   private readonly runnerFactory: (config: CodexImGatewayConfig) => CodexBridgeBackend;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
@@ -288,19 +288,8 @@ export class AccountManager {
       backend: () => this.runnerFor(this.configProvider())
     });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
-    this.clientFactory = options.clientFactory ?? ((account) => new WeixinApiClient({
-      baseUrl: account.baseUrl,
-      token: account.token
-    }));
+    this.adapterFactory = options.adapterFactory ?? channelFactoryWithLegacyOverrides(options);
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
-    this.channelFactory = options.channelFactory ?? ((account, adapterOptions) => {
-      if (account.channel === "wecom") return new WeComChannelAdapter(account);
-      if (account.channel === "feishu") {
-        return new FeishuChannelAdapter(account, { inboundDir: adapterOptions.inboundDir });
-      }
-      return new DingTalkChannelAdapter(account, { inboundDir: adapterOptions.inboundDir });
-    });
-    this.monitor = options.monitor ?? monitorWeixin;
     this.runnerFactory = options.runnerFactory ?? ((config) => new CodexBackendRouter({
       backend: config.codexBackend,
       appServerTransport: config.codexAppServerTransport,
@@ -398,31 +387,30 @@ export class AccountManager {
       ...(account.webhookUrl ? { webhookUrl: account.webhookUrl } : {}),
       ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
-    const adapter = channel === "weixin" ? undefined : this.channelFactory(
-      account as WeComAccount | FeishuAccount | DingTalkAccount,
-      { inboundDir: statePaths.inboundDir }
-    );
-    const client = adapter?.client ?? this.clientFactory(account as WeixinAccount);
     const config = this.configProvider();
+    const adapter = this.adapterFactory(account, { inboundDir: statePaths.inboundDir, maxInboundBytes: config.maxInboundBytes });
+    const client = adapter.client;
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       sessionControls: this.sessionControls,
-      onSubscriptionsChanged: () => this.threadEvents.refresh(),
+      onSubscriptionsChanged: () => { this.ensureCodexSessionMonitor(); return this.threadEvents.refresh(); },
       onTurnStarted: (session, turnId) => this.threadEvents.managedStarted({
         key: JSON.stringify([account.accountId, session.id]),
-        hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
+        hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
         threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
       }, turnId),
       createTextStream: (session) => this.threadEvents.managedStream({
         key: JSON.stringify([account.accountId, session.id]),
-        hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
-        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
+        hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
+        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true,
+        contextToken: store.getContextToken(session.senderId),
+        onTextDelivered: (part) => webhook.publish({ direction: "outbound", id: part.messageId,
+          recipientId: session.senderId, text: part.text, attachments: [] })
       }),
       config,
       stateStore: store,
-      weixin: client,
+      channel: client,
       inboundDir: statePaths.inboundDir,
-      ...(channel === "weixin" ? { cdnBaseUrl: (account as WeixinAccount).cdnBaseUrl } : {}),
       runner,
       intentResolver: createCodexChannelIntentResolver({
         runner,
@@ -449,7 +437,6 @@ export class AccountManager {
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
 
-    entry.status = "running";
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
       const authorizedConversation = message.source === "native-menu"
         ? store.getAuthorizedConversation(message.senderId)
@@ -457,7 +444,7 @@ export class AccountManager {
       const messageWithConversation = authorizedConversation
         ? { ...message, replyTargetId: authorizedConversation }
         : message;
-      if (channel !== "weixin") {
+      {
         const replyTargetId = messageWithConversation.replyTargetId ?? messageWithConversation.senderId;
         const allowedIds = new Set([...config.allowedSenderIds, ...store.listPairedSenderIds()]);
         store.rememberChannelIdentity(
@@ -483,28 +470,31 @@ export class AccountManager {
         contextToken: store.getContextToken(message.replyTargetId ?? message.senderId)
       });
     };
-    const task = adapter ? adapter.monitor({
+    const task = adapter.monitor({
       signal: controller.signal,
-      claimMessage: (message) => store.claimProcessedMessage(message.id),
-      onMessage: handleMessage,
-      onMessageError
-    }) : this.monitor({
-      client: client as WeixinApiClient,
-      signal: controller.signal,
-      initialSyncKey: store.getSyncKey(),
-      onSyncKey: (syncKey) => store.setSyncKey(syncKey),
+      checkpoint: store.getSyncKey(),
+      onCheckpoint: (checkpoint) => store.setSyncKey(checkpoint),
+      onStatus: (connection) => {
+        if (controller.signal.aborted) return;
+        entry.connection = connection;
+        entry.status = connection.state === "connected" ? "running"
+          : connection.state === "stopped" ? "stopped" : connection.state === "error" ? "error" : "starting";
+        entry.error = connection.state === "error" ? connection.detail : undefined;
+      },
       claimMessage: (message) => store.claimProcessedMessage(message.id),
       onMessage: handleMessage,
       onMessageError
     });
     entry.task = task.then(() => {
       entry.status = "stopped";
+      entry.connection = { state: "stopped" };
     }).catch((error: unknown) => {
       if (controller.signal.aborted) {
         entry.status = "stopped";
         return;
       }
       entry.status = "error";
+      entry.connection = { state: "error", detail: "Channel monitor failed" };
       entry.error = error instanceof Error ? error.message : String(error);
     });
     return this.summary(account);
@@ -517,6 +507,7 @@ export class AccountManager {
       entry.controller?.abort();
       await entry.task;
       entry.status = "stopped";
+      entry.connection = { state: "stopped" };
     }
     return this.summary(account);
   }
@@ -661,18 +652,7 @@ export class AccountManager {
   }
 
   async listCodexProjects(runner = this.runnerFor(this.configProvider())): Promise<readonly CodexProjectCandidate[]> {
-    try {
-      return projectCandidatesFromBackendCatalog(await runner.listProjects());
-    } catch (error) {
-      console.warn(
-        `[codex-im-gateway] unable to read selected backend project catalog; using local discovery fallback: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-      return this.configProvider().codexBackend === "exec"
-        ? listCodexCliProjectCandidates()
-        : listCodexProjectCandidates();
-    }
+    return projectCandidatesFromBackendCatalog(await runner.listProjects());
   }
 
   listKnowledgeBases(accountId?: string): AccountKnowledgeBase[] {
@@ -885,7 +865,7 @@ export class AccountManager {
     const pending = requireSession(store, sessionId);
     if (pending.threadId) {
       const project = pending.projectId ? store.getProject(pending.projectId) : undefined;
-      assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, project?.hostId));
+      assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, pending.hostId ?? project?.hostId));
     }
     const session = store.activateSession(sessionId);
     return this.sessionSummary(accountId, session, true);
@@ -932,7 +912,7 @@ export class AccountManager {
     }
     const storedProject = session.projectId ? store.getProject(session.projectId) : undefined;
     const project = storedProject ? this.synchronizeManagedProject(store, storedProject) : undefined;
-    const history = await this.runnerFor().getHistory(session.threadId, project?.hostId);
+    const history = await this.runnerFor().getHistory(session.threadId, session.hostId ?? project?.hostId);
     return history.flatMap((message) => {
       if (message.role === "user") {
         const parsed = parsePrompt(message.text);
@@ -984,7 +964,7 @@ export class AccountManager {
         prompt: promptParts.prompt,
         developerInstructions: promptParts.developerInstructions,
         cwd: session.workspace,
-        hostId: project?.hostId,
+        hostId: session.hostId ?? project?.hostId,
         projectId: project?.sourceProjectId,
         projectName: project?.name,
         threadId: session.threadId,
@@ -1044,7 +1024,8 @@ export class AccountManager {
   }
 
   private synchronizeManagedProject(store: RuntimeStateStore, project: ManagedProject): ManagedProject {
-    const candidate = listCodexProjectCandidates().find((item) => (
+    if (this.configProvider().codexBackend === "exec" || this.runner?.backendInfo?.().id === "exec") return project;
+    const candidate = readCodexDesktopProjects().find((item) => (
       path.resolve(item.workspace) === path.resolve(project.workspace)
       && (item.hostId ?? "local") === (project.hostId ?? "local")
     ));
@@ -1193,7 +1174,7 @@ export class AccountManager {
 
   private hasManagedProjects(): boolean {
     return listAccounts(this.options.paths).some((account) =>
-      this.storeFor(account.accountId).listProjects().length > 0
+      this.storeFor(account.accountId).listProjects().length > 0 || this.storeFor(account.accountId).listSessions().some(s => s.threadId)
     );
   }
 
@@ -1215,20 +1196,27 @@ export class AccountManager {
   }
 
   private threadSubscriptions(): ThreadSubscription[] {
+    if (this.runner?.backendInfo?.().capabilities.liveFollow === false || this.configProvider().codexBackend === "exec") return [];
     const result: ThreadSubscription[] = [];
     for (const [accountId, entry] of this.entries) {
-      if (entry.status !== "running" || !entry.client || !entry.store) continue;
+      // A temporary reconnect is not an unsubscribe. Keep persistent delivery
+      // cursors/cards; REST delivery may still work while the receive socket reconnects.
+      if ((entry.status !== "running" && entry.status !== "starting") || !entry.client || !entry.store) continue;
       const store = entry.store;
       for (const session of store.listSessions()) {
+        const hostId = session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local";
+        if (this.runner?.backendInfo?.(hostId).capabilities.liveFollow === false) continue;
         const managed = this.isSessionResponding(accountId, session.id);
         if (!session.threadId && !managed) continue;
         result.push({
           key: JSON.stringify([accountId, session.id]), threadId: session.threadId ?? "",
-          hostId: store.getProject(session.projectId ?? "")?.hostId ?? "local",
+          hostId,
           recipientId: session.senderId, client: entry.client,
           managed,
           enabled: managed || (session.follow !== false && store.getActiveSession(session.senderId)?.id === session.id),
-          contextToken: store.getContextToken(session.senderId)
+          contextToken: store.getContextToken(session.senderId),
+          onTextDelivered: (part) => entry.webhook?.publish({ direction: "outbound", id: part.messageId,
+            recipientId: session.senderId, text: part.text, attachments: [] })
         });
       }
     }
@@ -1236,6 +1224,7 @@ export class AccountManager {
   }
 
   private ensureCodexDesktopApprovalMonitor(): void {
+    if (this.configProvider().codexBackend === "exec") return;
     if (this.codexDesktopApprovalMonitor || !this.hasManagedProjects()) return;
     this.codexDesktopApprovalMonitor = this.codexDesktopApprovalMonitorFactory({
       onApproval: (approval) => this.handleDesktopApproval(approval)
@@ -1585,7 +1574,7 @@ export class AccountManager {
         text,
         ...(contextToken ? { contextToken } : {})
       };
-      if (card && entry.client.sendTaskCard) await this.sendChannelTaskCard(entry, message, card);
+      if (card && entry.client.capabilities.tasks === "available") await this.sendChannelTaskCard(entry, message, card);
       else await this.sendChannelText(entry, message);
     }));
     for (const result of results) {
@@ -1622,6 +1611,8 @@ export class AccountManager {
     return {
       ...publicAccount(account),
       status: entry?.status ?? "stopped",
+      ...(entry?.connection ? { connection: entry.connection } : {}),
+      ...(entry?.client ? { capabilities: entry.client.capabilities } : {}),
       ...(entry?.error ? { error: entry.error } : {}),
       pairedSenderIds: store.listPairedSenderIds(),
       lastActiveSenderId: store.getLastActiveSenderId(),

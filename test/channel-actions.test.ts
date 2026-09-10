@@ -162,6 +162,8 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async getRuntimeInfo() { return { model: "gpt-test", effort: "medium" }; },
       async stop() {}
     } as never
@@ -182,7 +184,7 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
   assert.deepEqual(cards.map((card) => card.title), [
     "Codex 渠道工作台",
     "选择 Codex 项目",
-    "选择会话",
+    "可绑定会话 · 全部 · 0 个 · 第 1/1 页",
     "选择模型",
     "选择推理强度",
     "过程进度",
@@ -282,6 +284,8 @@ test("keeps project mode, plan mode, and goals on the selected project's thread"
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async getGoal(threadId: string) {
         goalThreads.push(threadId);
         return {
@@ -371,6 +375,8 @@ test("natural plan and goal actions continue the original message while slash co
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { prompt: string; collaborationMode?: "default" | "plan" }) {
         runs.push(input);
         return { raw: "", text: `正常回复 ${runs.length}`, threadId: "thread-existing" };
@@ -443,6 +449,8 @@ test("Bridge renders approval decisions as buttons on interactive channels", asy
       }
     },
     runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
       async run(input: { onApproval?: (request: Record<string, unknown>) => Promise<"accept" | "decline"> }) {
         const decision = await input.onApproval?.({
           kind: "command",

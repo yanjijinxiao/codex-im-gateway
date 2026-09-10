@@ -12,6 +12,7 @@ export type FamilyBoundFetch = (
 
 type NetworkLifecycle = {
   family?: ResolvedNetworkFamily;
+  selection?: Promise<void>;
 };
 
 /**
@@ -33,10 +34,20 @@ export class PinnedNetworkLifecycleTransport {
     if (!id) throw new Error("Network lifecycle ID must not be empty");
     const lifecycle = this.lifecycles.get(id) ?? {};
     this.lifecycles.set(id, lifecycle);
+    // The first emotion, card and media request can start concurrently. Only
+    // one of them may negotiate; all others must inherit its accepted family.
+    while (lifecycle.selection) await waitForSelection(lifecycle.selection, init?.signal);
+    init?.signal?.throwIfAborted();
     if (lifecycle.family) {
       return this.requestByFamily(lifecycle.family, input, init);
     }
+    let release!: () => void;
+    lifecycle.selection = new Promise<void>((resolve) => { release = resolve; });
+    try { return await this.selectFamily(lifecycle, input, init); }
+    finally { lifecycle.selection = undefined; release(); }
+  }
 
+  private async selectFamily(lifecycle: NetworkLifecycle, input: string | URL, init?: RequestInit): Promise<Response> {
     const candidates = networkFamilyCandidates(this.policy);
     let lastError: unknown;
     let lastRejectedResponse: Response | undefined;
@@ -67,6 +78,16 @@ export class PinnedNetworkLifecycleTransport {
   close(lifecycleId: string): void {
     this.lifecycles.delete(lifecycleId);
   }
+}
+
+async function waitForSelection(selection: Promise<void>, signal?: AbortSignal | null): Promise<void> {
+  signal?.throwIfAborted();
+  if (!signal) return selection;
+  return new Promise<void>((resolve, reject) => {
+    const abort = () => { signal.removeEventListener("abort", abort); reject(signal.reason); };
+    signal.addEventListener("abort", abort, { once: true });
+    void selection.then(() => { signal.removeEventListener("abort", abort); resolve(); });
+  });
 }
 
 function networkFamilyCandidates(policy: NetworkFamilyPolicy): readonly ResolvedNetworkFamily[] {
