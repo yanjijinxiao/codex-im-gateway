@@ -23,7 +23,7 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 | --- | --- | --- | --- | --- |
 | 接收文字 | 支持 | 支持 | 支持 | 支持 |
 | 接收附件 | 图片、文件、视频、音频 | 图片、富文本中的图片 | 图片 | 未实现 |
-| 发送附件 | 图片、文件、视频 | 未实现 | 图片 | 未实现 |
+| 发送附件 | 图片、文件、视频 | 文件 | 图片 | 未实现 |
 | 每轮进度 | 合并文字 | 已配置模板时 AI Card，否则合并文字 | 合并文字 | 合并文字 |
 | 选择/表单/任务卡片 | 命令文字降级 | 命令文字降级 | 原生交互卡片 | 命令文字降级 |
 | 会话表格 | 紧凑文字列表 | 配置 AI 模板时 Markdown 表格，否则紧凑列表 | Card JSON 2.0 原生表格 | 紧凑文字列表 |
@@ -56,6 +56,22 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 卡片降级成多条文本时，回执包含实际成功的分段。中途失败会报告已发送分段，不自动从头重发，从而避免重复刷屏。原生卡片发送失败仍可降级文字；已有进度卡在终态更新失败时保留重试机会。
 
 未暴露原始内部推理；进度源仍是可见 commentary、公开摘要和工具状态。
+
+### 钉钉文件发送
+
+`DingTalkChannelAdapter.sendMedia(kind: "file")` 调用独立的 `DingTalkFileClient`；BridgeService、Codex CLI / App 后端和其他 IM 不增加渠道分支。文件不依赖 AI Card 模板，图片/视频/音频的出站能力仍未实现。
+
+- 先检查本机绝对路径、普通文件、非空、未在写入及 Gateway 的 20 MiB 上限，再上传原文件。读取有界，不会因文件增长而无界占用内存；不会修改内容或伪造扩展名。远程文件需先传到 Gateway 所在电脑。
+- `POST /media/upload?type=file` 的 multipart 字段为 `media`；使用返回的 `media_id` 和原始文件名/类型发送文件。类型和权限仍可能被平台拒绝，不承诺任意后缀均可发送。
+- 优先回复本轮入站消息提供的有效 `sessionWebhook`，载荷为 `{msgtype:"file",file:{mediaId,fileName,fileType}}`，不要求开通主动单聊推送。仅接受 HTTPS 的 `oapi.dingtalk.com/robot/sendBySession` 地址，须含 session 参数，不接受其他域名、端口、URL 用户名/密码。接收目标直接由会话回复地址确定。
+- 会话回复缺失或过期时才选主动接口：群聊走 `/v1.0/robot/groupMessages/send` 的 `openConversationId`，私聊走 `/v1.0/robot/oToMessages/batchSend` 的 `userIds`；载荷使用 `sampleFile` 和 `msgParam`。不根据 `cid` 前缀猜类型，不把加密 sender ID 当作 staff ID；没有有效会话回复且私聊缺员工 ID 时先报错，不上传。上传前后均检查有效期，只在尚未尝试投递时换路由，不对拒绝或结果不明的发送自动换接口重发。
+- 上传与消息发送复用同一轮的 IPv4/IPv6 生命周期；不在两步之间切换协议。同聊天的新入站消息不能替换前一轮的回复地址或网络生命周期。独立发送使用自己的生命周期并在成功/失败后释放。服务重启后需收到一条消息来确认接收目标。
+- 会话回复须明确返回 `errcode:0` 才确认成功；如果没有平台消息 ID，则产生标注为 `dingtalk-file-receipt:` 的本地投递回执，不得用于平台消息撤回。主动接口仍要求 `processQueryKey`，且私聊没有无效/过滤/限流接收人。HTTP 200 不等于成功。网络异常/单步 60 秒超时不自动重发；用户需先确认会话，以免重复发送。
+- 失败提示包含上传/发送/会话回复阶段和安全错误码，不回显 access token、session 参数、原始响应内容或 SDK 请求对象。`chatbotId.notAllow.sendOTO` 单独提示主动私聊受限，不能误报文件类型问题。
+
+参考[上传媒体文件](https://open.dingtalk.com/document/orgapp/upload-media-files)、[机器人消息类型](https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots)、[群消息接口](https://open.dingtalk.com/document/orgapp/the-robot-sends-a-group-message)。回归测试 `test/dingtalk-files.test.ts` 覆盖文件字节/名称、群私聊路由、能力声明、大小限制、错误回执、凭证脱敏、网络协议和 Gateway action 到渠道的完整模拟链路；模拟成功不代替真实账号权限与客户端收件验收。
+
+会话文件载荷另核对了 [QwenPaw 的 DingTalk 会话附件实现](https://github.com/agentscope-ai/QwenPaw/blob/main/src/qwenpaw/app/channels/dingtalk/channel.py)（`_send_media_part_via_webhook`）。这提供接口适配依据，不表示所有企业的权限与客户端均已实测。
 
 ## 连接、恢复与网络
 

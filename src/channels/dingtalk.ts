@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -15,11 +16,12 @@ import {
 import type { DingTalkAccount } from "../weixin/accounts.js";
 import { sanitizeFileName } from "../weixin/media.js";
 import type { ChannelMessage } from "./message.js";
-import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
+import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput } from "./types.js";
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
-import { ChannelPartialDeliveryError } from "./errors.js";
+import { ChannelCapabilityError, ChannelPartialDeliveryError } from "./errors.js";
+import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import {
   PinnedNetworkLifecycleTransport,
@@ -120,6 +122,7 @@ type ReplyTarget = {
   readonly conversationId: string;
   readonly conversationType: string;
   readonly actorId: string;
+  readonly staffId?: string;
   readonly robotCode: string;
   readonly messageId: string;
 };
@@ -140,10 +143,12 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   private readonly cardClient: DingTalkAICardClient;
   private readonly emotionClient: DingTalkEmotionClient;
   private readonly mediaClient: DingTalkInboundMediaClient;
+  private readonly fileClient: DingTalkFileClient;
   private readonly apiTransport: PinnedNetworkLifecycleTransport;
   private readonly inboundDir: string;
   private readonly now: () => number;
   private readonly replyTargets = new Map<string, ReplyTarget>();
+  private readonly replyContext = new AsyncLocalStorage<ReplyTarget>();
   private readonly activeNetworkLifecycles = new Set<string>();
 
   constructor(private readonly account: DingTalkAccount, options: DingTalkAdapterOptions = {}) {
@@ -162,8 +167,10 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.inboundDir = options.inboundDir ?? path.join(process.cwd(), ".codex-im-gateway-inbound", account.accountId);
     this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.now = options.now ?? Date.now;
+    this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
     this.client = createChannelClient("dingtalk", {
       ...TEXT_CAPABILITIES, inbound: { ...NO_MEDIA, image: "available" },
+      outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
       resumableProgress: Boolean(account.cardTemplateId)
@@ -179,6 +186,35 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       }
     }
     return this.sendWebhookText(input);
+  }
+
+  async sendMedia(input: ChannelMediaInput): Promise<{ messageId: string }> {
+    if (input.kind !== "file") throw new ChannelCapabilityError("dingtalk", `outbound.${input.kind}`, "not-implemented");
+    // Do not infer private/group routing from a cid prefix or guess a staff ID.
+    // Prefer replying to the incoming conversation over unsolicited OpenAPI sends.
+    const inFlight = this.replyContext.getStore();
+    const context = inFlight && (input.toUserId === inFlight.conversationId || input.toUserId === inFlight.actorId)
+      ? inFlight : this.replyTargets.get(input.toUserId);
+    if (!context) throw new Error("钉钉文件接收会话未知，请先向机器人发送一条消息");
+    let proactiveTarget: DingTalkProactiveFileTarget | undefined;
+    if (context.conversationType === "2") proactiveTarget = { type: "group", conversationId: context.conversationId };
+    else if (context.conversationType === "1") {
+      if (context.staffId) proactiveTarget = { type: "user", staffId: context.staffId };
+    } else throw new Error("钉钉文件接收会话缺少有效类型或员工 ID，请检查机器人应用可见范围");
+    const target: DingTalkFileTarget | undefined = context.expiresAt !== undefined
+      ? { type: "session", webhookUrl: context.webhookUrl, expiresAt: context.expiresAt, proactiveTarget }
+      : proactiveTarget;
+    if (!target) throw new Error("钉钉文件接收会话缺少有效回复通道或员工 ID，请重新向机器人发一条消息");
+    const borrowedLifecycle = this.activeNetworkLifecycles.has(context.messageId);
+    const lifecycleId = borrowedLifecycle ? context.messageId : `dingtalk-file-${crypto.randomUUID()}`;
+    try {
+      return await this.fileClient.send({
+        path: input.path, target, robotCode: context.robotCode, lifecycleId,
+        getAccessToken: () => this.accessToken()
+      });
+    } finally {
+      if (!borrowedLifecycle) this.apiTransport.close(lifecycleId);
+    }
   }
 
   /** Read-only table in the existing AI template; selection remains a slash command. */
@@ -270,6 +306,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         conversationId,
         conversationType: body.conversationType,
         actorId,
+        staffId: body.senderStaffId?.trim() || undefined,
         robotCode: body.robotCode?.trim() || this.account.clientId,
         messageId: body.msgId || frame.headers.messageId,
         ...(expiresAt !== undefined ? { expiresAt } : {})
@@ -286,7 +323,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         raw: { channel: "dingtalk", event: body }
       };
       if (options.claimMessage && !options.claimMessage(message)) return;
-      void this.handleMessageWithEmotion(message, replyTarget, options, content?.images);
+      void this.replyContext.run(replyTarget, () => this.handleMessageWithEmotion(message, replyTarget, options, content?.images));
     };
 
     this.streamClient.registerCallbackListener(TOPIC_ROBOT, handle);
