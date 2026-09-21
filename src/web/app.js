@@ -475,13 +475,6 @@ function renderAccounts() {
     return;
   }
   els.accountsList.innerHTML = state.accounts.map((account) => {
-    const activeActor = account.lastActiveActorId || account.lastActiveSenderId;
-    const activeConversationAllowed = account.lastActiveSenderId
-      && account.pairedSenderIds.includes(account.lastActiveSenderId);
-    const pendingSender = activeActor
-      && !account.pairedSenderIds.includes(activeActor)
-      && !activeConversationAllowed
-      ? activeActor : "";
     const authorized = account.pairedSenderIds.length > 0;
     const channel = account.channel || "weixin";
     const channelMeta = channelInfo(channel);
@@ -516,9 +509,8 @@ function renderAccounts() {
           ${renderChannelIdentifiers(account)}
         </dl>
       </details>
-      <div class="account-detail">${renderAuthorizationState(account, pendingSender)}</div>
+      <div class="account-detail">${renderAuthorizationState(account)}</div>
       ${authorized ? renderAccountProjects(account, projects) : ""}
-      ${authorized && pendingSender ? `<div class="pending-access"><div><strong>新的微信访问请求</strong><span>当前授权不受影响，可选择允许新的访问</span></div><button class="button button-secondary" type="button" data-account-action="allow" data-account-id="${escapeAttr(account.accountId)}" data-sender-id="${escapeAttr(pendingSender)}"><i data-lucide="user-check"></i><span>允许访问</span></button></div>` : ""}
       ${account.error ? `<div class="pending-access"><div><strong>账号运行错误</strong><span>${escapeHtml(account.error)}</span></div></div>` : ""}
     </article>`;
   }).join("");
@@ -559,24 +551,57 @@ function renderAccountProjects(account, projects) {
   </section>`;
 }
 
-function renderAuthorizationState(account, pendingSender) {
+function accountAccessIdentity(account) {
+  // Only personal WeChat uses one ID for both actor and conversation. A missing
+  // group-channel actor must never silently become a conversation-wide grant.
+  return {
+    actorId: account.lastActiveActorId || ((account.channel || "weixin") === "weixin" ? account.lastActiveSenderId : "") || "",
+    conversationId: account.lastActiveSenderId || ""
+  };
+}
+
+function renderPendingAuthorization(account, identity, authorized) {
+  const { actorId, conversationId } = identity;
+  const platform = channelInfo(account.channel || "weixin").shortLabel;
+  const attributes = `data-account-action="allow" data-account-id="${escapeAttr(account.accountId)}" data-actor-id="${escapeAttr(actorId)}" data-conversation-id="${escapeAttr(conversationId)}"`;
+  const canAllowConversation = actorId && conversationId && actorId !== conversationId && (account.channel || "weixin") !== "weixin";
+  return `<div class="authorization-state is-pending">
+    <span class="authorization-icon"><i data-lucide="shield-alert"></i></span>
+    <div class="authorization-copy">
+      <strong>${authorized ? `新的${platform}访问请求` : "待授权"}</strong>
+      <span>请核对发消息的用户和来源会话，再选择授权范围。</span>
+      <dl class="authorization-identities">
+        <div><dt>用户 Actor ID</dt><dd><code>${escapeHtml(actorId || "未获取，请重新发送消息")}</code></dd></div>
+        <div><dt>来源 Conversation ID</dt><dd><code>${escapeHtml(conversationId || "未获取")}</code></dd></div>
+      </dl>
+      <p class="authorization-hint">${actorId ? "用户授权：允许此用户在当前渠道使用 Codex，不授权同一聊天中的其他人。" : "无法确认访问者，暂不能授权。请从需要授权的账号重新发送消息后刷新。"}${canAllowConversation ? " 会话授权：允许此聊天中的所有成员使用 Codex；如果是群聊，将包含其他群成员。" : ""}</p>
+    </div>
+    ${actorId ? `<div class="authorization-actions">
+      <button class="button button-primary" type="button" ${attributes} data-authorization-scope="actor" data-sender-id="${escapeAttr(actorId)}"><i data-lucide="user-check"></i><span>仅允许此用户</span></button>
+      ${canAllowConversation ? `<button class="button button-secondary" type="button" ${attributes} data-authorization-scope="conversation" data-sender-id="${escapeAttr(conversationId)}"><i data-lucide="users"></i><span>允许整个会话</span></button>` : ""}
+    </div>` : ""}
+  </div>`;
+}
+
+function renderAuthorizationState(account) {
   const accountId = escapeAttr(account.accountId);
   const channel = account.channel || "weixin";
   const platform = channelInfo(channel).shortLabel;
-  if (account.pairedSenderIds.length) {
-    return `<div class="authorization-state is-authorized" aria-label="授权状态：已授权">
+  const identity = accountAccessIdentity(account);
+  const authorized = account.pairedSenderIds.length > 0;
+  const pending = (identity.actorId || identity.conversationId)
+    && !account.pairedSenderIds.includes(identity.actorId)
+    && !account.pairedSenderIds.includes(identity.conversationId);
+  const sections = [];
+  if (pending) sections.push(renderPendingAuthorization(account, identity, authorized));
+  if (authorized) {
+    sections.push(`<div class="authorization-state is-authorized" aria-label="授权状态：已授权">
       <span class="authorization-icon"><i data-lucide="shield-check"></i></span>
-      <div class="authorization-copy"><strong>已连接会话</strong><span>可以从${platform}控制 Codex</span></div>
+      <div class="authorization-copy"><strong>已有访问授权</strong><span>已授权的用户或会话可以从${platform}控制 Codex</span></div>
       <button class="button button-secondary authorization-action" type="button" data-account-action="revoke-all" data-account-id="${accountId}"><i data-lucide="shield-x"></i><span>撤销授权</span></button>
-    </div>`;
+    </div>`);
   }
-  if (pendingSender) {
-    return `<div class="authorization-state is-pending" aria-label="授权状态：待授权">
-      <span class="authorization-icon"><i data-lucide="shield-alert"></i></span>
-      <div class="authorization-copy"><strong>待授权</strong><span>检测到新的${platform}访问请求</span></div>
-      <button class="button button-primary authorization-action" type="button" data-account-action="allow" data-account-id="${accountId}" data-sender-id="${escapeAttr(pendingSender)}"><i data-lucide="user-check"></i><span>允许访问</span></button>
-    </div>`;
-  }
+  if (sections.length) return `<div class="authorization-stack">${sections.join("")}</div>`;
   return `<div class="authorization-state is-unauthorized" aria-label="授权状态：未授权">
     <span class="authorization-icon"><i data-lucide="shield"></i></span>
     <div class="authorization-copy"><strong>等待消息</strong><span>请先从${platform}向机器人发送一条消息</span></div>
@@ -1034,10 +1059,23 @@ async function handleAccountAction(event) {
     button.disabled = true;
     if (action === "start" || action === "stop") await api(`/api/accounts/${encodeURIComponent(accountId)}/${action}`, { method: "POST" });
     if (action === "allow") {
-      await api(`/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(button.dataset.senderId)}/allow`, { method: "POST" });
+      // Use the IDs on the displayed button, not a newly received message's IDs.
+      const { senderId, actorId, conversationId, authorizationScope } = button.dataset;
+      const userScope = authorizationScope === "actor" && actorId && senderId === actorId;
+      const conversationScope = authorizationScope === "conversation" && actorId && conversationId
+        && actorId !== conversationId && senderId === conversationId;
+      if (!account || (!userScope && !conversationScope)) {
+        throw new Error("授权对象信息不完整，请刷新页面并重新发送消息后再试。");
+      }
+      const scope = userScope
+        ? "仅允许此用户在当前渠道使用 Codex，不会授权同一聊天中的其他人。"
+        : "允许此会话中的所有成员使用 Codex。如果是群聊，其他群成员也将获得访问权限。";
+      if (!window.confirm(`${userScope ? "允许此用户" : "允许整个会话"}？\n渠道：${accountDisplayName(accountId)}\n用户 Actor ID：${actorId}\n来源 Conversation ID：${conversationId || "未获取"}\n\n${scope}`)) return;
+      await api(`/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(senderId)}/allow`, { method: "POST" });
+      toast(userScope ? `已允许用户 ${actorId}。请回聊天重新发送消息。` : `已允许整个会话 ${conversationId}。请回聊天重新发送消息。`);
     }
     if (action === "revoke-all" && account) {
-      if (!window.confirm("撤销此微信账号的全部控制授权？撤销后需要重新允许才能继续使用。")) return;
+      if (!window.confirm(`撤销“${accountDisplayName(accountId)}”的全部用户及会话授权？撤销后需要重新允许才能继续使用。`)) return;
       await Promise.all(account.pairedSenderIds.map((senderId) => api(
         `/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(senderId)}/remove`,
         { method: "POST" }
@@ -2306,7 +2344,8 @@ function renderChannelIdentifiers(account) {
   const channel = account.channel || "weixin";
   const provider = WEBHOOK_PROVIDER_PRESENTATION[account.webhookProvider] || WEBHOOK_PROVIDER_PRESENTATION.generic;
   const webhookStatus = account.webhookConfigured ? `已配置 · ${provider.label}` : "未配置";
-  const webhook = `<div><dt>Webhook</dt><dd><code>${escapeHtml(webhookStatus)}</code></dd></div>`;
+  const actor = `<div><dt>最近 Actor ID（发消息的用户）</dt><dd><code>${escapeHtml(accountAccessIdentity(account).actorId || "未获取")}</code></dd></div>`;
+  const webhook = `${actor}<div><dt>Webhook</dt><dd><code>${escapeHtml(webhookStatus)}</code></dd></div>`;
   if (channel === "wecom") {
     return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
   }

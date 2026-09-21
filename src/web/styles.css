@@ -188,6 +188,16 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 .authorization-state.is-pending .authorization-icon { color: var(--amber); background: var(--amber-soft); }
 .authorization-state.is-pending .authorization-copy strong { color: #85520b; }
 .authorization-action { min-height: 34px; }
+.authorization-stack { width: 100%; min-width: 0; }
+.authorization-stack > .authorization-state + .authorization-state { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.authorization-state.is-pending { align-items: start; }
+.authorization-state.is-pending .authorization-copy > span { white-space: normal; line-height: 1.6; }
+.authorization-identities { margin: 12px 0 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.authorization-identities dt { color: var(--ink-soft); font-size: 10px; font-weight: 650; }
+.authorization-identities dd { margin: 3px 0 0; }
+.authorization-identities code { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; user-select: all; }
+.authorization-hint { margin: 12px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.authorization-actions { display: flex; flex-direction: column; gap: 8px; }
 .pending-access { padding: 12px 20px; border-top: 1px solid #ecd4aa; background: var(--amber-soft); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .pending-access div { min-width: 0; }
 .pending-access strong { display: block; font-size: 12px; }
@@ -655,6 +665,7 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
   .account-identifiers-grid { padding: 2px 16px 14px 39px; grid-template-columns: 1fr; gap: 10px; }
   .authorization-state { grid-template-columns: auto minmax(0, 1fr); }
   .authorization-action { width: 100%; grid-column: 1 / -1; }
+  .authorization-actions { width: 100%; grid-column: 1 / -1; }
   .pending-access .button { width: 100%; }
   .session-account-bar { padding: 10px; align-items: stretch; flex-direction: column; gap: 8px; }
   .session-account-bar-label { padding-inline: 2px; }
