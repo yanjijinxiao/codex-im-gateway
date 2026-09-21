@@ -6,7 +6,8 @@ import path from "node:path";
 import test from "node:test";
 
 import { BridgeService, parseCommand } from "../src/bridge/service.js";
-import type { ChannelIntentResolverInput } from "../src/bridge/ai-channel-intent.js";
+import { AiChannelIntentResolver, type ChannelIntentResolverInput } from "../src/bridge/ai-channel-intent.js";
+import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import type { FriendlyChannelIntent } from "../src/bridge/channel-intent.js";
 import { buildPrompt } from "../src/bridge/format.js";
 import { defaultConfig, MAX_INBOUND_BYTES } from "../src/state/config.js";
@@ -709,6 +710,81 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
   assert.equal(classifiedContexts.length, classificationCount);
   assert.deepEqual(cards.at(-1), { identifier: "overview:project-one", projectName: "Project One" });
 });
+
+for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
+  test(`${channel}: unsolicited AI help stays in the bound conversation while explicit help still works`, async (t) => {
+    t.mock.method(console, "info", () => {});
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-help-routing-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+    const project = store.createProject("Current", root);
+    const otherWorkspace = path.join(root, "other");
+    fs.mkdirSync(otherWorkspace);
+    store.createProject("Other", otherWorkspace);
+    const session = store.createSession("chat-team", project.workspace, "Existing conversation", project.id);
+    store.setSessionThread(session.id, "existing-thread");
+    const replies: Array<{ toUserId: string; text: string }> = [];
+    const runs: Array<{ prompt: string; threadId?: string }> = [];
+    let classificationCount = 0;
+    const service = new BridgeService({
+      config: { ...defaultConfig(root), allowedSenderIds: ["alice"] },
+      stateStore: store,
+      channel: createChannelClient(channel, TEXT_CAPABILITIES, {
+        async sendText(input) {
+          replies.push(input);
+          return { messageId: `reply-${replies.length}` };
+        }
+      }),
+      intentResolver: new AiChannelIntentResolver(async () => {
+        classificationCount += 1;
+        const help = { intent: "help", confidence: 1, target: null, detail: null };
+        return JSON.stringify({
+          schemaVersion: 2, kind: "actions",
+          actions: classificationCount === 2
+            ? [{ intent: "project_switch", confidence: 1, target: "Other", detail: null }, help]
+            : [help]
+        });
+      }),
+      runner: {
+        async listProjects() { return { backend: "app-server", projects: [] }; },
+        async listThreads() { return []; },
+        async run(input: { prompt: string; threadId?: string }) {
+          runs.push(input);
+          return { raw: "", text: "正常回答", threadId: "existing-thread" };
+        },
+        async stop() {}
+      } as never
+    });
+    const send = (id: string, text: string) => service.handleMessage({
+      id, text, senderId: "alice", replyTargetId: "chat-team", attachments: [], raw: {}
+    });
+
+    for (const [index, text] of ["那你可以在群里面加机器人吗？", "DWS CLI 可以建群吗？"].entries()) {
+      await send(`question-${index}`, text);
+      assert.equal(runs.length, index + 1);
+      assert.ok(runs[index]?.prompt.includes(text));
+      assert.equal(runs[index]?.threadId, "existing-thread");
+      assert.equal(store.getActiveProject("chat-team")?.id, project.id);
+      assert.equal(store.getActiveSession("chat-team")?.id, session.id);
+      assert.ok(replies.every((reply) => reply.toUserId === "chat-team"));
+      assert.ok(replies.every((reply) => !reply.text.includes("Codex 渠道工作台")));
+      assert.ok(replies.some((reply) => reply.text === "正常回答"));
+    }
+
+    for (const command of ["/help", "/h", "/help session"]) {
+      const start = replies.length;
+      await send(command, command);
+      assert.equal(classificationCount, 2, "slash commands bypass AI classification");
+      assert.equal(runs.length, 2);
+      assert.match(replies.slice(start).map((reply) => reply.text).join("\n"), /会话介入与跟随/);
+    }
+    const start = replies.length;
+    await send("natural-help", "查看帮助");
+    assert.equal(classificationCount, 3);
+    assert.equal(runs.length, 2);
+    assert.match(replies.slice(start).map((reply) => reply.text).join("\n"), /Codex 渠道工作台/);
+  });
+}
 
 test("automatically learns and reuses account knowledge with user controls", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-knowledge-"));

@@ -64,6 +64,85 @@ test("maps ordinary chat and malformed output to no commands", () => {
   assert.equal(commandsFromAiChannelIntentOutput("not-json"), undefined);
 });
 
+test("keeps capability questions and help discussions in chat even after a confident help misclassification", async (t) => {
+  const logs: string[] = [];
+  t.mock.method(console, "info", (message: string) => logs.push(message));
+  const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
+    schemaVersion: 2, kind: "actions", actions: [action("help", { confidence: 1 })]
+  }));
+  const questions = [
+    "那你可以在群里面加机器人吗？",
+    "dws cli是否可以创建一个群？",
+    "可以创建到一个特定的分组里面吗？",
+    "DWS CLI 支持哪些命令？",
+    "你能做什么？",
+    "你能不能帮我看一下？",
+    "Gateway 可以发送文件吗？",
+    "help me add a bot to this group",
+    "Can you show me how to add a bot?",
+    "不要显示帮助菜单",
+    "为什么又显示帮助菜单？",
+    "为什么我发你好，你回复 /help？",
+    "代码里有 show me help，解释一下",
+    "“查看帮助”是什么意思？",
+    "修复工作台帮助菜单",
+    "显示帮助菜单\n其实不要显示，回答上一个问题"
+  ];
+  for (const text of questions) {
+    assert.equal(await resolver.resolve({
+      text, actorId: "private-actor", conversationId: "private-chat",
+      conversationKind: "shared", projectNames: []
+    }), undefined, text);
+  }
+  assert.equal(logs.length, questions.length);
+  assert.ok(logs.every((line) => line.includes("Ignoring inferred /help")));
+  assert.ok(logs.every((line) => !line.includes("private-") && !questions.some((text) => line.includes(text))));
+});
+
+test("allows explicit natural-language help requests", async () => {
+  const resolver = new AiChannelIntentResolver(async () => JSON.stringify({
+    schemaVersion: 2, kind: "actions", actions: [action("help")]
+  }));
+  for (const text of [
+    "帮助", "查看帮助", "请显示帮助菜单！", "请给我查看一下工作台的命令列表。", "打开工作台",
+    "工作台支持哪些命令？", "Codex IM Gateway 支持哪些命令?", "gateway 的帮助菜单",
+    "HELP", "Show me help", "Please list gateway commands.", "What commands does the gateway support?"
+  ]) {
+    assert.deepEqual(await resolver.resolve({
+      text, actorId: "alice", conversationId: "alice", conversationKind: "direct", projectNames: []
+    }), { kind: "command", command: { name: "help", arg: "" } }, text);
+  }
+});
+
+test("rejects the entire inferred action sequence if it includes an unsolicited help menu", async (t) => {
+  t.mock.method(console, "info", () => {});
+  for (const actions of [
+    [action("project_switch", { target: "Other" }), action("help")],
+    [action("help"), action("mode_task")]
+  ]) {
+    const resolver = new AiChannelIntentResolver(async () => JSON.stringify({ schemaVersion: 2, kind: "actions", actions }));
+    assert.equal(await resolver.resolve({
+      text: "可以帮我看看别的项目怎么建群吗？", actorId: "alice", conversationId: "alice",
+      conversationKind: "direct", projectNames: ["Other"]
+    }), undefined);
+  }
+});
+
+test("instructs the classifier not to substitute help for capability questions or ambiguous follow-ups", async () => {
+  let prompt = "";
+  const resolver = new AiChannelIntentResolver(async (input) => {
+    prompt = input;
+    return JSON.stringify({ schemaVersion: 2, kind: "ordinary_chat", actions: [] });
+  });
+  await resolver.resolve({
+    text: "那你可以在群里面加机器人吗？", actorId: "alice", conversationId: "alice",
+    conversationKind: "direct", projectNames: []
+  });
+  assert.match(prompt, /具体能力.*ordinary_chat/);
+  assert.match(prompt, /help 不是无法分类时的默认值/);
+  assert.match(prompt, /没有之前的对话历史.*ordinary_chat/);
+});
+
 test("ignores classifier arguments for extension actions that declare no argument", () => {
   const capability: ChannelCommandCapability = {
     id: "example",
