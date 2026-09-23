@@ -22,6 +22,7 @@ import {
 } from "../src/channels/dingtalk.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 import { createChoiceCard } from "../src/channels/action-card.js";
+import { parseCommand } from "../src/bridge/channel-commands.js";
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -312,6 +313,103 @@ test("DingTalk acknowledges and normalizes Stream robot messages before replying
   controller.abort();
   await monitoring;
   assert.equal(disconnected, true);
+});
+
+test("DingTalk group mentions preserve slash command routing without changing ordinary messages", async (t) => {
+  const cases = [
+    { text: "  @机器人  /session existing-thread  ", expected: "/session existing-thread" },
+    { text: "<@bot-open-id> /session existing-thread", expected: "/session existing-thread" },
+    { text: "@机器人\u00a0/session existing-thread", expected: "/session existing-thread" },
+    { text: "@机器人 @助手 /sessions", expected: "/sessions" },
+    { text: "/session existing-thread", expected: "/session existing-thread" },
+    { text: "@机器人 /steer 请检查 @同事 的提交", expected: "/steer 请检查 @同事 的提交" },
+    { text: "@机器人 请解释 /session", expected: "@机器人 请解释 /session" },
+    { text: "请发送 @机器人 /session existing-thread", expected: "请发送 @机器人 /session existing-thread" },
+    { text: "> @机器人 /stop", expected: "> @机器人 /stop" },
+    { text: "@机器人\n/stop", expected: "@机器人\n/stop" },
+    { text: "@机器人", expected: "@机器人" },
+    { text: "email@example.com /stop", expected: "email@example.com /stop" },
+    { text: "@机器人 /session existing-thread", expected: "@机器人 /session existing-thread", conversationType: "1" }
+  ];
+  for (const msgtype of ["text", "richText"]) {
+    for (const input of cases) {
+      await t.test(`${msgtype}: ${JSON.stringify(input.text)} (${input.conversationType ?? "2"})`, async (t) => {
+        t.mock.method(console, "info", () => {});
+        let listener: ((message: DWClientDownStream) => void) | undefined;
+        const adapter = new DingTalkChannelAdapter({
+          channel: "dingtalk", accountId: "mentions-test", clientId: "ding-client",
+          clientSecret: "ding-secret", savedAt: new Date().toISOString(), enabled: true
+        }, {
+          emotionClient: noEmotionClient(),
+          streamClient: streamClientThatCaptures((callback) => { listener = callback; })
+        });
+        const controller = new AbortController();
+        const received = Promise.withResolvers<NormalizedWeixinMessage>();
+        const monitoring = adapter.monitor({
+          signal: controller.signal, onMessage: async (message) => received.resolve(message)
+        });
+        t.after(async () => { controller.abort(); await monitoring; });
+        assert.ok(listener);
+        listener(frame({
+          ...robotMessage({ conversationType: input.conversationType ?? "2" }),
+          msgtype,
+          text: { content: input.text },
+          content: { richText: [{ text: input.text }] }
+        }));
+        const message = await received.promise;
+        assert.equal(message.text, input.expected);
+        assert.equal(message.senderId, "staff-123", "mention normalization must not change authorization identity");
+        assert.equal(message.replyTargetId, "conversation-123");
+        assert.deepEqual(parseCommand(message.text), parseCommand(input.expected));
+        if (input.expected === "/session existing-thread") {
+          assert.deepEqual(parseCommand(message.text), { name: "session", arg: "existing-thread" });
+        }
+      });
+    }
+  }
+});
+
+test("DingTalk identity diagnostics report only the raw callback code once per monitor", async (t) => {
+  for (const robotCode of ["observed-robot-code", undefined, "", "  observed-code  "]) {
+    await t.test(`raw robotCode ${JSON.stringify(robotCode)}`, async (t) => {
+      const info = t.mock.method(console, "info", () => {});
+      let listener: ((message: DWClientDownStream) => void) | undefined;
+      const received: NormalizedWeixinMessage[] = [];
+      const adapter = new DingTalkChannelAdapter({
+        channel: "dingtalk",
+        accountId: "identity-test",
+        clientId: "fallback-client-id",
+        clientSecret: "must-not-log-secret",
+        savedAt: new Date().toISOString(),
+        enabled: true
+      }, {
+        emotionClient: noEmotionClient(),
+        streamClient: streamClientThatCaptures((callback) => { listener = callback; })
+      });
+      const controller = new AbortController();
+      const monitoring = adapter.monitor({
+        signal: controller.signal,
+        claimMessage: (message) => message.id !== "duplicate",
+        onMessage: async (message) => { received.push(message); }
+      });
+      t.after(async () => { controller.abort(); await monitoring; });
+      assert.ok(listener);
+      listener(frame(robotMessage({ conversationId: "" })));
+      listener(frame(robotMessage({ msgId: "duplicate" })));
+      assert.equal(info.mock.callCount(), 0, "ignored callbacks must not consume the diagnostic");
+
+      const message = { ...robotMessage({ text: { content: "must-not-log-message" } }), robotCode };
+      listener(frame(message));
+      listener(frame({ ...message, msgId: "second-message", robotCode: "different-code" }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(received.length, 2, "diagnostics must not interrupt message delivery");
+      assert.deepEqual(info.mock.calls.map(({ arguments: args }) => args), [[
+        `[codex-im-gateway] DingTalk callback identity ${JSON.stringify({
+          accountId: "identity-test", source: "callback", robotCode: robotCode ?? null
+        })}`
+      ]], "only the account and raw identity may be logged, not credentials, actor, webhook, or text");
+    });
+  }
 });
 
 test("DingTalk downloads a picture message and passes its local path into the current session", async (t) => {

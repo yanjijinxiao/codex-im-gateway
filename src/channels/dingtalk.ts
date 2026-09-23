@@ -284,6 +284,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   async monitor(options: ChannelMonitorOptions): Promise<void> {
     if (options.signal?.aborted) return;
     options.onStatus?.({ state: "connecting" });
+    let callbackIdentityReported = false;
     const handle = (frame: DWClientDownStream) => {
       acknowledge(this.streamClient, frame);
       let body: DingTalkRobotMessage;
@@ -323,6 +324,16 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         raw: { channel: "dingtalk", event: body }
       };
       if (options.claimMessage && !options.claimMessage(message)) return;
+      if (!callbackIdentityReported) {
+        callbackIdentityReported = true;
+        // Diagnose the wire value, not ReplyTarget's Client ID fallback. Never log
+        // the complete callback: it contains message text and session credentials.
+        console.info(`[codex-im-gateway] DingTalk callback identity ${JSON.stringify({
+          accountId: this.account.accountId,
+          source: "callback",
+          robotCode: typeof body.robotCode === "string" ? body.robotCode : null
+        })}`);
+      }
       void this.replyContext.run(replyTarget, () => this.handleMessageWithEmotion(message, replyTarget, options, content?.images));
     };
 
@@ -1130,7 +1141,7 @@ function dingTalkMessageContent(
   body: DingTalkRobotMessage
 ): { text: string; images: DingTalkInboundImage[] } | undefined {
   if (body.msgtype === "text") {
-    return { text: stringValue(body.text?.content).trim(), images: [] };
+    return { text: dingTalkCommandText(body, stringValue(body.text?.content)), images: [] };
   }
   const content = parseDingTalkContent(body.content);
   if (body.msgtype === "picture") {
@@ -1167,9 +1178,21 @@ function dingTalkMessageContent(
       }
     }
     if (!textParts.length && !images.length) return undefined;
-    return { text: textParts.join("").trim(), images: uniqueDingTalkImages(images) };
+    return { text: dingTalkCommandText(body, textParts.join("")), images: uniqueDingTalkImages(images) };
   }
   return undefined;
+}
+
+function dingTalkCommandText(body: DingTalkRobotMessage, text: string): string {
+  const trimmed = text.trim();
+  if (body.conversationType !== "2") return trimmed;
+  // Group callbacks can retain the leading @mention (including DWS <@id>
+  // syntax). Strip only mention tokens immediately preceding a slash command;
+  // keep ordinary conversation, quoted examples and command arguments intact.
+  return trimmed.replace(
+    /^(?:(?:<@[^<>\s]+>|@[^@<>/\s]+)[^\S\r\n]+)+(?=\/[a-z][a-z0-9_-]*(?:\s|$))/iu,
+    ""
+  );
 }
 
 function parseDingTalkContent(value: unknown): Record<string, unknown> {
