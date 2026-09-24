@@ -1,7 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { inferMediaKind } from "../weixin/media.js";
 import { KNOWLEDGE_KINDS, type KnowledgeInput } from "../state/knowledge.js";
 
 export type SendAction = {
@@ -26,7 +25,7 @@ export type ParsedActionBlocks = {
 };
 
 const ACTION_BLOCK_RE = /```(?:codex-im-gateway|codex-channel-bridge|codex-weixin(?:-server)?)-actions\s*([\s\S]*?)```/gi;
-const MARKDOWN_LINK_RE = /(!)?\[[^\]]*]\(([^)]+)\)/g;
+const MARKDOWN_LINK_RE = /(!)?\[([^\]]*)]\((<[^>\r\n]+>|[^)\r\n]+)\)/g;
 
 function isAbsoluteLocalPath(value: string): boolean {
   return path.isAbsolute(value) || /^[a-zA-Z]:[\\/]/.test(value) || /^\\\\/.test(value);
@@ -61,7 +60,8 @@ function normalizeLocalMarkdownTarget(raw: string): string | undefined {
   }
   if (/^file:/i.test(target)) {
     try {
-      target = fileURLToPath(target);
+      const url = new URL(target);
+      target = fileURLToPath(url) + url.search + url.hash;
     } catch {
       return undefined;
     }
@@ -84,27 +84,19 @@ function appendSendAction(actions: BridgeActions, seen: Set<string>, action: Sen
   actions.send.push(action);
 }
 
-function extractLocalMarkdownLinks(text: string, actions: BridgeActions): string {
-  const seen = new Set(actions.send.map((action) => action.path.toLowerCase()));
-  const keptLines: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    let containsLocalTarget = false;
-    for (const match of line.matchAll(MARKDOWN_LINK_RE)) {
-      const target = normalizeLocalMarkdownTarget(match[2]);
-      if (!target) {
-        continue;
-      }
-      containsLocalTarget = true;
-      appendSendAction(actions, seen, {
-        type: match[1] === "!" ? "image" : inferMediaKind(target),
-        path: target
-      });
-    }
-    if (!containsLocalTarget) {
-      keptLines.push(line);
-    }
-  }
-  return keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+function renderLocalMarkdownReferences(text: string): string {
+  // A source citation (including :line or #Lline) is not an attachment request.
+  // Only explicit action blocks may enqueue sends. Keep the label, location and
+  // surrounding prose instead of removing the whole line containing the link.
+  return text.replace(MARKDOWN_LINK_RE, (link, _image: string | undefined, label: string, raw: string) => {
+    const target = normalizeLocalMarkdownTarget(raw);
+    if (!target) return link;
+    const longestBackticks = Math.max(0, ...(target.match(/`+/g) ?? []).map((run) => run.length));
+    const delimiter = "`".repeat(longestBackticks + 1);
+    const padding = target.endsWith("`") ? " " : "";
+    const location = `${delimiter}${padding}${target}${padding}${delimiter}`;
+    return label.trim() ? `${label} (${location})` : location;
+  });
 }
 
 function normalizeControlAction(raw: unknown): ControlAction {
@@ -187,5 +179,5 @@ export function parseActionBlocks(text: string): ParsedActionBlocks {
     return "";
   }).trim();
 
-  return { visibleText: extractLocalMarkdownLinks(visibleTextWithoutBlocks, actions), actions };
+  return { visibleText: renderLocalMarkdownReferences(visibleTextWithoutBlocks), actions };
 }

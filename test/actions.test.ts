@@ -44,7 +44,7 @@ test("accepts legacy codex-channel-bridge action blocks", () => {
   assert.deepEqual(parsed.actions.send, [{ type: "file", path: "/tmp/legacy.txt" }]);
 });
 
-test("extracts local markdown image links into native send actions", () => {
+test("keeps local markdown images as references without implicit sends or lost prose", () => {
   const text = [
     "找到了这张，来自下载目录：",
     "",
@@ -55,21 +55,18 @@ test("extracts local markdown image links into native send actions", () => {
 
   const parsed = parseActionBlocks(text);
 
-  assert.deepEqual(parsed.actions.send, [
-    { type: "image", path: "C:/Users/THU/Downloads/generated_image_latest.png" }
-  ]);
-  assert.equal(parsed.visibleText.includes("C:/Users/THU/Downloads"), false);
-  assert.equal(parsed.visibleText.includes("如果图片没有直接显示"), false);
-  assert.equal(parsed.visibleText, "找到了这张，来自下载目录：");
+  assert.deepEqual(parsed.actions.send, []);
+  assert.equal(parsed.visibleText.includes("C:/Users/THU/Downloads"), true);
+  assert.equal(parsed.visibleText.includes("如果图片没有直接显示"), true);
+  assert.equal(parsed.visibleText.startsWith("找到了这张，来自下载目录："), true);
+  assert.equal(parsed.visibleText.includes("]("), false);
 });
 
-test("extracts local markdown file links into native file send actions", () => {
+test("keeps local markdown files as references without implicit sends", () => {
   const parsed = parseActionBlocks("报告在这里：[report.pdf](C:\\Users\\THU\\Downloads\\report.pdf)");
 
-  assert.deepEqual(parsed.actions.send, [
-    { type: "file", path: "C:\\Users\\THU\\Downloads\\report.pdf" }
-  ]);
-  assert.equal(parsed.visibleText, "");
+  assert.deepEqual(parsed.actions.send, []);
+  assert.equal(parsed.visibleText, "报告在这里：report.pdf (`C:\\Users\\THU\\Downloads\\report.pdf`)");
 });
 
 test("parses explicit video send actions", () => {
@@ -87,13 +84,74 @@ test("parses explicit video send actions", () => {
   assert.equal(parsed.visibleText, "");
 });
 
-test("extracts local markdown video links into native video send actions", () => {
+test("keeps local markdown videos as references without implicit sends", () => {
   const parsed = parseActionBlocks("Random desktop video: [demo.mp4](C:/Users/THU/Desktop/demo.mp4)");
 
+  assert.deepEqual(parsed.actions.send, []);
+  assert.equal(parsed.visibleText, "Random desktop video: demo.mp4 (`C:/Users/THU/Desktop/demo.mp4`)");
+});
+
+test("preserves both remote source citations and their entire explanatory lines", () => {
+  const parsed = parseActionBlocks([
+    "这两个都是无状态辅助类，但职责不同。",
+    "1. [RegularTablePropertyPolicy](/home/admin/project/RegularTablePropertyPolicy.java:32) 负责属性过滤。",
+    "2. [SchemaPartSupport](/home/admin/project/SchemaPartSupport.java:20) 负责构造 AST。",
+    "保留后续说明。"
+  ].join("\n"));
+
+  assert.deepEqual(parsed.actions.send, []);
+  assert.equal(parsed.visibleText, [
+    "这两个都是无状态辅助类，但职责不同。",
+    "1. RegularTablePropertyPolicy (`/home/admin/project/RegularTablePropertyPolicy.java:32`) 负责属性过滤。",
+    "2. SchemaPartSupport (`/home/admin/project/SchemaPartSupport.java:20`) 负责构造 AST。",
+    "保留后续说明。"
+  ].join("\n"));
+});
+
+test("renders local URI, angle-bracket, fragment and Windows references without sends", () => {
+  for (const [link, target] of [
+    ["[source](file:///tmp/source.ts#L12)", "/tmp/source.ts#L12"],
+    ["[source](</tmp/My Project (copy)/source.ts:12:3>)", "/tmp/My Project (copy)/source.ts:12:3"],
+    ["[source](/tmp/My%20Project/source.ts#L12-L18)", "/tmp/My Project/source.ts#L12-L18"],
+    ["[source](C:\\work\\source.ts:12)", "C:\\work\\source.ts:12"],
+    ["[source](\\\\server\\share\\source.ts)", "\\\\server\\share\\source.ts"],
+    ["[source](/tmp/`source`.ts)", "/tmp/`source`.ts"]
+  ]) {
+    const parsed = parseActionBlocks(link);
+    assert.deepEqual(parsed.actions.send, []);
+    assert.ok(parsed.visibleText.includes(target));
+    assert.ok(parsed.visibleText.startsWith("source ("));
+    assert.ok(!parsed.visibleText.includes("]("));
+  }
+});
+
+test("leaves web and relative links unchanged", () => {
+  const text = "[docs](https://example.com/docs#L12) ![image](https://example.com/image.png) [relative](./source.ts)";
+  assert.deepEqual(parseActionBlocks(text), {
+    visibleText: text, actions: { send: [], control: [], remember: [] }
+  });
+});
+
+test("only explicit actions send attachments alongside references, with deduplication", () => {
+  const parsed = parseActionBlocks([
+    "源码：[source](/home/admin/project/source.ts:12)，附件：[report](/tmp/report.pdf)。",
+    "```codex-im-gateway-actions",
+    JSON.stringify({ send: [
+      { type: "file", path: "/tmp/report.pdf" },
+      { type: "file", path: "/tmp/report.pdf" },
+      { type: "image", path: "/tmp/image.png" },
+      { type: "video", path: "/tmp/video.mp4" }
+    ] }),
+    "```"
+  ].join("\n"));
   assert.deepEqual(parsed.actions.send, [
-    { type: "video", path: "C:/Users/THU/Desktop/demo.mp4" }
+    { type: "file", path: "/tmp/report.pdf" },
+    { type: "image", path: "/tmp/image.png" },
+    { type: "video", path: "/tmp/video.mp4" }
   ]);
-  assert.equal(parsed.visibleText, "");
+  assert.match(parsed.visibleText, /源码：source/);
+  assert.match(parsed.visibleText, /附件：report/);
+  assert.ok(!parsed.visibleText.includes("codex-im-gateway-actions"));
 });
 
 test("accepts legacy codex-weixin-server action blocks from existing threads", () => {

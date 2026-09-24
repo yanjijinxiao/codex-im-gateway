@@ -1204,6 +1204,36 @@ test("reports a managed session as responding only while its Web turn is active"
   await manager.stopAll();
 });
 
+test("keeps source citations in session history without fabricated attachments", async (t) => {
+  const { manager, root, history } = setup(t);
+  const session = manager.createSession("account-one", "alice@im.wechat", root, "Code review");
+  await manager.continueSession("account-one", session.id, "解释这两个类的职责");
+  history.push({
+    id: "assistant-sources",
+    role: "assistant",
+    text: [
+      "职责不同：",
+      "1. [RegularTablePropertyPolicy](/home/admin/project/RegularTablePropertyPolicy.java:32) 负责属性过滤。",
+      "2. [SchemaPartSupport](/home/admin/project/SchemaPartSupport.java:20) 负责构造 AST。"
+    ].join("\n")
+  });
+
+  const messages = await manager.getSessionMessages("account-one", session.id);
+  assert.deepEqual(messages.at(-1), {
+    id: "assistant-sources", role: "assistant",
+    text: [
+      "职责不同：",
+      "1. RegularTablePropertyPolicy (`/home/admin/project/RegularTablePropertyPolicy.java:32`) 负责属性过滤。",
+      "2. SchemaPartSupport (`/home/admin/project/SchemaPartSupport.java:20`) 负责构造 AST。"
+    ].join("\n"),
+    attachments: []
+  });
+  await assert.rejects(
+    manager.getSessionAttachment("account-one", session.id, "assistant-sources", 0),
+    /not found/
+  );
+});
+
 test("exposes files sent by Codex as session attachments", async (t) => {
   const { manager, root, history } = setup(t);
   const videoPath = path.join(root, "demo.mp4");

@@ -861,12 +861,64 @@ test("automatically learns and reuses account knowledge with user controls", asy
   assert.doesNotMatch(developerInstructions.at(-1) ?? "", /默认使用简体中文，并先给结论/);
 });
 
-test("sends local markdown images as native WeChat image messages", async (t) => {
+for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
+  for (const codexBackend of ["exec", "app-server"] as const) {
+    test(`${channel} preserves source citations without sending files (${codexBackend})`, async (t) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-source-citations-"));
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+      const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
+      const project = stateStore.createProject("Current", root);
+      const session = stateStore.createSession("chat-team", root, "Code review", project.id);
+      stateStore.setSessionThread(session.id, "existing-thread");
+      const replies: string[] = [];
+      let mediaSends = 0;
+      const service = new BridgeService({
+        config: { ...defaultConfig(root), codexBackend, allowedSenderIds: ["alice"] },
+        stateStore,
+        channel: createChannelClient(channel, {
+          ...TEXT_CAPABILITIES, outbound: { ...TEXT_CAPABILITIES.outbound, file: "available" }
+        }, {
+          async sendText(input) {
+            replies.push(input.text);
+            return { messageId: `reply-${replies.length}` };
+          },
+          async sendMedia() {
+            mediaSends += 1;
+            return { messageId: "unexpected-file" };
+          }
+        }),
+        runner: {
+          async listProjects() { return { backend: codexBackend, projects: [] }; },
+          async listThreads() { return []; },
+          async run() {
+            return { raw: "", threadId: "existing-thread", text: [
+              "1. [RegularTablePropertyPolicy](/home/admin/project/RegularTablePropertyPolicy.java:32) 负责属性过滤。",
+              "2. [SchemaPartSupport](/home/admin/project/SchemaPartSupport.java:20) 负责构造 AST。"
+            ].join("\n") };
+          },
+          async stop() {}
+        } as never
+      });
+
+      await service.handleMessage({
+        id: "source-question", text: "解释这两个类的职责", senderId: "alice",
+        replyTargetId: "chat-team", attachments: [], raw: {}
+      });
+
+      assert.equal(mediaSends, 0);
+      const reply = replies.join("\n");
+      assert.match(reply, /RegularTablePropertyPolicy.java:32.*负责属性过滤/);
+      assert.match(reply, /SchemaPartSupport.java:20.*负责构造 AST/);
+      assert.doesNotMatch(reply, /Failed to send|暂不支持|文件不存在/);
+    });
+  }
+}
+
+test("sends explicit image actions as native WeChat image messages", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const imagePath = path.join(tmpDir, "generated_image_latest.png");
   fs.writeFileSync(imagePath, Buffer.from("png image bytes"));
-  const markdownPath = imagePath.replace(/\\/g, "/");
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
@@ -918,9 +970,9 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
           text: [
             "找到了这张，来自下载目录：",
             "",
-            `![generated_image_latest.png](${markdownPath})`,
-            "",
-            `如果图片没有直接显示，点这里打开：[generated_image_latest.png](${markdownPath})`
+            "```codex-im-gateway-actions",
+            JSON.stringify({ send: [{ type: "image", path: imagePath }] }),
+            "```"
           ].join("\n")
         };
       },
@@ -941,7 +993,7 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   assert.equal(imageMessages[0].contextToken, "ctx");
   assert.equal(imageMessages[0].encryptQueryParam, "download-param");
   assert.equal(textReplies.some((reply) => reply.includes("[codex-channel-bridge] File send requested")), false);
-  assert.equal(textReplies.some((reply) => reply.includes(markdownPath)), false);
+  assert.equal(textReplies.some((reply) => reply.includes(imagePath)), false);
   assert.equal(textReplies.join("\n").includes("如果图片没有直接显示"), false);
   assert.deepEqual(outbound.find((message) => (
     Array.isArray(message.attachments) && message.attachments.length > 0
@@ -954,12 +1006,11 @@ test("sends local markdown images as native WeChat image messages", async (t) =>
   });
 });
 
-test("sends local markdown videos as native WeChat video messages", async (t) => {
+test("sends explicit video actions as native WeChat video messages", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-bridge-video-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const videoPath = path.join(tmpDir, "desktop-demo.mp4");
   fs.writeFileSync(videoPath, Buffer.from("mp4 video bytes"));
-  const markdownPath = videoPath.replace(/\\/g, "/");
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
@@ -1009,7 +1060,12 @@ test("sends local markdown videos as native WeChat video messages", async (t) =>
       async run() {
         return {
           raw: "",
-          text: `Random desktop video: [desktop-demo.mp4](${markdownPath})`
+          text: [
+            "Random desktop video:",
+            "```codex-im-gateway-actions",
+            JSON.stringify({ send: [{ type: "video", path: videoPath }] }),
+            "```"
+          ].join("\n")
         };
       },
       async stop() {}
@@ -1028,7 +1084,7 @@ test("sends local markdown videos as native WeChat video messages", async (t) =>
   assert.equal(videoMessages[0].toUserId, "alice@im.wechat");
   assert.equal(videoMessages[0].contextToken, "ctx");
   assert.equal(videoMessages[0].encryptQueryParam, "download-param");
-  assert.equal(textReplies.some((reply) => reply.includes(markdownPath)), false);
+  assert.equal(textReplies.some((reply) => reply.includes(videoPath)), false);
 });
 
 test("buffers inbound image attachments and includes local paths in prompt done", async (t) => {

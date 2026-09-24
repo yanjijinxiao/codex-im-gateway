@@ -159,7 +159,7 @@ test("Feishu sends an interactive Taskboard card and routes its button callback 
   }]);
 });
 
-test("Bridge sends a local Markdown image through a channel image capability", async (t) => {
+test("Bridge sends an explicit image action through a channel image capability", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-image-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const imagePath = path.join(root, "result.png");
@@ -183,7 +183,11 @@ test("Bridge sends a local Markdown image through a channel image capability", a
     },
     runner: {
       async run() {
-        return { raw: "", text: `![result.png](${imagePath})` };
+        return { raw: "", text: [
+          "```codex-im-gateway-actions",
+          JSON.stringify({ send: [{ type: "image", path: imagePath }] }),
+          "```"
+        ].join("\n") };
       },
       async stop() {}
     }
