@@ -7,7 +7,6 @@ import DingTalk from "@alicloud/dingtalk";
 import { Config as OpenApiConfig } from "@alicloud/openapi-client";
 import { RuntimeOptions } from "@alicloud/tea-util";
 import {
-  DWClient,
   TOPIC_ROBOT,
   type DWClientDownStream,
   type RobotMessage
@@ -16,12 +15,13 @@ import {
 import type { DingTalkAccount } from "../weixin/accounts.js";
 import { sanitizeFileName } from "../weixin/media.js";
 import type { ChannelMessage } from "./message.js";
-import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput } from "./types.js";
+import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput } from "./types.js";
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
 import { ChannelCapabilityError, ChannelPartialDeliveryError } from "./errors.js";
 import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
+import { DiagnosticDingTalkStreamClient } from "./dingtalk-stream-diagnostics.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import {
   PinnedNetworkLifecycleTransport,
@@ -30,6 +30,7 @@ import {
 
 type DingTalkStreamClient = {
   readonly connected?: boolean;
+  connectionStatus?(): ChannelConnectionStatus;
   registerCallbackListener(topic: string, listener: (message: DWClientDownStream) => void): unknown;
   connect(): Promise<void>;
   disconnect(): void;
@@ -152,7 +153,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   private readonly activeNetworkLifecycles = new Set<string>();
 
   constructor(private readonly account: DingTalkAccount, options: DingTalkAdapterOptions = {}) {
-    this.streamClient = options.streamClient ?? new DWClient({
+    this.streamClient = options.streamClient ?? new DiagnosticDingTalkStreamClient(account.accountId, {
       clientId: account.clientId,
       clientSecret: account.clientSecret,
       keepAlive: true
@@ -339,18 +340,34 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
 
     this.streamClient.registerCallbackListener(TOPIC_ROBOT, handle);
     let healthTimer: NodeJS.Timeout | undefined;
+    const stopped = waitForAbort(options.signal);
     try {
-      await this.streamClient.connect();
+      if (options.signal?.aborted) return;
+      let initialConnectComplete = false;
       let last: string | undefined;
       const report = () => {
-        const state = this.streamClient.connected === false ? "reconnecting" : "connected";
-        if (last !== state) { last = state; options.onStatus?.({ state }); }
+        const status = this.streamClient.connectionStatus?.() ?? (!initialConnectComplete
+          ? { state: "connecting" as const }
+          : this.streamClient.connected === false
+            ? { state: "error" as const, detail: "DingTalk Stream 已断开；无法确认 SDK 是否正在重连。" }
+            : { state: "connected" as const });
+        const key = JSON.stringify(status);
+        if (last !== key) { last = key; options.onStatus?.(status); }
       };
+      const connecting = this.streamClient.connect();
       report();
       healthTimer = setInterval(report, 5_000);
       healthTimer.unref();
-      await untilAborted(options.signal);
+      const result = await Promise.race([
+        connecting.then(() => "connected" as const),
+        stopped.promise.then(() => "stopped" as const)
+      ]);
+      if (result === "stopped") return;
+      initialConnectComplete = true;
+      report();
+      await stopped.promise;
     } finally {
+      stopped.dispose();
       if (healthTimer) clearInterval(healthTimer);
       this.streamClient.off(TOPIC_ROBOT, handle);
       this.streamClient.disconnect();
@@ -1410,9 +1427,14 @@ function normalizeExpiry(value: number): number | undefined {
   return value < 1_000_000_000_000 ? value * 1000 : value;
 }
 
-function untilAborted(signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-  return new Promise((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+function waitForAbort(signal?: AbortSignal): { promise: Promise<void>; dispose: () => void } {
+  let onAbort = () => {};
+  const promise = new Promise<void>((resolve) => {
+    onAbort = resolve;
+    if (signal?.aborted) resolve();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  return { promise, dispose: () => signal?.removeEventListener("abort", onAbort) };
 }
 
 function errorDetail(error: unknown): string {

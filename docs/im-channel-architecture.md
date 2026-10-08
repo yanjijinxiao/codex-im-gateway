@@ -79,6 +79,18 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 
 `monitor` 报告 `connecting / connected / reconnecting / stopped / error`；轮询型渠道用不透明检查点恢复。账号接口同时返回 `connection` 和 `capabilities`。`running` 由适配器就绪信号驱动，不能仅因启动函数被调用就宣称已连接。接收侧短暂重连不会清除任务跟随的卡片与投递游标。
 
+### 钉钉 Stream 连接诊断
+
+`dingtalk-stream-diagnostics.ts` 在 SDK 外记录结构化日志，前缀为 `[codex-im-gateway] DingTalk Stream`。每条包含 UTC 时间、账号 ID、运行标识、连接阶段、尝试/重试次数和阶段耗时；失败只记录白名单错误码、HTTP 状态和错误类别，恢复时补充断线时长及最近连接/收帧时间。SDK 原始 debug 不会开启，配置对象、连接 URL/ticket、回调正文和原始异常对象不会进入新增诊断日志。
+
+- `connect_attempt / endpoint_ready / connected / registered`：连接地址请求、WebSocket 握手、连接成功及注册。
+- `connect_failed / retry_scheduled`：记录 SDK 内部吞掉的失败，以及 SDK 实际安排的退避重试。重试仍由 SDK 单独负责，不增加第二套自动恢复循环。
+- `socket_closed / server_disconnect / disconnected_without_retry`：区分断开原因与未观察到重连安排，后者显示为 `error`，不再只因 `connected=false` 就宣称正在重连。
+- `connection_stalled`：阶段等待超过 30 秒，或超过重试计划时间 30 秒时告警，持续停滞每 60 秒最多记录一次。这是观测阈值，不会中止请求，也不等于已证实网络超时；管理接口返回安全的阶段说明。
+- `monitor_stopped`：账号停止时移除健康检查定时器和监听器。初次连接尚未完成也能停止监控，迟到的结果不会重新发布诊断状态。
+
+诊断识别当前 SDK `2.1.6-beta.1` 的固定生命周期消息；升级 SDK 时必须运行 `test/dingtalk-stream-diagnostics.test.ts` 的真实 SDK 重试与本地 WebSocket 断线回归。未知 debug 文本默认丢弃，不能为了诊断打开会输出凭证的 SDK debug。日志不追溯部署前未记录的失败；上线需构建并重启 Gateway。
+
 去重由 AccountManager 提供持久化的 `claimMessage`，适配器在处理同一消息/回调之前认领；长任务仍由统一任务层执行。一次消息接收成功不代表附件下载或后端执行一定成功。
 
 钉钉的现有 IPv4/IPv6 生命周期传输增加了并发协商互斥：同轮多个初始 API 请求只协商一次，接受响应后不再更换协议。本次没有把其他 SDK 的所有网络请求改造成这一传输层。
