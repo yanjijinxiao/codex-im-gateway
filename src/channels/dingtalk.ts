@@ -19,7 +19,7 @@ import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMon
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
-import { ChannelCapabilityError, ChannelPartialDeliveryError } from "./errors.js";
+import { ChannelCapabilityError, ChannelPartialDeliveryError, channelProgressError } from "./errors.js";
 import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
 import { DiagnosticDingTalkStreamClient } from "./dingtalk-stream-diagnostics.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
@@ -257,9 +257,13 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
   }
 
-  async startTextStream(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
+  async sendProgressText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
+    return this.sendWebhookText(input);
+  }
+
+  async startTextStream(input: { toUserId: string; text: string; streamId?: string }): Promise<{ messageId: string }> {
     if (!this.account.cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
-    return this.createTextCard(this.cardTarget(input.toUserId), input.text, false);
+    return this.createTextCard(this.cardTarget(input.toUserId), input.text, false, input.streamId);
   }
 
   readonly resumableTextStream = true;
@@ -475,11 +479,12 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   private async createTextCard(
     target: CardTargetContext,
     text: string,
-    finalize: boolean
+    finalize: boolean,
+    streamId?: string
   ): Promise<{ messageId: string }> {
     const cardTemplateId = this.account.cardTemplateId?.trim();
     if (!cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
-    const outTrackId = `codex_bridge_${crypto.randomUUID().replaceAll("-", "")}`;
+    const outTrackId = streamId ?? `codex_bridge_${crypto.randomUUID().replaceAll("-", "")}`;
     const accessToken = await this.accessToken();
     const contentKey = this.account.cardContentKey?.trim() || "content";
     await this.cardClient.create({
@@ -496,14 +501,13 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         ? { lifecycleId: target.messageId }
         : {})
     });
-    await this.cardClient.update({
-      accessToken,
-      contentKey,
-      outTrackId,
-      text,
-      finalize,
-      error: false
-    });
+    try {
+      await this.cardClient.update({ accessToken, contentKey, outTrackId, text, finalize, error: false });
+    } catch (error) {
+      // Creation/delivery succeeded: retry this card, never create its replacement.
+      if (!finalize) throw channelProgressError(error, outTrackId);
+      throw error;
+    }
     return { messageId: outTrackId };
   }
 

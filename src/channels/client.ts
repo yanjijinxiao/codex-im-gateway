@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { chunkText } from "../bridge/format.js";
-import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, InboundMediaTooLargeError } from "./errors.js";
+import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, InboundMediaTooLargeError, channelProgressError } from "./errors.js";
 import type { ChannelAttachment } from "./message.js";
 import type { Capability, ChannelCapabilities, ChannelClient, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
 
@@ -40,13 +40,25 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
   };
   return {
     channel, capabilities: caps, resumableTextStream: caps.resumableProgress, sendText,
-    startTextStream(input) {
+    async sendProgressText(input) {
+      // Text-only drivers already send plain messages. Card-capable drivers
+      // must implement this operation explicitly rather than create a new card.
+      const method = driver.sendProgressText ?? (caps.progress !== "available" ? driver.sendText : undefined);
+      return acknowledged("sendProgressText", required(method, "progressText").call(driver, input));
+    },
+    async startTextStream(input) {
       requireFeature("progress", caps.progress);
-      return acknowledged("startTextStream", required(driver.startTextStream, "progress").call(driver, input));
+      const start = required(driver.startTextStream, "progress");
+      try {
+        return await acknowledged("startTextStream", start.call(driver, input));
+      } catch (error) { throw channelProgressError(error); }
     },
     async updateTextStream(input) {
       requireFeature("progress", caps.progress);
-      await required(driver.updateTextStream, "progress").call(driver, input);
+      const update = required(driver.updateTextStream, "progress");
+      try {
+        await update.call(driver, input);
+      } catch (error) { throw channelProgressError(error, input.messageId); }
     },
     sendActionCard(input) {
       // Rendering a table does not imply support for interactive buttons.

@@ -11,7 +11,7 @@ export function adaptLegacyClient(driver: ChannelTextClient, options: {
   if (driver.capabilities && "channel" in driver) return driver as ChannelClient;
   const api = driver as ChannelTextClient & Partial<WeixinApiClient>;
   const available = (yes: unknown) => yes ? "available" as const : "not-implemented" as const;
-  const native = Object.fromEntries(["sendText", "startTextStream", "updateTextStream", "sendImage", "sendActionCard",
+  const native = Object.fromEntries(["sendText", "sendProgressText", "startTextStream", "updateTextStream", "sendImage", "sendActionCard",
     "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping", "sendMedia"].flatMap((name) => {
     const method = driver[name as keyof ChannelTextClient];
     return typeof method === "function" ? [[name, method.bind(driver)]] : [];
@@ -30,6 +30,11 @@ export function adaptLegacyClient(driver: ChannelTextClient, options: {
       try { return await driver.sendText(input); }
       catch (error) { if (isStaleContextError(error)) throw new ChannelContextExpiredError(); throw error; }
     },
+    // Preserve injected clients predating the explicit progress-text operation.
+    sendProgressText: native.sendProgressText ?? (async (input) => {
+      try { return await driver.sendText(input); }
+      catch (error) { if (isStaleContextError(error)) throw new ChannelContextExpiredError(); throw error; }
+    }),
     sendMedia: native.sendMedia ?? ((input) => sendLocalMediaFile({ client: api as WeixinApiClient,
       ...input, filePath: input.path, kind: input.kind as "image" | "file" | "video", fetch: options.mediaFetch })),
     resolveAttachments: async (message) => {

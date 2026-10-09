@@ -6,6 +6,53 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
+test("session following recovers one card after an outage without replaying a burst of reasoning titles", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-progress-recovery-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let offline = false, starts = 0;
+  const frames: Array<{ messageId: string; text: string; finalize?: boolean }> = [];
+  const texts: string[] = [];
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+    client: {
+      async sendText() { throw new Error("must not create one-shot cards"); },
+      async sendProgressText(input) { texts.push(input.text); return { messageId: "plain" }; },
+      async startTextStream() { starts++; return { messageId: "original" }; },
+      async updateTextStream(input) {
+        frames.push(input);
+        if (offline) throw Object.assign(new Error("DNS unavailable"), { code: "ENOTFOUND" });
+      }
+    }
+  };
+  const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub], backend: () => ({
+    async readThreadSnapshot() { return { state: { threadId: "thread", persistence: "active", runtimeStatus: "notLoaded", activeFlags: [] }, turns: [] }; }
+  }) });
+  t.after(() => hub.stop());
+  await hub.started("local", "thread", "turn", new Date().toISOString());
+  await hub.activity("local", "thread", "turn", "开始执行");
+  offline = true;
+  await hub.activity("local", "thread", "turn", "🤔 Waiting on session");
+  t.mock.timers.tick(500);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  for (let i = 0; i < 20; i++) await hub.activity("local", "thread", "turn", `🤔 Heading ${i}`);
+  await hub.activity("local", "thread", "turn", "最新公开进展");
+  offline = false;
+  t.mock.timers.tick(5_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(starts, 1);
+  assert.equal(frames.length, 2);
+  assert.equal(frames[1].messageId, "original");
+  assert.match(frames[1].text, /最新公开进展/);
+  assert.ok(texts.every((text) => !text.includes("Heading")));
+  await hub.completion("local", "thread", "turn", "最终结果");
+  const count = frames.length;
+  await hub.activity("local", "thread", "turn", "迟到进度");
+  t.mock.timers.tick(60_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(frames.length, count);
+  assert.equal(frames.at(-1)?.finalize, true);
+});
+
 test("a loaded snapshot can deliver a short next turn completed between polling ticks", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-short-turn-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

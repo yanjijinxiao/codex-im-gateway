@@ -5,14 +5,18 @@ import type { ChannelTableLayout } from "./table.js";
 
 export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
+export type ChannelTextInput = { toUserId: string; text: string; contextToken?: string };
 
 export type ChannelTextClient = {
   /** Legacy transport boundary. Production consumers receive a ChannelClient. */
   capabilities?: ChannelCapabilities;
   /** Can update an existing stream using only its persisted message ID. */
   resumableTextStream?: boolean;
-  sendText(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
-  startTextStream?(input: { toUserId: string; text: string; contextToken?: string }): Promise<{ messageId: string }>;
+  sendText(input: ChannelTextInput): Promise<{ messageId: string }>;
+  /** Plain, rate-limited progress fallback; must not create a new progress card. */
+  sendProgressText?(input: ChannelTextInput): Promise<{ messageId: string }>;
+  /** Repeated starts with the same streamId must target the same logical card. */
+  startTextStream?(input: ChannelTextInput & { streamId?: string }): Promise<{ messageId: string }>;
   updateTextStream?(input: {
     toUserId: string;
     messageId: string;

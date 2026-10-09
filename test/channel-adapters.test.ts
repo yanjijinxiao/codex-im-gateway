@@ -39,7 +39,7 @@ for (const account of accounts) {
     const adapter = createChannelAdapter(account, { inboundDir: "/tmp", maxInboundBytes: 1024 });
     const client = adapter.client;
     assert.equal(client.channel, account.channel);
-    for (const method of ["sendText", "sendMedia", "resolveAttachments", "startTextStream", "updateTextStream", "sendActionCard", "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping"] as const) {
+    for (const method of ["sendText", "sendProgressText", "sendMedia", "resolveAttachments", "startTextStream", "updateTextStream", "sendActionCard", "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping"] as const) {
       assert.equal(typeof client[method], "function", method);
     }
     assert.equal(client.capabilities.progress, account.channel === "dingtalk" ? "not-configured" : "not-implemented");

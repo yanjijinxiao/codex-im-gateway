@@ -23,6 +23,7 @@ import {
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 import { createChoiceCard } from "../src/channels/action-card.js";
 import { parseCommand } from "../src/bridge/channel-commands.js";
+import { ChannelTurnTextStream } from "../src/channels/progress.js";
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -753,8 +754,38 @@ test("DingTalk creates, delivers, streams, and finalizes an AI Card for a group 
   await monitoring;
 });
 
+test("DingTalk retains an acknowledged card when its first progress update fails", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  let creates = 0;
+  const updates: Array<{ outTrackId: string; text: string; finalize: boolean }> = [];
+  const adapter = new DingTalkChannelAdapter({
+    channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true
+  }, {
+    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    cardClient: {
+      async create() { creates++; },
+      async update(input) {
+        updates.push(input);
+        if (updates.length === 1) throw Object.assign(new Error("DNS unavailable"), { code: "ENOTFOUND" });
+      }
+    }
+  });
+  const stream = new ChannelTurnTextStream(adapter.client, "cid-test");
+  t.after(() => stream.suspend());
+  await stream.progress("开始");
+  assert.ok(stream.checkpoint().messageId);
+  t.mock.timers.tick(5_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(creates, 1);
+  assert.equal(updates.length, 2);
+  assert.equal(updates[0].outTrackId, updates[1].outTrackId);
+  assert.equal(await stream.finalize("完成"), true);
+});
+
 test("DingTalk falls back to the session webhook when AI Card creation fails", async () => {
   let listener: ((message: DWClientDownStream) => void) | undefined;
+  let creates = 0;
   const webhookTexts: string[] = [];
   const adapter = new DingTalkChannelAdapter({
     channel: "dingtalk",
@@ -775,7 +806,7 @@ test("DingTalk falls back to the session webhook when AI Card creation fails", a
       socketCallBackResponse() {}
     },
     cardClient: {
-      async create() { throw new Error("template unavailable"); },
+      async create() { creates++; throw new Error("template unavailable"); },
       async update() {}
     },
     async webhookSender(input) {
@@ -789,6 +820,12 @@ test("DingTalk falls back to the session webhook when AI Card creation fails", a
   assert.ok(listener);
   listener(frame(robotMessage()));
   await received.promise;
+
+  const plain = await adapter.client.sendProgressText({ toUserId: "conversation-123", text: "降级进度" });
+  assert.equal(plain.messageId, "fallback-text");
+  assert.deepEqual(webhookTexts, ["降级进度"]);
+  assert.equal(creates, 0, "plain progress bypasses AI Card creation entirely");
+  webhookTexts.length = 0;
 
   assert.deepEqual(await adapter.sendText({ toUserId: "conversation-123", text: "fallback" }), {
     messageId: "fallback-text"
