@@ -26,6 +26,7 @@ All notable changes to Codex IM Gateway are documented in this file.
 
 ### Fixed
 
+- Added transport-neutral `/follow sync`, idempotent `/follow on` recovery and persisted follow health in `/follow` and `/status`. Targeted read-only reconciliation is bounded, host/binding guarded, and reports unconfirmed runtimes and presentation failures honestly; restart restores the original active card even when progress was already deduplicated.
 - Ordinary IM messages now inspect the real Desktop writer before applying ask/steer/queue policies; CLI uses the same policy boundary. Desktop starts wait for actual idle, reject orphan UI turns and old-turn acknowledgements, and never replay uncertain submissions.
 - Binding changes refresh following across session, project, new-session and Taskboard commands. Leaving remains detached across restart; old-task progress/results cannot leak into a new binding, and disabling progress keeps final delivery.
 - Unified the 29-command inventory for aliases, reservation and capability-aware help, documented compatibility-only commands, added the missing `/answer` help entry, and clarified Gateway-only project rename/delete operations.

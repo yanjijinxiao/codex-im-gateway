@@ -58,7 +58,7 @@ const SESSION_HELP_LINES = [
   "新会话在下一条消息时启动 Codex；没有当前项目时 /new 会提示选择，不自动选第一个项目",
   "/history（/hist）[1-20] - 查看最近对话，例如 /history 10",
   "/history more - 继续查看更早的对话",
-  "/follow [on|off] - 查看或切换实时跟随（App 后端），例如 /follow off",
+  "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/leave - 退出当前会话并停止跟随；不会停止任务，也不会自动接回旧会话",
   "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时会提示改用 /queue",
   "/queue 补充要求 - 排到当前任务之后，作为下一轮执行",

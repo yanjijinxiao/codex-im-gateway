@@ -234,9 +234,35 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     },
     setRuntimeInfo(value: typeof runtimeInfo) {
       runtimeInfo = value;
-    }
+    },
+    runner
   };
 }
+
+test("account manager routes follow sync through the shared hub and rejects an old binding", async t => {
+  const f = setup(t);
+  const reads: Array<{ threadId: string; hostId?: string }> = [];
+  Object.assign(f.runner, {
+    async readThreadSnapshot(threadId: string, hostId?: string) {
+      reads.push({ threadId, hostId });
+      return { state: { threadId, persistence: "active", runtimeStatus: "idle", activeFlags: [] }, turns: [] };
+    }
+  });
+  await f.manager.startAccount("account-one", false);
+  t.after(() => f.manager.stopAll());
+  const options = f.bridges.get("account-one")!;
+  const s = options.stateStore.createSession("group", f.root, "Original", undefined, "session", undefined, { standalone: true, hostId: "remote-host" });
+  options.stateStore.setSessionThread(s.id, "thread");
+  const session = options.stateStore.getSession(s.id)!;
+  assert.ok(options.sessionFollow);
+  assert.equal((await options.sessionFollow.synchronize(session)).status, "synced");
+  assert.deepEqual(reads, [{ threadId: "thread", hostId: "remote-host" }]);
+  assert.equal(options.sessionFollow.status(session).status, "synced");
+  options.stateStore.createSession("group", f.root, "New");
+  assert.equal((await options.sessionFollow.synchronize(session)).failure?.code, "binding-changed");
+  assert.equal(reads.length, 1);
+  assert.equal(f.runs.length, 0);
+});
 
 test("notifies Taskboard review state once as an actionable card with the latest evidence", async (t) => {
   let emit: ((event: object) => Promise<void> | void) | undefined;

@@ -1,0 +1,54 @@
+import type { CodexThreadState } from "../codex/backend.js";
+import type { ManagedSession } from "../state/runtime-state.js";
+
+/** Application port: commands never own transport subscriptions or card handles. */
+export type SessionFollowPort = {
+  status(session: ManagedSession): SessionFollowStatus;
+  synchronize(session: ManagedSession): Promise<SessionFollowStatus>;
+};
+
+export type FollowSyncFailure = {
+  code: "timeout" | "connection" | "permission" | "backend" | "unconfirmed" | "orphan-turn" | "presentation" | "binding-changed" | "unavailable";
+  /** Safe, transport-neutral explanation; never raw provider errors or commands. */
+  message: string;
+};
+
+export type SessionFollowStatus = {
+  status: "disabled" | "pending" | "syncing" | "synced" | "stale" | "unconfirmed" | "failed";
+  lastAttemptAt?: string;
+  lastSyncedAt?: string;
+  snapshotAt?: string;
+  runtime?: CodexThreadState;
+  failure?: FollowSyncFailure;
+  presentation?: "updated" | "text-only" | "off" | "idle";
+};
+
+export function followSyncFailure(error: unknown): FollowSyncFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed?\s*out|timeout/i.test(message)) return { code: "timeout", message: "读取 Codex 当前状态超时；请检查对应主机或 Codex App 的连接后重试。" };
+  if (/EACCES|EPERM|permission denied|forbidden|unauthorized|access denied/i.test(message)) return { code: "permission", message: "读取 Codex 状态被拒绝；请检查对应主机或后端的访问权限。" };
+  if (/ECONN|ENOTFOUND|EHOST|EPIPE|socket.*(?:closed|missing)|connection.*(?:closed|refused|failed)|SSH.*(?:failed|exit)/i.test(message)) return { code: "connection", message: "Codex 状态读取连接不可用；请检查本机 App、对应远程主机或 SSH 连接。" };
+  return { code: "backend", message: "无法读取 Codex 当前状态；请检查对应后端连接，详细诊断见本机服务日志。" };
+}
+
+export function formatFollowStatus(state: SessionFollowStatus): string[] {
+  const labels: Record<SessionFollowStatus["status"], string> = {
+    disabled: "已关闭", pending: "等待首次同步", syncing: "正在同步", synced: "同步成功",
+    stale: "同步已过期", unconfirmed: "状态未确认", failed: "同步失败"
+  };
+  const time = (value: string) => new Date(value).toLocaleString("zh-CN", { hour12: false });
+  const runtimeLabel = state.status === "synced" ? "已确认状态" : "最近快照状态（不代表当前）";
+  return [
+    `跟随同步：${labels[state.status]}`,
+    `最后成功同步：${state.lastSyncedAt ? time(state.lastSyncedAt) : "尚未成功同步"}`,
+    ...(state.lastAttemptAt ? [`最近尝试：${time(state.lastAttemptAt)}`] : []),
+    ...(state.snapshotAt ? [`最近快照读取：${time(state.snapshotAt)}`] : []),
+    ...(state.failure ? [`原因：${state.failure.message}（${state.failure.code}）`] : []),
+    ...(state.runtime?.activeFlags.includes("waitingOnApproval") ? [`${runtimeLabel}：等待审批`]
+      : state.runtime?.activeFlags.includes("waitingOnUserInput") ? [`${runtimeLabel}：等待用户确认`]
+      : state.runtime ? [`${runtimeLabel}：${({ active: "正在执行", idle: "空闲", notLoaded: "未加载，无法确认执行状态", unknown: "未知", systemError: "系统错误" })[state.runtime.runtimeStatus]}`] : []),
+    ...(state.presentation === "updated" ? ["进度呈现：已更新当前卡片"]
+      : state.presentation === "text-only" ? ["进度呈现：渠道原生文本；未补发历史进展"]
+      : state.presentation === "off" ? ["进度呈现：已关闭；保留最终结果同步"] : [])
+  ];
+}

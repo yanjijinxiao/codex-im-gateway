@@ -396,6 +396,17 @@ export class AccountManager {
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       sessionControls: this.sessionControls,
+      sessionFollow: {
+        status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
+        synchronize: async (session) => {
+          if (store.getActiveSession(session.senderId)?.id !== session.id) return {
+            status: "failed" as const, failure: { code: "binding-changed" as const, message: "当前对话已切换绑定，未同步旧会话。" }
+          };
+          this.ensureCodexSessionMonitor();
+          this.refreshDesktopApprovalSubscriptions();
+          return this.threadEvents.synchronize(JSON.stringify([account.accountId, session.id]));
+        }
+      },
       onSubscriptionsChanged: () => {
         this.ensureCodexSessionMonitor();
         this.refreshDesktopApprovalSubscriptions();

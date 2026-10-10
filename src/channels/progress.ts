@@ -85,6 +85,12 @@ export class ChannelTurnTextStream {
       ...(this.terminalNoticeSent ? { terminalNoticeSent: true } : {}) };
   }
 
+  deliveryState(): "active" | "pending" | "unavailable" | "finished" {
+    if (this.finished || this.terminal) return "finished";
+    if (this.phase !== "active" || this.suspended) return "unavailable";
+    return this.messageId || !this.supported ? "active" : "pending";
+  }
+
   /** Stop local timers without marking a remote card completed during shutdown. */
   async suspend(): Promise<void> { this.suspended = true; this.stopTimers(); await this.textProgress?.close(); await this.opening; await this.chain.catch(() => undefined); await this.notifying; }
 
@@ -95,6 +101,30 @@ export class ChannelTurnTextStream {
       await this.updateNow();
     }
     await this.chain;
+  }
+
+  /** Explicit recovery probe using the persisted handle, never a replacement card. */
+  async synchronize(): Promise<"updated" | "text-only" | "unavailable" | "finished"> {
+    if (this.finished || this.terminal) return "finished";
+    if (this.suspended) return "unavailable";
+    if (!this.supported) return "text-only";
+    await this.opening;
+    await this.chain.catch(() => undefined);
+    if (this.finished || this.terminal || this.suspended) return "unavailable";
+    if (this.updateTimer) clearTimeout(this.updateTimer);
+    this.updateTimer = undefined;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    this.phase = "active";
+    this.retryAt = 0;
+    this.latestText = this.render();
+    if (this.messageId) {
+      this.startHeartbeat();
+      await this.updateNow();
+    } else {
+      await this.openNow();
+    }
+    return this.phase === "active" && this.messageId ? "updated" : "unavailable";
   }
 
   async progress(text: string): Promise<boolean> {

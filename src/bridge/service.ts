@@ -84,6 +84,7 @@ import { ChannelContextExpiredError, ChannelPartialDeliveryError, InboundMediaTo
 import { validateLocalAttachments } from "../channels/client.js";
 import { adaptLegacyClient } from "../channels/legacy.js";
 import { ChannelTurnTextStream } from "../channels/progress.js";
+import { formatFollowStatus, type SessionFollowPort } from "./session-follow.js";
 export { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
 import type { ChannelMessage } from "../channels/message.js";
 import type { OutboundChannelMessage } from "../webhooks/channel-message-webhook.js";
@@ -123,6 +124,7 @@ export type BridgeServiceOptions = {
   sessionControls?: SessionControlJournal;
   createTextStream?: (session: ManagedSession) => ChannelTurnTextStream;
   onSubscriptionsChanged?: () => Promise<void>;
+  sessionFollow?: SessionFollowPort;
   onTurnStarted?: (session: ManagedSession, turnId: string) => Promise<void> | void;
   config: CodexImGatewayConfig;
   stateStore: RuntimeStateStore;
@@ -1396,13 +1398,28 @@ export class BridgeService {
       return;
     }
     if (command.name === "follow") {
-      if (arg && arg !== "on" && arg !== "off") {
-        await this.reply(senderId, "用法：/follow [on|off]");
+      if (arg && !["on", "off", "sync"].includes(arg)) {
+        await this.reply(senderId, "用法：/follow [on|off|sync]；sync 只同步当前绑定，不创建新任务。");
         return;
       }
-      if (arg !== "off") this.assertSessionCapability(senderId, "liveFollow");
-      if (arg) this.options.stateStore.setSessionFollow(session.id, arg === "on");
-      await this.reply(senderId, "实时跟随：" + (arg ? arg === "on" ? "已开启" : "已关闭" : session.follow === false ? "已关闭" : "已开启") + "。");
+      if (arg === "on" || arg === "sync") this.assertSessionCapability(senderId, "liveFollow");
+      if (arg === "on" || arg === "off") this.options.stateStore.setSessionFollow(session.id, arg === "on");
+      const current = this.options.stateStore.getSession(session.id)!;
+      const enabled = current.follow !== false;
+      if (arg === "sync" && !enabled) {
+        await this.reply(senderId, "实时跟随已关闭，未执行同步。发送 /follow on 开启并同步；/follow sync 不会改变开关或绑定。");
+        return;
+      }
+      const supported = this.runner.backendInfo?.(this.sessionHostId(current)).capabilities.liveFollow !== false;
+      const status = (arg === "on" || arg === "sync") && current.threadId && this.options.sessionFollow
+        ? await this.options.sessionFollow.synchronize(current)
+        : this.options.sessionFollow?.status(current);
+      await this.reply(senderId, [
+        `实时跟随：${enabled ? "已开启" : "已关闭"}${supported ? "" : "（当前后端不支持）"}。`,
+        ...(!current.threadId ? ["当前绑定尚未创建 Codex thread，暂时没有可同步的任务。"]
+          : supported && status ? formatFollowStatus(status) : supported ? ["同步状态：当前部署未接入跟随协调器，未确认同步成功。"] : []),
+        ...(arg === "on" || arg === "sync" ? ["未创建新任务、未介入或停止原任务。"] : ["发送 /follow sync 立即同步当前状态；/stream on 开启过程进度。"])
+      ].join("\n\n"));
       return;
     }
     if (arg && !["ask", "steer", "queue"].includes(arg)) {
@@ -2216,6 +2233,7 @@ export class BridgeService {
       ...(activeTurnId ? [`运行轮次：${activeTurnId}`] : []),
       `实时跟随：${this.runner.backendInfo?.(session ? this.sessionHostId(session) : undefined).capabilities.liveFollow === false
         ? "当前后端不支持" : session?.follow === false || !session ? "关闭" : "开启"}`,
+      ...(session && this.options.sessionFollow ? formatFollowStatus(this.options.sessionFollow.status(session)) : []),
       `backend：${this.options.config.codexBackend}`,
       `app-server transport：${this.options.config.codexAppServerTransport}`,
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,

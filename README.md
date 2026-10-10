@@ -129,10 +129,15 @@ node dist/server/index.js
 /model                      查看或切换模型
 /effort                     查看或切换推理强度
 /stream                     设置过程进度
+/follow                     查看跟随开关、同步健康、最后同步时间及失败原因
+/follow on                  开启并立即同步；已经开启时也会重新同步
+/follow sync                只同步当前绑定，不新建、介入或停止任务
 /stop                       中断当前任务
 ```
 
 普通消息不是隐式 `/steer`：任务运行中默认询问，也可用 `/policy queue` 排到下一轮。Desktop relay 目前不支持安全介入，请使用询问或排队；`/leave` 会持续退出绑定，直到显式选择会话或 `/new`。`/stream off` 关闭过程进度但保留最终结果。全部命令的保留、兼容及能力限制见[渠道命令审计](./docs/channel-command-audit.md)。
+
+Gateway 重启后会自动恢复已有绑定及跟随游标，并在渠道支持持久句柄时续用原进度卡片；即使进展内容没有变化，也会恢复活动卡片。需要手动恢复时，在原对话发送 `/follow sync`；若跟随已经关闭，发送 `/follow on`。`/status` 和 `/follow` 区分“设置开启”和“同步成功”。超时、未确认的 Desktop 持有者、悬空界面轮次和卡片更新失败都会明确显示，不能据“未加载”断言任务结束。纯 CLI 不支持外部实时跟随，命令会报告能力限制。
 
 远程项目复用 Codex Desktop 保存的 `hostId` 和本机 SSH 配置；网关不保存 SSH 密码或私钥内容。项目、模式和 Taskboard 的完整交互见[渠道项目工作台](./docs/channel-project-modes.md)。
 

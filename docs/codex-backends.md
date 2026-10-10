@@ -68,6 +68,16 @@ Project discovery is deliberately backend-owned:
 
 An active-writer error is not a backend fallback. It remains inside the app-server path and may use the Desktop continuation relay for that thread.
 
+## Follow synchronization boundary
+
+`SessionFollowPort` (`src/bridge/session-follow.ts`) is the application boundary between channel commands and persistent delivery. `BridgeService` handles `/follow`, `/follow on|off|sync` and status presentation; `AccountManager` resolves the account + session binding and verifies it is still active. `ThreadEventHub` owns subscriptions, synchronization health, read cursors and card checkpoints. IM adapters only implement presentation and acknowledge transport delivery. No DingTalk-only synchronization implementation or second binding flow is introduced.
+
+Both background recovery and explicit synchronization use the selected backend's existing read-only `readThreadSnapshot(threadId, hostId)` contract. CLI's `liveFollow: false` is honored before synchronization. An explicit sync never calls start, resume, steer or stop, does not enable disabled following, and respects `/stream off`. Repeating `/follow on` performs a new synchronization even when the setting is already on.
+
+Targeted reads have a 25-second deadline and do not wait for unrelated subscriptions. Concurrent manual requests for a binding are coalesced; a newer read supersedes late background results, and binding changes invalidate delivery. Persisted health distinguishes successful sync, unconfirmed runtime, backend timeout/failure, and card delivery failure. Runtime `notLoaded`/`unknown` and orphan Desktop UI turns never count as successful synchronization. Safe structured diagnostics include host/thread identity and an error category, never provider payloads or credentials.
+
+Activity cards restore from their saved handles even when all progress entries are already deduplicated. Explicit recovery probes update that same handle; failed updates do not create replacement cards or switch to text. Text-only channels retain native batching without replaying past turns. Completed turns remain terminal and final delivery remains deduplicated across restarts.
+
 ## App-server transports
 
 The app-server protocol implementation is independent of its transport:

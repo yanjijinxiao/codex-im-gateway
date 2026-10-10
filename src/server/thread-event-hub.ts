@@ -5,6 +5,7 @@ import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels
 import { parseActionBlocks } from "../bridge/actions.js";
 import { chunkText } from "../bridge/format.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
+import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus } from "../bridge/session-follow.js";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
 
 export type ThreadSubscription = {
@@ -35,6 +36,11 @@ type FollowState = {
   initialized: boolean;
   runtime?: CodexThreadState;
   observedAt?: string;
+  syncStatus?: "pending" | "syncing" | "synced" | "unconfirmed" | "failed";
+  lastAttemptAt?: string;
+  lastSyncedAt?: string;
+  syncFailure?: FollowSyncFailure;
+  presentation?: SessionFollowStatus["presentation"];
   terminalPending?: { turnId: string; text: string; fallbackSent: boolean };
 };
 type Options = {
@@ -42,6 +48,7 @@ type Options = {
   subscriptions: () => ThreadSubscription[];
   backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot">;
   intervalMs?: number;
+  readTimeoutMs?: number;
 };
 
 /**
@@ -57,9 +64,14 @@ export class ThreadEventHub {
   private timer?: NodeJS.Timeout;
   private scan?: Promise<void>;
   private stopped = false;
+  private readSequence = 0;
+  private readonly readVersions = new Map<string, number>();
+  private readonly manualSyncs = new Map<string, Promise<SessionFollowStatus>>();
+  private readonly errorLogTimes = new Map<string, number>();
   constructor(private readonly options: Options) {
     this.states = readJsonFile(options.filePath, {});
     for (const state of Object.values(this.states)) {
+      if (state.syncStatus === "syncing") state.syncStatus = "pending";
       if (state.eventVersion !== 2) {
         // Older delivery records could contain guardian output attributed to
         // its parent. Keep the card handle, but never replay that saved text.
@@ -101,6 +113,7 @@ export class ThreadEventHub {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     await this.scan;
+    await Promise.allSettled(this.manualSyncs.values());
     await Promise.all([...this.streams.values()].map((stream) => stream.suspend()));
     this.streams.clear();
   }
@@ -109,6 +122,32 @@ export class ThreadEventHub {
     if (this.scan) return this.scan;
     this.scan = this.scanSubscriptions();
     try { await this.scan; } finally { this.scan = undefined; }
+  }
+
+  status(key: string): SessionFollowStatus {
+    const sub = this.options.subscriptions().find(item => item.key === key);
+    const state = this.states[key];
+    const matching = sub && state && sub.hostId === state.hostId && sub.threadId === state.threadId ? state : undefined;
+    let status: SessionFollowStatus["status"] = sub?.enabled === false || !sub ? "disabled" : matching?.syncStatus ?? "pending";
+    if (status === "synced" && matching?.lastSyncedAt
+      && Date.now() - Date.parse(matching.lastSyncedAt) > 60_000) status = "stale";
+    return { status, lastAttemptAt: matching?.lastAttemptAt, lastSyncedAt: matching?.lastSyncedAt,
+      snapshotAt: matching?.observedAt, runtime: matching?.runtime, failure: matching?.syncFailure,
+      presentation: matching?.presentation };
+  }
+
+  /** Targeted read-only synchronization; never waits for unrelated polling reads. */
+  async synchronize(key: string): Promise<SessionFollowStatus> {
+    const existing = this.manualSyncs.get(key);
+    if (existing) return existing;
+    const sub = this.options.subscriptions().find(item => item.key === key);
+    if (!sub || sub.enabled === false || !sub.threadId) return this.status(key);
+    if (this.stopped) return { ...this.status(key), status: "failed",
+      failure: { code: "unavailable", message: "Gateway 正在停止，未执行同步；请在服务恢复后重试。" } };
+    const work = this.observe(sub, () => this.options.backend().readThreadSnapshot(sub.threadId, sub.hostId), true);
+    this.manualSyncs.set(key, work);
+    try { return await work; }
+    finally { if (this.manualSyncs.get(key) === work) this.manualSyncs.delete(key); }
   }
   private async scanSubscriptions(): Promise<void> {
     const all = this.options.subscriptions();
@@ -136,25 +175,113 @@ export class ThreadEventHub {
         // Disabled bindings above can restore their cards. Deleted accounts no
         // longer provide a client, so only their local cursor can be retired.
         delete this.states[key];
+        this.readVersions.delete(key);
+        this.errorLogTimes.delete(key);
       }
     }
     const snapshots = new Map<string, Promise<CodexThreadSnapshot>>();
     await Promise.all(subscriptions.map(async (sub) => {
       if (!sub.threadId || typeof this.options.backend().readThreadSnapshot !== "function") return;
-      const sequenceBeforeRead = this.states[sub.key]?.sequence ?? 0;
+      const manual = this.manualSyncs.get(sub.key);
+      if (manual) { await manual; return; }
       const key = JSON.stringify([sub.hostId, sub.threadId]);
-      if (!snapshots.has(key)) snapshots.set(key,
-        this.options.backend().readThreadSnapshot(sub.threadId, sub.hostId));
-      try {
-        const snapshot = await snapshots.get(key)!;
-        if (this.stopped) return;
-        await this.queue.run(sub.key, async () => {
-          if ((this.states[sub.key]?.sequence ?? 0) !== sequenceBeforeRead) return;
-          await this.reconcile(sub, snapshot);
-        });
-      } catch (error) { report(error); }
+      if (!snapshots.has(key)) snapshots.set(key, Promise.resolve().then(() =>
+        this.options.backend().readThreadSnapshot(sub.threadId, sub.hostId)));
+      await this.observe(sub, () => snapshots.get(key)!);
     }));
     this.save();
+  }
+
+  private async observe(sub: ThreadSubscription, read: () => Promise<CodexThreadSnapshot>, force = false): Promise<SessionFollowStatus> {
+    const state = this.state(sub);
+    const sequenceBeforeRead = state.sequence;
+    const version = ++this.readSequence;
+    this.readVersions.set(sub.key, version);
+    state.lastAttemptAt = new Date().toISOString();
+    state.syncStatus = "syncing";
+    this.save();
+    try {
+      const snapshot = await boundedRead(read(), this.options.readTimeoutMs ?? 25_000);
+      return await this.queue.run(sub.key, async () => {
+        const current = this.currentSubscription(sub);
+        if (this.stopped || !current) return this.changedBinding();
+        // Settings/ownership may change while a backend read is in flight.
+        sub = current;
+        if (this.readVersions.get(sub.key) !== version) return this.status(sub.key);
+        if (state.sequence !== sequenceBeforeRead && snapshot.state.activeTurnId !== state.turnId) {
+          this.failSync(sub, { code: "unconfirmed", message: "读取期间任务轮次发生变化；未覆盖较新的进展，请重试同步。" }, "unconfirmed");
+          return this.status(sub.key);
+        }
+        // Reject a mismatched response before any progress or cursor can be updated.
+        if (snapshot.state.threadId !== sub.threadId) throw new Error("Backend returned another thread snapshot");
+        const restoreCard = !this.streams.has(sub.key) && Boolean(state.checkpoint?.messageId && !state.checkpoint.finished);
+        await this.reconcile(sub, snapshot);
+        if (this.stopped || !this.isLive(sub)) return this.changedBinding();
+        const runtime = snapshot.state;
+        if (["archived", "missing"].includes(runtime.persistence) || runtime.runtimeStatus === "systemError") {
+          this.failSync(sub, { code: "unavailable", message: "会话已归档、不存在或发生系统错误；请在对应 Codex 后端检查。" });
+        } else if (runtime.pendingTurnWithoutId && runtime.runtimeStatus !== "active") {
+          this.failSync(sub, { code: "orphan-turn", message: "Codex App 有未确认的界面轮次，不能当成正在执行的任务；请重新加载 App。" }, "unconfirmed");
+        } else if (["notLoaded", "unknown"].includes(runtime.runtimeStatus) || runtime.persistence !== "active") {
+          this.failSync(sub, { code: "unconfirmed", message: "已读取记录，但会话未加载或实际持有者无法确认；未将其当成空闲或已结束。" }, "unconfirmed");
+        } else if (runtime.runtimeStatus === "active" && !snapshot.turns.some(turn => turn.status === "inProgress"
+          && (!runtime.activeTurnId || turn.id === runtime.activeTurnId))) {
+          this.failSync(sub, { code: "unconfirmed", message: "后端报告正在执行，但没有可确认的当前轮次；未创建占位卡片。" }, "unconfirmed");
+        } else {
+          let presentation: SessionFollowStatus["presentation"] = sub.progressEnabled === false ? "off"
+            : runtime.runtimeStatus === "active" ? state.presentation : "idle";
+          if (runtime.runtimeStatus === "active" && (!sub.managed || this.streams.has(sub.key))
+            && sub.progressEnabled !== false && (force || restoreCard)) {
+            const result = await this.stream(sub).synchronize();
+            if (result === "unavailable" || result === "finished") {
+              this.failSync(sub, { code: "presentation", message: "后端状态已读取，但原进度卡片未能更新；请检查渠道权限和连接后重试。" });
+              return this.status(sub.key);
+            }
+            presentation = result;
+          }
+          if (this.stopped || !this.isLive(sub)) return this.changedBinding();
+          if (runtime.runtimeStatus === "active" && sub.progressEnabled !== false
+            && this.streams.get(sub.key)?.deliveryState() === "unavailable") {
+            this.failSync(sub, { code: "presentation", message: "后端状态已读取，但当前进度卡片仍不可用；请检查渠道权限和连接后重试。" });
+            return this.status(sub.key);
+          }
+          if (state.terminalPending) {
+            this.failSync(sub, { code: "presentation", message: "任务已经结束，但原卡片的最终结果尚未送达；将保留原卡片并重试。" });
+          } else {
+            state.syncStatus = "synced";
+            state.lastSyncedAt = new Date().toISOString();
+            state.presentation = presentation;
+            delete state.syncFailure;
+            this.save();
+          }
+        }
+        return this.status(sub.key);
+      });
+    } catch (error) {
+      if (this.stopped || !this.isLive(sub)) return this.changedBinding();
+      if (this.readVersions.get(sub.key) === version) this.failSync(sub, followSyncFailure(error));
+      return this.status(sub.key);
+    }
+  }
+
+  private changedBinding(): SessionFollowStatus {
+    return { status: "failed", failure: { code: "binding-changed", message: "同步期间绑定已切换或跟随已关闭；未向原对话补发进展。" } };
+  }
+
+  private failSync(sub: ThreadSubscription, failure: FollowSyncFailure, status: "failed" | "unconfirmed" = "failed"): void {
+    const state = this.state(sub);
+    const changed = state.syncFailure?.code !== failure.code;
+    state.syncStatus = status;
+    state.syncFailure = failure;
+    this.save();
+    const lastLog = this.errorLogTimes.get(sub.key) ?? 0;
+    if (changed || Date.now() - lastLog > 60_000) {
+      this.errorLogTimes.set(sub.key, Date.now());
+      console.warn(`[codex-im-gateway] thread follow sync ${JSON.stringify({
+        timestamp: new Date().toISOString(), hostId: sub.hostId, threadId: sub.threadId,
+        status, code: failure.code, lastSyncedAt: state.lastSyncedAt
+      })}`);
+    }
   }
   private async reconcile(sub: ThreadSubscription, snapshot: CodexThreadSnapshot): Promise<void> {
     if (!this.isLive(sub)) return;
@@ -303,7 +430,9 @@ export class ThreadEventHub {
     return state;
   }
   private async deliver(sub: ThreadSubscription, turnId: string, text: string): Promise<void> {
-    if (!this.isLive(sub) || sub.progressEnabled === false) return;
+    const current = this.currentSubscription(sub);
+    if (!current || current.progressEnabled === false) return;
+    sub = current;
     const state = this.state(sub);
     if (state.completed.includes(turnId) || state.terminalPending) return;
     const clean = visibleText(text).trim();
@@ -319,7 +448,9 @@ export class ThreadEventHub {
     this.save();
   }
   private async finish(sub: ThreadSubscription, turnId: string, text: string, allowSwitch = false): Promise<void> {
-    if (!this.isLive(sub)) return;
+    const current = this.currentSubscription(sub);
+    if (!current) return;
+    sub = current;
     const state = this.state(sub);
     if (state.completed.includes(turnId)) return;
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
@@ -353,7 +484,11 @@ export class ThreadEventHub {
   }
 
   private isLive(sub: ThreadSubscription): boolean {
-    return this.options.subscriptions().some(current => current.enabled !== false && current.key === sub.key
+    return Boolean(this.currentSubscription(sub));
+  }
+
+  private currentSubscription(sub: ThreadSubscription): ThreadSubscription | undefined {
+    return this.options.subscriptions().find(current => current.enabled !== false && current.key === sub.key
       && current.hostId === sub.hostId && current.threadId === sub.threadId);
   }
 
@@ -371,5 +506,14 @@ function visibleText(text: string): string {
   return parseActionBlocks(text).visibleText;
 }
 function report(error: unknown): void {
-  console.warn("[codex-im-gateway] thread follow reconciliation failed: " + String(error));
+  console.warn("[codex-im-gateway] thread follow reconciliation failed: " + followSyncFailure(error).code);
+}
+
+async function boundedRead<T>(read: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([read, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Follow snapshot read timed out")), timeoutMs);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
 }
