@@ -3,32 +3,44 @@ import {
   type ChannelCommandCapability
 } from "./channel-capability.js";
 import type { ChannelCommand } from "./channel-intent.js";
+import type { CodexBackendCapabilities } from "../codex/backend.js";
 
-const COMMAND_ALIASES: Readonly<Record<string, string>> = {
-  h: "help",
-  where: "status",
-  st: "status",
-  bal: "balance",
-  knowledge: "memory",
-  mem: "memory",
-  projects: "project",
-  p: "project",
-  n: "new",
-  ss: "sessions",
-  s: "session",
-  hist: "history",
-  iv: "steer",
-  m: "model",
-  e: "effort",
-  str: "stream",
-  pp: "prompt",
-  ok: "approve",
-  no: "reject",
-  x: "stop",
-  tb: "task",
-  v: "mode",
-  q: "qa"
-};
+/** One canonical command inventory for aliases, reservation and help limits. */
+export const CHANNEL_COMMAND_REGISTRY = [
+  { name: "help", aliases: ["h"] },
+  { name: "status", aliases: ["where", "st"] },
+  { name: "balance", aliases: ["bal"], capability: "accountRateLimits" },
+  { name: "memory", aliases: ["knowledge", "mem"] },
+  { name: "project", aliases: ["projects", "p"] },
+  { name: "new", aliases: ["n"] },
+  { name: "sessions", aliases: ["ss"] },
+  { name: "session", aliases: ["s"] },
+  { name: "history", aliases: ["hist"] },
+  { name: "follow", aliases: [], capability: "liveFollow" },
+  { name: "leave", aliases: [] },
+  { name: "policy", aliases: [] },
+  { name: "role", aliases: [] },
+  { name: "intervene", aliases: [] },
+  { name: "steer", aliases: ["iv"], capability: "turnSteering" },
+  { name: "queue", aliases: [] },
+  { name: "model", aliases: ["m"] },
+  { name: "effort", aliases: ["e"] },
+  { name: "stream", aliases: ["str"], capability: "progress" },
+  { name: "prompt", aliases: ["pp"] },
+  { name: "approve", aliases: ["ok"], capability: "approvals" },
+  { name: "reject", aliases: ["no"], capability: "approvals" },
+  { name: "answer", aliases: [], capability: "userInput" },
+  { name: "stop", aliases: ["x"] },
+  { name: "task", aliases: ["tb"] },
+  { name: "mode", aliases: ["v", "view"] },
+  { name: "qa", aliases: ["q"] },
+  { name: "plan", aliases: [], capability: "collaborationModes" },
+  { name: "goal", aliases: [], capability: "goals" }
+] as const;
+
+const COMMAND_ALIASES: Readonly<Record<string, string>> = Object.fromEntries(
+  CHANNEL_COMMAND_REGISTRY.flatMap(command => command.aliases.map(alias => [alias, command.name]))
+);
 
 const SESSION_HELP_LINES = [
   "会话介入与跟随",
@@ -47,7 +59,7 @@ const SESSION_HELP_LINES = [
   "/history（/hist）[1-20] - 查看最近对话，例如 /history 10",
   "/history more - 继续查看更早的对话",
   "/follow [on|off] - 查看或切换实时跟随（App 后端），例如 /follow off",
-  "/leave - 退出当前会话并停止跟随；不会停止任务",
+  "/leave - 退出当前会话并停止跟随；不会停止任务，也不会自动接回旧会话",
   "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时会提示改用 /queue",
   "/queue 补充要求 - 排到当前任务之后，作为下一轮执行",
   "/policy [ask|steer|queue] - 查看或设置运行中消息的处理方式",
@@ -71,8 +83,8 @@ const BUILT_IN_HELP_LINES = [
   "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
   "/project（/p）[l|P编号|C编号] - 查看项目；选择时绑定并切换（可选入口）",
   "/project add（/p a）[C编号] - /project 的兼容别名",
-  "/project rename（/p rn）P1|新名称 - 重命名项目",
-  "/project delete（/p d）P1 - 移除没有任务的项目",
+  "/project rename（/p rn）P1|新名称 - 仅修改 Gateway 显示名称，不重命名 Codex App 项目",
+  "/project delete（/p d）P1 - 仅移除没有任务的 Gateway 登记，不删除 Codex 项目或目录",
   "/mode（/v）[session|task|qa] - 查看或切换当前项目工作模式",
   "/qa（/q）- 进入绑定 llm-wiki 的问答模式",
   "/plan [on|off] - 切换 Codex 原生计划模式",
@@ -84,42 +96,16 @@ const BUILT_IN_HELP_LINES = [
   "模型、消息与审批",
   "/model（/m）[编号|模型ID|default] - 查看或切换当前任务模型",
   "/effort（/e）[编号|级别|default] - 查看或切换推理强度",
-  "/stream（/str）[on|off|default] - 查看或切换流式回复",
+  "/stream（/str）[on|off|default] - 开关本会话过程进度（包括跟随）；最终结果仍发送",
   "/prompt start（/pp s）- 开始合并多条渠道消息",
   "/prompt done（/pp d）- 提交已合并的消息",
   "/approve（/ok）[A编号] - 批准一次当前渠道收到的 Codex 审批",
-  "/reject（/no）[A编号] - 拒绝当前渠道收到的 Codex 审批"
+  "/reject（/no）[A编号] - 拒绝当前渠道收到的 Codex 审批",
+  "/answer 编号 选项 - 回答 Codex 的待确认问题；格式以问题卡提示为准"
 ] as const;
 
-const BUILT_IN_COMMAND_NAMES = new Set([
-  "help",
-  "status",
-  "balance",
-  "memory",
-  "project",
-  "mode",
-  "qa",
-  "plan",
-  "goal",
-  "task",
-  "sessions",
-  "session",
-  "history",
-  "follow",
-  "leave",
-  "policy",
-  "role",
-  "intervene",
-  "steer",
-  "queue",
-  "new",
-  "model",
-  "effort",
-  "stream",
-  "prompt",
-  "approve",
-  "reject",
-  "stop",
+const BUILT_IN_COMMAND_NAMES: ReadonlySet<string> = new Set([
+  ...CHANNEL_COMMAND_REGISTRY.map(command => command.name),
   ...Object.keys(COMMAND_ALIASES)
 ]);
 
@@ -146,12 +132,28 @@ export function parseCommand(
   };
 }
 
-export function channelHelpText(capabilities: readonly ChannelCommandCapability[], topic = ""): string {
+export type ChannelHelpContext = {
+  backendCapabilities?: CodexBackendCapabilities;
+  desktopOwned?: boolean;
+  taskboardAvailable?: boolean;
+};
+
+export function channelHelpText(capabilities: readonly ChannelCommandCapability[], topic = "", context: ChannelHelpContext = {}): string {
+  const describe = (line: string): string => {
+    const token = /^\/(\w+)/.exec(line)?.[1];
+    const command = CHANNEL_COMMAND_REGISTRY.find(item => item.name === token);
+    if (token === "task" && context.taskboardAvailable === false) return `${line}【需启用 Taskboard】`;
+    if (token === "steer" && context.desktopOwned) return `${line}【当前 Desktop 转发不支持安全介入，请用 /queue】`;
+    if (command && "capability" in command && context.backendCapabilities?.[command.capability] === false) {
+      return `${line}【当前后端不支持】`;
+    }
+    return line;
+  };
   if (topic.trim().toLowerCase() === "session") {
-    return [...SESSION_HELP_LINES, "发送 /help 查看全部命令。"].join("\n\n");
+    return [...SESSION_HELP_LINES, "发送 /help 查看全部命令。"].map(describe).join("\n\n");
   }
   if (topic.trim() && topic.trim().toLowerCase() !== "all") {
     return "用法：/help 查看全部命令；/help session 查看会话介入与跟随说明。";
   }
-  return [...BUILT_IN_HELP_LINES, ...channelCapabilityHelpLines(capabilities)].filter(Boolean).join("\n\n");
+  return [...BUILT_IN_HELP_LINES, ...channelCapabilityHelpLines(capabilities)].filter(Boolean).map(describe).join("\n\n");
 }

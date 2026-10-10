@@ -93,6 +93,8 @@ export type RuntimeState = {
   activeSessionIds: Record<string, string>;
   activeQaSessionIds: Record<string, string>;
   activeProjectIds: Record<string, string>;
+  /** An explicit /leave must survive restarts and implicit project selection. */
+  detachedSessionSenders: string[];
   interactionModes: Record<string, ProjectInteractionMode>;
   pendingDeliveries: Array<{
     id: string;
@@ -119,6 +121,7 @@ export function emptyRuntimeState(): RuntimeState {
     activeSessionIds: {},
     activeQaSessionIds: {},
     activeProjectIds: {},
+    detachedSessionSenders: [],
     interactionModes: {},
     pendingDeliveries: [],
     knowledge: [],
@@ -190,7 +193,12 @@ export class RuntimeStateStore {
     const session = this.mutableActiveSession(senderId);
     if (session) session.follow = false;
     delete this.state.activeSessionIds[senderId];
+    this.state.detachedSessionSenders = [...new Set([...this.state.detachedSessionSenders, senderId])];
     this.save();
+  }
+
+  isSessionDetached(senderId: string): boolean {
+    return this.state.detachedSessionSenders.includes(senderId);
   }
 
   save(): void {
@@ -576,6 +584,7 @@ export class RuntimeStateStore {
   activateProject(senderId: string, projectId: string): ManagedProject {
     const project = this.mutableProject(projectId);
     this.state.activeProjectIds[senderId] = project.id;
+    this.state.detachedSessionSenders = this.state.detachedSessionSenders.filter(id => id !== senderId);
     this.save();
     return structuredClone(project);
   }
@@ -685,6 +694,7 @@ export class RuntimeStateStore {
       updatedAt: now
     };
     this.state.sessions.push(session);
+    this.state.detachedSessionSenders = this.state.detachedSessionSenders.filter(id => id !== senderId);
     if (project) this.state.activeProjectIds[senderId] = project.id;
     else delete this.state.activeProjectIds[senderId];
     if (mode === "qa") this.state.activeQaSessionIds[senderId] = session.id;
@@ -722,6 +732,7 @@ export class RuntimeStateStore {
 
   activateSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
+    this.state.detachedSessionSenders = this.state.detachedSessionSenders.filter(id => id !== session.senderId);
     if (session.mode === "qa") this.state.activeQaSessionIds[session.senderId] = session.id;
     else this.state.activeSessionIds[session.senderId] = session.id;
     if (session.projectId) this.state.activeProjectIds[session.senderId] = session.projectId;
@@ -749,6 +760,16 @@ export class RuntimeStateStore {
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
+  }
+
+  /** Selecting a Taskboard thread is a binding change, not a retargeted old session. */
+  bindProjectThread(senderId: string, projectId: string, threadId: string, title: string): ManagedSession {
+    const project = this.mutableProject(projectId);
+    const existing = this.state.sessions.find(session => session.senderId === senderId
+      && session.mode !== "qa" && session.projectId === projectId && session.threadId === threadId);
+    if (existing) return this.activateSession(existing.id);
+    const session = this.createSession(senderId, project.workspace, title, projectId);
+    return this.setSessionThread(session.id, threadId);
   }
 
   updateSessionRuntime(sessionId: string, overrides: SessionRuntimeOverrides): ManagedSession {
@@ -909,6 +930,8 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
   return {
     ...emptyRuntimeState(),
     ...value,
+    detachedSessionSenders: Array.isArray(value.detachedSessionSenders)
+      ? value.detachedSessionSenders.filter((id): id is string => typeof id === "string") : [],
     approvalSequence: Number.isSafeInteger(value.approvalSequence) && value.approvalSequence! >= 0
       ? value.approvalSequence! : 0,
     sessionPageSizes: value.sessionPageSizes && typeof value.sessionPageSizes === "object" && !Array.isArray(value.sessionPageSizes)

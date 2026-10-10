@@ -26,6 +26,9 @@ All notable changes to Codex IM Gateway are documented in this file.
 
 ### Fixed
 
+- Ordinary IM messages now inspect the real Desktop writer before applying ask/steer/queue policies; CLI uses the same policy boundary. Desktop starts wait for actual idle, reject orphan UI turns and old-turn acknowledgements, and never replay uncertain submissions.
+- Binding changes refresh following across session, project, new-session and Taskboard commands. Leaving remains detached across restart; old-task progress/results cannot leak into a new binding, and disabling progress keeps final delivery.
+- Unified the 29-command inventory for aliases, reservation and capability-aware help, documented compatibility-only commands, added the missing `/answer` help entry, and clarified Gateway-only project rename/delete operations.
 - Continued Codex Desktop-owned sessions through the local follower IPC instead of failing with `already has an active writer`; busy Desktop turns now wait in order and their final reply returns to the originating channel.
 - Allowed ordinary channel turns with a user-input callback to use the Desktop relay; only turns that actually register bridge-owned dynamic tools remain unsupported.
 - Fixed personal-WeChat image handling to use the CDN endpoint returned by QR login, include images quoted through `ref_msg`, and immediately report download/decryption failures instead of silently starting an empty agent turn.

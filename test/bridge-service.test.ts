@@ -1403,7 +1403,8 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
   assert.equal(stateStore.listProjects().some((project) => project.workspace === manualWorkspace), false);
 
   await sendWithProjects("project-rename", `/p rn P${projectNumber}|嘉兴AI社区`);
-  assert.match(replies.at(-1) ?? "", /已重命名 Codex 项目/);
+  assert.match(replies.at(-1) ?? "", /已修改 Gateway 项目显示名称/);
+  assert.match(replies.at(-1) ?? "", /Codex App 项目名称和磁盘目录未改变/);
   await sendWithProjects("project-switch", `/p P${projectNumber}`);
   assert.match(replies.at(-1) ?? "", /请选择接下来要进入的工作模式/);
   assert.equal(stateStore.getActiveProject("alice@im.wechat")?.id, addedProject?.id);

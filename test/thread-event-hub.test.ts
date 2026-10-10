@@ -6,6 +6,75 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
+test("/stream off suppresses followed progress but sends the final result exactly once", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-stream-off-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const texts: string[] = [];
+  let starts = 0;
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat",
+    managed: false, progressEnabled: false, client: {
+      async sendText(x) { texts.push(x.text); return { messageId: "text" }; },
+      async startTextStream() { starts++; return { messageId: "card" }; }, async updateTextStream() {}
+    }
+  };
+  const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub],
+    backend: () => ({ async readThreadSnapshot() { return { state: { threadId: "thread", persistence: "active", runtimeStatus: "notLoaded", activeFlags: [] }, turns: [] }; } }) });
+  t.after(() => hub.stop());
+  await hub.started("local", "thread", "turn", new Date().toISOString());
+  await hub.activity("local", "thread", "turn", "MUST_NOT_SEND_PROGRESS");
+  await hub.completion("local", "thread", "turn", "最终结果");
+  await hub.completion("local", "thread", "turn", "最终结果");
+  assert.equal(starts, 0);
+  assert.deepEqual(texts, ["最终结果"]);
+});
+
+test("a snapshot read before switching bindings cannot open the old session card", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-switch-read-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const texts: string[] = [];
+  let sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "old", recipientId: "chat", managed: false,
+    client: { async sendText(x) { texts.push(x.text); return { messageId: "text" }; } } };
+  let release!: (snapshot: CodexThreadSnapshot) => void;
+  const reading = new Promise<CodexThreadSnapshot>(resolve => { release = resolve; });
+  const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub],
+    backend: () => ({ readThreadSnapshot: () => reading }) });
+  t.after(() => hub.stop());
+  const refresh = hub.refresh();
+  sub = { ...sub, threadId: "new" };
+  release({ state: { threadId: "old", persistence: "active", runtimeStatus: "active", activeFlags: [], activeTurnId: "old-turn" },
+    turns: [{ id: "old-turn", status: "inProgress", messages: [{ id: "progress", role: "assistant", kind: "progress", text: "OLD_PROGRESS" }] }] });
+  await refresh;
+  assert.deepEqual(texts, []);
+});
+
+test("switching binding during an active stream closes the old card and follows only the new task", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-switch-card-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const writes: Array<{ text: string; finalize?: boolean }> = [];
+  let starts = 0;
+  let sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "old", recipientId: "chat", managed: false,
+    client: {
+      async sendText(x) { writes.push(x); return { messageId: "text" }; },
+      async startTextStream(x) { starts++; writes.push(x); return { messageId: `card-${starts}` }; },
+      async updateTextStream(x) { writes.push(x); }
+    } };
+  const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub],
+    backend: () => ({ async readThreadSnapshot(threadId) { return { state: { threadId, persistence: "active", runtimeStatus: "active", activeFlags: [], activeTurnId: threadId + "-turn" },
+      turns: [{ id: threadId + "-turn", status: "inProgress", messages: [] }] }; } }) });
+  t.after(() => hub.stop());
+  await hub.refresh();
+  sub = { ...sub, threadId: "new" };
+  await hub.refresh();
+  const count = writes.length;
+  await hub.activity("local", "old", "old-turn", "OLD_PROGRESS");
+  await hub.completion("local", "old", "old-turn", "OLD_RESULT");
+  assert.equal(writes.length, count);
+  assert.equal(starts, 2);
+  assert.ok(writes.some(x => x.finalize && x.text.includes("已切换绑定")));
+  await hub.completion("local", "new", "new-turn", "新结果");
+  assert.equal(writes.at(-1)?.text, "新结果");
+});
+
 test("session following recovers one card after an outage without replaying a burst of reasoning titles", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-progress-recovery-"));

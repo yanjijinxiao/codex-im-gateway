@@ -10,7 +10,8 @@ const EXPLICIT_HELP_REQUESTS = [
   new RegExp(`^${WORKBENCH_NAME}\\s*(?:有哪些|支持哪些|有什么|支持什么)(?:内置)?(?:命令|指令)$`, "u"),
   /^(?:help|help menu|command list)$/u,
   /^(?:please )?(?:show|open|display|list)(?: me)? (?:the )?(?:(?:codex im gateway|gateway|workbench)(?:'s)? )?(?:help(?: menu)?|command list|commands)$/u,
-  /^what commands does (?:the )?(?:codex im gateway|gateway|workbench) support$/u
+  /^what commands does (?:the )?(?:codex im gateway|gateway|workbench) support$/u,
+  /^(?:当前|现在)?(?:有|支持)(?:哪些|什么)(?:内置)?(?:命令|指令)$/u
 ] as const;
 
 export function isExplicitHelpMenuRequest(text: string): boolean {

@@ -10,8 +10,12 @@ import type {
   CodexSteerInput,
   CodexSteerResult,
   CodexStopResult,
-  CodexThreadContinuation
+  CodexThreadContinuation,
+  CodexThreadSnapshot,
+  CodexThreadState,
+  CodexTurnStatus
 } from "./backend.js";
+import { parseThreadHistory } from "./app-server-runner.js";
 import {
   CodexSessionCompletionMonitor,
   type CodexSessionActivity,
@@ -60,6 +64,28 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private monitorStarted = false;
   private closed = false;
 
+  /** Read the actual Desktop writer, not an unrelated private app-server. */
+  async readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot | undefined> {
+    const connection = new DesktopIpcConnection(this.socketPath, Math.min(this.requestTimeoutMs, 20_000));
+    try {
+      await connection.initialize();
+      await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
+      return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+    } catch (error) {
+      // Discovery is read-only. An unanswered discovery is not proof of an
+      // idle Desktop task; the caller may only fall back to the app-server's
+      // own writer, whose resume lock still rejects foreign ownership.
+      if (isDesktopOwnerUnavailable(error) || /thread-owner-discovery timed out/.test(String(error))) return undefined;
+      throw error;
+    } finally {
+      connection.close();
+    }
+  }
+
+  async inspectThread(threadId: string): Promise<CodexThreadState | undefined> {
+    return (await this.readThreadSnapshot(threadId))?.state;
+  }
+
   constructor(options: DesktopCodexRunnerOptions = {}) {
     this.socketPath = options.socketPath ?? path.join(os.homedir(), ".codex", "ipc", "ipc.sock");
     this.requestTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -105,6 +131,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       });
       let queuedNoticeSent = false;
       let response: unknown;
+      let previousTurnIds = new Set<string>();
       while (response === undefined) {
         if (this.closed) throw new Error("Codex Desktop runner is closed");
         try {
@@ -112,7 +139,10 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
             socketPath: this.socketPath,
             timeoutMs: this.requestTimeoutMs,
             threadId: input.threadId,
-            request
+            request,
+            onSnapshot: (snapshot) => {
+              previousTurnIds = new Set(snapshot.turns.map((turn) => turn.id));
+            }
           });
         } catch (error) {
           if (!isDesktopTurnBusyError(error)) throw error;
@@ -126,6 +156,11 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       const turnId = followerTurnId(response);
       if (!turnId) {
         throw new Error("Codex Desktop accepted the message but did not return a turn id");
+      }
+      if (previousTurnIds.has(turnId)) {
+        // A concurrent Desktop writer can race our read. The message may have
+        // been consumed by that turn: fail visibly, never retry or duplicate it.
+        throw new CodexInterventionError("Desktop 将这条消息接收到了已有轮次，而不是新任务。未重复提交，请查看 /history 和 /status 确认。");
       }
       await input.onTurnStarted?.({ threadId: input.threadId, turnId });
       const completion = await this.waitForCompletion(input.threadId, turnId, input.onProgress);
@@ -287,6 +322,7 @@ type FollowerRequest = {
   timeoutMs: number;
   threadId: string;
   request: Record<string, unknown>;
+  onSnapshot?: (snapshot: CodexThreadSnapshot) => void;
 };
 
 async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
@@ -297,11 +333,15 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
       conversationId: input.threadId,
       hostId: "local"
     });
-    await connection.broadcast("thread-stream-following-changed", 1, {
-      conversationId: input.threadId,
-      hostId: "local",
-      following: true
-    });
+    const snapshot = parseDesktopSnapshot(input.threadId, await connection.followSnapshot(input.threadId));
+    if (snapshot.state.pendingTurnWithoutId && snapshot.state.runtimeStatus !== "active") {
+      throw new CodexInterventionError("Codex App 残留了没有轮次 ID 的运行中消息，但后端没有执行任务。为避免重复提交，未发送新消息；请先重新加载 Codex App 并检查 /history。");
+    }
+    if (snapshot.state.runtimeStatus === "active") throw new Error("Codex Desktop thread has an active turn");
+    if (snapshot.state.runtimeStatus !== "idle") {
+      throw new CodexInterventionError("无法确认 Codex Desktop 会话处于空闲状态，未发送新消息。请检查 /status 后重试。");
+    }
+    input.onSnapshot?.(snapshot);
     return await connection.request("thread-follower-start-turn", 2, {
       conversationId: input.threadId,
       turnStart: {
@@ -337,6 +377,13 @@ class DesktopIpcConnection {
   private socket?: net.Socket;
   private clientId = "initializing-client";
   private buffer = Buffer.alloc(0);
+  private readonly snapshots = new Map<string, Record<string, unknown>>();
+  private snapshotWaiter?: {
+    threadId: string;
+    resolve: (state: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  };
   private readonly pending = new Map<string, {
     method: string;
     resolve: (value: unknown) => void;
@@ -388,13 +435,39 @@ class DesktopIpcConnection {
     return this.sendAndFlush({ type: "broadcast", sourceClientId: this.clientId, version, method, params });
   }
 
+  followSnapshot(threadId: string): Promise<Record<string, unknown>> {
+    // The owner can publish its initial snapshot during discovery, before
+    // the response resolves. Do not lose that snapshot between the two RPCs.
+    const early = this.snapshots.get(threadId);
+    if (early) return Promise.resolve(early);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.snapshotWaiter = undefined;
+        reject(new Error("Codex Desktop owner snapshot timed out; no message was submitted"));
+      }, this.timeoutMs);
+      this.snapshotWaiter = { threadId, resolve, reject, timer };
+      void this.broadcast("thread-stream-following-changed", 1, {
+        conversationId: threadId, hostId: "local", following: true
+      }).catch((error) => { this.failSnapshot(error); });
+    });
+  }
+
+  private failSnapshot(error: Error): void {
+    if (!this.snapshotWaiter) return;
+    clearTimeout(this.snapshotWaiter.timer);
+    this.snapshotWaiter.reject(error);
+    this.snapshotWaiter = undefined;
+  }
+
   close(): void {
     const error = new Error("Codex Desktop IPC connection closed");
+    this.failSnapshot(error);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
+    this.snapshots.clear();
     this.socket?.destroy();
     this.socket = undefined;
   }
@@ -417,6 +490,7 @@ class DesktopIpcConnection {
       });
       socket.on("data", (chunk) => this.receive(chunk));
       socket.on("close", () => {
+        this.failSnapshot(new Error("Codex Desktop IPC closed before the owner snapshot arrived"));
         if (!this.pending.size) return;
         const error = new Error("Codex Desktop IPC connection closed before the response arrived");
         for (const pending of this.pending.values()) {
@@ -450,6 +524,21 @@ class DesktopIpcConnection {
   }
 
   private handleMessage(message: IpcMessage): void {
+    if (message.type === "broadcast" && message.method === "thread-stream-state-changed") {
+      const params = recordValue(message.params);
+      const change = recordValue(params?.change);
+      const state = recordValue(change?.conversationState);
+      if (typeof params?.conversationId === "string" && change?.type === "snapshot" && state) {
+        this.snapshots.set(params.conversationId, state);
+      }
+      if (this.snapshotWaiter && params?.conversationId === this.snapshotWaiter.threadId
+        && change?.type === "snapshot" && state) {
+        clearTimeout(this.snapshotWaiter.timer);
+        this.snapshotWaiter.resolve(state);
+        this.snapshotWaiter = undefined;
+      }
+      return;
+    }
     if (message.type === "client-discovery-request" && typeof message.requestId === "string") {
       this.send({
         type: "client-discovery-response",
@@ -493,6 +582,50 @@ class DesktopIpcConnection {
       });
     });
   }
+}
+
+export function parseDesktopSnapshot(threadId: string, owner: Record<string, unknown>): CodexThreadSnapshot {
+  const history = recordValue(recordValue(owner.turnHistory)?.history);
+  const entities = recordValue(history?.entitiesByKey);
+  // Older pages are appended to entitiesByKey, so object insertion order is
+  // not the conversation order. Never mistake an older page for the active tail.
+  const rawTurns = (entities ? Object.values(entities) : Array.isArray(owner.turns) ? owner.turns : [])
+    .map(recordValue).filter((turn): turn is Record<string, unknown> => Boolean(turn))
+    .sort((a, b) => Number(a.turnStartedAtMs ?? 0) - Number(b.turnStartedAtMs ?? 0));
+  const turns: CodexThreadSnapshot["turns"] = [];
+  let pendingTurnWithoutId = false;
+  for (const value of rawTurns) {
+    const turn = recordValue(value);
+    if (!turn) continue;
+    const id = stringValue(turn.turnId) ?? stringValue(turn.id);
+    const status = turn.status as CodexTurnStatus;
+    if (!["inProgress", "completed", "interrupted", "failed"].includes(status)) continue;
+    if (!id) { pendingTurnWithoutId ||= status === "inProgress"; continue; }
+    turns.push({ id, status, messages: parseThreadHistory({ turns: [{ ...turn, id,
+      startedAt: typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs / 1_000 : turn.startedAt
+    }] }) });
+  }
+  const runtime = recordValue(owner.threadRuntimeStatus)?.type;
+  const runtimeStatus = ["idle", "active", "notLoaded", "systemError"].includes(String(runtime))
+    ? runtime as CodexThreadState["runtimeStatus"] : "unknown";
+  const activeTurn = runtimeStatus === "active" ? turns.filter((turn) => turn.status === "inProgress").at(-1) : undefined;
+  const flags = recordValue(owner.threadRuntimeStatus)?.activeFlags;
+  return { state: {
+    threadId, persistence: "active", runtimeStatus, executionOwner: "desktop",
+    activeFlags: Array.isArray(flags) ? flags.filter((flag): flag is "waitingOnApproval" | "waitingOnUserInput" =>
+      flag === "waitingOnApproval" || flag === "waitingOnUserInput") : [],
+    ...(activeTurn ? { activeTurnId: activeTurn.id } : {}),
+    ...(pendingTurnWithoutId ? { pendingTurnWithoutId: true } : {}),
+    ...(turns.at(-1) ? { latestTurnStatus: turns.at(-1)!.status } : {}),
+    ...(stringValue(owner.cwd) ? { cwd: stringValue(owner.cwd) } : {}),
+    ...(stringValue(owner.title) ? { title: stringValue(owner.title) } : {}),
+    ...(stringValue(owner.projectId) ? { projectId: stringValue(owner.projectId) } : {})
+  }, turns };
+}
+
+function isDesktopOwnerUnavailable(error: unknown): boolean {
+  const detail = error instanceof Error ? error.message : String(error);
+  return /ENOENT|ECONNREFUSED|no (?:thread )?owner|owner.*not found|no client.*handle/i.test(detail);
 }
 
 function followerTurnId(value: unknown): string | undefined {

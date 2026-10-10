@@ -13,6 +13,19 @@ function createStore(t: test.TestContext): RuntimeStateStore {
   return new RuntimeStateStore(resolveStatePaths(root));
 }
 
+test("Taskboard selects a new binding without rewriting the previous session", t => {
+  const store = createStore(t);
+  const project = store.createProject("Project", "/work/project");
+  const previous = store.createSession("chat", project.workspace, "Original", project.id);
+  store.setSessionThread(previous.id, "original-thread");
+  const next = store.bindProjectThread("chat", project.id, "task-thread", "Task");
+  assert.notEqual(next.id, previous.id);
+  assert.equal(store.getSession(previous.id)?.threadId, "original-thread");
+  assert.equal(store.getActiveSession("chat")?.threadId, "task-thread");
+  assert.equal(store.bindProjectThread("chat", project.id, "original-thread", "Original").id, previous.id);
+  assert.equal(store.listSessions().length, 2);
+});
+
 test("keeps a channel actor separate from its conversation scope", (t) => {
   const store = createStore(t);
 

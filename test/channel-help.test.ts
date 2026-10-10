@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { channelHelpText, parseCommand } from "../src/bridge/channel-commands.js";
+import { CHANNEL_COMMAND_REGISTRY, channelHelpText, isReservedChannelCommandToken, parseCommand } from "../src/bridge/channel-commands.js";
+import { EXEC_BACKEND_CAPABILITIES } from "../src/codex/backend.js";
 import { chunkText } from "../src/bridge/format.js";
 import { normalizeDingTalkCardContent } from "../src/channels/dingtalk.js";
 
@@ -15,6 +16,23 @@ test("DingTalk help keeps intervention commands in its first message with paragr
   assert.ok(rendered[0].includes("\n\n/history more"));
   assert.ok(rendered[0].includes("\n\n/follow"));
   assert.ok(rendered.join("\n").includes("/reject"), "later sections must not be lost when split");
+});
+
+test("command inventory reserves every canonical command/alias and reports backend limits", () => {
+  const help = channelHelpText([], "", { backendCapabilities: EXEC_BACKEND_CAPABILITIES, taskboardAvailable: false });
+  for (const command of CHANNEL_COMMAND_REGISTRY) {
+    assert.ok(isReservedChannelCommandToken(command.name), command.name);
+    assert.ok(help.includes("/" + command.name), command.name);
+    for (const alias of command.aliases) {
+      assert.ok(isReservedChannelCommandToken(alias), alias);
+      assert.equal(parseCommand("/" + alias)?.name, command.name);
+    }
+  }
+  assert.match(help, /\/steer[^\n]+【当前后端不支持】/);
+  assert.match(help, /\/follow[^\n]+【当前后端不支持】/);
+  assert.match(help, /\/answer[^\n]+【当前后端不支持】/);
+  assert.match(help, /\/task[^\n]+【需启用 Taskboard】/);
+  assert.match(channelHelpText([], "session", { desktopOwned: true }), /Desktop 转发不支持安全介入/);
 });
 
 test("focused session help describes policies, permissions and backend limits", () => {

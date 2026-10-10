@@ -245,13 +245,7 @@ export class TaskboardChannelController {
 
   private bindThread(senderId: string, context: TaskboardChannelContext, issue: TaskboardIssue): void {
     if (!issue.threadId) return;
-    const session = context.session ?? this.options.stateStore.createSession(
-      senderId,
-      context.managedProject.workspace,
-      issue.title,
-      context.managedProject.id
-    );
-    this.options.stateStore.setSessionThread(session.id, issue.threadId);
+    this.options.stateStore.bindProjectThread(senderId, context.managedProject.id, issue.threadId, issue.title);
   }
 
   private requireClient(): TaskboardClient {

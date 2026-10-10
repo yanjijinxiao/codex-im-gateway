@@ -1,4 +1,5 @@
 import { AppServerCodexRunner } from "./app-server-runner.js";
+import path from "node:path";
 import {
   resolveLocalAppServerTransport,
   type AppServerConnectionMode
@@ -25,6 +26,7 @@ import type {
   CodexStopResult,
   CodexThreadListInput,
   CodexThreadState,
+  CodexThreadSnapshot,
   CodexThreadGoal,
   CodexThreadGoalStatus,
   CodexBackendAdapter,
@@ -42,7 +44,7 @@ export type CodexBackendRouterOptions = {
   timeoutMs?: number;
   codexHome?: string;
   desktopRunner?: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread">>;
   appServerBackend?: CodexAppServerBackend;
   execBackend?: CodexBackendAdapter;
   remoteTransportResolver?: typeof resolveRemoteCodexTransport;
@@ -62,9 +64,10 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly appServer: CodexAppServerBackend;
   private readonly exec: CodexBackendAdapter;
   private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
   private readonly runTails = new Map<string, Promise<void>>();
+  private readonly desktopOwnedThreads = new Set<string>();
   private selectedAutoBackend?: "exec" | "app-server";
   private get selectedBackend() { return this.options.backend === "auto" ? this.selectedAutoBackend ?? "app-server" : this.options.backend; }
 
@@ -91,7 +94,11 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       sandbox: options.execSandbox,
       timeoutMs: options.timeoutMs
     });
-    this.desktop = options.desktopRunner ?? new DesktopCodexRunner({ timeoutMs: options.timeoutMs });
+    this.desktop = options.desktopRunner ?? new DesktopCodexRunner({
+      timeoutMs: options.timeoutMs,
+      codexHome: options.codexHome,
+      ...(options.codexHome ? { socketPath: path.join(options.codexHome, "ipc", "ipc.sock") } : {})
+    });
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
@@ -123,6 +130,8 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   async steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult> {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
     if (this.selectedBackend === "exec") return this.exec.steer(input);
+    const state = await this.inspectThread(input.threadId);
+    if (state.executionOwner === "desktop") return this.desktop.steer(input);
     try {
       return await this.appServer.steer(input);
     } catch (error) {
@@ -144,6 +153,11 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (this.selectedBackend === "exec") {
       return this.exec.run(withInlineDeveloperInstructions(input));
     }
+    // Read and write must target the same owner. A private app-server can read
+    // a Desktop rollout as notLoaded even when Desktop is actively working.
+    if (input.threadId && this.desktopOwnedThreads.has(input.threadId)) {
+      return this.desktop.run(withInlineDeveloperInstructions(input));
+    }
     try {
       const result = await this.appServer.run({
         ...input,
@@ -160,6 +174,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       return result;
     } catch (error) {
       if (input.threadId && isActiveWriterError(error)) {
+        this.desktopOwnedThreads.add(input.threadId);
         return this.desktop.run(withInlineDeveloperInstructions(input));
       }
       if (this.options.backend === "app-server" || this.selectedAutoBackend || input.threadId || !canRunWithoutCapabilityLoss(this.exec, input)) {
@@ -184,16 +199,13 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     }
     if (this.selectedBackend === "exec") return this.exec.stop(threadId);
     if (threadId) {
-      if (this.options.backend === "exec") return this.exec.stop(threadId);
-      try {
-        const result = await this.appServer.stop(threadId);
-        if (result === "interrupted") return result;
-      } catch (error) {
-        if (!isDesktopSteerCandidateError(error)) throw error;
+      const owner = await this.inspectThread(threadId);
+      if (owner.executionOwner === "desktop") {
+        // Never use an unguarded interrupt to clear an optimistic UI tail.
+        if (owner.runtimeStatus !== "active" || !owner.activeTurnId) return "not-active";
+        return this.desktop.stop(threadId, owner.activeTurnId);
       }
-      const state = await this.appServer.inspectThread(threadId);
-      if (!state.activeTurnId) return "not-active";
-      return this.desktop.stop(threadId, state.activeTurnId);
+      return this.appServer.stop(threadId);
     }
     const results = await Promise.all([this.appServer.stop(threadId), this.desktop.stop(threadId)]);
     return results.includes("interrupted") ? "interrupted" : "not-active";
@@ -238,8 +250,23 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     return this.backendForSharedOperation(hostId).getHistory(threadId);
   }
 
-  async readThreadSnapshot(threadId: string, hostId?: string) {
-    return this.backendForSharedOperation(hostId).readThreadSnapshot(threadId);
+  async readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot> {
+    if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
+      return this.backendForSharedOperation(hostId).readThreadSnapshot(threadId);
+    }
+    const snapshot = await this.appServer.readThreadSnapshot(threadId);
+    if (["archived", "missing"].includes(snapshot.state.persistence)) {
+      this.desktopOwnedThreads.delete(threadId);
+      return snapshot;
+    }
+    // An active task on this connection is authoritative. A persisted idle or
+    // notLoaded record is not: ask the Desktop owner before using it.
+    if (snapshot.state.runtimeStatus !== "active") {
+      const owner = await this.desktop.readThreadSnapshot?.(threadId);
+      if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
+    }
+    this.desktopOwnedThreads.delete(threadId);
+    return snapshot;
   }
 
   async getHistoryPage(
@@ -278,8 +305,17 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     await this.backendForSharedOperation(hostId).clearGoal(threadId);
   }
 
-  inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
-    return this.backendForSharedOperation(hostId).inspectThread(threadId);
+  async inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
+    if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
+      return this.backendForSharedOperation(hostId).inspectThread(threadId);
+    }
+    const state = await this.appServer.inspectThread(threadId);
+    if (state.runtimeStatus !== "active" && state.persistence !== "missing" && state.persistence !== "archived") {
+      const owner = await this.desktop.inspectThread?.(threadId);
+      if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
+    }
+    this.desktopOwnedThreads.delete(threadId);
+    return state;
   }
 
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]> {

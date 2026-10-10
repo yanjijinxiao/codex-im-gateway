@@ -47,6 +47,10 @@ export type CodexThreadState = {
   activeFlags: CodexThreadActiveFlag[];
   latestTurnStatus?: CodexTurnStatus;
   activeTurnId?: string;
+  /** The owner has an unacknowledged UI turn, but no actual active execution. */
+  pendingTurnWithoutId?: boolean;
+  /** Live execution authority; a private storage reader is not the Desktop owner. */
+  executionOwner?: "desktop";
   cwd?: string;
   projectId?: string;
   /** CLI's derived workspace catalog key, for display grouping only; not native membership. */

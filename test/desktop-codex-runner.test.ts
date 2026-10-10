@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { DesktopCodexRunner } from "../src/codex/desktop-runner.js";
+import { DesktopCodexRunner, parseDesktopSnapshot } from "../src/codex/desktop-runner.js";
 
 test("relays a turn to the Desktop thread owner and returns its session-log completion", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-desktop-runner-"));
@@ -34,6 +34,9 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
         const message = JSON.parse(buffer.subarray(4, length + 4).toString("utf8")) as Record<string, unknown>;
         buffer = buffer.subarray(length + 4);
         received.push(message);
+        if (message.method === "thread-stream-following-changed") {
+          writeFrame(socket, ownerSnapshot("thread-desktop", { threadRuntimeStatus: { type: "idle" }, turns: [] }));
+        }
         if (message.type !== "request") continue;
         if (message.method === "initialize") {
           writeFrame(socket, response(message, { clientId: "bridge-client" }));
@@ -223,3 +226,102 @@ function writeFrame(socket: net.Socket, message: unknown): void {
   header.writeUInt32LE(payload.length);
   socket.write(Buffer.concat([header, payload]));
 }
+
+function ownerSnapshot(threadId: string, state: unknown): Record<string, unknown> {
+  return { type: "broadcast", method: "thread-stream-state-changed", version: 11,
+    params: { conversationId: threadId, hostId: "local", change: { type: "snapshot", conversationState: state } } };
+}
+
+test("Desktop paginated owner history is ordered by turn time, and orphan UI tails are not executions", () => {
+  const result = parseDesktopSnapshot("thread", { cwd: "/tmp/project", threadRuntimeStatus: { type: "idle" },
+    turns: [], turnHistory: { history: { entitiesByKey: {
+      newest: { turnId: "new", status: "interrupted", turnStartedAtMs: 2000, items: [] },
+      orphan: { turnId: null, status: "inProgress", turnStartedAtMs: 2500, items: [] },
+      olderPage: { turnId: "old", status: "completed", turnStartedAtMs: 1000,
+        items: [{ id: "u", type: "userMessage", content: [{ type: "text", text: "普通钉钉消息" }] }] }
+    } } } });
+  assert.equal(result.state.executionOwner, "desktop");
+  assert.equal(result.state.runtimeStatus, "idle");
+  assert.equal(result.state.pendingTurnWithoutId, true);
+  assert.equal(result.state.activeTurnId, undefined);
+  assert.equal(result.state.latestTurnStatus, "interrupted");
+  assert.deepEqual(result.turns.map(turn => turn.id), ["old", "new"]);
+  assert.equal(result.turns[0].messages[0].createdAt, "1970-01-01T00:00:01.000Z");
+});
+
+async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<string, unknown>, accepted: unknown = {}, earlySnapshot = false) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-desktop-state-"));
+  fs.mkdirSync(path.join(root, "sessions"));
+  const socketPath = path.join(root, "ipc.sock");
+  const received: Record<string, unknown>[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0);
+    socket.on("data", chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4) {
+        const size = buffer.readUInt32LE(0);
+        if (buffer.length < size + 4) return;
+        const message = JSON.parse(buffer.subarray(4, size + 4).toString()) as Record<string, unknown>;
+        buffer = buffer.subarray(size + 4);
+        received.push(message);
+        if (message.method === "initialize") writeFrame(socket, response(message, { clientId: "test" }));
+        if (message.method === "thread-owner-discovery") {
+          if (earlySnapshot) writeFrame(socket, ownerSnapshot("thread", snapshot()));
+          writeFrame(socket, response(message, {}));
+        }
+        if (message.method === "thread-stream-following-changed") writeFrame(socket, ownerSnapshot("thread", snapshot()));
+        if (message.method === "thread-follower-start-turn") writeFrame(socket, response(message, accepted));
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+  const runner = new DesktopCodexRunner({ codexHome: root, socketPath, timeoutMs: 300, busyRetryDelayMs: 5 });
+  t.after(async () => {
+    runner.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return { runner, received };
+}
+
+test("owner snapshots published before the discovery response are not lost", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }), {}, true);
+  const snapshot = await runner.readThreadSnapshot("thread");
+  assert.equal(snapshot?.state.runtimeStatus, "idle");
+  assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 0);
+});
+
+test("ordinary Desktop messages wait for idle instead of invoking start while the old turn is active", async t => {
+  let observations = 0;
+  const { runner, received } = await desktopOwnerFixture(t, () => ({
+    threadRuntimeStatus: { type: ++observations < 3 ? "active" : "idle" },
+    turns: [{ turnId: "old-turn", status: observations < 3 ? "inProgress" : "completed", items: [] }]
+  }));
+  const progress: string[] = [];
+  await assert.rejects(runner.run({ cwd: "/tmp", threadId: "thread", prompt: "你是 GPT？",
+    onProgress: text => { progress.push(text); } }), /did not return a turn id/);
+  assert.equal(observations, 3);
+  assert.equal(received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.equal(progress.filter(text => text.includes("已加入队列")).length, 1);
+});
+
+test("idle Desktop with a null inProgress UI turn fails visibly without submitting or interrupting", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" },
+    turns: [{ turnId: null, status: "inProgress", items: [] }] }));
+  await assert.rejects(runner.run({ cwd: "/tmp", threadId: "thread", prompt: "你是 GPT？" }), /残留.*轮次 ID/);
+  assert.equal(received.filter(message => /start-turn|interrupt-turn/.test(String(message.method))).length, 0);
+});
+
+test("a Desktop acknowledgement of an existing turn is never retried or reported as a new turn", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" },
+    turns: [{ turnId: "old-turn", status: "interrupted", items: [] }] }), { result: { turn: { id: "old-turn" } } });
+  let starts = 0;
+  await assert.rejects(runner.run({ cwd: "/tmp", threadId: "thread", prompt: "你是 GPT？",
+    onTurnStarted: () => { starts++; } }), /已有轮次.*未重复提交/);
+  assert.equal(starts, 0);
+  assert.equal(received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});

@@ -15,6 +15,8 @@ export type ThreadSubscription = {
   client: ChannelTextClient;
   managed: boolean;
   enabled?: boolean;
+  /** /stream controls progress presentation, not the binding or final answer. */
+  progressEnabled?: boolean;
   contextToken?: string;
   onTextDelivered?: (part: { messageId: string; text: string }) => void;
 };
@@ -117,8 +119,14 @@ export class ThreadEventHub {
         && !this.states[sub.key].checkpoint?.finished && !this.streams.has(sub.key)) this.stream(sub);
     }
     for (const [key, stream] of this.streams) {
-      if (!live.has(key)) {
-        await stream.finalize("已停止跟随此会话；任务继续运行。");
+      const sub = subscriptions.find(item => item.key === key);
+      const state = this.states[key];
+      const changed = sub && state && (sub.hostId !== state.hostId || sub.threadId !== state.threadId);
+      if (!live.has(key) || changed) {
+        await stream.finalize(changed ? "已切换绑定的会话；原任务继续运行。" : "已停止跟随此会话；任务继续运行。");
+        await stream.suspend();
+        this.streams.delete(key);
+      } else if (sub?.progressEnabled === false) {
         await stream.suspend();
         this.streams.delete(key);
       }
@@ -149,6 +157,7 @@ export class ThreadEventHub {
     this.save();
   }
   private async reconcile(sub: ThreadSubscription, snapshot: CodexThreadSnapshot): Promise<void> {
+    if (!this.isLive(sub)) return;
     const state = this.state(sub);
     state.runtime = snapshot.state;
     state.observedAt = new Date().toISOString();
@@ -181,6 +190,7 @@ export class ThreadEventHub {
         continue;
       }
       if (turn.status === "inProgress") {
+        if (snapshot.state.runtimeStatus !== "active") continue;
         const activeId = snapshot.state.activeTurnId
           ?? turns.filter((item) => item.status === "inProgress").at(-1)?.id;
         if (turn.id !== activeId) continue;
@@ -205,6 +215,7 @@ export class ThreadEventHub {
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false
       && sub.hostId === hostId && sub.threadId === threadId)
       .map((sub) => this.queue.run(sub.key, async () => {
+        if (!this.isLive(sub)) return;
         const state = this.state(sub);
         if (state.completed.includes(turnId) || state.retired?.includes(turnId)) return;
         if (state.startedAt && Date.parse(startedAt) < Date.parse(state.startedAt)) return;
@@ -219,6 +230,7 @@ export class ThreadEventHub {
   async activity(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false && sub.hostId === hostId && sub.threadId === threadId)
       .map((sub) => this.queue.run(sub.key, async () => {
+        if (!this.isLive(sub)) return;
         if (sub.managed) {
           const state = this.state(sub);
           if (state.turnId && state.turnId !== turnId) return;
@@ -243,6 +255,7 @@ export class ThreadEventHub {
   }
   /** Reuse the same persistent record for turns initiated from the IM channel. */
   managedStarted(sub: ThreadSubscription, turnId: string): void {
+    if (!this.isLive(sub)) return;
     const state = this.state(sub);
     state.turnId = turnId;
     state.sequence++;
@@ -290,6 +303,7 @@ export class ThreadEventHub {
     return state;
   }
   private async deliver(sub: ThreadSubscription, turnId: string, text: string): Promise<void> {
+    if (!this.isLive(sub) || sub.progressEnabled === false) return;
     const state = this.state(sub);
     if (state.completed.includes(turnId) || state.terminalPending) return;
     const clean = visibleText(text).trim();
@@ -305,12 +319,21 @@ export class ThreadEventHub {
     this.save();
   }
   private async finish(sub: ThreadSubscription, turnId: string, text: string, allowSwitch = false): Promise<void> {
+    if (!this.isLive(sub)) return;
     const state = this.state(sub);
     if (state.completed.includes(turnId)) return;
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
     const clean = visibleText(text).trim() || "任务已结束。";
     state.terminalPending ??= { turnId, text: clean, fallbackSent: false };
     this.save();
+    if (sub.progressEnabled === false && !state.checkpoint?.messageId) {
+      await this.sendText(sub, clean);
+      state.completed = [...state.completed, turnId].slice(-200);
+      delete state.terminalPending;
+      state.sequence++;
+      this.save();
+      return;
+    }
     const stream = this.stream(sub);
     if (!await stream.finalize(clean)) {
       if (!state.terminalPending.fallbackSent) {
@@ -327,6 +350,11 @@ export class ThreadEventHub {
     delete state.terminalPending;
     state.sequence++;
     this.save();
+  }
+
+  private isLive(sub: ThreadSubscription): boolean {
+    return this.options.subscriptions().some(current => current.enabled !== false && current.key === sub.key
+      && current.hostId === sub.hostId && current.threadId === sub.threadId);
   }
 
   private async sendText(sub: ThreadSubscription, text: string): Promise<void> {

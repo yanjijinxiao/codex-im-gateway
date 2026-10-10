@@ -1237,7 +1237,8 @@ export class AccountManager {
           hostId,
           recipientId: session.senderId, client: entry.client,
           managed,
-          enabled: managed || (session.follow !== false && store.getActiveSession(session.senderId)?.id === session.id),
+          enabled: store.getActiveSession(session.senderId)?.id === session.id && (managed || session.follow !== false),
+          progressEnabled: session.streamReplies ?? this.configProvider().streamReplies,
           contextToken: store.getContextToken(session.senderId),
           onTextDelivered: (part) => entry.webhook?.publish({ direction: "outbound", id: part.messageId,
             recipientId: session.senderId, text: part.text, attachments: [] })

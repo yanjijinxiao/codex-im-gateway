@@ -232,8 +232,22 @@ export class BridgeService {
   }
 
   async handleMessage(message: ChannelMessage): Promise<void> {
-    return this.actor.run(message.senderId, () =>
-      this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message)));
+    const conversationId = message.replyTargetId ?? message.senderId;
+    const binding = () => {
+      const session = this.options.stateStore.getActiveSession(conversationId);
+      const project = this.options.stateStore.getActiveProject(conversationId);
+      return JSON.stringify([session?.id, session?.threadId, session?.follow, session?.streamReplies,
+        project?.id, this.options.stateStore.getInteractionMode(conversationId)]);
+    };
+    const before = binding();
+    try {
+      await this.actor.run(message.senderId, () =>
+        this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message)));
+    } finally {
+      // All binding entry points (new, project, Taskboard, catalog and leave)
+      // use the same subscription invalidation boundary.
+      if (binding() !== before) await this.options.onSubscriptionsChanged?.();
+    }
   }
 
   private role(conversationId: string): SessionRole {
@@ -318,6 +332,10 @@ export class BridgeService {
       if (!continueAsConversation) return;
     }
 
+    if (this.options.stateStore.isSessionDetached(replyTargetId)) {
+      await this.reply(replyTargetId, "已退出会话，未发送这条消息。请用 /sessions 重新绑定，或 /new 新建会话。");
+      return;
+    }
     if (!this.executionSession(replyTargetId) && !this.ensureBoundProjectContext(replyTargetId)) {
       await this.replyProjectRequired(replyTargetId);
       return;
@@ -406,7 +424,18 @@ export class BridgeService {
     switch (command.name) {
       case "help":
       case "h":
-        await this.replyActionCard(message.senderId, createMainMenuCard(channelHelpText(channelCapabilities, command.arg)));
+        {
+          const session = this.executionSession(message.senderId);
+          let desktopOwned = false;
+          if (session?.threadId && typeof this.runner.inspectThread === "function") {
+            try { desktopOwned = (await this.runner.inspectThread(session.threadId, this.sessionHostId(session))).executionOwner === "desktop"; }
+            catch { /* Help remains available during a backend outage. */ }
+          }
+          await this.replyActionCard(message.senderId, createMainMenuCard(channelHelpText(channelCapabilities, command.arg, {
+            backendCapabilities: this.runner.backendInfo?.(session ? this.sessionHostId(session) : undefined).capabilities,
+            desktopOwned, taskboardAvailable: Boolean(this.options.taskboard)
+          })));
+        }
         return;
       case "status":
       case "where":
@@ -653,7 +682,7 @@ export class BridgeService {
         return;
       }
       const renamed = this.options.stateStore.renameProject(project.id, name);
-      await this.reply(senderId, `已重命名 Codex 项目：${renamed.name}`);
+      await this.reply(senderId, `已修改 Gateway 项目显示名称：${renamed.name}\nCodex App 项目名称和磁盘目录未改变。`);
       return;
     }
     const deleteMatch = /^(?:delete|d)\s+(.+)$/i.exec(input);
@@ -666,7 +695,7 @@ export class BridgeService {
       }
       try {
         this.options.stateStore.deleteProject(project.id);
-        await this.reply(senderId, `已移除 Codex 项目：${project.name}\n磁盘目录未删除。`);
+        await this.reply(senderId, `已移除 Gateway 项目登记：${project.name}\nCodex App 项目和磁盘目录未删除；刷新目录时仍可能发现该项目。`);
       } catch {
         await this.reply(senderId, "项目下还有任务，请先删除或迁移任务后再移除项目。");
       }
@@ -1228,7 +1257,6 @@ export class BridgeService {
     if (!existing) store.setSessionThread(session.id, threadId);
     store.setSessionFollow(session.id, this.runner.backendInfo?.(hostId).capabilities.liveFollow ?? this.options.config.codexBackend !== "exec");
     store.setInteractionMode(senderId, "session");
-    await this.options.onSubscriptionsChanged?.();
     await this.reply(senderId, `已绑定会话：${session.title}\n\n主机：${hostId}\n\n工作目录：${state.cwd}\n\n下一条消息将继续这个会话；/history 查看历史，/leave 退出绑定。`);
     await this.handleHistoryCommand(senderId, "6");
   }
@@ -1289,7 +1317,15 @@ export class BridgeService {
       return;
     }
     const hostId = this.sessionHostId(session);
+    if (this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
+      await this.reply(message.senderId, "当前后端不支持介入正在执行的轮次，消息未提交。请用 /queue 排到下一轮。");
+      return;
+    }
     const state = await this.runner.inspectThread(session.threadId, hostId);
+    if (state.executionOwner === "desktop") {
+      await this.reply(message.senderId, "当前 Desktop 转发协议不支持指定轮次的安全介入，消息未提交。请用 /queue 排到下一轮。");
+      return;
+    }
     if (state.persistence !== "active" || state.runtimeStatus === "systemError") {
       const reason = unavailableProjectSessionChoiceReason({
         managed: session,
@@ -1356,7 +1392,6 @@ export class BridgeService {
     if (command.name === "leave") {
       this.options.stateStore.leaveSession(senderId);
       this.historyPages.delete(senderId);
-      await this.options.onSubscriptionsChanged?.();
       await this.reply(senderId, "已退出会话并停止跟随；任务继续运行。");
       return;
     }
@@ -1367,13 +1402,21 @@ export class BridgeService {
       }
       if (arg !== "off") this.assertSessionCapability(senderId, "liveFollow");
       if (arg) this.options.stateStore.setSessionFollow(session.id, arg === "on");
-      await this.options.onSubscriptionsChanged?.();
       await this.reply(senderId, "实时跟随：" + (arg ? arg === "on" ? "已开启" : "已关闭" : session.follow === false ? "已关闭" : "已开启") + "。");
       return;
     }
     if (arg && !["ask", "steer", "queue"].includes(arg)) {
       await this.reply(senderId, "用法：/policy [ask|steer|queue]");
       return;
+    }
+    if (arg === "steer") {
+      const hostId = this.sessionHostId(session);
+      const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
+        && (await this.runner.inspectThread(session.threadId, hostId)).executionOwner === "desktop";
+      if (desktopOwned || this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
+        await this.reply(senderId, "当前后端不支持安全介入，处理策略未改变。请使用 /policy ask 或 /policy queue。");
+        return;
+      }
     }
     if (arg) this.options.stateStore.setActiveMessagePolicy(session.id, arg as "ask" | "steer" | "queue");
     await this.reply(senderId, "运行中消息处理方式：" + (arg || session.activeMessagePolicy || "ask") + "（ask 询问，steer 介入，queue 排队）。");
@@ -1382,11 +1425,17 @@ export class BridgeService {
   private async handleActiveMessage(message: ChannelMessage, items: PromptBufferItem[]): Promise<boolean> {
     const session = this.executionSession(message.senderId);
     if (!session?.threadId || session.mode === "qa" || session.activeMessagePolicy === "queue") return false;
-    if (this.options.config.codexBackend === "exec" || typeof this.runner.inspectThread !== "function") return false;
+    if (typeof this.runner.inspectThread !== "function") return false;
     const hostId = this.sessionHostId(session);
     const state = await this.runner.inspectThread(session.threadId, hostId);
-    if (state.runtimeStatus !== "active" || !state.activeTurnId) return false;
-    const prompt = buildPromptParts("", items, "WeChat", []).prompt;
+    if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
+      await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
+      return true;
+    }
+    if (state.runtimeStatus !== "active") return false;
+    const canSteer = Boolean(state.activeTurnId)
+      && state.executionOwner !== "desktop" && this.runner.backendInfo?.(hostId).capabilities.turnSteering !== false;
+    const prompt = buildPromptParts("", items, channelPromptSource(this.channel.channel), []).prompt;
     if (session.activeMessagePolicy === "steer") {
       await this.handleSteerCommand(message, prompt, state.activeTurnId);
       return true;
@@ -1394,17 +1443,17 @@ export class BridgeService {
     const choice = this.controls.createChoice({
       actorId: this.actor.getStore() ?? message.senderId, conversationId: message.senderId,
       sessionId: session.id, threadId: session.threadId, hostId: hostId ?? "local",
-      turnId: state.activeTurnId, prompt, items
+      turnId: state.activeTurnId ?? "", prompt, items
     });
     await this.replyActionCard(message.senderId, createChoiceCard({
       title: "当前任务正在执行",
       body: "如何处理这条新消息？\n\n" + boundedProgressText(buildPromptPreview("", items) ?? "", 500),
       choices: [
-        { label: "介入当前任务", command: "intervene", arg: choice.id + " steer", style: "primary" },
+        ...(canSteer ? [{ label: "介入当前任务", command: "intervene" as const, arg: choice.id + " steer", style: "primary" as const }] : []),
         { label: "排到下一轮", command: "intervene", arg: choice.id + " queue" },
         { label: "取消", command: "intervene", arg: choice.id + " cancel" }
       ],
-      fallbackText: "发送 /intervene " + choice.id + " steer 介入，queue 排队，cancel 取消。"
+      fallbackText: "发送 /intervene " + choice.id + (canSteer ? " steer 介入，" : "（当前后端不支持安全介入），") + "queue 排队，cancel 取消。"
     }));
     return true;
   }
@@ -1801,6 +1850,10 @@ export class BridgeService {
   }
 
   private async runCodexTurn(message: ChannelMessage, text: string, attachments: PromptBufferItem[] = []): Promise<void> {
+    if (this.options.stateStore.isSessionDetached(message.senderId)) {
+      await this.reply(message.senderId, "已退出会话，消息未提交。请用 /sessions 重新绑定，或 /new 新建会话。");
+      return;
+    }
     const activeProject = this.options.stateStore.getActiveProject(message.senderId);
     const activeSession = this.options.stateStore.getActiveSession(message.senderId);
     const standalone = !activeProject && activeSession?.projectBinding === "none" ? activeSession : undefined;
@@ -1829,6 +1882,9 @@ export class BridgeService {
       assertCodexThreadRunnable(await this.runner.inspectThread(threadId, this.sessionHostId(session)));
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
+    const stillBound = () => this.executionSession(message.senderId)?.id === session.id;
+    const wantsProgress = () => stillBound()
+      && (this.options.stateStore.getSession(session.id)?.streamReplies ?? this.options.config.streamReplies);
     const sentProgress = new Set<string>();
     const replyStream = progressEnabled
       ? this.options.createTextStream?.(session) ?? new ChannelTurnTextStream(this.channel, message.senderId, {
@@ -1857,6 +1913,7 @@ export class BridgeService {
           threadTitle: preferredThreadTitle(session.title, promptPreview),
           onThreadCreated: (createdThreadId) => {
             this.options.stateStore.setSessionThread(session.id, createdThreadId);
+            return this.options.onSubscriptionsChanged?.();
           },
           onTurnStarted: ({ threadId: startedThreadId, turnId }) => {
             session.threadId = startedThreadId;
@@ -1874,12 +1931,14 @@ export class BridgeService {
           ...(progressEnabled ? {
             ...(replyStream?.supported ? {
               onDelta: async (delta: string) => {
+                if (!wantsProgress()) return;
                 streamedAnswer += delta;
                 const visible = visibleStreamingAnswer(streamedAnswer);
                 if (visible) await replyStream.answer(visible);
               }
             } : {}),
             onProgress: async (progress: string) => {
+              if (!wantsProgress()) return;
               const progressText = progress.trim();
               if (!progressText || sentProgress.has(progressText)) return;
               sentProgress.add(progressText);
@@ -1899,10 +1958,14 @@ export class BridgeService {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
         const remaining = chunkText(parsed.visibleText);
-        const streamed = replyStream
+        const bound = stillBound();
+        const streamed = bound && replyStream
           ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。")
           : false;
-        if (!streamed && replyStream?.supported) {
+        if (!bound) {
+          await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。");
+          await replyStream?.suspend();
+        } else if (!streamed && replyStream?.supported) {
           await replyStream.reportTerminalFailure();
         } else if (remaining.length && !streamed) {
           for (const chunk of remaining) {
@@ -1910,6 +1973,7 @@ export class BridgeService {
           }
         }
         for (const action of parsed.actions.send) {
+          if (!stillBound()) break;
           await this.sendLocalMedia(message.senderId, action);
         }
         await this.options.onTurnCompleted?.({
@@ -1921,9 +1985,9 @@ export class BridgeService {
         });
       });
     } catch (error) {
-      let failureWasReported = await replyStream?.fail(
+      let failureWasReported = !stillBound() || (await replyStream?.fail(
         stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
-      ) ?? false;
+      ) ?? false);
       if (!failureWasReported && replyStream?.supported) {
         try { failureWasReported = await replyStream.reportTerminalFailure(); }
         catch { console.warn("[codex-im-gateway] terminal delivery-error notice failed"); }
@@ -2123,6 +2187,21 @@ export class BridgeService {
       }
     }
     const runtime = await this.effectiveRuntime(senderId);
+    let execution = "尚未创建任务";
+    let activeTurnId: string | undefined;
+    if (session?.threadId && typeof this.runner.inspectThread === "function") {
+      try {
+        const state = await this.runner.inspectThread(session.threadId, this.sessionHostId(session));
+        activeTurnId = state.activeTurnId;
+        execution = state.pendingTurnWithoutId && state.runtimeStatus !== "active"
+          ? "状态异常：App 有未确认的运行中消息，但实际后端空闲"
+          : state.activeFlags.includes("waitingOnApproval") ? "等待审批"
+          : state.activeFlags.includes("waitingOnUserInput") ? "等待用户确认"
+          : ({ active: "正在执行", idle: "空闲", notLoaded: "未加载（不能据此断言任务已结束）",
+            unknown: "未确认", systemError: "系统错误" } as const)[state.runtimeStatus];
+        if (state.executionOwner === "desktop") execution += "（Desktop 实际持有者）";
+      } catch { execution = "运行状态暂不可读取（未按空闲处理）"; }
+    }
     return [
       "当前工作上下文",
       `项目：${project?.name ?? "尚未选择"}`,
@@ -2133,13 +2212,17 @@ export class BridgeService {
       `对话状态：${session?.collaborationMode === "plan" ? "计划协作" : "普通对话（未附加模式）"}`,
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,
+      `运行状态：${execution}`,
+      ...(activeTurnId ? [`运行轮次：${activeTurnId}`] : []),
+      `实时跟随：${this.runner.backendInfo?.(session ? this.sessionHostId(session) : undefined).capabilities.liveFollow === false
+        ? "当前后端不支持" : session?.follow === false || !session ? "关闭" : "开启"}`,
       `backend：${this.options.config.codexBackend}`,
       `app-server transport：${this.options.config.codexAppServerTransport}`,
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
       `model: ${runtime.model ?? "(Codex default)"}`,
       `effort: ${runtime.effort ?? "(Codex default)"}`,
       `过程回复：${(session?.streamReplies ?? this.options.config.streamReplies) ? "开启" : "关闭"}${typeof session?.streamReplies === "boolean" ? "（当前会话）" : "（全局）"}`
-    ].join("\n");
+    ].join("\n\n");
   }
 
   private async handleBalanceCommand(senderId: string): Promise<void> {

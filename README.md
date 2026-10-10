@@ -132,6 +132,8 @@ node dist/server/index.js
 /stop                       中断当前任务
 ```
 
+普通消息不是隐式 `/steer`：任务运行中默认询问，也可用 `/policy queue` 排到下一轮。Desktop relay 目前不支持安全介入，请使用询问或排队；`/leave` 会持续退出绑定，直到显式选择会话或 `/new`。`/stream off` 关闭过程进度但保留最终结果。全部命令的保留、兼容及能力限制见[渠道命令审计](./docs/channel-command-audit.md)。
+
 远程项目复用 Codex Desktop 保存的 `hostId` 和本机 SSH 配置；网关不保存 SSH 密码或私钥内容。项目、模式和 Taskboard 的完整交互见[渠道项目工作台](./docs/channel-project-modes.md)。
 
 会话列表也会隐藏本地用途配置中已确认的探活记录，并显示隐藏数量；不会仅凭 `READY` 标题或 CLI 来源过滤正常对话，也不会删除或归档记录。配置及恢复方式见[会话用途筛选](./docs/codex-backends.md#probe-records-versus-user-conversations)。
