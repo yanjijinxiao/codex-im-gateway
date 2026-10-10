@@ -75,6 +75,7 @@ export type SessionRuntimeOverrides = {
 };
 
 export type RuntimeState = {
+  approvalSequence: number;
   sessionPageSizes: Record<string, number>;
   conversationRoles: Record<string, Record<string, "viewer" | "participant" | "controller">>;
   pairedSenderIds: string[];
@@ -105,6 +106,7 @@ export type RuntimeState = {
 
 export function emptyRuntimeState(): RuntimeState {
   return {
+    approvalSequence: 0,
     sessionPageSizes: {},
     conversationRoles: {},
     pairedSenderIds: [],
@@ -134,6 +136,12 @@ export class RuntimeStateStore {
 
   get snapshot(): RuntimeState {
     return structuredClone(this.state);
+  }
+
+  allocateApprovalId(): string {
+    this.state.approvalSequence += 1;
+    this.save();
+    return `A${this.state.approvalSequence}`;
   }
 
   getSessionPageSize(conversationId: string, actorId: string): number {
@@ -901,6 +909,8 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
   return {
     ...emptyRuntimeState(),
     ...value,
+    approvalSequence: Number.isSafeInteger(value.approvalSequence) && value.approvalSequence! >= 0
+      ? value.approvalSequence! : 0,
     sessionPageSizes: value.sessionPageSizes && typeof value.sessionPageSizes === "object" && !Array.isArray(value.sessionPageSizes)
       ? Object.fromEntries(Object.entries(value.sessionPageSizes).filter(([, size]) => isSessionPageSize(size))) : {},
     pairedSenderIds: Array.isArray(value.pairedSenderIds) ? value.pairedSenderIds : [],

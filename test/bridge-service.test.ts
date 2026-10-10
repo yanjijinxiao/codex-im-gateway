@@ -427,7 +427,7 @@ test("sends Codex approvals to the originating sender and accepts channel decisi
   });
   assert.equal(await approvalSeen, "accept");
   await runningTurn;
-  assert.match(replies.at(-2)?.text ?? "", /已批准.*A1/);
+  assert.match(replies.at(-2)?.text ?? "", /已提交批准.*A1/);
   assert.match(replies.at(-1)?.text ?? "", /审批结果：accept/);
 });
 
@@ -468,6 +468,31 @@ test("automatically declines unanswered channel approvals after the timeout", as
 
   assert.equal(decision, "decline");
   assert.ok(replies.some((reply) => /审批 A1 已超时.*自动拒绝/.test(reply)));
+});
+
+test("only a controller in the approval's original group can confirm it", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "group-approval-role-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(root));
+  store.setRole("group-one", "owner", "controller");
+  store.setRole("group-one", "member", "participant");
+  store.setRole("group-two", "owner", "controller");
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(root), allowedSenderIds: ["group-one", "group-two"] }, stateStore: store,
+    weixin: { async sendText(input: { text: string }) { replies.push(input.text); return { messageId: "sent" }; } } as never,
+    runner: {} as never
+  });
+  const decision = service.requestApproval("group-one", {
+    kind: "command", threadId: "thread", turnId: "turn", itemId: "item", command: "echo test"
+  });
+  await service.handleMessage({ id: "member", senderId: "member", replyTargetId: "group-one", text: "/approve A1", attachments: [], raw: {} });
+  assert.match(replies.at(-1)!, /需要 controller/);
+  await service.handleMessage({ id: "wrong-room", senderId: "owner", replyTargetId: "group-two", text: "/approve A1", attachments: [], raw: {} });
+  assert.match(replies.at(-1)!, /没有待审批/);
+  await service.handleMessage({ id: "owner", senderId: "owner", replyTargetId: "group-one", text: "/approve A1", attachments: [], raw: {} });
+  assert.equal(await decision, "accept");
+  assert.match(replies.at(-1)!, /已提交批准审批 A1/);
 });
 
 test("lists and binds Taskboard issues to the active Codex session", async (t) => {

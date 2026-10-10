@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
-import { ChannelApprovalController } from "./approval.js";
+import { ChannelApprovalController, type ApprovalDeliveryResult } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
   assertNeverChannelCapabilityResolution,
@@ -195,7 +195,8 @@ export class BridgeService {
       (senderId, notice) => notice.card
         ? this.replyActionCard(senderId, notice.card)
         : this.reply(senderId, notice.text),
-      options.approvalTimeoutMs
+      options.approvalTimeoutMs,
+      () => options.stateStore.allocateApprovalId()
     );
     this.runner = options.runner ?? new CodexBackendRouter({
       backend: options.config.codexBackend,
@@ -2301,6 +2302,10 @@ export class BridgeService {
 
   requestApproval(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
     return this.approvals.request(senderId, request);
+  }
+
+  reportApprovalResult(senderId: string, request: CodexApprovalRequest, result: ApprovalDeliveryResult): Promise<void> {
+    return this.approvals.reportResult(senderId, request, result);
   }
 }
 

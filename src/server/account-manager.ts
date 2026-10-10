@@ -12,6 +12,7 @@ import { createInstalledSkillCapabilitiesProvider } from "../bridge/installed-sk
 import { buildPromptParts, buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
+import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import { SessionControlJournal } from "../bridge/session-control.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import {
@@ -49,7 +50,8 @@ import {
 } from "./codex-session-monitor.js";
 import {
   CodexDesktopApprovalMonitor,
-  type CodexDesktopApproval
+  type CodexDesktopApproval,
+  type CodexDesktopApprovalMonitorOptions
 } from "./codex-desktop-approval-monitor.js";
 import {
   RuntimeStateStore,
@@ -246,9 +248,7 @@ export type AccountManagerOptions = {
     }
   ) => CodexSessionCompletionMonitor;
   codexDesktopApprovalMonitorFactory?: (
-    handlers: {
-      onApproval: (approval: CodexDesktopApproval) => Promise<CodexApprovalDecision | undefined>;
-    }
+    handlers: CodexDesktopApprovalMonitorOptions
   ) => CodexDesktopApprovalMonitor;
   taskboardClientFactory?: (url: string) => TaskboardClient;
   llmWiki?: LlmWikiMcpClientPool;
@@ -256,6 +256,8 @@ export type AccountManagerOptions = {
 };
 
 export class AccountManager {
+  private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
+  private readonly approvalOrigins = new Map<string, { accountId: string; sessionId: string; turnId: string }>();
   private readonly entries = new Map<string, RuntimeEntry>();
   private readonly respondingSessions = new Map<string, number>();
   private readonly configProvider: () => CodexImGatewayConfig;
@@ -330,6 +332,7 @@ export class AccountManager {
     await this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
+    this.approvalOrigins.clear();
     this.managedTurnCompletions.clear();
     await this.threadEvents.stop();
     this.taskboardController?.abort();
@@ -393,12 +396,21 @@ export class AccountManager {
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       sessionControls: this.sessionControls,
-      onSubscriptionsChanged: () => { this.ensureCodexSessionMonitor(); return this.threadEvents.refresh(); },
-      onTurnStarted: (session, turnId) => this.threadEvents.managedStarted({
-        key: JSON.stringify([account.accountId, session.id]),
-        hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
-        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
-      }, turnId),
+      onSubscriptionsChanged: () => {
+        this.ensureCodexSessionMonitor();
+        this.refreshDesktopApprovalSubscriptions();
+        return this.threadEvents.refresh();
+      },
+      onTurnStarted: (session, turnId) => {
+        this.rememberApprovalOrigin(account.accountId, session, turnId);
+        this.ensureCodexSessionMonitor();
+        this.refreshDesktopApprovalSubscriptions();
+        return this.threadEvents.managedStarted({
+          key: JSON.stringify([account.accountId, session.id]),
+          hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
+          threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
+        }, turnId);
+      },
       createTextStream: (session) => this.threadEvents.managedStream({
         key: JSON.stringify([account.accountId, session.id]),
         hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
@@ -436,6 +448,7 @@ export class AccountManager {
     });
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
+    this.refreshDesktopApprovalSubscriptions();
 
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
       const authorizedConversation = message.source === "native-menu"
@@ -509,6 +522,7 @@ export class AccountManager {
       entry.status = "stopped";
       entry.connection = { state: "stopped" };
     }
+    this.refreshDesktopApprovalSubscriptions();
     return this.summary(account);
   }
 
@@ -842,6 +856,7 @@ export class AccountManager {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
     const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title, project?.id);
+    this.refreshDesktopApprovalSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
 
@@ -868,17 +883,20 @@ export class AccountManager {
       assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, pending.hostId ?? project?.hostId));
     }
     const session = store.activateSession(sessionId);
+    this.refreshDesktopApprovalSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
 
   resetSession(accountId: string, sessionId: string): AccountSession {
     const session = this.storeFor(accountId).resetSession(sessionId);
+    this.refreshDesktopApprovalSubscriptions();
     return this.sessionSummary(accountId, session, this.isActive(accountId, session.id));
   }
 
   deleteSession(accountId: string, sessionId: string): void {
     this.storeFor(accountId).deleteSession(sessionId);
     this.respondingSessions.delete(sessionRuntimeKey(accountId, sessionId));
+    this.refreshDesktopApprovalSubscriptions();
   }
 
   async getSessionMessages(accountId: string, sessionId: string): Promise<SessionHistoryMessage[]> {
@@ -971,11 +989,17 @@ export class AccountManager {
         threadTitle: preferredThreadTitle(session.title, promptPreview),
         onThreadCreated: (createdThreadId) => {
           store.setSessionThread(session.id, createdThreadId);
+          this.ensureCodexSessionMonitor();
+          this.refreshDesktopApprovalSubscriptions();
+        },
+        onTurnStarted: ({ threadId, turnId }) => {
+          this.rememberApprovalOrigin(accountId, { ...session, threadId }, turnId);
+          this.refreshDesktopApprovalSubscriptions();
         },
         queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
-        onApproval: (request: CodexApprovalRequest) => this.requestProjectApprovalForSession(accountId, session, request),
+        onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
           ? { onProgress }
           : {})
@@ -1120,6 +1144,7 @@ export class AccountManager {
     } else {
       this.respondingSessions.delete(key);
     }
+    this.refreshDesktopApprovalSubscriptions();
   }
 
   private runnerFor(config = this.configProvider()): CodexBridgeBackend {
@@ -1182,12 +1207,11 @@ export class AccountManager {
     const key = `${task.sessionId}\n${task.turnId}`;
     if (task.status === "running") {
       this.externalCodexTasks.set(key, task);
-      if (this.projectForExternalThread(task.sessionId, task.workspace)) {
-        this.codexDesktopApprovalMonitor?.followThread(task.sessionId);
-      }
+      this.refreshDesktopApprovalSubscriptions();
       await this.threadEvents.started("local", task.sessionId, task.turnId, task.startedAt);
     } else {
       this.externalCodexTasks.delete(key);
+      this.refreshDesktopApprovalSubscriptions();
     }
   }
 
@@ -1227,48 +1251,116 @@ export class AccountManager {
     if (this.configProvider().codexBackend === "exec") return;
     if (this.codexDesktopApprovalMonitor || !this.hasManagedProjects()) return;
     this.codexDesktopApprovalMonitor = this.codexDesktopApprovalMonitorFactory({
-      onApproval: (approval) => this.handleDesktopApproval(approval)
+      onApproval: (approval) => this.handleDesktopApproval(approval),
+      onResult: (approval, result) => this.reportDesktopApprovalResult(approval, result)
     });
     this.codexDesktopApprovalMonitor.start();
+    this.refreshDesktopApprovalSubscriptions();
+  }
+
+  private refreshDesktopApprovalSubscriptions(): void {
+    const monitor = this.codexDesktopApprovalMonitor;
+    if (!monitor) return;
+    const threadIds = new Set(this.threadSubscriptions()
+      .filter((binding) => binding.enabled && binding.hostId === "local" && binding.threadId)
+      .map((binding) => binding.threadId));
+    for (const task of this.externalCodexTasks.values()) {
+      // Keep the legacy project-notification route for unbound Desktop tasks.
+      if (!this.hasLocalThreadBinding(task.sessionId)
+        && this.projectForExternalThread(task.sessionId, task.workspace)?.notifications?.some(target => target.enabled)) {
+        threadIds.add(task.sessionId);
+      }
+    }
+    monitor.setFollowedThreads(threadIds);
+  }
+
+  private hasLocalThreadBinding(threadId: string): boolean {
+    return listAccounts(this.options.paths).some(account => {
+      const store = this.storeFor(account.accountId);
+      return store.listSessions().some(session => session.threadId === threadId
+        && (session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local") === "local");
+    });
+  }
+
+  private rememberApprovalOrigin(accountId: string, session: ManagedSession, turnId: string): void {
+    const hostId = session.hostId ?? this.storeFor(accountId).getProject(session.projectId ?? "")?.hostId ?? "local";
+    if (!session.threadId) return;
+    this.approvalOrigins.set(JSON.stringify([hostId, session.threadId]), { accountId, sessionId: session.id, turnId });
+    if (this.approvalOrigins.size > 2_000) this.approvalOrigins.delete(this.approvalOrigins.keys().next().value!);
+  }
+
+  private async reportDesktopApprovalResult(approval: CodexDesktopApproval, result: ApprovalDeliveryResult): Promise<void> {
+    const route = this.approvalRoutes.get(approval);
+    if (!route) return;
+    this.approvalRoutes.delete(approval);
+    await route.service.reportApprovalResult(route.recipientId, approval.request, result);
   }
 
   private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
+    const bindings = this.threadSubscriptions().filter(binding => binding.enabled
+      && binding.hostId === "local" && binding.threadId === approval.request.threadId);
+    const origin = this.approvalOrigins.get(JSON.stringify(["local", approval.request.threadId]));
+    const originatingBinding = origin?.turnId === approval.request.turnId
+      ? bindings.find(binding => binding.key === JSON.stringify([origin.accountId, origin.sessionId])) : undefined;
+    const destinations = new Map(bindings.map(binding => {
+      const [accountId] = JSON.parse(binding.key) as [string, string];
+      return [JSON.stringify([accountId, binding.recipientId]), binding];
+    }));
+    const binding = originatingBinding ?? (destinations.size === 1 ? [...destinations.values()][0] : undefined);
+    if (binding) {
+      const [accountId] = JSON.parse(binding.key) as [string, string];
+      const service = this.entries.get(accountId)?.service;
+      if (!service) return undefined;
+      this.approvalRoutes.set(approval, { service, recipientId: binding.recipientId });
+      const decision = await service.requestApproval(binding.recipientId, approval.request);
+      if (!this.threadSubscriptions().some(candidate => candidate.key === binding.key && candidate.enabled
+        && candidate.threadId === binding.threadId && candidate.hostId === "local")) {
+        await this.reportDesktopApprovalResult(approval, "withdrawn");
+        return undefined;
+      }
+      return decision;
+    }
+    // Never route an inactive/ambiguous explicit binding by its working directory.
+    if (this.hasLocalThreadBinding(approval.request.threadId)) {
+      console.warn("[codex-im-gateway] approval has no unique active session binding; left for Desktop");
+      return undefined;
+    }
     const project = this.projectForExternalThread(approval.request.threadId, approval.request.cwd);
     if (!project) {
       console.warn(`[codex-im-gateway] no managed project found for Codex Desktop approval ${approval.requestId}`);
       return undefined;
     }
-    return this.requestProjectApproval(project, approval.request);
+    const target = this.projectApprovalTarget(project);
+    if (!target) return undefined;
+    this.approvalRoutes.set(approval, target);
+    return target.service.requestApproval(target.recipientId, approval.request);
   }
 
-  private requestProjectApprovalForSession(
+  private requestSessionApproval(
     accountId: string,
     session: ManagedSession,
     request: CodexApprovalRequest
   ): Promise<CodexApprovalDecision> {
-    const project = session.projectId
-      ? this.storeFor(accountId).listProjects().find((candidate) => candidate.id === session.projectId)
-      : undefined;
-    if (!project) return Promise.resolve("decline");
-    return this.requestProjectApproval(project, request).then((decision) => decision ?? "decline");
+    const entry = this.entries.get(accountId);
+    if (!entry?.service || (entry.status !== "running" && entry.status !== "starting")) return Promise.resolve("decline");
+    return entry.service.requestApproval(session.senderId, request);
   }
 
-  private async requestProjectApproval(
-    project: ManagedProject,
-    request: CodexApprovalRequest
-  ): Promise<CodexApprovalDecision | undefined> {
-    const target = (project.notifications ?? [])
+  private projectApprovalTarget(project: ManagedProject): { service: BridgeService; recipientId: string } | undefined {
+    const targets = (project.notifications ?? [])
       .filter((candidate) => candidate.enabled)
-      .find((candidate) => {
+      .filter((candidate) => {
         const entry = this.entries.get(candidate.accountId);
         return entry?.status === "running" && Boolean(entry.service);
       });
+    const unique = new Map(targets.map(target => [JSON.stringify([target.accountId, target.recipientId]), target]));
+    const target = unique.size === 1 ? [...unique.values()][0] : undefined;
     if (!target) {
       console.warn(`[codex-im-gateway] no running notification channel for approval in project ${project.name}`);
       return undefined;
     }
     const entry = this.entries.get(target.accountId);
-    return entry?.service?.requestApproval(target.recipientId, request);
+    return entry?.service ? { service: entry.service, recipientId: target.recipientId } : undefined;
   }
 
   private projectForExternalThread(threadId: string, workspace?: string): ManagedProject | undefined {
@@ -1277,7 +1369,7 @@ export class AccountManager {
       const projects = new Map(store.listProjects().map((project) => [project.id, project]));
       return store.listSessions().flatMap((session) => {
         const project = session.projectId ? projects.get(session.projectId) : undefined;
-        return project ? [{ session, project }] : [];
+        return project && (session.hostId ?? project.hostId ?? "local") === "local" ? [{ session, project }] : [];
       });
     });
     const exact = contexts.find(({ session }) => session.threadId === threadId)?.project;
@@ -1286,7 +1378,7 @@ export class AccountManager {
     const canonical = canonicalWorkspace(workspace);
     return contexts.find(({ project }) => canonicalWorkspace(project.workspace) === canonical)?.project
       ?? listAccounts(this.options.paths).flatMap((account) => this.storeFor(account.accountId).listProjects())
-        .find((project) => canonicalWorkspace(project.workspace) === canonical);
+        .find((project) => (project.hostId ?? "local") === "local" && canonicalWorkspace(project.workspace) === canonical);
   }
 
   private projectSummary(

@@ -8,6 +8,7 @@ import test from "node:test";
 import { buildPrompt } from "../src/bridge/format.js";
 import { AccountManager } from "../src/server/account-manager.js";
 import type { CodexDesktopApproval } from "../src/server/codex-desktop-approval-monitor.js";
+import type { ApprovalDeliveryResult } from "../src/bridge/approval.js";
 import type {
   CodexSessionActivity,
   CodexSessionCompletion,
@@ -48,6 +49,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   }> = [];
   const sentCards: Array<{ accountId: string; toUserId: string; card: { identifier: string; latestComment?: string; actions: readonly { label: string }[] } }> = [];
   const runs: Array<Record<string, unknown>> = [];
+  const bridges = new Map<string, Parameters<NonNullable<ConstructorParameters<typeof AccountManager>[0]["bridgeFactory"]>>[0]>();
   let runtimeInfo: { model?: string; effort?: string; provider?: string } = {
     model: "runtime-model",
     effort: "medium"
@@ -57,7 +59,10 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   let externalTaskHandler: ((task: CodexSessionTask) => void) | undefined;
   let externalActivityHandler: ((activity: CodexSessionActivity) => Promise<void>) | undefined;
   let desktopApprovalHandler: ((approval: CodexDesktopApproval) => Promise<"accept" | "decline" | undefined>) | undefined;
+  let approvalResultHandler: ((approval: CodexDesktopApproval, result: ApprovalDeliveryResult) => Promise<void> | void) | undefined;
   const followedDesktopThreads: string[] = [];
+  const currentlyFollowed = new Set<string>();
+  const approvalResults: Array<{ senderId: string; result: ApprovalDeliveryResult }> = [];
   const channelApprovals: Array<{ senderId: string; request: Record<string, unknown> }> = [];
   const history = [
     { id: "user-1", role: "user" as const, text: buildPrompt("历史问题") },
@@ -132,7 +137,10 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
         await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
       }
     }),
-    bridgeFactory: (input) => ({
+    bridgeFactory: (input) => {
+      const accountId = path.basename(input.inboundDir!);
+      bridges.set(accountId, input);
+      return ({
       async handleMessage(message: NormalizedWeixinMessage) {
         handledMessages.push(message);
       },
@@ -140,13 +148,17 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
         channelApprovals.push({ senderId, request });
         return "accept" as const;
       },
+      async reportApprovalResult(senderId: string, _request: unknown, result: ApprovalDeliveryResult) {
+        approvalResults.push({ senderId, result });
+      },
       allowSender(senderId: string) {
         input.stateStore.setPairedSenderIds([...input.stateStore.listPairedSenderIds(), senderId]);
       },
       removeSender(senderId: string) {
         input.stateStore.setPairedSenderIds(input.stateStore.listPairedSenderIds().filter((id) => id !== senderId));
       }
-    }) as never,
+      }) as never;
+    },
     monitor: async ({ client, signal, onMessage }) => {
       const accountId = (client as never as { accountId: string }).accountId;
       starts.push(accountId);
@@ -162,10 +174,17 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     },
     codexDesktopApprovalMonitorFactory: (handlers) => {
       desktopApprovalHandler = handlers.onApproval;
+      approvalResultHandler = handlers.onResult;
       return {
         start() {},
         stop() {},
-        followThread(threadId: string) { followedDesktopThreads.push(threadId); }
+        followThread(threadId: string) { followedDesktopThreads.push(threadId); },
+        setFollowedThreads(threadIds: Iterable<string>) {
+          const next = new Set(threadIds);
+          for (const id of next) if (!currentlyFollowed.has(id)) followedDesktopThreads.push(id);
+          currentlyFollowed.clear();
+          for (const id of next) currentlyFollowed.add(id);
+        }
       } as never;
     }
   });
@@ -202,6 +221,12 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       assert.ok(desktopApprovalHandler, "Codex Desktop approval monitor should be active");
       return desktopApprovalHandler(approval);
     },
+    async emitApprovalResult(approval: CodexDesktopApproval, result: ApprovalDeliveryResult) {
+      await approvalResultHandler?.(approval, result);
+    },
+    approvalResults,
+    currentlyFollowed,
+    bridges,
     followedDesktopThreads,
     channelApprovals,
     setRunHandler(handler: typeof runHandler) {
@@ -603,8 +628,6 @@ test("forwards an existing Codex Desktop approval to the project's configured ch
   const workspace = path.join(root, "desktop-approval-project");
   const project = manager.createProject("account-one", "桌面审批项目", workspace);
   const session = manager.createSession("account-one", "alice@im.wechat", undefined, "桌面会话", project.id);
-  new RuntimeStateStore(accountStatePaths(paths, "account-one"))
-    .setSessionThread(session.id, "desktop-approval-thread");
   manager.setProjectNotifications("account-one", project.id, [{
     accountId: "account-two",
     recipientId: "approval-room",
@@ -645,6 +668,133 @@ test("forwards an existing Codex Desktop approval to the project's configured ch
       cwd: workspace
     }
   }]);
+  await manager.stopAll();
+});
+
+function seedApprovalBinding(paths: ReturnType<typeof resolveStatePaths>, accountId: string, room: string,
+  options: { hostId?: string; follow?: boolean; project?: boolean } = {}) {
+  const store = new RuntimeStateStore(accountStatePaths(paths, accountId));
+  const workspace = path.join(paths.root, "approval-workspace");
+  const project = options.project ? store.createProject("审批项目", workspace) : undefined;
+  const session = store.createSession(room, workspace, "审批会话", project?.id, "session", undefined,
+    { standalone: !project, hostId: options.hostId });
+  store.setSessionThread(session.id, "bound-approval-thread");
+  if (options.follow === false) store.setSessionFollow(session.id, false);
+  if (project) store.setProjectNotifications(project.id, [{ accountId: "account-two", recipientId: "other-room", enabled: true }]);
+  return session;
+}
+
+function boundApproval(): CodexDesktopApproval {
+  return { requestId: 316, method: "item/commandExecution/requestApproval", request: {
+    kind: "command", threadId: "bound-approval-thread", turnId: "approval-turn", itemId: "approval-item", command: "echo test"
+  } };
+}
+
+test("subscribes standalone bound sessions on startup and reports receipts to their original IM", async (t) => {
+  const { manager, paths, followedDesktopThreads, channelApprovals, emitDesktopApproval, emitApprovalResult, approvalResults } = setup(t);
+  seedApprovalBinding(paths, "account-one", "bound-room");
+  await manager.startAll();
+  assert.deepEqual(followedDesktopThreads, ["bound-approval-thread"]);
+  const approval = boundApproval();
+  assert.equal(await emitDesktopApproval(approval), "accept");
+  assert.equal(channelApprovals[0]?.senderId, "bound-room");
+  await emitApprovalResult(approval, "confirmed");
+  await emitApprovalResult(approval, "failed");
+  assert.deepEqual(approvalResults, [{ senderId: "bound-room", result: "confirmed" }]);
+  await manager.stopAll();
+});
+
+test("explicit session bindings take precedence over unrelated project notification channels", async (t) => {
+  const { manager, paths, channelApprovals, emitDesktopApproval } = setup(t);
+  seedApprovalBinding(paths, "account-one", "bound-room", { project: true });
+  await manager.startAll();
+  assert.equal(await emitDesktopApproval(boundApproval()), "accept");
+  assert.equal(channelApprovals[0]?.senderId, "bound-room");
+  await manager.stopAll();
+});
+
+test("does not confuse a remote binding with an identically named local thread", async (t) => {
+  const { manager, paths, channelApprovals, emitDesktopApproval, followedDesktopThreads } = setup(t);
+  seedApprovalBinding(paths, "account-one", "local-room");
+  seedApprovalBinding(paths, "account-two", "remote-room", { hostId: "remote-host" });
+  await manager.startAll();
+  assert.deepEqual(followedDesktopThreads, ["bound-approval-thread"]);
+  assert.equal(await emitDesktopApproval(boundApproval()), "accept");
+  assert.equal(channelApprovals[0]?.senderId, "local-room");
+  await manager.stopAll();
+});
+
+for (const binding of ["remote", "not-following", "ambiguous"] as const) {
+  test(`leaves ${binding} Desktop approvals for Desktop rather than guessing a destination`, async (t) => {
+    const { manager, paths, channelApprovals, emitDesktopApproval, currentlyFollowed } = setup(t);
+    seedApprovalBinding(paths, "account-one", "one-room", {
+      hostId: binding === "remote" ? "remote-host" : undefined,
+      follow: binding !== "not-following", project: binding === "not-following"
+    });
+    if (binding === "ambiguous") seedApprovalBinding(paths, "account-two", "two-room");
+    await manager.startAll();
+    const approval = boundApproval();
+    approval.request.cwd = path.join(paths.root, "approval-workspace");
+    assert.equal(await emitDesktopApproval(approval), undefined);
+    assert.deepEqual(channelApprovals, []);
+    if (binding !== "ambiguous") assert.equal(currentlyFollowed.size, 0);
+    await manager.stopAll();
+  });
+}
+
+test("pins a managed turn's approval to its originating binding when several groups follow", async (t) => {
+  const { manager, paths, channelApprovals, emitDesktopApproval, setRunHandler } = setup(t);
+  const session = seedApprovalBinding(paths, "account-one", "origin-room");
+  seedApprovalBinding(paths, "account-two", "other-room");
+  await manager.startAll();
+  setRunHandler(async input => {
+    await (input.onTurnStarted as (value: { threadId: string; turnId: string }) => Promise<void> | void)(
+      { threadId: "bound-approval-thread", turnId: "approval-turn" });
+    assert.equal(await emitDesktopApproval(boundApproval()), "accept");
+    return { raw: "", text: "done", threadId: "bound-approval-thread", turnId: "approval-turn" };
+  });
+  await manager.continueSession("account-one", session.id, "continue");
+  assert.equal(channelApprovals[0]?.senderId, "origin-room");
+  await manager.stopAll();
+});
+
+test("web-initiated app-server approvals also use standalone session bindings", async (t) => {
+  const { manager, paths, channelApprovals, setRunHandler } = setup(t);
+  const session = seedApprovalBinding(paths, "account-one", "standalone-room");
+  await manager.startAll();
+  setRunHandler(async input => {
+    const onApproval = input.onApproval as (request: CodexDesktopApproval["request"]) => Promise<string>;
+    assert.equal(await onApproval(boundApproval().request), "accept");
+    return { raw: "", text: "done", threadId: "bound-approval-thread" };
+  });
+  await manager.continueSession("account-one", session.id, "continue");
+  assert.equal(channelApprovals[0]?.senderId, "standalone-room");
+  await manager.stopAll();
+});
+
+test("refreshes Desktop approval subscriptions when sessions are deleted or a channel stops", async (t) => {
+  const { manager, paths, currentlyFollowed } = setup(t);
+  const session = seedApprovalBinding(paths, "account-one", "one-room");
+  seedApprovalBinding(paths, "account-two", "two-room");
+  await manager.startAll();
+  manager.deleteSession("account-one", session.id);
+  assert.equal(currentlyFollowed.has("bound-approval-thread"), true);
+  await manager.stopAccount("account-two", false);
+  assert.equal(currentlyFollowed.size, 0);
+  await manager.stopAll();
+});
+
+test("starts approval monitoring when the first standalone IM turn creates its thread", async t => {
+  const { manager, bridges, channelApprovals, emitDesktopApproval, currentlyFollowed } = setup(t);
+  await manager.startAll();
+  const bridge = bridges.get("account-one")!;
+  const session = bridge.stateStore.createSession("fresh-room", "/tmp/approval-test", "fresh", undefined,
+    "session", undefined, { standalone: true });
+  bridge.stateStore.setSessionThread(session.id, "bound-approval-thread");
+  await bridge.onTurnStarted?.({ ...session, threadId: "bound-approval-thread" }, "approval-turn");
+  assert.equal(currentlyFollowed.has("bound-approval-thread"), true);
+  assert.equal(await emitDesktopApproval(boundApproval()), "accept");
+  assert.equal(channelApprovals[0]?.senderId, "fresh-room");
   await manager.stopAll();
 });
 
