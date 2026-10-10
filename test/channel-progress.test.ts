@@ -29,6 +29,20 @@ function transport() {
   return { client, starts, frames, texts, setOffline(value: boolean) { offline = value; } };
 }
 
+test("shutdown suspension cannot finalize the persisted card as a failed task", async t => {
+  const io = transport();
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  t.after(() => stream.suspend());
+  await stream.progress("任务仍在 Codex 中执行");
+  await stream.suspend();
+  const writes = io.frames.length;
+  assert.equal(await stream.fail("Gateway connection closed"), false);
+  assert.equal(await stream.reportTerminalFailure(), false);
+  assert.equal(stream.checkpoint().terminal, undefined);
+  assert.equal(stream.checkpoint().finished, false);
+  assert.equal(io.frames.length, writes);
+});
+
 test("recovers the original card with the newest state without sending text progress", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
   const io = transport();

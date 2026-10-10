@@ -171,6 +171,9 @@ export class ChannelTurnTextStream {
   async finalize(text: string, error = false): Promise<boolean> {
     const content = text.trim();
     if (this.finished) return true;
+    // A shutdown-detached writer must not poison the checkpoint that its
+    // replacement follower will resume while the Codex task is still running.
+    if (this.suspended) return false;
     if (!content) return false;
     // Set the terminal guard before awaiting any in-flight operation. A failed
     // final frame retains its handle and terminal payload for later recovery.
@@ -213,7 +216,7 @@ export class ChannelTurnTextStream {
 
   /** Report failed terminal delivery once; never resend the answer as a new card. */
   async reportTerminalFailure(): Promise<boolean> {
-    if (!this.supported || !this.terminal || this.finished) return false;
+    if (!this.supported || !this.terminal || this.finished || this.suspended) return false;
     if (this.terminalNoticeSent) return true;
     if (this.notifying) return this.notifying;
     this.notifying = (async () => {
