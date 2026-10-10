@@ -4,6 +4,7 @@ import { ChannelTurnTextStream } from "../src/channels/progress.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import { ChannelCapabilityError, ChannelProgressError, channelProgressError } from "../src/channels/errors.js";
 import { TextProgressBatcher } from "../src/channels/text-progress.js";
+import { summarizeProgress } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -28,7 +29,7 @@ function transport() {
   return { client, starts, frames, texts, setOffline(value: boolean) { offline = value; } };
 }
 
-test("recovers the original card with the newest state and drops queued fallback progress", async (t) => {
+test("recovers the original card with the newest state without sending text progress", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
   const io = transport();
   const stream = new ChannelTurnTextStream(io.client, "chat");
@@ -74,7 +75,7 @@ test("retries opening after DNS failure with a stable per-turn stream identity",
   assert.equal(await stream.finalize("结果"), true);
 });
 
-test("outage backoff is bounded and thinking titles cannot flood plain-text progress", async (t) => {
+test("outage backoff is bounded and no thinking, tool or commentary events become plain-text progress", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
   const io = transport();
   const stream = new ChannelTurnTextStream(io.client, "chat");
@@ -91,12 +92,11 @@ test("outage backoff is bounded and thinking titles cannot flood plain-text prog
   }
   assert.equal(io.starts.length, 1);
   assert.equal(io.frames.length, 4); // Initial failure, then 5s, 10s and 20s backoffs.
-  assert.ok(io.texts.length <= 3);
-  assert.ok(io.texts.every((text) => !text.includes("Internal heading")));
-  assert.ok(io.texts.some((text) => text.includes("公开进度")));
+  assert.equal(io.texts.length, 0);
+  assert.ok(stream.checkpoint().progressEntries.some((text) => text.includes("公开进度")));
 });
 
-test("permission failures stop automatic card retries while fallback progress stays bounded", async (t) => {
+test("permission failures stop card retries without sending any text progress", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
   let attempts = 0;
   const texts: string[] = [];
@@ -112,9 +112,8 @@ test("permission failures stop automatic card retries while fallback progress st
   t.mock.timers.tick(120_000);
   await settle();
   assert.equal(attempts, 1);
-  assert.ok(texts.length <= 2);
-  assert.match(texts[0], /权限或配置/);
-  assert.equal(await stream.finalize("最终回复由普通消息发送"), false);
+  assert.equal(texts.length, 0);
+  assert.equal(await stream.finalize("不应作为普通消息发送的最终回复"), false);
   await stream.suspend();
 });
 
@@ -210,7 +209,7 @@ test("slow card updates serialize and coalesce intervening progress into the lat
   assert.ok(!frames[1].includes("较早的进度"));
 });
 
-test("concurrent text-only progress calls enforce the same 30-second window", async (t) => {
+test("concurrent text-only progress calls preserve the native 30-second window", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_800_000_000_000 });
   const writes: string[] = [];
   const batch = new TextProgressBatcher(async (text) => { writes.push(text); });
@@ -225,6 +224,194 @@ test("concurrent text-only progress calls enforce the same 30-second window", as
   assert.equal(writes.length, 2);
   assert.match(writes[1], /最新状态/);
   await batch.close();
+});
+
+test("route-dependent rejection recovers only the original card without text degradation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const io = transport();
+  const originalUpdate = io.client.updateTextStream;
+  let rejected = true;
+  io.client.updateTextStream = async (input) => {
+    if (rejected) throw new ChannelProgressError(false, input.messageId, 30_000, undefined, true);
+    return originalUpdate(input);
+  };
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  t.after(() => stream.suspend());
+  await stream.progress("开始任务");
+  await stream.progress("旧状态");
+  await stream.flush();
+  for (let i = 0; i < 30; i++) await stream.progress(`最新状态 ${i}`);
+  assert.equal(io.texts.length, 0);
+  rejected = false;
+  t.mock.timers.tick(30_000);
+  await settle();
+  assert.equal(io.starts.length, 1);
+  assert.equal(io.frames.length, 1);
+  assert.equal(io.frames[0].messageId, "original-card");
+  assert.match(io.frames[0].text, /最新状态 29/);
+  t.mock.timers.tick(30_000);
+  await settle();
+  assert.equal(io.texts.length, 0);
+  assert.equal(await stream.finalize("最终答案"), true);
+});
+
+test("route rejection probes are bounded at 30, 60 and 120 seconds, without opening replacements", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const io = transport();
+  let attempts = 0;
+  io.client.updateTextStream = async (input) => {
+    attempts++;
+    throw new ChannelProgressError(false, input.messageId, 30_000, undefined, true);
+  };
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  t.after(() => stream.suspend());
+  await stream.progress("开始任务");
+  await stream.progress("开始检查");
+  await stream.flush();
+  for (const delay of [30_000, 60_000, 120_000]) {
+    t.mock.timers.tick(delay - 1);
+    await settle();
+    const count = attempts;
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(attempts, count + 1);
+  }
+  assert.equal(attempts, 4);
+  t.mock.timers.tick(600_000);
+  await settle();
+  assert.equal(attempts, 4);
+  assert.equal(io.starts.length, 1);
+  assert.equal(io.texts.length, 0, "exhausting probes must not switch presentation");
+});
+
+test("a probe hint without an acknowledged card cannot retry creation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const io = transport();
+  let attempts = 0;
+  io.client.startTextStream = async () => {
+    attempts++;
+    throw new ChannelProgressError(false, undefined, 30_000, undefined, true);
+  };
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  t.after(() => stream.suspend());
+  await stream.progress("开始任务");
+  t.mock.timers.tick(600_000);
+  await settle();
+  assert.equal(attempts, 1);
+});
+
+test("completion cancels allowlist probes before closing the original card", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const io = transport();
+  const originalUpdate = io.client.updateTextStream;
+  let rejected = true;
+  let attempts = 0;
+  io.client.updateTextStream = async (input) => {
+    attempts++;
+    if (rejected) throw new ChannelProgressError(false, input.messageId, 30_000, undefined, true);
+    return originalUpdate(input);
+  };
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  await stream.progress("开始任务");
+  await stream.progress("正在检查");
+  await stream.flush();
+  await stream.progress("即将完成");
+  rejected = false;
+  assert.equal(await stream.finalize("已完成"), true);
+  const count = attempts;
+  await stream.progress("迟到命令状态");
+  t.mock.timers.tick(600_000);
+  await settle();
+  assert.equal(attempts, count);
+  assert.equal(io.texts.length, 0);
+  assert.equal(io.starts.length, 1);
+  await stream.suspend();
+});
+
+test("command summaries remove heredoc scripts and arguments from cards and native text progress", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const source = "🔎 正在执行命令：`/bin/zsh -lc \"ssh admin@example python3 - <<'PY'\nprint('SECRET_ARGUMENT')\nPY\"`";
+  const done = "✅ 命令完成：`python3 - <<'PY'\nprint('SECRET_ARGUMENT')\nPY`，退出码 0，1.0s";
+  assert.equal(summarizeProgress(source), "🔎 正在执行远程命令");
+  assert.equal(summarizeProgress(done), "✅ Python 脚本完成，退出码 0，耗时 1.0s");
+  assert.equal(summarizeProgress("已定位调度缺陷，需要补充回归测试。"), "已定位调度缺陷，需要补充回归测试。");
+  const io = transport();
+  io.setOffline(true);
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  t.after(() => stream.suspend());
+  await stream.progress(source);
+  for (let i = 0; i < 20; i++) await stream.progress(source.replace("SECRET_ARGUMENT", `PRIVATE_${i}`));
+  await stream.progress(done);
+  assert.equal(io.texts.length, 0);
+  t.mock.timers.tick(60_000);
+  await settle();
+  assert.equal(io.texts.length, 0);
+  assert.ok(stream.checkpoint().progressEntries.every((entry) => !entry.includes("SECRET_ARGUMENT")));
+  const texts: string[] = [];
+  const textOnly = new ChannelTurnTextStream(createChannelClient("generic", TEXT_CAPABILITIES, {
+    async sendText(input) { texts.push(input.text); return { messageId: "text" }; }
+  }), "chat");
+  t.after(() => textOnly.suspend());
+  await textOnly.progress(source);
+  await textOnly.progress(done);
+  t.mock.timers.tick(30_000);
+  await settle();
+  assert.equal(texts.length, 2);
+  assert.ok(texts.every((text) => text.length < 650 && !text.includes("SECRET_ARGUMENT") && !text.includes("/bin/zsh")));
+});
+
+test("closing waits for in-flight fallback and discards queued progress", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_800_000_000_000 });
+  const sending = Promise.withResolvers<void>();
+  const writes: string[] = [];
+  const batch = new TextProgressBatcher(async (text) => { writes.push(text); await sending.promise; });
+  const progress = batch.push("正在检查");
+  await settle();
+  await batch.push("不得迟到的进度");
+  let closed = false;
+  const closing = batch.close().then(() => { closed = true; });
+  await settle();
+  assert.equal(closed, false);
+  sending.resolve();
+  await Promise.all([progress, closing]);
+  t.mock.timers.tick(120_000);
+  await settle();
+  assert.equal(writes.length, 1);
+  assert.ok(!writes[0].includes("不得迟到"));
+});
+
+test("terminal card delivery failures produce one error notice, never a replacement answer, even after restart", async () => {
+  const io = transport();
+  const stream = new ChannelTurnTextStream(io.client, "chat");
+  await stream.progress("开始任务");
+  io.setOffline(true);
+  assert.equal(await stream.finalize("PRIVATE_FINAL_ANSWER"), false);
+  await Promise.all([stream.reportTerminalFailure(), stream.reportTerminalFailure()]);
+  assert.equal(io.texts.length, 1);
+  assert.match(io.texts[0], /最终答复未能更新原 AI Card/);
+  assert.ok(!io.texts[0].includes("PRIVATE_FINAL_ANSWER"));
+  const checkpoint = stream.checkpoint();
+  assert.equal(checkpoint.terminalNoticeSent, true);
+  await stream.suspend();
+  const restored = new ChannelTurnTextStream(io.client, "chat", { restore: checkpoint, save() {} });
+  assert.equal(await restored.reportTerminalFailure(), true);
+  assert.equal(io.texts.length, 1);
+  io.setOffline(false);
+  assert.equal(await restored.finalize("PRIVATE_FINAL_ANSWER"), true);
+  assert.equal(io.starts.length, 1);
+  await restored.suspend();
+});
+
+test("restored cards do not degrade to text when their template is no longer configured", async () => {
+  const texts: string[] = [];
+  const stream = new ChannelTurnTextStream(createChannelClient("generic", { ...TEXT_CAPABILITIES, progress: "not-configured" }, {
+    async sendText(input) { texts.push(input.text); return { messageId: "text" }; }
+  }), "chat", { restore: { messageId: "existing", startedAt: Date.now(), progressEntries: [], thought: "旧状态", answerPreview: "", finished: false }, save() {} });
+  assert.equal(stream.supported, true);
+  await stream.progress("新进展");
+  await stream.flush();
+  assert.equal(texts.length, 0);
+  await stream.suspend();
 });
 
 test("the contract never substitutes one-shot card sending for explicit progress text", async () => {

@@ -19,7 +19,7 @@ import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMon
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
-import { ChannelCapabilityError, ChannelPartialDeliveryError, channelProgressError } from "./errors.js";
+import { ChannelCapabilityError, ChannelPartialDeliveryError, ChannelProgressError, channelProgressError } from "./errors.js";
 import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
 import { DiagnosticDingTalkStreamClient } from "./dingtalk-stream-diagnostics.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
@@ -276,14 +276,16 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     error?: boolean;
   }): Promise<void> {
     if (!this.account.cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
-    await this.cardClient.update({
-      accessToken: await this.accessToken(),
-      contentKey: this.account.cardContentKey?.trim() || "content",
-      outTrackId: input.messageId,
-      text: input.text,
-      finalize: input.finalize ?? false,
-      error: input.error ?? false
-    });
+    try {
+      await this.cardClient.update({
+        accessToken: await this.accessToken(),
+        contentKey: this.account.cardContentKey?.trim() || "content",
+        outTrackId: input.messageId,
+        text: input.text,
+        finalize: input.finalize ?? false,
+        error: input.error ?? false
+      });
+    } catch (error) { throw dingTalkProgressError(error, input.messageId); }
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {
@@ -505,7 +507,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       await this.cardClient.update({ accessToken, contentKey, outTrackId, text, finalize, error: false });
     } catch (error) {
       // Creation/delivery succeeded: retry this card, never create its replacement.
-      if (!finalize) throw channelProgressError(error, outTrackId);
+      if (!finalize) throw dingTalkProgressError(error, outTrackId);
       throw error;
     }
     return { messageId: outTrackId };
@@ -523,6 +525,15 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       robotCode: this.account.clientId
     };
   }
+}
+
+function dingTalkProgressError(error: unknown, messageId: string): ChannelProgressError {
+  // IP routing/allowlist state can recover during a turn. Only an acknowledged
+  // card may be probed; actual permission/template failures remain permanent.
+  if (/\bIpNotInWhiteList\b/i.test(errorDetail(error))) {
+    return new ChannelProgressError(false, messageId, 30_000, error, true);
+  }
+  return channelProgressError(error, messageId);
 }
 
 type DingTalkCardSdkClient = Pick<
@@ -720,12 +731,18 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
         return;
       } catch (error) {
         lastError = error;
-        if (attempt + 1 < this.retryDelaysMs.length) {
-          console.warn(
-            `[codex-im-gateway] DingTalk AI Card HTTPS ${operation} attempt ${attempt + 1} failed; retrying: `
-            + errorDetail(error)
-          );
-        }
+        const detail = errorDetail(error);
+        const outTrackId = (body as { outTrackId?: unknown })?.outTrackId;
+        console.warn(`[codex-im-gateway] DingTalk AI Card ${JSON.stringify({
+          timestamp: new Date().toISOString(), event: "update_failed", operation,
+          ...(typeof outTrackId === "string" ? { outTrackId } : {}), attempt: attempt + 1,
+          httpStatus: Number(detail.match(/HTTP\s+(\d{3})/i)?.[1]) || undefined,
+          code: detail.match(/\bcode=([A-Za-z0-9_.-]{1,100})(?=[,）\s]|$)/)?.[1],
+          requestId: detail.match(/\brequestId=([A-Za-z0-9_-]{1,100})(?=[,）\s]|$)/)?.[1]
+        })}`);
+        // Permanent rejections are handled once by the common lifecycle. A
+        // bounded recovery probe must not amplify into three immediate 403s.
+        if (!channelProgressError(error).retryable) throw error;
       }
     }
     throw lastError instanceof Error ? lastError : new Error(errorDetail(lastError));

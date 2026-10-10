@@ -2,6 +2,9 @@ import crypto from "node:crypto";
 import type { ChannelTextClient } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
+import { summarizeProgress } from "./progress-summary.js";
+
+const MAX_RECOVERY_PROBES = 3;
 
 export type ChannelStreamCheckpoint = {
   streamId?: string;
@@ -13,20 +16,25 @@ export type ChannelStreamCheckpoint = {
   finished: boolean;
   /** Terminal delivery may be retried, but progress must never resume. */
   terminal?: { text: string; error: boolean };
+  /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
+  terminalNoticeSent?: boolean;
 };
 
 export class ChannelTurnTextStream {
-  private readonly fallback: TextProgressBatcher;
+  private readonly textProgress?: TextProgressBatcher;
   readonly supported: boolean;
   private messageId?: string;
   private readonly streamId: string;
   private phase: "active" | "backoff" | "unavailable" = "active";
   private failures = 0;
+  private recoveryProbes = 0;
   private retryAt = 0;
   private suspended = false;
   private terminal?: { text: string; error: boolean };
   private finalizing?: Promise<boolean>;
   private terminalBlocked = false;
+  private terminalNoticeSent = false;
+  private notifying?: Promise<boolean>;
   private latestText = "";
   private startedAt = Date.now();
   private finished = false;
@@ -51,25 +59,21 @@ export class ChannelTurnTextStream {
       onTextDelivered?: (part: { messageId: string; text: string }) => void;
     }
   ) {
-    this.fallback = new TextProgressBatcher(async (text) => {
-      // Bare injected clients retain compatibility; production clients always
-      // provide the explicit operation, with no implicit AI-card conversion.
-      const send = client.sendProgressText ?? (!client.capabilities ? client.sendText : undefined);
-      if (!send) throw new Error("Channel progress-text operation unavailable");
-      const sent = await send.call(client, { toUserId, text, ...(persistence?.contextToken ? { contextToken: persistence.contextToken } : {}) });
-      persistence?.onTextDelivered?.({ messageId: sent.messageId, text });
-    });
-    this.supported = client.capabilities ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream);
     const saved = persistence?.restore;
+    this.supported = Boolean(saved?.messageId) || (client.capabilities
+      ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream));
+    // Choose presentation once per turn. Card failures never switch to text.
+    if (!this.supported) this.textProgress = new TextProgressBatcher((text) => this.sendPlainText(text));
     this.streamId = saved?.streamId ?? saved?.messageId ?? `codex_bridge_${crypto.randomUUID().replaceAll("-", "")}`;
     if (saved) {
       this.messageId = saved.messageId;
       this.startedAt = saved.startedAt;
-      this.progressEntries.push(...saved.progressEntries);
+      this.progressEntries.push(...saved.progressEntries.map((entry) => summarizeProgress(entry)));
       this.thought = saved.thought;
       this.answerPreview = saved.answerPreview;
       this.finished = saved.finished;
       this.terminal = saved.terminal;
+      this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
     }
   }
 
@@ -77,11 +81,12 @@ export class ChannelTurnTextStream {
     return { streamId: this.streamId, messageId: this.messageId, startedAt: this.startedAt,
       progressEntries: [...this.progressEntries], thought: this.thought,
       answerPreview: this.answerPreview, finished: this.finished,
-      ...(this.terminal ? { terminal: this.terminal } : {}) };
+      ...(this.terminal ? { terminal: this.terminal } : {}),
+      ...(this.terminalNoticeSent ? { terminalNoticeSent: true } : {}) };
   }
 
   /** Stop local timers without marking a remote card completed during shutdown. */
-  async suspend(): Promise<void> { this.suspended = true; this.stopTimers(); await this.fallback.close(); await this.opening; await this.chain.catch(() => undefined); }
+  async suspend(): Promise<void> { this.suspended = true; this.stopTimers(); await this.textProgress?.close(); await this.opening; await this.chain.catch(() => undefined); await this.notifying; }
 
   async flush(): Promise<void> {
     if (this.updateTimer) {
@@ -94,7 +99,7 @@ export class ChannelTurnTextStream {
 
   async progress(text: string): Promise<boolean> {
     if (this.finished || this.terminal || this.suspended) return true;
-    const content = text.trim();
+    const content = summarizeProgress(text);
     if (!content) return false;
     if (content.startsWith("🤔")) {
       this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
@@ -107,10 +112,9 @@ export class ChannelTurnTextStream {
       this.thought = thinkingStatusForProgress(content);
     }
     this.persistence?.save(this.checkpoint());
-    if (await this.publish(this.render())) return true;
-    // Reasoning titles are state, not separate chat messages. Text channels
-    // still receive public commentary and bounded tool progress.
-    try { return await this.fallback.push(content.startsWith("🤔") ? "任务正在执行，等待新的进展。" : content); }
+    if (this.supported) { await this.publish(this.render()); return true; }
+    // Native text-only channels retain their normal progress presentation.
+    try { return await this.textProgress!.push(content.startsWith("🤔") ? "任务正在执行，等待新的进展。" : content); }
     catch { console.warn("[codex-im-gateway] text progress delivery failed"); return true; }
   }
 
@@ -149,7 +153,7 @@ export class ChannelTurnTextStream {
   }
 
   private async finalizeNow(): Promise<boolean> {
-    await this.fallback.close();
+    await this.textProgress?.close();
     await this.opening;
     await this.chain.catch(() => undefined);
     if (!this.supported || !this.messageId || this.terminalBlocked) return false;
@@ -175,6 +179,32 @@ export class ChannelTurnTextStream {
 
   async fail(text: string): Promise<boolean> {
     return this.finalize(text, true);
+  }
+
+  /** Report failed terminal delivery once; never resend the answer as a new card. */
+  async reportTerminalFailure(): Promise<boolean> {
+    if (!this.supported || !this.terminal || this.finished) return false;
+    if (this.terminalNoticeSent) return true;
+    if (this.notifying) return this.notifying;
+    this.notifying = (async () => {
+      await this.sendPlainText(this.terminal!.error
+        ? "任务执行失败，原 AI Card 也未能更新。请到原 Codex 会话查看详细错误。"
+        : "最终答复未能更新原 AI Card。请到原 Codex 会话查看结果。");
+      this.terminalNoticeSent = true;
+      this.persistence?.save(this.checkpoint());
+      return true;
+    })();
+    try { return await this.notifying; } finally { this.notifying = undefined; }
+  }
+
+  private async sendPlainText(text: string): Promise<void> {
+    // Explicit plain delivery also carries a single terminal delivery-error
+    // notice. It must never use sendText's implicit one-shot card conversion.
+    const send = this.client.sendProgressText ?? (!this.client.capabilities ? this.client.sendText : undefined);
+    if (!send) throw new Error("Channel plain-text operation unavailable");
+    const sent = await send.call(this.client, { toUserId: this.toUserId, text,
+      ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+    this.persistence?.onTextDelivered?.({ messageId: sent.messageId, text });
   }
 
   private async updateNow(): Promise<void> {
@@ -267,29 +297,35 @@ export class ChannelTurnTextStream {
   }
 
   private recovered(): void {
+    const wasUnavailable = this.phase !== "active";
     this.phase = "active";
     this.failures = 0;
+    this.recoveryProbes = 0;
     this.retryAt = 0;
     this.lastUpdateAt = Date.now();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
-    this.fallback.clearPending();
     this.persistence?.save(this.checkpoint());
     this.startHeartbeat();
+    if (wasUnavailable) this.reportRecovery("recovered");
   }
 
   private unavailable(error: unknown): void {
     if (this.finished || this.terminal || this.suspended) return;
     const failure = channelProgressError(error);
-    this.phase = failure.retryable ? "backoff" : "unavailable";
+    const probe = !failure.retryable && failure.recoveryProbe && Boolean(this.messageId)
+      && this.recoveryProbes < MAX_RECOVERY_PROBES;
+    this.phase = failure.retryable || probe ? "backoff" : "unavailable";
     if (this.updateTimer) clearTimeout(this.updateTimer);
     this.updateTimer = undefined;
-    void this.fallback.push(failure.retryable
-      ? "进度卡暂时无法更新，任务仍在执行，正在重试连接。"
-      : "进度卡不可用，请检查渠道权限或配置；任务仍在执行，后续进展将合并发送。", true)
-      .catch(() => console.warn("[codex-im-gateway] progress fallback unavailable"));
-    if (!failure.retryable) { this.stopTimers(); return; }
-    const delay = Math.max(failure.retryAfterMs ?? 0, Math.min(60_000, 5_000 * 2 ** Math.min(this.failures++, 4)));
+    if (!failure.retryable && !probe) {
+      this.stopTimers();
+      this.reportRecovery("unavailable");
+      return;
+    }
+    const delay = Math.max(failure.retryAfterMs ?? 0, probe
+      ? Math.min(120_000, 30_000 * 2 ** this.recoveryProbes++)
+      : Math.min(60_000, 5_000 * 2 ** Math.min(this.failures++, 4)));
     this.retryAt = Date.now() + delay;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => {
@@ -300,7 +336,16 @@ export class ChannelTurnTextStream {
       else void this.openNow();
     }, delay);
     this.retryTimer.unref?.();
-    console.warn(`[codex-im-gateway] channel progress retry scheduled in ${delay}ms`);
+    this.reportRecovery(probe ? "recovery_probe_scheduled" : "retry_scheduled", delay);
+  }
+
+  private reportRecovery(event: string, delayMs?: number): void {
+    // Do not log commentary, shell arguments, tokens or raw provider errors.
+    console.warn(`[codex-im-gateway] channel progress ${JSON.stringify({
+      timestamp: new Date().toISOString(), event, streamId: this.streamId,
+      messageId: this.messageId, phase: this.phase, recoveryProbes: this.recoveryProbes,
+      ...(delayMs !== undefined ? { delayMs } : {})
+    })}`);
   }
 }
 

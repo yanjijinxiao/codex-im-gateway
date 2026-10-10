@@ -21,7 +21,9 @@ export class ChannelContextExpiredError extends Error {
 /** Transport-neutral recovery policy, optionally retaining an acknowledged card. */
 export class ChannelProgressError extends Error {
   readonly name = "ChannelProgressError";
-  constructor(readonly retryable: boolean, readonly messageId?: string, readonly retryAfterMs?: number, cause?: unknown) {
+  constructor(readonly retryable: boolean, readonly messageId?: string, readonly retryAfterMs?: number, cause?: unknown,
+    /** Adapter opt-in: a route-dependent rejection may be probed on an existing card only. */
+    readonly recoveryProbe = false) {
     super(retryable ? "Channel progress temporarily unavailable" : "Channel progress unavailable", { cause });
   }
 }
@@ -29,7 +31,7 @@ export class ChannelProgressError extends Error {
 export function channelProgressError(error: unknown, messageId?: string): ChannelProgressError {
   if (error instanceof ChannelProgressError) {
     return messageId && !error.messageId
-      ? new ChannelProgressError(error.retryable, messageId, error.retryAfterMs, error)
+      ? new ChannelProgressError(error.retryable, messageId, error.retryAfterMs, error, error.recoveryProbe)
       : error;
   }
   if (error instanceof ChannelCapabilityError || error instanceof ChannelContextExpiredError || error instanceof ChannelDeliveryError) {

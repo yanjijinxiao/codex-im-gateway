@@ -314,7 +314,8 @@ export class ThreadEventHub {
     const stream = this.stream(sub);
     if (!await stream.finalize(clean)) {
       if (!state.terminalPending.fallbackSent) {
-        await this.sendText(sub, clean);
+        if (stream.supported) await stream.reportTerminalFailure();
+        else await this.sendText(sub, clean);
         state.terminalPending.fallbackSent = true;
         this.save();
       }

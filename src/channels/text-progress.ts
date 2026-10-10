@@ -1,4 +1,6 @@
-/** Bounded, per-turn text fallback shared by managed execution and session following. */
+import { summarizeProgress } from "./progress-summary.js";
+
+/** Native progress for text-only channels; never a fallback from an AI Card. */
 export class TextProgressBatcher {
   private pending: string[] = [];
   private readonly seen = new Set<string>();
@@ -8,16 +10,15 @@ export class TextProgressBatcher {
   private chain: Promise<void> = Promise.resolve();
   constructor(private readonly send: (text: string) => Promise<void>, private readonly intervalMs = 30_000) {}
 
-  async push(text: string, deferFirst = false): Promise<boolean> {
-    if (this.closed || this.seen.has(text)) return true;
-    const clean = text.trim().slice(0, 450);
-    if (!clean) return true;
-    this.seen.add(text);
+  async push(text: string): Promise<boolean> {
+    if (this.closed) return true;
+    const clean = summarizeProgress(text, 180);
+    if (!clean || this.seen.has(clean)) return true;
+    this.seen.add(clean);
     if (this.seen.size > 200) this.seen.delete(this.seen.values().next().value!);
     this.pending.push(clean);
     this.pending = this.pending.slice(-3);
-    const delay = deferFirst && this.lastSentAt === -Infinity
-      ? this.intervalMs : this.intervalMs - (Date.now() - this.lastSentAt);
+    const delay = this.intervalMs - (Date.now() - this.lastSentAt);
     if (delay <= 0) { await this.flush(); return true; }
     this.schedule(delay);
     return true;
@@ -47,8 +48,7 @@ export class TextProgressBatcher {
     this.timer.unref();
   }
 
-  /** A recovered card supersedes text accumulated while it was unavailable. */
-  clearPending(): void {
+  private clearPending(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.pending = [];

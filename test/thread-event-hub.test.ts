@@ -305,16 +305,18 @@ test("isolates identical thread ids by host and closes a card when follow is dis
   await hub.stop();
 });
 
-test("retries a failed terminal card update after restart without repeating its fallback answer", async (t) => {
+test("retries the original terminal card after restart without resending its answer or error notice", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-terminal-retry-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  let fail = true, starts = 0, texts = 0, finalized = 0;
+  let fail = true, starts = 0, finalized = 0;
+  const notices: string[] = [];
   const sub: ThreadSubscription = {
     key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
     client: {
       resumableTextStream: true,
       async startTextStream() { starts++; return { messageId: "original" }; },
-      async sendText() { texts++; return { messageId: "fallback" }; },
+      async sendText() { throw new Error("must not resend an answer as a one-shot card"); },
+      async sendProgressText(input) { notices.push(input.text); return { messageId: "notice" }; },
       async updateTextStream(input) {
         if (input.finalize && fail) throw new Error("temporary failure");
         if (input.finalize) { assert.equal(input.messageId, "original"); finalized++; }
@@ -332,7 +334,9 @@ test("retries a failed terminal card update after restart without repeating its 
   const first = new ThreadEventHub(options);
   await first.activity("local", "thread", "turn", "正在运行");
   await first.completion("local", "thread", "turn", "结果");
-  assert.equal(texts, 1);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /最终答复未能更新原 AI Card/);
+  assert.ok(!notices[0].includes("【进展】"));
   await first.stop();
   fail = false;
   const restarted = new ThreadEventHub(options);
@@ -340,6 +344,6 @@ test("retries a failed terminal card update after restart without repeating its 
   await restarted.refresh();
   assert.equal(finalized, 1);
   assert.equal(starts, 1);
-  assert.equal(texts, 1);
+  assert.equal(notices.length, 1);
   await restarted.stop();
 });

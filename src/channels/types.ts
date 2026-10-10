@@ -13,7 +13,7 @@ export type ChannelTextClient = {
   /** Can update an existing stream using only its persisted message ID. */
   resumableTextStream?: boolean;
   sendText(input: ChannelTextInput): Promise<{ messageId: string }>;
-  /** Plain, rate-limited progress fallback; must not create a new progress card. */
+  /** Plain delivery for native text progress or a terminal error notice; never create an AI Card. */
   sendProgressText?(input: ChannelTextInput): Promise<{ messageId: string }>;
   /** Repeated starts with the same streamId must target the same logical card. */
   startTextStream?(input: ChannelTextInput & { streamId?: string }): Promise<{ messageId: string }>;

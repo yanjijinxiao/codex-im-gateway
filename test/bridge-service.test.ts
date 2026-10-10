@@ -1755,6 +1755,68 @@ test("retries the terminal card update after a progress update disables streamin
   assert.deepEqual(ordinaryReplies, []);
 });
 
+test("reports terminal card delivery failure once without sending a replacement answer", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-card-delivery-failure-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  stateStore.createProject("Card delivery failure project", tmpDir);
+  const notices: string[] = [];
+  const attempts: Array<{ messageId: string; text: string; finalize?: boolean }> = [];
+  let starts = 0;
+  const service = new BridgeService({
+    config: {
+      ...defaultConfig(tmpDir),
+      allowedSenderIds: ["ding-user"],
+      streamReplies: true
+    },
+    stateStore,
+    channel: createChannelClient("dingtalk", {
+      ...TEXT_CAPABILITIES,
+      progress: "available",
+      resumableProgress: true
+    }, {
+      async sendText() { throw new Error("must not create a replacement answer card"); },
+      async sendProgressText(input) {
+        notices.push(input.text);
+        return { messageId: "delivery-error-notice" };
+      },
+      async startTextStream() {
+        starts++;
+        return { messageId: "original-card" };
+      },
+      async updateTextStream(input) {
+        attempts.push(input);
+        throw new Error("HTTP 403 Forbidden");
+      }
+    }),
+    runner: {
+      async listProjects() { return { backend: "app-server", projects: [] }; },
+      async listThreads() { return []; },
+      async run(input: { onProgress?: (message: string) => Promise<void> }) {
+        await input.onProgress?.("正在查询资料。");
+        return { raw: "", threadId: "thread-card-delivery-failure", text: "PRIVATE_FINAL_ANSWER" };
+      },
+      async getRuntimeInfo() { return {}; },
+      async stop() {}
+    } as never
+  });
+
+  await service.handleMessage({
+    id: "card-delivery-failure-turn",
+    senderId: "ding-user",
+    text: "开始",
+    raw: {}
+  });
+
+  assert.equal(starts, 1);
+  assert.ok(attempts.length > 0);
+  assert.ok(attempts.every((attempt) => attempt.messageId === "original-card"));
+  assert.equal(attempts.at(-1)?.finalize, true);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /最终答复未能更新原 AI Card/);
+  assert.doesNotMatch(notices[0]!, /PRIVATE_FINAL_ANSWER|【进展】/);
+});
+
 test("finalizes a failed channel turn as a visible card instead of an empty error card", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-card-failure-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));

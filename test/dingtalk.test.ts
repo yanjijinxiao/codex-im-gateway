@@ -24,6 +24,7 @@ import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 import { createChoiceCard } from "../src/channels/action-card.js";
 import { parseCommand } from "../src/bridge/channel-commands.js";
 import { ChannelTurnTextStream } from "../src/channels/progress.js";
+import { ChannelProgressError } from "../src/channels/errors.js";
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -781,6 +782,56 @@ test("DingTalk retains an acknowledged card when its first progress update fails
   assert.equal(updates.length, 2);
   assert.equal(updates[0].outTrackId, updates[1].outTrackId);
   assert.equal(await stream.finalize("完成"), true);
+});
+
+test("DingTalk HTTPS allowlist recovery reuses its delivered card without multiplying 403 requests", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const warnings: string[] = [];
+  t.mock.method(console, "warn", (...parts: unknown[]) => { warnings.push(parts.join(" ")); });
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  let rejected = true;
+  const cardClient = new DingTalkHttpsAICardClient(async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+    return String(url).endsWith("/streaming") && rejected
+      ? new Response(JSON.stringify({ code: "Forbidden.AccessDenied.IpNotInWhiteList", message: "DO_NOT_LOG_PROVIDER_BODY", requestId: "req-test" }), { status: 403 })
+      : new Response(JSON.stringify({ success: true }), { status: 200 });
+  }, [0, 0, 0], async () => undefined);
+  const adapter = new DingTalkChannelAdapter({
+    channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true
+  }, { streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient });
+  const stream = new ChannelTurnTextStream(adapter.client, "cid-test");
+  t.after(() => stream.suspend());
+  await stream.progress("开始检查");
+  const originalCard = stream.checkpoint().messageId;
+  assert.ok(originalCard);
+  assert.equal(calls.filter((call) => call.url.endsWith("/streaming")).length, 1);
+  assert.ok(warnings.some((line) => line.includes('"httpStatus":403') && line.includes('"code":"Forbidden.AccessDenied.IpNotInWhiteList"')));
+  assert.ok(warnings.every((line) => !line.includes("DO_NOT_LOG_PROVIDER_BODY")));
+  await stream.progress("最新状态");
+  rejected = false;
+  t.mock.timers.tick(30_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls.filter((call) => call.url.endsWith("/deliver")).length, 1);
+  assert.equal(calls.filter((call) => call.url.endsWith("/streaming")).length, 2);
+  assert.ok(calls.every((call) => call.body.outTrackId === originalCard));
+  assert.match(String(calls.findLast((call) => call.url.endsWith("/streaming"))?.body.content), /最新状态/);
+  assert.equal(await stream.finalize("最终结果"), true);
+});
+
+test("DingTalk does not reinterpret unrelated 403 permission failures as route recovery", async () => {
+  const adapter = new DingTalkChannelAdapter({
+    channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true
+  }, {
+    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    cardClient: {
+      async create() {},
+      async update() { throw new Error("HTTP 403 Forbidden.AccessDenied.PermissionDenied"); }
+    }
+  });
+  await assert.rejects(adapter.client.updateTextStream({ toUserId: "cid-test", messageId: "original", text: "进度" }),
+    (error: unknown) => error instanceof ChannelProgressError && !error.retryable && !error.recoveryProbe);
 });
 
 test("DingTalk falls back to the session webhook when AI Card creation fails", async () => {

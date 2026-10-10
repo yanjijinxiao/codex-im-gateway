@@ -1901,7 +1901,9 @@ export class BridgeService {
         const streamed = replyStream
           ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。")
           : false;
-        if (remaining.length && !streamed) {
+        if (!streamed && replyStream?.supported) {
+          await replyStream.reportTerminalFailure();
+        } else if (remaining.length && !streamed) {
           for (const chunk of remaining) {
             await this.reply(message.senderId, chunk);
           }
@@ -1918,9 +1920,13 @@ export class BridgeService {
         });
       });
     } catch (error) {
-      const failureWasReported = await replyStream?.fail(
+      let failureWasReported = await replyStream?.fail(
         stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
       ) ?? false;
+      if (!failureWasReported && replyStream?.supported) {
+        try { failureWasReported = await replyStream.reportTerminalFailure(); }
+        catch { console.warn("[codex-im-gateway] terminal delivery-error notice failed"); }
+      }
       if (failureWasReported) markMessageHandlingErrorReported(error);
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
