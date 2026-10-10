@@ -39,7 +39,7 @@ function hubFixture(t: test.TestContext, readTimeoutMs = 1000) {
     } }) };
   let hub = new ThreadEventHub(options);
   t.after(async () => { await hub.stop(); fs.rmSync(root, { recursive: true, force: true }); });
-  return { reads, writes, get starts() { return starts; }, get hub() { return hub; },
+  return { reads, writes, get starts() { return starts; }, get hub() { return hub; }, filePath: options.filePath,
     setRead(fn: typeof read) { read = fn; }, setUpdateFails(value: boolean) { updateFails = value; },
     setSubscriptions(value: ThreadSubscription[]) { subscriptions = value; }, get subscriptions() { return subscriptions; },
     async restart() { await hub.stop(); hub = new ThreadEventHub(options); } };
@@ -54,6 +54,37 @@ test("restart restores the same active card even when every progress message was
   assert.equal(f.writes.at(-1)?.messageId, "original-card");
   assert.match(f.writes.at(-1)!.text, /当前公开进展/);
   assert.equal(f.hub.status("binding").status, "synced");
+});
+
+test("a live writer can recover a pre-upgrade local shutdown error without replacing the card", async t => {
+  const f = hubFixture(t);
+  await f.hub.refresh();
+  await f.hub.stop();
+  const state = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  state.binding.checkpoint.terminal = { text: "Gateway connection closed", error: true };
+  fs.writeFileSync(f.filePath, JSON.stringify(state));
+  await f.restart();
+  const result = await f.hub.synchronize("binding");
+  assert.equal(result.status, "synced");
+  assert.equal(f.starts, 1);
+  assert.equal(f.writes.at(-1)?.messageId, "original-card");
+  const recovered = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  assert.equal(recovered.binding.checkpoint.terminal, undefined);
+  assert.equal(recovered.binding.checkpoint.finished, false);
+});
+
+test("unconfirmed runtime cannot reopen an old presentation error", async t => {
+  const f = hubFixture(t);
+  await f.hub.refresh();
+  await f.hub.stop();
+  const state = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  state.binding.checkpoint.terminal = { text: "Gateway connection closed", error: true };
+  fs.writeFileSync(f.filePath, JSON.stringify(state));
+  await f.restart();
+  f.setRead(async () => ({ state: { ...snapshot().state, runtimeStatus: "notLoaded" }, turns: snapshot().turns }));
+  assert.equal((await f.hub.synchronize("binding")).status, "unconfirmed");
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).binding.checkpoint.terminal.error, true);
+  assert.equal(f.starts, 1);
 });
 
 test("explicit sync is scoped by binding and host, coalesces concurrent calls and reuses the card", async t => {

@@ -214,6 +214,21 @@ export class ThreadEventHub {
         }
         // Reject a mismatched response before any progress or cursor can be updated.
         if (snapshot.state.threadId !== sub.threadId) throw new Error("Backend returned another thread snapshot");
+        // Pre-upgrade Gateway shutdown could poison a suspended card with a
+        // local transport error. Only a loaded writer confirming the SAME
+        // still-running turn may recover an unacknowledged presentation error.
+        const activeId = snapshot.state.activeTurnId;
+        if (snapshot.state.runtimeStatus === "active" && activeId && state.turnId === activeId
+          && snapshot.turns.some(turn => turn.id === activeId && turn.status === "inProgress")
+          && state.checkpoint?.terminal?.error && !state.checkpoint.finished
+          && !state.completed.includes(activeId) && !state.terminalPending) {
+          await this.streams.get(sub.key)?.suspend();
+          if (this.stopped || !this.isLive(sub)) return this.changedBinding();
+          this.streams.delete(sub.key);
+          const { terminal: _terminal, terminalNoticeSent: _notice, ...checkpoint } = state.checkpoint;
+          state.checkpoint = checkpoint;
+          this.save();
+        }
         const restoreCard = !this.streams.has(sub.key) && Boolean(state.checkpoint?.messageId && !state.checkpoint.finished);
         await this.reconcile(sub, snapshot);
         if (this.stopped || !this.isLive(sub)) return this.changedBinding();
@@ -241,7 +256,7 @@ export class ThreadEventHub {
           }
           if (this.stopped || !this.isLive(sub)) return this.changedBinding();
           if (runtime.runtimeStatus === "active" && sub.progressEnabled !== false
-            && this.streams.get(sub.key)?.deliveryState() === "unavailable") {
+            && ["unavailable", "finished"].includes(this.streams.get(sub.key)?.deliveryState() ?? "active")) {
             this.failSync(sub, { code: "presentation", message: "后端状态已读取，但当前进度卡片仍不可用；请检查渠道权限和连接后重试。" });
             return this.status(sub.key);
           }
