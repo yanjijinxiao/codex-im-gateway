@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { CodexInterventionError } from "./backend.js";
+import { CodexInterventionError, CodexOwnerUnavailableError } from "./backend.js";
 
 import type {
   CodexRunResult,
@@ -60,6 +60,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private readonly activities = new Map<string, CodexSessionActivity[]>();
   private readonly waiters = new Map<string, CompletionWaiter>();
   private readonly activeThreads = new Set<string>();
+  private readonly unavailableOwnerLogTimes = new Map<string, number>();
   private readonly monitor: CodexSessionCompletionMonitor;
   private monitorStarted = false;
   private closed = false;
@@ -70,11 +71,23 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     try {
       await connection.initialize();
       await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
-      return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+      const snapshot = parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+      this.unavailableOwnerLogTimes.delete(threadId);
+      return snapshot;
     } catch (error) {
       // Discovery is read-only. An unanswered discovery is not proof of an
       // idle Desktop task; the caller may only fall back to the app-server's
       // own writer, whose resume lock still rejects foreign ownership.
+      if (error instanceof CodexOwnerUnavailableError) {
+        const last = this.unavailableOwnerLogTimes.get(threadId) ?? 0;
+        if (Date.now() - last > 60_000) {
+          this.unavailableOwnerLogTimes.set(threadId, Date.now());
+          console.info(`[codex-im-gateway] owner discovery ${JSON.stringify({ timestamp: new Date().toISOString(),
+            backend: "desktop", hostId: "local", threadId, operation: error.operation, code: error.code,
+            outcome: "no-live-owner", messageSubmitted: false })}`);
+        }
+        return undefined;
+      }
       if (isDesktopOwnerUnavailable(error) || /thread-owner-discovery timed out/.test(String(error))) return undefined;
       throw error;
     } finally {
@@ -554,7 +567,13 @@ class DesktopIpcConnection {
     this.pending.delete(message.requestId);
     clearTimeout(pending.timer);
     if (message.resultType === "error" || message.error) {
-      pending.reject(new Error(`Codex Desktop IPC ${pending.method} failed: ${ipcErrorDetail(message)}`));
+      const detail = ipcErrorDetail(message);
+      const errorCode = stringValue(recordValue(message.error)?.code) ?? stringValue(recordValue(message.result)?.code);
+      // Only discovery can certify that NOTHING was submitted. The same code
+      // from start-turn must remain an uncertain failure and cannot be replayed.
+      pending.reject(pending.method === "thread-owner-discovery" && (detail === "no-client-found" || errorCode === "no-client-found")
+        ? new CodexOwnerUnavailableError()
+        : new Error(`Codex Desktop IPC ${pending.method} failed: ${detail}`));
       return;
     }
     pending.resolve(message.result);

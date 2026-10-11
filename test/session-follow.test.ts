@@ -178,6 +178,23 @@ test("unloaded and orphan App states are unconfirmed, never false sync success",
   assert.equal(f.starts, 0);
 });
 
+test("unloaded bindings report safe diagnostics and continue waiting for their live owner", async t => {
+  const logs: string[] = [];
+  t.mock.method(console, "warn", (line: string) => logs.push(line));
+  const f = hubFixture(t);
+  f.setRead(async () => ({ state: { ...snapshot().state, runtimeStatus: "notLoaded", activeTurnId: undefined }, turns: [] }));
+  const result = await f.hub.synchronize("binding");
+  assert.equal(result.status, "unconfirmed");
+  assert.match(result.failure!.message, /绑定已保留.*同一会话.*不会启动任务/);
+  const detail = JSON.parse(logs.find(line => line.includes("thread follow sync"))!.split("thread follow sync ")[1]);
+  assert.equal(detail.operation, "follow-synchronize");
+  assert.equal(detail.snapshotRuntime, "notLoaded");
+  assert.equal(detail.snapshotPersistence, "active");
+  assert.match(detail.message, /绑定已保留/);
+  f.setRead(async () => snapshot());
+  assert.equal((await f.hub.synchronize("binding")).status, "synced");
+});
+
 test("a wrong thread or active runtime without a confirmed turn cannot create a placeholder card", async t => {
   const f = hubFixture(t);
   f.setRead(async () => snapshot("WRONG_THREAD"));

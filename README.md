@@ -139,6 +139,8 @@ node dist/server/index.js
 
 Gateway 重启后会自动恢复已有绑定及跟随游标，并在渠道支持持久句柄时续用原进度卡片；即使进展内容没有变化，也会恢复活动卡片。需要手动恢复时，在原对话发送 `/follow sync`；若跟随已经关闭，发送 `/follow on`。`/status` 和 `/follow` 区分“设置开启”和“同步成功”。超时、未确认的 Desktop 持有者、悬空界面轮次和卡片更新失败都会明确显示，不能据“未加载”断言任务结束。纯 CLI 不支持外部实时跟随，命令会报告能力限制。
 
+会话未加载或 Desktop 返回 `no-client-found` 时，群与 session 的绑定不会丢失；同步显示“状态未确认”，保留订阅等待实时持有者恢复，不会为了同步启动任务。发送普通消息才会尝试由对应后端恢复**同一个** session，并遵守单写入者锁。若 Desktop 持有关系在读取后发生变化，只有明确的“提交前未找到持有者”才能重试原会话；权限错误、超时、提交后的错误或无法确认的回执不会自动重发。
+
 远程项目复用 Codex Desktop 保存的 `hostId` 和本机 SSH 配置；网关不保存 SSH 密码或私钥内容。项目、模式和 Taskboard 的完整交互见[渠道项目工作台](./docs/channel-project-modes.md)。
 
 会话列表也会隐藏本地用途配置中已确认的探活记录，并显示隐藏数量；不会仅凭 `READY` 标题或 CLI 来源过滤正常对话，也不会删除或归档记录。配置及恢复方式见[会话用途筛选](./docs/codex-backends.md#probe-records-versus-user-conversations)。

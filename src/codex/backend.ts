@@ -119,6 +119,15 @@ export class CodexBackendCapabilityError extends Error {
 export class CodexInterventionError extends Error {
   constructor(message: string) { super(message); this.name = "CodexInterventionError"; }
 }
+/** Explicit negative discovery BEFORE submission; never a transport timeout or an uncertain acknowledgement. */
+export class CodexOwnerUnavailableError extends Error {
+  readonly code = "no-client-found";
+  readonly operation = "thread-owner-discovery";
+  constructor() {
+    super("Codex Desktop has no live thread owner (no-client-found); no message was submitted");
+    this.name = "CodexOwnerUnavailableError";
+  }
+}
 export type CodexThreadStateErrorCode = "archived" | "missing" | "system-error";
 
 export class CodexThreadStateError extends Error {

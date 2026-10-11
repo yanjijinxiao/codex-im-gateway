@@ -238,7 +238,9 @@ export class ThreadEventHub {
         } else if (runtime.pendingTurnWithoutId && runtime.runtimeStatus !== "active") {
           this.failSync(sub, { code: "orphan-turn", message: "Codex App 有未确认的界面轮次，不能当成正在执行的任务；请重新加载 App。" }, "unconfirmed");
         } else if (["notLoaded", "unknown"].includes(runtime.runtimeStatus) || runtime.persistence !== "active") {
-          this.failSync(sub, { code: "unconfirmed", message: "已读取记录，但会话未加载或实际持有者无法确认；未将其当成空闲或已结束。" }, "unconfirmed");
+          this.failSync(sub, { code: "unconfirmed", message: runtime.runtimeStatus === "notLoaded"
+            ? "会话未加载或暂无实时持有者；绑定已保留，跟随继续等待。发送新消息会尝试继续同一会话；同步命令不会启动任务。"
+            : "已读取记录，但实际持有者无法确认；绑定已保留，未将其当成空闲或已结束。" }, "unconfirmed");
         } else if (runtime.runtimeStatus === "active" && !snapshot.turns.some(turn => turn.status === "inProgress"
           && (!runtime.activeTurnId || turn.id === runtime.activeTurnId))) {
           this.failSync(sub, { code: "unconfirmed", message: "后端报告正在执行，但没有可确认的当前轮次；未创建占位卡片。" }, "unconfirmed");
@@ -294,7 +296,9 @@ export class ThreadEventHub {
       this.errorLogTimes.set(sub.key, Date.now());
       console.warn(`[codex-im-gateway] thread follow sync ${JSON.stringify({
         timestamp: new Date().toISOString(), hostId: sub.hostId, threadId: sub.threadId,
-        status, code: failure.code, lastSyncedAt: state.lastSyncedAt
+        operation: "follow-synchronize", status, code: failure.code, message: failure.message,
+        snapshotRuntime: state.runtime?.runtimeStatus, snapshotPersistence: state.runtime?.persistence,
+        snapshotAt: state.observedAt, lastSyncedAt: state.lastSyncedAt
       })}`);
     }
   }

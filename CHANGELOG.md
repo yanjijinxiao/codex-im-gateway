@@ -26,6 +26,7 @@ All notable changes to Codex IM Gateway are documented in this file.
 
 ### Fixed
 
+- Treated Desktop's explicit `no-client-found` discovery response as an absent live owner, preserving unloaded bindings and follow subscriptions. Ordinary IM messages resume the same thread through the selected backend; stale ownership and writer-lock races allow only bounded pre-submission recovery, never replaying uncertain acknowledgements. Added safe structured owner/follow diagnostics and end-to-end regressions for DingTalk, WeChat and Feishu.
 - Added transport-neutral `/follow sync`, idempotent `/follow on` recovery and persisted follow health in `/follow` and `/status`. Targeted read-only reconciliation is bounded, host/binding guarded, and reports unconfirmed runtimes and presentation failures honestly; restart restores the original active card even when progress was already deduplicated.
 - Prevented shutdown-suspended progress streams from recording a false terminal error when the detached Gateway writer closes; the replacement follower retains the active card checkpoint.
 - Recovered pre-upgrade, unacknowledged local presentation errors only when a loaded backend confirms the exact same turn is still running; terminal results and unconfirmed runtimes are never reopened.

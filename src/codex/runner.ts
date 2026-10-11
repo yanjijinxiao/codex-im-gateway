@@ -7,7 +7,7 @@ import {
 import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
-import { CodexBackendCapabilityError } from "./backend.js";
+import { CodexBackendCapabilityError, CodexOwnerUnavailableError } from "./backend.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import type {
   CodexAppServerBackend,
@@ -156,26 +156,30 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     // Read and write must target the same owner. A private app-server can read
     // a Desktop rollout as notLoaded even when Desktop is actively working.
     if (input.threadId && this.desktopOwnedThreads.has(input.threadId)) {
-      return this.desktop.run(withInlineDeveloperInstructions(input));
+      try {
+        return await this.desktop.run(withInlineDeveloperInstructions(input));
+      } catch (error) {
+        // A cached renderer can disappear after inspection. Only an explicit
+        // pre-submission negative discovery permits the guarded resume below.
+        if (!(error instanceof CodexOwnerUnavailableError)) throw error;
+        this.desktopOwnedThreads.delete(input.threadId);
+      }
     }
     try {
-      const result = await this.appServer.run({
-        ...input,
-        onThreadCreated: async (threadId) => {
-          try {
-            await input.onThreadCreated?.(threadId);
-          } finally {
-            await this.refreshDesktopTaskList(threadId);
-          }
-        }
-      });
-      await this.refreshDesktopTaskList(result.threadId);
-      if (this.options.backend === "auto") this.selectedAutoBackend = "app-server";
-      return result;
+      return await this.runOnAppServer(input);
     } catch (error) {
       if (input.threadId && isActiveWriterError(error)) {
         this.desktopOwnedThreads.add(input.threadId);
-        return this.desktop.run(withInlineDeveloperInstructions(input));
+        try {
+          return await this.desktop.run(withInlineDeveloperInstructions(input));
+        } catch (ownerError) {
+          if (!(ownerError instanceof CodexOwnerUnavailableError)) throw ownerError;
+          this.desktopOwnedThreads.delete(input.threadId);
+          // The writer vanished between the lock rejection and discovery.
+          // Exactly one retry of the SAME id, with app-server's writer lock;
+          // no loop, force takeover, thread/start or CLI fallback.
+          return this.runOnAppServer(input);
+        }
       }
       if (this.options.backend === "app-server" || this.selectedAutoBackend || input.threadId || !canRunWithoutCapabilityLoss(this.exec, input)) {
         throw error;
@@ -191,6 +195,19 @@ export class CodexBackendRouter implements CodexBridgeBackend {
         text: `Warning: Codex app-server was unavailable, used codex exec fallback.\n\n${fallback.text}`
       };
     }
+  }
+
+  private async runOnAppServer(input: CodexRunnerInput): Promise<CodexRunResult> {
+    const result = await this.appServer.run({
+      ...input,
+      onThreadCreated: async (threadId) => {
+        try { await input.onThreadCreated?.(threadId); }
+        finally { await this.refreshDesktopTaskList(threadId); }
+      }
+    });
+    await this.refreshDesktopTaskList(result.threadId);
+    if (this.options.backend === "auto") this.selectedAutoBackend = "app-server";
+    return result;
   }
 
   async stop(threadId?: string, hostId?: string): Promise<CodexStopResult> {
