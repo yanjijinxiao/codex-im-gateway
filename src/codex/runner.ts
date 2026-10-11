@@ -22,6 +22,9 @@ import type {
   CodexRunnerInput,
   CodexSteerInput,
   CodexSteerResult,
+  CodexNativeQueue,
+  CodexQueueAddInput,
+  CodexQueuedRunInput,
   CodexRuntimeInfo,
   CodexStopResult,
   CodexThreadListInput,
@@ -138,6 +141,33 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       if (!isDesktopSteerCandidateError(error)) throw error;
       return this.desktop.steer(input);
     }
+  }
+
+  private nativeQueue(hostId?: string): CodexAppServerBackend & CodexNativeQueue {
+    if (this.selectedBackend === "exec") throw new CodexBackendCapabilityError("nativeQueue", "exec");
+    const backend = this.appServerFor(hostId);
+    if (!backend.addQueuedSubmission || !backend.listQueuedSubmissions || !backend.deleteQueuedSubmission || !backend.runQueuedSubmission) {
+      throw new CodexBackendCapabilityError("nativeQueue", "app-server");
+    }
+    return backend as CodexAppServerBackend & CodexNativeQueue;
+  }
+
+  async addQueuedSubmission(input: CodexQueueAddInput, hostId?: string) {
+    return this.nativeQueue(hostId).addQueuedSubmission(input);
+  }
+  async listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string) {
+    return this.nativeQueue(hostId).listQueuedSubmissions(threadId, cursor);
+  }
+  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string) {
+    return this.nativeQueue(hostId).deleteQueuedSubmission(threadId, queuedSubmissionId);
+  }
+  async runQueuedSubmission(input: CodexQueuedRunInput) {
+    // Queue metadata can be read without owning the thread. Consumption is a
+    // writer operation and must never steal a Desktop owner's execution.
+    const backend = this.nativeQueue(input.hostId);
+    const state = await this.inspectThread(input.threadId, input.hostId);
+    if (state.executionOwner === "desktop" && !input.observeOnly) throw new Error("Desktop 正在持有此会话，原生队列等待实际持有者消费；Gateway 不接管任务。");
+    return backend.runQueuedSubmission(input);
   }
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {

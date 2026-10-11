@@ -4,6 +4,9 @@ All notable changes to Codex IM Gateway are documented in this file.
 
 ## Unreleased
 
+- Defaulted busy-session messages to guarded `steer`, preserving explicit per-session overrides; exposed the global policy in settings and updated shared channel help.
+- Added experimental App Server native queue add/list/delete/start adapters, shared account-scoped write-ahead receipts and restart reconciliation by exact client/turn IDs. Queue content/order stay in Codex; ambiguous acknowledgements are never replayed. Added `/queue list` and scoped cancellation, and retained one progress/approval delivery path for queued tasks. Exec and unsupported Desktop follower operations explicitly reject rather than silently falling back.
+
 - Renamed the independently maintained project to `codex-im-gateway`, moved the canonical package, UI, protocol, environment variables, request header, and state directory to the new name, and retained compatibility with existing `codex-channel-bridge` and `codex-weixin` installations.
 - Preserved the MIT license and documented the full project lineage from `XavierJiezou/codex-weixin` through `lsiten/codex-channel-bridge` to `yanjijinxiao/codex-im-gateway`.
 

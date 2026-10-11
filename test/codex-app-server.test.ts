@@ -9,6 +9,33 @@ import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
+test("native queue add/list/delete/start consumes the stored item and retains approval callbacks", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  const discarded = await runner.addQueuedSubmission({ threadId: "thread-existing", prompt: "discard", clientUserMessageId: "client-discard" });
+  assert.equal(await runner.deleteQueuedSubmission("thread-existing", discarded.id), true);
+  const item = await runner.addQueuedSubmission({ threadId: "thread-existing", prompt: "approval:command", clientUserMessageId: "client-next", onApproval: async () => "accept" });
+  assert.equal((await runner.listQueuedSubmissions("thread-existing")).data[0].id, item.id);
+  const events: string[] = [];
+  const result = await runner.runQueuedSubmission({ threadId: "thread-existing", queuedSubmissionId: item.id,
+    cwd: "/tmp/project", onQueueStarting: () => { events.push("submitting"); },
+    onTurnStarted: () => { events.push("accepted"); }, onApproval: async () => { events.push("approval"); return "accept"; } });
+  assert.equal(result.threadId, "thread-existing");
+  assert.equal(events[0], "submitting");
+  assert.deepEqual(events.slice(1).sort(), ["accepted", "approval"]);
+  assert.equal((await runner.listQueuedSubmissions("thread-existing")).data.length, 0);
+  await assert.rejects(runner.runQueuedSubmission({ threadId: "thread-existing", queuedSubmissionId: item.id, cwd: "/tmp/project" }), /原生队列已发生变化/);
+});
+
+test("an older app-server explicitly rejects native queue without execution fallback", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs"), "--without-queue-api"], mode: "remote-daemon"
+  } }); t.after(() => runner.close());
+  await assert.rejects(runner.addQueuedSubmission({ threadId: "thread-existing", prompt: "never execute", clientUserMessageId: "client-id" }), /does not support nativeQueue/);
+});
+
 for (const infer of [false, true]) {
   test(`independent app-server start has no project and clears unexpected assignment: infer=${infer}`, async t => {
     const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
@@ -105,6 +132,8 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
       id: "history-user-1",
       role: "user",
       text: "hello history",
+      turnId: "history-turn-1",
+      turnStatus: "completed",
       createdAt: "2023-11-14T22:13:20.000Z"
     },
     {
@@ -130,6 +159,8 @@ test("uses the Codex V2 initialize, thread, and turn lifecycle", async (t) => {
         id: "history-user-1",
         role: "user",
         text: "hello history",
+        turnId: "history-turn-1",
+        turnStatus: "completed",
         createdAt: "2023-11-14T22:13:20.000Z"
       },
       {

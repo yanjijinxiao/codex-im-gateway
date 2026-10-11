@@ -65,6 +65,7 @@ test("enforces roles on commands, scopes pending choices, rejects stale turns an
   await send("admin", "/role bob participant");
   await send("bob", "/stop");
   assert.equal(stops, 0);
+  await send("bob", "/policy ask");
   await send("bob", "先检查接口");
   assert.equal(cards.at(-1)!.title, "当前任务正在执行");
   const arg = cards.at(-1)!.actionGroups.flat()[0].value.arg;

@@ -22,6 +22,7 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
   store.setSessionThread(session.id, "thread");
   const texts: string[] = [], cards: ChannelActionCard[] = [], runs: CodexRunnerInput[] = [];
   let subscriptionsChanged = 0, steers = 0, sequence = 0;
+  const queued: Array<{ id: string; clientUserMessageId: string; input: Array<{ type: string; text: string }> }> = [];
   let state: CodexThreadState = { threadId: "thread", persistence: "active", runtimeStatus: "active", activeFlags: [], activeTurnId: "old-turn" };
   let runImpl = async (input: CodexRunnerInput) => ({ threadId: input.threadId ?? "new-thread", turnId: "new-turn", text: "完成", raw: "" });
   const build = (stateStore = store) => new BridgeService({
@@ -38,11 +39,24 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
       async run(input: CodexRunnerInput) { runs.push(input); return runImpl(input); },
       async steer() { steers++; return { status: "accepted", threadId: "thread", turnId: "old-turn" }; },
       async getRuntimeInfo() { return {}; },
-      async getHistory() { return []; }
+      async getHistory() { return []; },
+      async getHistoryPage() { return { messages: [] }; },
+      async addQueuedSubmission(input: { prompt: string; clientUserMessageId: string }) {
+        const item = { id: "queue-" + (queued.length + 1), clientUserMessageId: input.clientUserMessageId,
+          input: [{ type: "text", text: input.prompt }] };
+        queued.push(item); return item;
+      },
+      async listQueuedSubmissions() { return { data: queued }; },
+      async runQueuedSubmission(input: CodexRunnerInput & { queuedSubmissionId: string; onQueueStarting?: () => void }) {
+        input.onQueueStarting?.();
+        await input.onTurnStarted?.({ threadId: input.threadId!, turnId: "queue-turn" });
+        const entry = queued.shift()!;
+        const run = { ...input, prompt: entry.input[0].text }; runs.push(run); return runImpl(run);
+      }
     } as never
   });
   let service = build();
-  return { paths, store, project, session, texts, cards, runs,
+  return { paths, store, project, session, texts, cards, runs, queued,
     get changes() { return subscriptionsChanged; }, get steers() { return steers; },
     setState(next: Partial<CodexThreadState>) { state = { ...state, ...next }; },
     setRun(fn: typeof runImpl) { runImpl = fn; },
@@ -55,9 +69,17 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
   for (const backend of ["app-server", "exec"] as const) {
     test(`${channel}/${backend}: a plain message asks while busy and never silently starts or steers`, async t => {
       const f = fixture(t, channel, backend);
+      f.store.setActiveMessagePolicy(f.session.id, "ask");
       await f.send("你是 GPT？");
       assert.equal(f.runs.length, 0);
       assert.equal(f.steers, 0);
+      if (backend === "exec") {
+        assert.equal(f.cards.length, 0); assert.match(f.texts.at(-1)!, /不支持.*消息未提交/);
+        await f.send("/policy queue");
+        assert.match(f.texts.at(-1)!, /不支持.*原生队列.*策略未改变/);
+        assert.equal(f.store.getSession(f.session.id)?.activeMessagePolicy, "ask");
+        return;
+      }
       const card = f.cards.at(-1)!;
       assert.equal(card.title, "当前任务正在执行");
       const choices = card.actionGroups.flat();
@@ -66,6 +88,7 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
       // The original turn can finish before the user chooses the next round.
       f.setState({ runtimeStatus: "idle", activeTurnId: undefined });
       await f.send("/intervene " + queued.value.arg);
+      for (let n = 0; n < 100 && !f.runs.length; n++) await new Promise(resolve => setTimeout(resolve, 2));
       assert.equal(f.runs.length, 1);
       assert.match(f.runs[0].prompt, /你是 GPT？/);
       assert.equal(f.steers, 0);
@@ -73,11 +96,14 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
   }
 }
 
-test("Desktop-owned normal messages offer queue/cancel, and an orphan UI tail is not submitted", async t => {
+test("Desktop-owned messages do not offer unsupported actions; an orphan UI tail is not submitted", async t => {
   const f = fixture(t);
+  f.store.setActiveMessagePolicy(f.session.id, "ask");
   f.setState({ executionOwner: "desktop" });
   await f.send("你是 GPT？");
-  assert.ok(f.cards.at(-1)!.actionGroups.flat().every(x => !x.value.arg.endsWith(" steer")));
+  assert.equal(f.cards.length, 0); assert.match(f.texts.at(-1)!, /不支持.*消息未提交/);
+  await f.send("/policy queue");
+  assert.match(f.texts.at(-1)!, /不支持.*原生队列.*策略未改变/);
   await f.send("/policy steer");
   assert.match(f.texts.at(-1)!, /不支持安全介入.*策略未改变/);
   assert.equal(f.store.getSession(f.session.id)?.activeMessagePolicy ?? "ask", "ask");
@@ -91,6 +117,32 @@ test("Desktop-owned normal messages offer queue/cancel, and an orphan UI tail is
   assert.match(f.texts.at(-1)!, /实际任务已空闲.*消息未提交/);
   await f.send("/status");
   assert.match(f.cards.at(-1)!.body, /状态异常.*实际后端空闲/);
+});
+
+for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
+  test(`${channel}: the default busy-message policy is steer, with no ask card or new turn`, async t => {
+    const f = fixture(t, channel);
+    await f.send("补充要求");
+    assert.equal(f.steers, 1); assert.equal(f.runs.length, 0); assert.equal(f.cards.length, 0);
+    await f.send("/policy"); assert.match(f.texts.at(-1)!, /steer/);
+  });
+  test(`${channel}: explicit queue is native, returns promptly while busy, and survives restart`, async t => {
+    const f = fixture(t, channel);
+    await f.send("/queue 下一轮内容");
+    assert.equal(f.queued.length, 1); assert.equal(f.runs.length, 0); assert.equal(f.steers, 0);
+    f.restart(); await f.send("/queue list"); assert.match(f.texts.at(-1)!, /queue-1.*queued/);
+  });
+}
+
+test("default steer never silently falls back for Desktop or exec", async t => {
+  const desktop = fixture(t); desktop.setState({ executionOwner: "desktop" });
+  await desktop.send("补充要求");
+  assert.match(desktop.texts.at(-1)!, /不支持.*安全介入.*未提交/);
+  assert.equal(desktop.runs.length, 0); assert.equal(desktop.steers, 0);
+  const exec = fixture(t, "weixin", "exec");
+  await exec.send("补充要求");
+  assert.match(exec.texts.at(-1)!, /不支持.*消息未提交/);
+  assert.equal(exec.runs.length, 0);
 });
 
 test("/leave remains detached after restart; /new explicitly rebinds and refreshes following", async t => {

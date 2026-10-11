@@ -19,6 +19,8 @@ import type { AppServerTransport } from "./app-server-transport.js";
 import {
   APP_SERVER_BACKEND_CAPABILITIES,
   CodexThreadStateError,
+  CodexBackendCapabilityError,
+  CodexTurnExecutionError,
   assertCodexThreadRunnable,
   assertCodexProjectBinding,
   type CodexAppServerBackend,
@@ -36,6 +38,10 @@ import {
   type CodexRuntimeInfo,
   type CodexSteerInput,
   type CodexSteerResult,
+  type CodexQueueAddInput,
+  type CodexQueuePage,
+  type CodexQueuedSubmission,
+  type CodexQueuedRunInput,
   type CodexStopResult,
   type CodexThreadActiveFlag,
   type CodexThreadGoal,
@@ -154,6 +160,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private operationLeases = 0;
   private projectCatalogSupported?: boolean;
   private modelOptions?: CodexModelOption[];
+  private readonly nativeQueueOrigins = new Map<string, CodexQueueAddInput>();
+  private readonly nativeTurnClients = new Map<string, string>();
+  private readonly subscribedThreads = new Set<string>();
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
 
@@ -168,7 +177,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
   }
 
-  private async runWithLease(input: CodexRunnerInput): Promise<CodexRunResult> {
+  private async runWithLease(input: CodexRunnerInput & Partial<Pick<CodexQueuedRunInput, "queuedSubmissionId" | "clientUserMessageId" | "onQueueStarting">>): Promise<CodexRunResult> {
     await this.ensureConnected();
 
     if (input.threadId) {
@@ -189,15 +198,17 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       : undefined;
     let threadResponse: Record<string, unknown>;
     try {
+      const alreadySubscribedQueue = Boolean(input.queuedSubmissionId && input.threadId && this.subscribedThreads.has(input.threadId));
       threadResponse = await this.request(
-        input.threadId ? "thread/resume" : "thread/start",
+        alreadySubscribedQueue ? "thread/read" : input.threadId ? "thread/resume" : "thread/start",
         compactObject({
+          ...(alreadySubscribedQueue ? { includeTurns: false } : {}),
           ...(input.threadId ? { threadId: input.threadId } : {}),
           ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
           cwd: input.cwd,
           model: input.model,
           developerInstructions: input.developerInstructions,
-          approvalPolicy: "never",
+          approvalPolicy: input.queuedSubmissionId && input.onApproval ? "on-request" : "never",
           ...(!input.threadId && nativeProjectId ? { projectId: nativeProjectId } : {}),
           ...(!input.threadId && input.projectBinding === "none" ? { projectId: null } : {}),
           ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
@@ -212,6 +223,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!threadId) {
       throw new Error("Codex app-server did not return a thread id");
     }
+    this.subscribedThreads.add(threadId);
     try {
     const currentProjectId = typeof thread?.projectId === "string" ? thread.projectId : undefined;
     if (!input.threadId && input.projectBinding === "none" && currentProjectId) {
@@ -280,9 +292,33 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (input.onDynamicToolCall) this.dynamicToolHandlersByThread.set(threadId, input.onDynamicToolCall);
     if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
     try {
-      turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+      if (input.queuedSubmissionId) {
+        // Resume itself can cause Codex to drain its native queue. Observe
+        // that exact item instead of attempting a second start.
+        const existing = await this.findQueuedTurn(input.threadId!, input.clientUserMessageId);
+        if (existing) return await this.observeQueuedTurn(input as CodexQueuedRunInput, existing);
+        const head = await this.queueRequest("thread/queue/list", { threadId, limit: 1 }) as { data?: CodexQueuedSubmission[] };
+        if (head.data?.[0]?.id !== input.queuedSubmissionId) {
+          // Queue removal can precede the history index by a few events.
+          // Bounded read-only reconciliation, never another mutation.
+          const consumed = await this.findRecentlyConsumedTurn(threadId, input.clientUserMessageId);
+          if (consumed) return await this.observeQueuedTurn(input as CodexQueuedRunInput, consumed);
+          throw new Error("原生队列已发生变化，未跳过队首或重复启动。");
+        }
+        await input.onQueueStarting?.();
+        try {
+          turnResponse = await this.queueRequest("thread/queue/start", { threadId, queuedSubmissionId: input.queuedSubmissionId }) as Record<string, unknown>;
+        } catch (error) {
+          if (error instanceof CodexBackendCapabilityError) throw error;
+          const consumed = await this.findRecentlyConsumedTurn(threadId, input.clientUserMessageId);
+          if (consumed) return await this.observeQueuedTurn(input as CodexQueuedRunInput, consumed);
+          throw error;
+        }
+      } else {
+        turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
+      }
     } catch (error) {
-      if (!input.threadId || !isThreadBusyError(error)) {
+      if (input.queuedSubmissionId || !input.threadId || !isThreadBusyError(error)) {
         this.approvalHandlersByThread.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
@@ -336,7 +372,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     await input.onTurnStarted?.({ threadId, turnId });
     return await this.waitForTurn(threadId, turnId);
     } finally {
-      await this.unsubscribeThread(threadId);
+      // A native queued turn may start before this turn's delivery finishes.
+      // Keep its subscription (and approval requests) on the same connection.
+      if (![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)
+        && !this.activeTurns.has(threadId)) await this.unsubscribeThread(threadId);
       await this.recyclePrivateTransportIfIdle();
     }
   }
@@ -348,6 +387,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         { threadId },
         Math.min(this.options.requestTimeoutMs ?? 600_000, 10_000)
       );
+      this.subscribedThreads.delete(threadId);
     } catch (error) {
       // Releasing ownership is best-effort and must never replace the actual
       // turn result. A closed transport already releases all of its threads.
@@ -367,7 +407,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
    * be stopped by an individual Bridge client.
    */
   private async recyclePrivateTransportIfIdle(): Promise<void> {
-    if (this.options.transport || this.operationLeases || this.activeTurns.size || this.pending.size) return;
+    if (this.options.transport || this.operationLeases || this.activeTurns.size || this.pending.size || this.nativeQueueOrigins.size) return;
     const child = this.child;
     if (!child || child.exitCode !== null) return;
 
@@ -375,6 +415,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       child.once("exit", () => resolve(true));
     });
     this.child = undefined;
+    this.subscribedThreads.clear();
     this.initialized = false;
     this.lines?.close();
     this.lines = undefined;
@@ -785,12 +826,177 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const response = await this.request("turn/steer", {
         threadId: input.threadId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
-        expectedTurnId: turnId
+        expectedTurnId: turnId,
+        ...(input.clientUserMessageId ? { clientUserMessageId: input.clientUserMessageId } : {})
       }) as Record<string, unknown>;
       const acceptedTurnId = typeof response.turnId === "string" ? response.turnId : turnId;
       return { status: "accepted", threadId: input.threadId, turnId: acceptedTurnId };
     } catch (error) {
       throw normalizeSteerError(error, input.threadId, turnId);
+    }
+  }
+
+  async addQueuedSubmission(input: CodexQueueAddInput): Promise<CodexQueuedSubmission> {
+    if (!input.prompt.trim() || !input.clientUserMessageId) throw new Error("Queue input and client message id are required");
+    // add can start immediately on a loaded idle thread. Retain the transport
+    // and approval origin BEFORE writing, even before the add ack arrives.
+    this.nativeQueueOrigins.set(input.clientUserMessageId, input);
+    this.operationLeases++;
+    let result: { queuedSubmission?: CodexQueuedSubmission };
+    try {
+      await this.ensureConnected();
+      // thread/resume subscribes without submitting a prompt. An idle loaded
+      // thread can auto-consume add, so subscribe before that external write.
+      // Never reconfigure an already running turn to attach its queue.
+      if (!this.subscribedThreads.has(input.threadId)) {
+        await this.request("thread/resume", compactObject({ threadId: input.threadId,
+          ...(!this.activeTurns.has(input.threadId) && input.onApproval ? { approvalPolicy: "on-request" } : {}) }));
+        this.subscribedThreads.add(input.threadId);
+      }
+      result = await this.queueRequest("thread/queue/add", {
+        threadId: input.threadId, clientUserMessageId: input.clientUserMessageId,
+        input: [{ type: "text", text: input.prompt, text_elements: [] }]
+      }) as { queuedSubmission?: CodexQueuedSubmission };
+    }
+    catch (error) {
+      if (error instanceof CodexBackendCapabilityError) {
+        this.nativeQueueOrigins.delete(input.clientUserMessageId);
+        if (this.subscribedThreads.has(input.threadId) && !this.activeTurns.has(input.threadId)
+          && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)) {
+          await this.unsubscribeThread(input.threadId);
+        }
+      }
+      throw error;
+    }
+    finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+    if (!result.queuedSubmission?.id || result.queuedSubmission.clientUserMessageId !== input.clientUserMessageId) {
+      throw new Error("Native queue acknowledgement is incomplete; do not resubmit");
+    }
+    return result.queuedSubmission;
+  }
+
+  async listQueuedSubmissions(threadId: string, cursor?: string): Promise<CodexQueuePage> {
+    const result = await this.queueOperation("thread/queue/list", compactObject({ threadId, cursor, limit: 100 })) as {
+      data?: CodexQueuedSubmission[]; nextCursor?: string | null;
+    };
+    if (!Array.isArray(result.data)) throw new Error("Invalid native queue list response");
+    return { data: result.data, ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}) };
+  }
+
+  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string): Promise<boolean> {
+    let item: CodexQueuedSubmission | undefined, cursor: string | undefined;
+    const cursors = new Set<string>();
+    do {
+      const page = await this.listQueuedSubmissions(threadId, cursor);
+      item = page.data.find(x => x.id === queuedSubmissionId); cursor = page.nextCursor;
+      if (cursor && cursors.has(cursor)) throw new Error("Native queue pagination repeated cursor");
+      if (cursor) cursors.add(cursor);
+    } while (!item && cursor);
+    const result = await this.queueOperation("thread/queue/delete", { threadId, queuedSubmissionId }) as { deleted?: boolean };
+    if (result.deleted && item) this.nativeQueueOrigins.delete(item.clientUserMessageId);
+    if (result.deleted && this.subscribedThreads.has(threadId) && !this.activeTurns.has(threadId)
+      && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)) {
+      await this.unsubscribeThread(threadId);
+      await this.recyclePrivateTransportIfIdle();
+    }
+    return result.deleted === true;
+  }
+
+  async runQueuedSubmission(input: CodexQueuedRunInput): Promise<CodexRunResult> {
+    this.operationLeases++;
+    try {
+      await this.ensureConnected();
+      const existing = await this.findQueuedTurn(input.threadId, input.clientUserMessageId, input.acceptedTurnId);
+      if (existing) {
+        if (input.observeOnly && existing.status === "inProgress") throw new Error("轮次仍在执行；只读恢复不会接管任务。");
+        if (existing.status === "inProgress" && !this.subscribedThreads.has(input.threadId)) {
+          if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
+          if (input.onUserInput) this.userInputHandlersByThread.set(input.threadId, input.onUserInput);
+          await this.request("thread/resume", { threadId: input.threadId });
+          this.subscribedThreads.add(input.threadId);
+          const refreshed = await this.findQueuedTurn(input.threadId, undefined, String(existing.id));
+          if (!refreshed) throw new Error("已接收的轮次无法核对，未重复启动。");
+          return await this.observeQueuedTurn(input, refreshed);
+        }
+        return await this.observeQueuedTurn(input, existing);
+      }
+      if (input.observeOnly) throw new Error("只读恢复未找到原轮次，未启动任务。");
+      if (input.acceptedTurnId) throw new Error("已接收的原生队列轮次暂时无法核对，未重复启动。");
+      if (!input.queuedSubmissionId) throw new Error("缺少待执行项 ID，未启动任务。");
+      return await this.runWithLease({ ...input, prompt: "" });
+    }
+    finally {
+      if (this.subscribedThreads.has(input.threadId) && !this.activeTurns.has(input.threadId)
+        && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)) {
+        await this.unsubscribeThread(input.threadId);
+      }
+      this.operationLeases--; await this.recyclePrivateTransportIfIdle();
+    }
+  }
+
+  private async findQueuedTurn(threadId: string, clientId?: string, turnId?: string): Promise<Record<string, unknown> | undefined> {
+    if (!clientId && !turnId) return undefined;
+    const cursors = new Set<string>(); let cursor: string | undefined;
+    do {
+      const page = await this.request("thread/turns/list", compactObject({ threadId, cursor, limit: 100,
+        sortDirection: "desc", itemsView: "full" }), Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000)) as {
+        data: Array<Record<string, unknown>>; nextCursor?: string;
+      };
+      const turn = page.data.find(t => turnId ? t.id === turnId : Array.isArray(t.items)
+        && t.items.some(i => i.type === "userMessage" && i.clientId === clientId));
+      if (turn) return turn;
+      cursor = page.nextCursor;
+      if (cursor && cursors.has(cursor)) throw new Error("Native turn history repeated cursor");
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    return undefined;
+  }
+
+  private async findRecentlyConsumedTurn(threadId: string, clientId?: string): Promise<Record<string, unknown> | undefined> {
+    if (!clientId) return undefined;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const turn = await this.findQueuedTurn(threadId, clientId);
+      if (turn) return turn;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return undefined;
+  }
+
+  private async observeQueuedTurn(input: CodexQueuedRunInput, turn: Record<string, unknown>): Promise<CodexRunResult> {
+    const turnId = String(turn.id), key = turnKey(input.threadId, turnId);
+    if (turn.status === "inProgress") {
+      if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
+      if (input.onUserInput) this.userInputHandlersByThread.set(input.threadId, input.onUserInput);
+    }
+    this.turnStreams.set(key, { onDelta: input.onDelta, onProgress: input.onProgress, chain: Promise.resolve() });
+    for (const event of this.queuedTurnEvents.get(key) ?? []) this.enqueueTurnEvent(key, event);
+    this.queuedTurnEvents.delete(key);
+    await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+    if (this.completedTurns.has(key)) return await this.waitForTurn(input.threadId, turnId);
+    if (turn.status !== "inProgress") {
+      if (input.clientUserMessageId) this.nativeQueueOrigins.delete(input.clientUserMessageId);
+      return await new Promise<CodexRunResult>((resolve, reject) => {
+        void this.finishTurn(input.threadId, key, { status: String(turn.status), text: extractAgentMessageFromTurn(turn),
+          raw: JSON.stringify(turn), error: typeof (turn.error as { message?: string })?.message === "string"
+            ? (turn.error as { message: string }).message : undefined }, resolve, reject);
+      });
+    }
+    return await this.waitForTurn(input.threadId, turnId);
+  }
+
+  private async queueOperation(method: string, params: Record<string, unknown>): Promise<unknown> {
+    this.operationLeases++;
+    try { await this.ensureConnected(); return await this.queueRequest(method, params); }
+    finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+  }
+
+  private async queueRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
+    try { return await this.request(method, params, Math.min(this.options.requestTimeoutMs ?? 30_000, 30_000)); }
+    catch (error) {
+      if (/method not found|unknown (?:method|variant)|experimental.*(?:disabled|unsupported)/i.test(String(error))) {
+        throw new CodexBackendCapabilityError("nativeQueue", "app-server");
+      }
+      throw error;
     }
   }
 
@@ -929,6 +1135,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const args = this.options.transport?.args
       ?? [...localCommand.argsPrefix, "app-server", "--stdio"];
     const child = spawn(command, [...args], {
+      ...(this.options.codexHome && (!this.options.transport || this.options.transport.mode === "stdio")
+        ? { env: { ...process.env, CODEX_HOME: this.options.codexHome } } : {}),
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
       windowsHide: true
@@ -1044,6 +1252,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (method === "turn/started") {
+      const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+      const turn = params.turn as { id?: string } | undefined;
+      if (threadId && turn?.id) this.activeTurns.set(threadId, turn.id);
+    }
     if (method === "thread/status/changed") {
       const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
       if (threadId) {
@@ -1093,6 +1306,19 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (method === "item/started") {
       const key = turnKeyFromParams(params);
       const item = params.item as Record<string, unknown> | undefined;
+      if (item?.type === "userMessage" && typeof item.clientId === "string" && key) {
+        const origin = this.nativeQueueOrigins.get(item.clientId);
+        if (origin) {
+          const turnId = String(params.turnId), threadId = String(params.threadId);
+          this.nativeTurnClients.set(key, item.clientId);
+          this.activeTurns.set(threadId, turnId);
+          if (origin.onApproval) this.approvalHandlersByThread.set(threadId, origin.onApproval);
+          if (origin.onUserInput) this.userInputHandlersByThread.set(threadId, origin.onUserInput);
+          void Promise.resolve(origin.onAccepted?.(turnId)).catch(() => {
+            console.warn("[codex-im-gateway] native turn acknowledgement callback failed; no input replayed");
+          });
+        }
+      }
       const itemId = typeof item?.id === "string" ? item.id : undefined;
       if (key && itemId && item?.type === "agentMessage" && typeof item.phase === "string") {
         const phases = this.itemPhasesByTurn.get(key) ?? new Map<string, string>();
@@ -1180,7 +1406,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       raw: (this.turnEvents.get(key) ?? []).join("\n"),
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
-    this.activeTurns.delete(threadId);
+    if (this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
+    const nativeClientId = this.nativeTurnClients.get(key);
+    if (nativeClientId) { this.nativeQueueOrigins.delete(nativeClientId); this.nativeTurnClients.delete(key); }
     const previousState = this.threadStates.get(threadId);
     this.threadStates.set(threadId, {
       threadId,
@@ -1257,6 +1485,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     resolve: (value: CodexRunResult) => void,
     reject: (error: Error) => void
   ): Promise<void> {
+    const turnId = key.slice(threadId.length + 1);
+    // Completion can beat the start acknowledgement on the JSONL transport.
+    if (this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
     const stream = this.turnStreams.get(key);
     this.turnStreams.delete(key);
     await stream?.chain;
@@ -1270,10 +1501,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       return;
     }
     if (completion.status === "interrupted") {
-      reject(new Error("Codex app-server turn was interrupted"));
+      reject(new CodexTurnExecutionError("interrupted", "Codex app-server turn was interrupted"));
       return;
     }
-    reject(new Error(completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
+    reject(new CodexTurnExecutionError("failed", completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
   }
 
   private appendTurnEvent(key: string, raw: string): void {
@@ -1430,6 +1661,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       waiter.reject(error);
     }
     this.activeTurns.clear();
+    this.nativeQueueOrigins.clear();
+    this.nativeTurnClients.clear();
+    this.subscribedThreads.clear();
     this.approvalHandlersByThread.clear();
     this.dynamicToolHandlersByThread.clear();
     this.userInputHandlersByThread.clear();
@@ -1944,7 +2178,12 @@ export function parseThreadHistory(thread: Record<string, unknown> | undefined):
       if (item.type === "userMessage") {
         const text = extractUserMessageText(item.content);
         if (text) {
-          messages.push({ id, role: "user", text, ...(userCreatedAt ? { createdAt: userCreatedAt } : {}) });
+          messages.push({ id, role: "user", text,
+            ...(typeof item.clientId === "string" ? { clientUserMessageId: item.clientId } : {}),
+            ...(typeof turn.id === "string" ? { turnId: turn.id } : {}),
+            ...(["inProgress", "completed", "interrupted", "failed"].includes(String(turn.status))
+              ? { turnStatus: turn.status as CodexTurnStatus } : {}),
+            ...(userCreatedAt ? { createdAt: userCreatedAt } : {}) });
         }
         continue;
       }

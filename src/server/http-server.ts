@@ -139,6 +139,7 @@ const sessionPatchSchema = z.object({
   streamReplies: z.boolean().nullable().optional()
 }).refine((value) => Object.keys(value).length > 0, "Session update is empty");
 const configSchema = z.object({
+  activeMessagePolicy: z.enum(["ask", "steer", "queue"]).optional(),
   defaultCwd: z.string().min(1),
   allowedWorkspaces: z.array(z.string().min(1)).min(1),
   codexBackend: z.enum(["auto", "app-server", "exec"]),

@@ -18,6 +18,8 @@ export type CodexBackendCapabilities = {
   readonly historyPaging: boolean;
   /** Appends user input to the currently active turn. */
   readonly turnSteering: boolean;
+  /** Experimental native queue API; older servers can explicitly reject it. */
+  readonly nativeQueue?: boolean;
   /** Can follow activity produced by a turn that was started elsewhere. */
   readonly liveFollow: boolean;
   readonly runtimeInfo: boolean;
@@ -98,6 +100,37 @@ export type CodexSteerInput = {
   clientUserMessageId?: string;
 };
 
+export type CodexQueuedSubmission = {
+  id: string;
+  clientUserMessageId: string;
+  input: Array<{ type: string; text?: string; [key: string]: unknown }>;
+};
+export type CodexQueuePage = { data: CodexQueuedSubmission[]; nextCursor?: string };
+export type CodexQueueAddInput = {
+  threadId: string; prompt: string; clientUserMessageId: string;
+  onApproval?: CodexApprovalHandler;
+  onUserInput?: CodexUserInputHandler;
+  onAccepted?: (turnId: string) => Promise<void> | void;
+};
+/** Queue execution consumes a server-owned item, never resubmits its prompt. */
+export type CodexQueuedRunInput = Omit<CodexRunnerInput, "prompt" | "threadId"> & {
+  threadId: string;
+  queuedSubmissionId?: string;
+  clientUserMessageId?: string;
+  /** Observe an already consumed native item, without starting anything. */
+  acceptedTurnId?: string;
+  /** Terminal receipt recovery may read a result even after ownership changes. */
+  observeOnly?: boolean;
+  onQueueStarting?: () => Promise<void> | void;
+};
+
+export interface CodexNativeQueue {
+  addQueuedSubmission(input: CodexQueueAddInput, hostId?: string): Promise<CodexQueuedSubmission>;
+  listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string): Promise<CodexQueuePage>;
+  deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string): Promise<boolean>;
+  runQueuedSubmission(input: CodexQueuedRunInput): Promise<CodexRunResult>;
+}
+
 export type CodexHistoryPageInput = {
   cursor?: string;
   limit?: number;
@@ -118,6 +151,11 @@ export class CodexBackendCapabilityError extends Error {
 }
 export class CodexInterventionError extends Error {
   constructor(message: string) { super(message); this.name = "CodexInterventionError"; }
+}
+export class CodexTurnExecutionError extends Error {
+  constructor(readonly status: "interrupted" | "failed", message: string) {
+    super(message); this.name = "CodexTurnExecutionError";
+  }
 }
 /** Explicit negative discovery BEFORE submission; never a transport timeout or an uncertain acknowledgement. */
 export class CodexOwnerUnavailableError extends Error {
@@ -251,6 +289,10 @@ export type CodexHistoryMessage = {
   text: string;
   kind?: "progress";
   createdAt?: string;
+  /** Exact server correlation, never inferred by comparing message text. */
+  clientUserMessageId?: string;
+  turnId?: string;
+  turnStatus?: CodexTurnStatus;
 };
 
 export type CodexThreadSnapshot = {
@@ -357,12 +399,12 @@ export interface CodexBackendControls {
   deleteThread(threadId: string): Promise<void>;
 }
 
-export interface CodexAppServerBackend extends CodexBackendAdapter {
+export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
   readonly id: "app-server";
 }
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
-export interface CodexBridgeBackend {
+export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
@@ -407,6 +449,7 @@ export const EXEC_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.freeze
   history: true,
   historyPaging: true,
   turnSteering: false,
+  nativeQueue: false,
   liveFollow: false,
   runtimeInfo: false,
   models: false,
@@ -431,6 +474,7 @@ export const APP_SERVER_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.
   history: true,
   historyPaging: true,
   turnSteering: true,
+  nativeQueue: true,
   liveFollow: true,
   runtimeInfo: true,
   models: true,

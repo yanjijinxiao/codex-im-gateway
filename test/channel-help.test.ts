@@ -32,7 +32,7 @@ test("command inventory reserves every canonical command/alias and reports backe
   assert.match(help, /\/follow[^\n]+【当前后端不支持】/);
   assert.match(help, /\/answer[^\n]+【当前后端不支持】/);
   assert.match(help, /\/task[^\n]+【需启用 Taskboard】/);
-  assert.match(channelHelpText([], "session", { desktopOwned: true }), /Desktop 转发不支持安全介入/);
+  assert.match(channelHelpText([], "session", { desktopOwned: true }), /Desktop 转发不支持此操作/);
 });
 
 test("focused session help describes policies, permissions and backend limits", () => {
@@ -44,9 +44,9 @@ test("focused session help describes policies, permissions and backend limits", 
   assert.match(text, /\/sessions size 50/);
   assert.match(text, /\/follow \[on\|off\|sync\]/);
   for (const name of interventionCommands) assert.ok(text.includes(name));
-  assert.match(text, /ask：先询问（默认）/);
+  assert.match(text, /steer：插入当前轮次（默认）/);
   assert.match(text, /viewer：只读；participant：对话与插话；controller/);
-  assert.match(text, /后端不支持时会提示改用 \/queue/);
+  assert.match(text, /后端不支持时明确拒绝，不暗中排队/);
   assert.match(text, /发送 \/help 查看全部命令/);
   assert.doesNotMatch(text, /\/task new/);
   assert.equal(channelHelpText([], "all"), channelHelpText([]));

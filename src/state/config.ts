@@ -19,6 +19,8 @@ export type CodexImGatewayConfig = {
   model?: string;
   effort?: string;
   streamReplies: boolean;
+  /** Default busy-session policy. A ManagedSession may explicitly override it. */
+  activeMessagePolicy: "ask" | "steer" | "queue";
   maxBufferItems: number;
   promptBufferTtlMs: number;
   maxInboundBytes: number;
@@ -38,6 +40,7 @@ export function defaultConfig(cwd = defaultStateDir()): CodexImGatewayConfig {
     codexBackend: "auto",
     codexAppServerTransport: "auto",
     streamReplies: true,
+    activeMessagePolicy: "steer",
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
     maxInboundBytes: MAX_INBOUND_BYTES,
@@ -60,6 +63,7 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfi
     ),
     codexExecSandbox,
     streamReplies: typeof loaded.streamReplies === "boolean" ? loaded.streamReplies : base.streamReplies,
+    activeMessagePolicy: normalizeActiveMessagePolicy(loaded.activeMessagePolicy),
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
     taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
       ? loaded.taskboardUrl.trim()
@@ -88,8 +92,13 @@ function normalizeAppServerTransport(
 export function saveConfig(paths: StatePaths, config: CodexImGatewayConfig): void {
   writeJsonFile(paths.configPath, {
     ...config,
+    activeMessagePolicy: normalizeActiveMessagePolicy(config.activeMessagePolicy),
     maxInboundBytes: normalizeInboundBytes(config.maxInboundBytes, MAX_INBOUND_BYTES)
   });
+}
+
+function normalizeActiveMessagePolicy(value: unknown): CodexImGatewayConfig["activeMessagePolicy"] {
+  return value === "ask" || value === "queue" ? value : "steer";
 }
 
 function normalizeInboundBytes(value: unknown, fallback: number): number {

@@ -37,6 +37,16 @@ Bridge-only policy and private knowledge are sent through `developerInstructions
 
 The shared types and interfaces live in `src/codex/backend.ts`. Concrete implementations do not import their public input types from one another.
 
+### Native queue and receipt recovery
+
+`CodexNativeQueue` is an optional backend port for experimental native queue add/list/delete/consume operations. The router resolves the selected host/backend and actual execution owner; exec never borrows app-server, and the current Desktop continuation relay cannot safely steer or consume a native queue. Unsupported operations fail explicitly.
+
+`NativeQueueCoordinator` is a shared application service, not an IM adapter or a second execution backlog. Codex owns input content, order and pending-item persistence. Gateway stores only account/conversation/actor/message identity and submission/turn/delivery receipts in `runtime/native-submissions.json`, durably before submission. Recovery pages through native queue and history using exact client and turn IDs, never text similarity. Ambiguous writes are not retried; known consumed turns are observed, never started again. Delivery uncertainty stops automatic re-delivery and points to `/history`.
+
+Queue operations use short per-host/backend/thread control locks. Execution observation is separately guarded per thread; different threads recover independently, and controls/approvals do not wait behind a running task. A native item may auto-start on add or resume: retain the subscribed execution connection and route approval/user-input events to its original account and actor. Only an idle, verified native head may be explicitly consumed. Queued turns use the same progress, approvals and final-delivery pipeline as ordinary turns; binding changes do not retarget accepted work.
+
+Private stdio shutdown interrupts active execution. Native pending items and receipts persist, but active work is not transparently migrated to another executor. Shared daemon lifecycle is independent of Gateway clients. These distinctions are tested with an isolated real Codex binary and local mock model, including busy submission, restart and exactly one observed execution per native input.
+
 ### Session discovery is a first-class backend operation
 
 `listSessionCatalog` returns `CodexSessionCatalog` with `backend`, `source`, `threads`, `hostIds`, `complete`, and `warnings`. `/sessions` consumes this contract; it does not combine raw CLI and App storage. `listThreads` remains a lower-level storage/lifecycle operation.
@@ -113,7 +123,7 @@ For local replay of an internal rollout, run `TMPDIR=/private/tmp node --import 
 
 The current Desktop follower `thread-follower-steer-turn` v1 does **not** accept `expectedTurnId`: Desktop chooses the turn itself and may retry on a different one. Bridge therefore rejects this unsafe relay path. Strict steering remains available through the shared App Server's official `turn/steer`, which enforces `expectedTurnId`. Desktop interrupt v4 supports an expected turn guard; the router obtains that ID from the actual owner and never interrupts an orphan UI tail. The private Desktop protocol is version-dependent and is not equivalent to the official App Server API.
 
-Ordinary IM text is not an implicit `/steer`: `ask` offers only supported actions, `queue` waits for the next turn, and `steer` requires safe turn steering. Setting `/policy steer` on CLI or Desktop relay is rejected without changing the old policy. The same policy boundary applies to DingTalk, WeChat and Feishu. Binding changes invalidate subscriptions centrally. Switching or leaving does not interrupt Codex; queued work stays attached to its original session, but later progress/results are not delivered into the recipient's new binding. `/leave` remains detached across restart until an explicit selection or `/new`. `/stream off` suppresses followed progress without losing the final result.
+Ordinary IM text during an active turn defaults to guarded `steer`. Explicit per-session overrides remain intact: `ask` offers supported actions, and `queue` submits to the native next-turn queue. Exec and the current Desktop relay reject unsafe steering/native queue consumption; CLI App Server uses its own native implementation. No implicit policy or backend fallback occurs. The same policy boundary applies to DingTalk, WeChat and Feishu. Binding changes invalidate subscriptions centrally. Switching or leaving does not interrupt Codex; queued work stays attached to its original session, but later progress/results are not delivered into the recipient's new binding. `/leave` remains detached across restart until an explicit selection or `/new`. `/stream off` suppresses followed progress without losing the final result.
 
 ### Chat commands
 
@@ -137,9 +147,9 @@ Ordinary IM text is not an implicit `/steer`: `ask` offers only supported action
 | `/history 10`, `/history more` | Read recent messages, then older pages |
 | `/follow on`, `/follow off` | Toggle live delivery for the selected session |
 | `/leave` | Persistently detach and stop following, without stopping the task or implicitly resuming on the next message |
-| `/policy ask`, `/policy steer`, `/policy queue` | Handle ordinary messages received during an active turn; default is ask |
+| `/policy ask`, `/policy steer`, `/policy queue` | Handle ordinary messages received during an active turn; global default is steer, explicit session overrides are preserved |
 | `/steer text` | Submit guarded input to the active turn |
-| `/queue text` | Submit the next turn after current work finishes |
+| `/queue text`, `/queue list`, `/queue cancel id` | Submit to native queue, inspect this chat's receipts, or cancel an owned pending native item |
 | `/intervene ID steer\|queue\|cancel` | Resolve the originating user's pending choice |
 | `/role`, `/role USER viewer\|participant\|controller` | Inspect or configure chat permissions |
 
@@ -172,6 +182,7 @@ Bindings are identified by host + thread ID within a channel recipient. A projec
 | Runtime state | Unknown for foreign processes; own active process is confirmed | Catalog runtime unknown; native inspection describes the queried server, not a different Desktop writer |
 | Remote host | Explicitly unsupported | Registered remote transport |
 | Live following / guarded steering | Explicitly unsupported; history and new turns remain available | Supported subject to writer/protocol constraints below |
+| Native queue add/list/delete/consume | Explicitly unsupported | Experimental native APIs; actual Desktop relay consumption unsupported |
 | Stop | Gateway's own CLI subprocess only | Native interrupt / guarded Desktop relay |
 | Models, rate limits, goals, lifecycle mutations, native plan mode | Explicitly unsupported; explicit model/effort execution flags remain usable | Native APIs |
 

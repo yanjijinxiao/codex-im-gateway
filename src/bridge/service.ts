@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
+import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
+import { CodexTurnExecutionError } from "../codex/backend.js";
 import { ChannelApprovalController, type ApprovalDeliveryResult } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
@@ -49,6 +51,7 @@ import {
 import type {
   CodexDynamicToolCall,
   CodexBridgeBackend,
+  CodexRunnerInput,
   CodexHistoryMessage,
   CodexModelOption,
   CodexRuntimeInfo,
@@ -121,6 +124,8 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
+  accountId?: string;
+  nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
   createTextStream?: (session: ManagedSession) => ChannelTurnTextStream;
   onSubscriptionsChanged?: () => Promise<void>;
@@ -163,6 +168,10 @@ export class BridgeService {
   }>();
   private readonly actor = new AsyncLocalStorage<string>();
   private readonly controls: SessionControlJournal;
+  private readonly nativeQueue: NativeQueueCoordinator;
+  private recoveringQueue = false;
+  private lastQueueWarningAt = 0;
+  private readonly runningSessions = new Set<string>();
   private readonly catalogControls = new SessionControlQueue();
   private readonly turnDeliveries = new SessionControlQueue();
   private readonly historyPages = new Map<string, {
@@ -185,6 +194,8 @@ export class BridgeService {
       maxInboundBytes: options.config.maxInboundBytes, cdnBaseUrl: options.cdnBaseUrl, mediaFetch: options.mediaFetch
     });
     this.controls = options.sessionControls ?? new SessionControlJournal(options.stateStore.controlJournalPath);
+    this.nativeQueue = options.nativeQueue ?? new NativeQueueCoordinator(
+      path.join(path.dirname(options.stateStore.controlJournalPath), "native-submissions.json"));
     this.access = new AccessController({
       allowedSenderIds: options.config.allowedSenderIds,
       pairedSenderIds: options.stateStore.listPairedSenderIds()
@@ -510,11 +521,7 @@ export class BridgeService {
         await this.handleSteerCommand(message, command.arg);
         return;
       case "queue":
-        if (!command.arg.trim()) {
-          await this.reply(message.senderId, "用法：/queue <下一轮要发送的内容>");
-          return;
-        }
-        await this.runCodexTurn(message, command.arg.trim());
+        await this.handleQueueCommand(message, command.arg);
         return;
       case "model":
         await this.handleModelCommand(message.senderId, command.arg);
@@ -1320,12 +1327,12 @@ export class BridgeService {
     }
     const hostId = this.sessionHostId(session);
     if (this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
-      await this.reply(message.senderId, "当前后端不支持介入正在执行的轮次，消息未提交。请用 /queue 排到下一轮。");
+      await this.reply(message.senderId, "当前后端不支持介入正在执行的轮次，消息未提交。原生队列也需要后端支持；可在 Codex 中操作。");
       return;
     }
     const state = await this.runner.inspectThread(session.threadId, hostId);
     if (state.executionOwner === "desktop") {
-      await this.reply(message.senderId, "当前 Desktop 转发协议不支持指定轮次的安全介入，消息未提交。请用 /queue 排到下一轮。");
+      await this.reply(message.senderId, "当前 Desktop 转发协议不支持指定轮次的安全介入，消息未提交。请在 Codex App 中介入或排队，或改用共享 App Server 会话。");
       return;
     }
     if (state.persistence !== "active" || state.runtimeStatus === "systemError") {
@@ -1431,17 +1438,27 @@ export class BridgeService {
       const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
         && (await this.runner.inspectThread(session.threadId, hostId)).executionOwner === "desktop";
       if (desktopOwned || this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
-        await this.reply(senderId, "当前后端不支持安全介入，处理策略未改变。请使用 /policy ask 或 /policy queue。");
+        await this.reply(senderId, "当前后端不支持安全介入，处理策略未改变。请在实际持有会话的 Codex 中操作，或等当前任务完成后发送。");
+        return;
+      }
+    }
+    if (arg === "queue") {
+      const hostId = this.sessionHostId(session);
+      const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
+        && (await this.runner.inspectThread(session.threadId, hostId)).executionOwner === "desktop";
+      if (desktopOwned || this.runner.backendInfo?.(hostId).capabilities.nativeQueue === false
+        || typeof this.runner.addQueuedSubmission !== "function") {
+        await this.reply(senderId, "当前后端不支持可靠的原生队列，处理策略未改变。请在实际持有会话的 Codex 中排队。");
         return;
       }
     }
     if (arg) this.options.stateStore.setActiveMessagePolicy(session.id, arg as "ask" | "steer" | "queue");
-    await this.reply(senderId, "运行中消息处理方式：" + (arg || session.activeMessagePolicy || "ask") + "（ask 询问，steer 介入，queue 排队）。");
+    await this.reply(senderId, "运行中消息处理方式：" + (arg || session.activeMessagePolicy || this.options.config.activeMessagePolicy || "steer") + "（ask 询问，steer 介入，queue 原生排队）。");
   }
 
   private async handleActiveMessage(message: ChannelMessage, items: PromptBufferItem[]): Promise<boolean> {
     const session = this.executionSession(message.senderId);
-    if (!session?.threadId || session.mode === "qa" || session.activeMessagePolicy === "queue") return false;
+    if (!session?.threadId || session.mode === "qa") return false;
     if (typeof this.runner.inspectThread !== "function") return false;
     const hostId = this.sessionHostId(session);
     const state = await this.runner.inspectThread(session.threadId, hostId);
@@ -1449,12 +1466,30 @@ export class BridgeService {
       await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
       return true;
     }
-    if (state.runtimeStatus !== "active") return false;
+    if (state.runtimeStatus !== "active") {
+      if (this.runningSessions.has(session.id)) {
+        await this.reply(message.senderId, "上一条消息正在提交，尚未确认活动轮次；这条消息未提交。请稍后发送，或显式 /queue 排到下一轮。");
+        return true;
+      }
+      return false;
+    }
     const canSteer = Boolean(state.activeTurnId)
       && state.executionOwner !== "desktop" && this.runner.backendInfo?.(hostId).capabilities.turnSteering !== false;
+    const canQueue = state.executionOwner !== "desktop"
+      && this.runner.backendInfo?.(hostId).capabilities.nativeQueue !== false
+      && typeof this.runner.addQueuedSubmission === "function";
     const prompt = buildPromptParts("", items, channelPromptSource(this.channel.channel), []).prompt;
-    if (session.activeMessagePolicy === "steer") {
+    const policy = session.activeMessagePolicy ?? this.options.config.activeMessagePolicy ?? "steer";
+    if (policy === "queue") {
+      await this.enqueueNativeMessage(message, "", items);
+      return true;
+    }
+    if (policy === "steer") {
       await this.handleSteerCommand(message, prompt, state.activeTurnId);
+      return true;
+    }
+    if (!canSteer && !canQueue) {
+      await this.reply(message.senderId, "当前后端不支持安全介入或可靠的原生队列，这条消息未提交。请在实际持有会话的 Codex 中操作，或等当前任务完成后发送。");
       return true;
     }
     const choice = this.controls.createChoice({
@@ -1467,10 +1502,12 @@ export class BridgeService {
       body: "如何处理这条新消息？\n\n" + boundedProgressText(buildPromptPreview("", items) ?? "", 500),
       choices: [
         ...(canSteer ? [{ label: "介入当前任务", command: "intervene" as const, arg: choice.id + " steer", style: "primary" as const }] : []),
-        { label: "排到下一轮", command: "intervene", arg: choice.id + " queue" },
+        ...(canQueue ? [{ label: "排到下一轮", command: "intervene" as const, arg: choice.id + " queue" }] : []),
         { label: "取消", command: "intervene", arg: choice.id + " cancel" }
       ],
-      fallbackText: "发送 /intervene " + choice.id + (canSteer ? " steer 介入，" : "（当前后端不支持安全介入），") + "queue 排队，cancel 取消。"
+      fallbackText: "发送 /intervene " + choice.id + " " + [
+        ...(canSteer ? ["steer 介入"] : []), ...(canQueue ? ["queue 原生排队"] : []), "cancel 取消"
+      ].join("，") + "。"
     }));
     return true;
   }
@@ -1490,7 +1527,109 @@ export class BridgeService {
       return;
     }
     if (action === "steer") await this.handleSteerCommand({ ...message, id: choice.id }, choice.prompt, choice.turnId);
-    else await this.runCodexTurn({ ...message, id: choice.id }, "", choice.items);
+    else await this.enqueueNativeMessage({ ...message, id: choice.id }, "", choice.items);
+  }
+
+  private async handleQueueCommand(message: ChannelMessage, arg: string): Promise<void> {
+    const value = arg.trim();
+    if (!value || value === "list") {
+      let warning: string | undefined;
+      try { await this.nativeQueue.reconcile(this.options.accountId ?? "standalone", this.runner); }
+      catch { warning = "部分后端暂时无法核对，以下为持久化回执，不代表已确认的当前状态。"; }
+      const rows = this.nativeQueue.list(this.options.accountId ?? "standalone", message.senderId);
+      await this.reply(message.senderId, rows.length ? ["本聊天的原生队列回执（任务内容与顺序由 Codex 保存）：",
+        ...(warning ? [warning] : []),
+        ...rows.slice(-20).map(r => `${r.queuedSubmissionId ?? r.clientUserMessageId} · ${r.status}${r.status === "completed" ? r.delivered ? " · 结果已处理" : " · 结果未确认投递" : ""}\nSession：${r.threadId}${r.reason ? "\n" + r.reason : ""}`),
+        "取消待执行消息：/queue cancel <队列ID>；显式排队：/queue <内容>"].join("\n\n")
+        : "本聊天暂无原生队列回执。用法：/queue <内容>；/queue list；/queue cancel <队列ID>。");
+      return;
+    }
+    if (/^cancel(?:\s|$)/.test(value)) {
+      const [, id, extra] = value.split(/\s+/);
+      if (!id || extra) { await this.reply(message.senderId, "用法：/queue cancel <队列ID>"); return; }
+      const cancelled = await this.nativeQueue.cancel(this.options.accountId ?? "standalone", message.senderId,
+        this.actor.getStore() ?? message.senderId, id, this.runner, this.role(message.senderId) === "controller");
+      await this.reply(message.senderId, cancelled ? "已从 Codex 原生队列取消待执行消息。" : "队列项已不在待执行列表中，未停止任务、未重发消息。请用 /queue list 核对。");
+      return;
+    }
+    const items = await this.promptItemsFromMessageWithNotice({ ...message, text: "" });
+    if (items) await this.enqueueNativeMessage(message, value, items);
+  }
+
+  private async enqueueNativeMessage(message: ChannelMessage, text: string, items: PromptBufferItem[]): Promise<void> {
+    const session = this.executionSession(message.senderId);
+    if (!session?.threadId || session.mode === "qa") {
+      await this.reply(message.senderId, "原生队列需要已绑定且已创建的普通 session；请先绑定会话。QA 和首次创建不支持原生排队。");
+      return;
+    }
+    const hostId = this.sessionHostId(session) ?? "local";
+    const state = await this.runner.inspectThread(session.threadId, hostId);
+    assertCodexThreadRunnable(state);
+    if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
+      await this.reply(message.senderId, "会话存在未确认轮次，消息未入队；请先重新加载 Codex App 并核对状态。"); return;
+    }
+    // The current Desktop follower cannot refresh/start the native server
+    // queue safely. Never acknowledge a queued task that no owner can consume.
+    if (state.executionOwner === "desktop") {
+      await this.reply(message.senderId, "当前 Desktop 转发协议尚不支持可靠的原生队列消费，消息未提交。请在 Codex App 中排队，或使用共享 App Server 会话。"); return;
+    }
+    const preview = buildPromptPreview(text, items) ?? text;
+    const knowledge = this.options.stateStore.relevantKnowledge(preview, session.projectId);
+    const { prompt } = buildPromptParts(text, items, channelPromptSource(this.channel.channel), knowledge);
+    const receipt = await this.nativeQueue.enqueue({
+      accountId: this.options.accountId ?? "standalone", conversationId: message.senderId,
+      actorId: this.actor.getStore() ?? message.senderId, messageId: message.id,
+      sessionId: session.id, hostId, backend: this.runner.backendInfo(hostId).id, threadId: session.threadId
+    }, prompt, this.runner, {
+      onApproval: request => this.approvals.request(message.senderId, request),
+      onUserInput: request => this.userInputs.request(message.senderId, request)
+    });
+    this.options.stateStore.setSessionPromptPreview(session.id, preview);
+    await this.reply(message.senderId, receipt.status === "queued" || receipt.status === "running"
+      ? `已由 Codex 接收${receipt.status === "running" ? "，任务已开始" : "并加入原生队列"}。\n队列ID：${receipt.queuedSubmissionId}\nGateway 重启后只核对回执，不重发消息。任务继承该会话的原生执行设置。`
+      : `这条消息已有 ${receipt.status} 回执，未重复提交。请用 /queue list 核对。`);
+    void this.recoverNativeQueue().catch(() => {
+      this.warnNativeQueueRecovery();
+    });
+  }
+
+  /** Called by the shared account lifecycle, not by an IM-specific scheduler. */
+  async recoverNativeQueue(): Promise<void> {
+    if (this.recoveringQueue) return;
+    this.recoveringQueue = true;
+    const accountId = this.options.accountId ?? "standalone";
+    try {
+      await this.nativeQueue.reconcile(accountId, this.runner);
+    } catch {
+      // An unavailable host/thread must not starve other reconciled receipts.
+      this.warnNativeQueueRecovery();
+    } finally { this.recoveringQueue = false; }
+    await this.nativeQueue.dispatch(accountId, this.runner, async (receipt, starting, started, item) => {
+        if (!this.access.requireAccess(receipt.actorId, receipt.conversationId).allowed) {
+          throw new Error("Queued origin access was revoked; native item preserved");
+        }
+        const currentRole = this.options.stateStore.roleFor(receipt.conversationId, receipt.actorId)
+          ?? (this.access.isAllowed(receipt.actorId) ? "controller" : this.options.stateStore.roleFor(receipt.conversationId, "*") ?? "participant");
+        if (!roleAllows(currentRole, "participant")) {
+          throw new Error("Queued origin role was revoked; native item preserved");
+        }
+        const session = this.options.stateStore.getSession(receipt.sessionId);
+        if (!session || session.threadId !== receipt.threadId || (this.sessionHostId(session) ?? "local") !== receipt.hostId) {
+          throw new Error("Queued session identity changed; native item was not started");
+        }
+        await this.actor.run(receipt.actorId, () => this.runCodexTurn({
+          id: receipt.messageId, senderId: receipt.conversationId, text: "", attachments: [], raw: {}
+        }, item?.input.map(x => x.type === "text" ? x.text ?? "" : "").join("\n") ?? "", [], { receipt, starting, started }));
+      });
+  }
+
+  private warnNativeQueueRecovery(): void {
+    const now = Date.now();
+    if (now - this.lastQueueWarningAt < 60_000) return;
+    this.lastQueueWarningAt = now;
+    console.warn("[codex-im-gateway] native queue recovery deferred; receipts preserved, no input replayed", {
+      accountId: this.options.accountId ?? "standalone", category: "native_queue_recovery"
+    });
   }
 
 
@@ -1866,22 +2005,25 @@ export class BridgeService {
     }
   }
 
-  private async runCodexTurn(message: ChannelMessage, text: string, attachments: PromptBufferItem[] = []): Promise<void> {
-    if (this.options.stateStore.isSessionDetached(message.senderId)) {
+  private async runCodexTurn(message: ChannelMessage, text: string, attachments: PromptBufferItem[] = [], queued?: {
+    receipt: QueueReceipt; starting: () => void; started: (turnId: string) => void;
+  }): Promise<void> {
+    if (!queued && this.options.stateStore.isSessionDetached(message.senderId)) {
       await this.reply(message.senderId, "已退出会话，消息未提交。请用 /sessions 重新绑定，或 /new 新建会话。");
       return;
     }
-    const activeProject = this.options.stateStore.getActiveProject(message.senderId);
-    const activeSession = this.options.stateStore.getActiveSession(message.senderId);
+    const pinned = queued ? this.options.stateStore.getSession(queued.receipt.sessionId) : undefined;
+    const activeProject = queued ? this.options.stateStore.getProject(pinned?.projectId ?? "") : this.options.stateStore.getActiveProject(message.senderId);
+    const activeSession = pinned ?? this.options.stateStore.getActiveSession(message.senderId);
     const standalone = !activeProject && activeSession?.projectBinding === "none" ? activeSession : undefined;
     if (!activeProject && !standalone) throw new Error("请先发送 /sessions 选择会话，或 /project 选择项目。");
     // Turn execution must not wait for a fresh catalog request. Account start
     // and project/session selection already establish the execution context.
     const project = standalone ? undefined : activeProject;
-    const mode = this.options.stateStore.getInteractionMode(message.senderId);
+    const mode = queued ? "session" : this.options.stateStore.getInteractionMode(message.senderId);
     const qaContext = mode === "qa" && project ? this.resolveQaContext(project) : undefined;
     if (mode === "qa" && !qaContext) throw new Error("Current project has no available llm-wiki knowledge base");
-    const session = standalone ?? (mode === "qa"
+    const session = pinned ?? standalone ?? (mode === "qa"
       ? this.ensureQaSession(message.senderId, project!, qaContext as ManagedKnowledgeBase)
       : this.ensureConversationSession(message.senderId, project!));
     return this.turnDeliveries.run(JSON.stringify([this.sessionHostId(session), session.id]), async () => {
@@ -1911,14 +2053,16 @@ export class BridgeService {
       })
       : undefined;
     let streamedAnswer = "";
+    let acceptedQueueTurn = false;
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
+    this.runningSessions.add(session.id);
     try {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-im-gateway] starting Codex turn for ${message.senderId} in ${workspace}`);
-        if (replyStream?.supported) await replyStream.progress("🤔 正在理解任务并规划下一步…");
+        if (!queued && replyStream?.supported) await replyStream.progress("🤔 正在理解任务并规划下一步…");
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
         const promptParts = buildPromptParts(text, attachments, channelPromptSource(this.channel.channel), knowledge);
-        const result = await this.runner.run({
+        const runInput: CodexRunnerInput = {
           prompt: qaContext ? buildQaPrompt(promptParts.prompt, project!, qaContext) : promptParts.prompt,
           developerInstructions: promptParts.developerInstructions,
           cwd: workspace,
@@ -1932,10 +2076,12 @@ export class BridgeService {
             this.options.stateStore.setSessionThread(session.id, createdThreadId);
             return this.options.onSubscriptionsChanged?.();
           },
-          onTurnStarted: ({ threadId: startedThreadId, turnId }) => {
+          onTurnStarted: async ({ threadId: startedThreadId, turnId }: { threadId: string; turnId: string }) => {
+            if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             session.threadId = startedThreadId;
             this.options.stateStore.setSessionThread(session.id, startedThreadId);
-            return this.options.onTurnStarted?.(session, turnId);
+            await this.options.onTurnStarted?.(session, turnId);
+            if (queued && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
           },
           queueKey: threadId ?? session.id,
           model: session.model ?? this.options.config.model,
@@ -1964,8 +2110,18 @@ export class BridgeService {
             }
           } : {}),
           onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
-          onUserInput: (request) => this.userInputs.request(message.senderId, request)
-        });
+          onUserInput: (request: import("../codex/backend.js").CodexUserInputRequest) => this.userInputs.request(message.senderId, request)
+        };
+        const result = queued
+          ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,
+            queuedSubmissionId: queued.receipt.queuedSubmissionId, onQueueStarting: queued.starting,
+            clientUserMessageId: queued.receipt.clientUserMessageId, acceptedTurnId: queued.receipt.turnId,
+            observeOnly: queued.receipt.status === "completed",
+            // Native queue consumes only its stored input and inherits native
+            // settings. Do not silently apply later Bridge setting changes.
+            model: undefined, effort: undefined, collaborationMode: undefined,
+            projectId: undefined, projectName: undefined, threadTitle: undefined })
+          : await this.runner.run(runInput);
         console.log(`[codex-im-gateway] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
           this.options.stateStore.setSessionThread(session.id, result.threadId);
@@ -2002,6 +2158,7 @@ export class BridgeService {
         });
       });
     } catch (error) {
+      if (queued && !acceptedQueueTurn) throw error;
       let failureWasReported = !stillBound() || (await replyStream?.fail(
         stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
       ) ?? false);
@@ -2016,8 +2173,10 @@ export class BridgeService {
         text: error instanceof Error ? error.message : String(error),
         success: false
       });
+      if (queued && error instanceof CodexTurnExecutionError) return;
       throw error;
     } finally {
+      this.runningSessions.delete(session.id);
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
     }
     });

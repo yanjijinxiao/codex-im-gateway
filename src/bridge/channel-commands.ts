@@ -22,7 +22,7 @@ export const CHANNEL_COMMAND_REGISTRY = [
   { name: "role", aliases: [] },
   { name: "intervene", aliases: [] },
   { name: "steer", aliases: ["iv"], capability: "turnSteering" },
-  { name: "queue", aliases: [] },
+  { name: "queue", aliases: [], capability: "nativeQueue" },
   { name: "model", aliases: ["m"] },
   { name: "effort", aliases: ["e"] },
   { name: "stream", aliases: ["str"], capability: "progress" },
@@ -60,10 +60,11 @@ const SESSION_HELP_LINES = [
   "/history more - 继续查看更早的对话",
   "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/leave - 退出当前会话并停止跟随；不会停止任务，也不会自动接回旧会话",
-  "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时会提示改用 /queue",
-  "/queue 补充要求 - 排到当前任务之后，作为下一轮执行",
+  "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时明确拒绝，不暗中排队",
+  "/queue 补充要求 - 加入 Codex 原生队列，作为下一轮执行（需后端支持）",
+  "/queue list；/queue cancel 队列ID - 查看本聊天回执；取消自己的待执行消息",
   "/policy [ask|steer|queue] - 查看或设置运行中消息的处理方式",
-  "ask：先询问（默认）；steer：插入当前轮次；queue：排队到下一轮",
+  "steer：插入当前轮次（默认）；queue：原生排队到下一轮；ask：兼容的询问模式",
   "/intervene 编号 steer|queue|cancel - 处理待确认消息；编号由提示卡提供",
   "/role - 查看聊天权限",
   "/role 用户ID或* viewer|participant|controller - 设置权限（仅 controller 可操作）",
@@ -143,7 +144,7 @@ export function channelHelpText(capabilities: readonly ChannelCommandCapability[
     const token = /^\/(\w+)/.exec(line)?.[1];
     const command = CHANNEL_COMMAND_REGISTRY.find(item => item.name === token);
     if (token === "task" && context.taskboardAvailable === false) return `${line}【需启用 Taskboard】`;
-    if (token === "steer" && context.desktopOwned) return `${line}【当前 Desktop 转发不支持安全介入，请用 /queue】`;
+    if ((token === "steer" || token === "queue") && context.desktopOwned) return `${line}【当前 Desktop 转发不支持此操作，请在 App 中操作或使用共享 App Server】`;
     if (command && "capability" in command && context.backendCapabilities?.[command.capability] === false) {
       return `${line}【当前后端不支持】`;
     }

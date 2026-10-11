@@ -711,6 +711,7 @@ function renderSettings() {
   document.querySelector("#defaultCwdInput").value = state.config.defaultCwd || "";
   document.querySelector("#allowedWorkspacesInput").value = (state.config.allowedWorkspaces || []).join("\n");
   document.querySelector("#backendInput").value = state.config.codexBackend || "auto";
+  document.querySelector("#activeMessagePolicyInput").value = state.config.activeMessagePolicy || "steer";
   document.querySelector("#appServerTransportInput").value = state.config.codexAppServerTransport || "auto";
   document.querySelector("#sandboxInput").value = state.config.codexExecSandbox || "";
   document.querySelector("#streamRepliesInput").checked = Boolean(state.config.streamReplies);
@@ -2210,6 +2211,7 @@ async function saveSettings(event) {
         defaultCwd: document.querySelector("#defaultCwdInput").value.trim(),
         allowedWorkspaces: document.querySelector("#allowedWorkspacesInput").value.split("\n").map((line) => line.trim()).filter(Boolean),
         codexBackend: document.querySelector("#backendInput").value,
+        activeMessagePolicy: document.querySelector("#activeMessagePolicyInput").value,
         codexAppServerTransport: document.querySelector("#appServerTransportInput").value,
         codexExecSandbox: document.querySelector("#sandboxInput").value || null,
         model: document.querySelector("#modelInput").value.trim(),

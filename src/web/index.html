@@ -218,6 +218,15 @@
               <small class="field-hint">仅影响 app-server 后端；自动模式在 daemon 不可用时回退到 stdio。</small>
             </label>
             <label>
+              <span>运行中消息的默认策略</span>
+              <select id="activeMessagePolicyInput" name="activeMessagePolicy">
+                <option value="steer">Steer · 介入当前轮次（默认）</option>
+                <option value="queue">Queue · Codex 原生排队</option>
+                <option value="ask">Ask · 先询问（兼容）</option>
+              </select>
+              <small class="field-hint">仅影响忙碌会话；/policy 可覆盖。后端不支持时明确提示，不自动切换策略。</small>
+            </label>
+            <label>
               <span>Codex 文件权限</span>
               <select id="sandboxInput" name="codexExecSandbox">
                 <option value="">沿用 Codex 设置</option>

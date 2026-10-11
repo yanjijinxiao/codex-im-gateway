@@ -33,6 +33,9 @@ const projects = [{
 let externalBusyReads = 0;
 let ephemeralThreadStarted = false;
 let dynamicToolsEnabled = false;
+const nativeQueue = new Map();
+let nextQueue = 1;
+let resumedApprovalPolicy = "never";
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -96,6 +99,36 @@ function historyTurns(activeTurnId) {
 
 rl.on("line", (line) => {
   const message = JSON.parse(line);
+
+  if (message.method?.startsWith("thread/queue/")) {
+    if (process.argv.includes("--without-queue-api")) {
+      send({ id: message.id, error: { code: -32601, message: "Method not found" } }); return;
+    }
+    if (!experimentalApiEnabled || !initialized) { fail(message.id, "native queue requires experimental initialization"); return; }
+    const threadId = message.params.threadId;
+    const items = nativeQueue.get(threadId) ?? [];
+    nativeQueue.set(threadId, items);
+    if (message.method === "thread/queue/add") {
+      const item = { id: `queued-${nextQueue++}`, clientUserMessageId: message.params.clientUserMessageId,
+        input: message.params.input };
+      const index = items.findIndex(x => x.clientUserMessageId === item.clientUserMessageId);
+      if (index >= 0) items.splice(index, 1);
+      items.push(item); respond(message.id, { queuedSubmission: item }); return;
+    }
+    if (message.method === "thread/queue/list") { respond(message.id, { data: items, nextCursor: null }); return; }
+    const index = items.findIndex(x => x.id === message.params.queuedSubmissionId);
+    if (message.method === "thread/queue/delete") {
+      if (index >= 0) items.splice(index, 1); respond(message.id, { deleted: index >= 0 }); return;
+    }
+    if (message.method === "thread/queue/start") {
+      if (index < 0) { fail(message.id, "queued submission not found"); return; }
+      const [item] = items.splice(index, 1);
+      message.method = "turn/start";
+      message.params = { threadId, input: item.input, clientUserMessageId: item.clientUserMessageId,
+        approvalPolicy: resumedApprovalPolicy };
+    }
+  }
+  if (message.method === "thread/resume") resumedApprovalPolicy = message.params.approvalPolicy ?? "never";
 
   if (message.method === "initialize") {
     if (message.jsonrpc) {

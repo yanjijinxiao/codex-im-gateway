@@ -31,6 +31,19 @@
 
 服务只监听 `127.0.0.1`，渠道凭据、附件、会话绑定和个人知识均保存在本机。
 
+### 运行中消息与原生队列
+
+普通消息在已确认运行中的 session 默认使用 `steer`（介入当前轮次），空闲时仍作为新一轮消息发送。全局 `activeMessagePolicy` 默认值为 `steer`，管理页可修改；已有 `/policy ask|steer|queue` 会话级设置保持不变。`ask` 仅作为兼容选项，不再是默认值。
+
+- `/queue <内容>`：提交到 Codex 原生队列；`/queue list` 查看本聊天回执；`/queue cancel <队列ID>` 取消自己的待执行消息，controller 可取消本聊天其他用户的待执行消息。
+- 队列内容、顺序和待执行项的持久化由 Codex 管理。Gateway 的 `runtime/native-submissions.json` 仅保存来源账号、用户、会话及提交/执行 ID，不保存第二份待执行 prompt。
+- Gateway 重启后查询原生队列与分页历史，通过 `clientUserMessageId` / turn ID 核对。回执丢失或查不到项不会触发重发：队列项可能已经开始执行；无法确认时显示 `uncertain`。
+- Codex 可能自动消费原生队列。Gateway 会保持执行连接、进展与审批订阅，并观察同一 turn，不再次启动。只有确认项仍在原生队首、会话不忙且没有 Desktop 持有者时才调用 `thread/queue/start`，不会跳过其他写入者的队列项。审批、回答和停止命令不等待队列任务。
+- 重启后恢复的是原生待执行项及回执；关闭私有 stdio 执行器会中断它正在执行的任务，不能承诺该任务跨进程继续运行。恢复时会按原 turn 状态报告，不重跑已消费的输入。共享 daemon 的执行生命周期由 daemon 管理。
+- 排队消息固定归属提交时的 host/backend/thread，切换绑定不迁移旧消息；旧任务完成后不会把回答送到新绑定。队列任务继承 Codex 原生会话的执行设置，不支持按队列项单独设置模型或 QA 动态工具。
+
+能力限制：原生队列接口是 App Server 的实验性接口，旧版本与 `codex exec` 会明确拒绝，不借用其他后端。本机当前 Desktop follower 协议不能校验介入目标轮次，也不能可靠刷新/消费原生队列，因此 Desktop 持有的会话请在 App 中介入/排队，或使用支持这些操作的共享 App Server。Gateway 不会把 `steer` 暗中改成排队，不会抢占 Desktop 的任务。首次创建 thread 和 QA 会话不支持原生排队。
+
 ## 核心能力
 
 - **多渠道统一接入**：个人微信、企业微信、飞书和钉钉可以同时连接，同一套项目、会话、审批和通知能力按账号隔离运行。
@@ -135,7 +148,7 @@ node dist/server/index.js
 /stop                       中断当前任务
 ```
 
-普通消息不是隐式 `/steer`：任务运行中默认询问，也可用 `/policy queue` 排到下一轮。Desktop relay 目前不支持安全介入，请使用询问或排队；`/leave` 会持续退出绑定，直到显式选择会话或 `/new`。`/stream off` 关闭过程进度但保留最终结果。全部命令的保留、兼容及能力限制见[渠道命令审计](./docs/channel-command-audit.md)。
+普通消息在任务运行中默认安全 `steer`，也可显式 `/queue` 或用 `/policy queue` 排到下一轮。Desktop relay 目前不支持安全介入和可靠原生排队，请使用 App 自身操作或支持该能力的共享 App Server；不支持的后端会明确拒绝，不暗中切换策略。`/leave` 会持续退出绑定，直到显式选择会话或 `/new`。`/stream off` 关闭过程进度但保留最终结果。全部命令的保留、兼容及能力限制见[渠道命令审计](./docs/channel-command-audit.md)。
 
 Gateway 重启后会自动恢复已有绑定及跟随游标，并在渠道支持持久句柄时续用原进度卡片；即使进展内容没有变化，也会恢复活动卡片。需要手动恢复时，在原对话发送 `/follow sync`；若跟随已经关闭，发送 `/follow on`。`/status` 和 `/follow` 区分“设置开启”和“同步成功”。超时、未确认的 Desktop 持有者、悬空界面轮次和卡片更新失败都会明确显示，不能据“未加载”断言任务结束。纯 CLI 不支持外部实时跟随，命令会报告能力限制。
 

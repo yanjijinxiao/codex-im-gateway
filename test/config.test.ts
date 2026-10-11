@@ -11,12 +11,26 @@ test("uses ~/.codex-im-gateway as the default Codex workspace", () => {
   assert.equal(defaultConfig().defaultCwd, path.join(os.homedir(), ".codex-im-gateway"));
   assert.deepEqual(defaultConfig().allowedWorkspaces, [path.join(os.homedir(), ".codex-im-gateway")]);
   assert.equal(defaultConfig().streamReplies, true);
+  assert.equal(defaultConfig().activeMessagePolicy, "steer");
   assert.equal(defaultConfig().codexBackend, "auto");
   assert.equal(defaultConfig().codexAppServerTransport, "auto");
   assert.equal(defaultConfig().maxInboundBytes, 100 * 1024 * 1024);
   assert.equal(defaultConfig().taskboardEnabled, true);
   assert.equal(defaultConfig().taskboardUrl, "http://127.0.0.1:47823");
   assert.equal(resolveStatePaths("/tmp/codex-weixin-test").taskboardDir, "/tmp/codex-weixin-test/taskboard");
+});
+
+test("busy-message defaults migrate to steer and explicit policies are preserved", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-policy-config-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const paths = resolveStatePaths(dir);
+  assert.equal(loadConfig(paths).activeMessagePolicy, "steer");
+  for (const policy of ["ask", "steer", "queue"] as const) {
+    saveConfig(paths, { ...defaultConfig(dir), activeMessagePolicy: policy });
+    assert.equal(loadConfig(paths).activeMessagePolicy, policy);
+  }
+  fs.writeFileSync(paths.configPath, JSON.stringify({ activeMessagePolicy: "invalid" }));
+  assert.equal(loadConfig(paths).activeMessagePolicy, "steer");
 });
 
 test("uses the selected legacy state root as the workspace fallback", (t) => {

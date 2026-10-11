@@ -14,6 +14,7 @@ import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import { SessionControlJournal } from "../bridge/session-control.js";
+import { NativeQueueCoordinator } from "../bridge/native-queue.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import {
   userFacingMessageHandlingError,
@@ -270,6 +271,9 @@ export class AccountManager {
   private readonly managedTurnCompletions = new Set<string>();
   private readonly threadEvents: ThreadEventHub;
   private readonly sessionControls: SessionControlJournal;
+  private readonly nativeQueue: NativeQueueCoordinator;
+  private nativeQueueTimer?: NodeJS.Timeout;
+  private readonly nativeQueueWarningAt = new Map<string, number>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
   private readonly taskboardWorkbench: TaskboardWorkbench;
   private readonly recentTaskboardNotifications = new Map<string, number>();
@@ -284,6 +288,7 @@ export class AccountManager {
 
   constructor(private readonly options: AccountManagerOptions) {
     this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
+    this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     this.threadEvents = new ThreadEventHub({
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       subscriptions: () => this.threadSubscriptions(),
@@ -395,6 +400,8 @@ export class AccountManager {
     const client = adapter.client;
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
+      accountId: account.accountId,
+      nativeQueue: this.nativeQueue,
       sessionControls: this.sessionControls,
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
@@ -459,6 +466,7 @@ export class AccountManager {
     });
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
+    this.ensureNativeQueueRecovery();
     this.refreshDesktopApprovalSubscriptions();
 
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
@@ -1171,8 +1179,29 @@ export class AccountManager {
   }
 
   private closeRunner(): void {
+    if (this.nativeQueueTimer) clearInterval(this.nativeQueueTimer);
+    this.nativeQueueTimer = undefined;
     this.runner?.close();
     this.runner = undefined;
+  }
+
+  private ensureNativeQueueRecovery(): void {
+    if (this.nativeQueueTimer) return;
+    const recover = () => {
+      for (const [accountId, entry] of this.entries) {
+        if (entry.status !== "running" || !entry.service?.recoverNativeQueue) continue;
+        void entry.service.recoverNativeQueue().catch(() => {
+          const now = Date.now();
+          if (now - (this.nativeQueueWarningAt.get(accountId) ?? 0) < 60_000) return;
+          this.nativeQueueWarningAt.set(accountId, now);
+          console.warn("[codex-im-gateway] native queue recovery deferred; receipts preserved, no input replayed", {
+            accountId, category: "native_queue_recovery"
+          });
+        });
+      }
+    };
+    this.nativeQueueTimer = setInterval(recover, 5_000);
+    this.nativeQueueTimer.unref();
   }
 
   private async notifyProjectCompletion(
