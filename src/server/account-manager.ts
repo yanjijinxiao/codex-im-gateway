@@ -423,13 +423,13 @@ export class AccountManager {
         this.rememberApprovalOrigin(account.accountId, session, turnId);
         this.ensureCodexSessionMonitor();
         this.refreshDesktopApprovalSubscriptions();
-        return this.threadEvents.managedStarted({
+        return this.threadEvents.managedTurnStarted({
           key: JSON.stringify([account.accountId, session.id]),
           hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
           threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
         }, turnId);
       },
-      createTextStream: (session) => this.threadEvents.managedStream({
+      createTextStream: (session) => this.threadEvents.prepareManagedStream({
         key: JSON.stringify([account.accountId, session.id]),
         hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
         threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true,
@@ -437,6 +437,12 @@ export class AccountManager {
         onTextDelivered: (part) => webhook.publish({ direction: "outbound", id: part.messageId,
           recipientId: session.senderId, text: part.text, attachments: [] })
       }),
+      deliverTurnResult: (session, turnId, text) => this.threadEvents.managedCompletion({
+        key: JSON.stringify([account.accountId, session.id]),
+        hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
+        threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true,
+        contextToken: store.getContextToken(session.senderId)
+      }, turnId, text),
       config,
       stateStore: store,
       channel: client,

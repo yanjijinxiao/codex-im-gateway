@@ -8,6 +8,29 @@ import { defaultConfig } from "../src/state/config.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import type { CodexThreadState } from "../src/codex/backend.js";
+
+test("unqualified binding preserves this chat's known remote host and unloaded errors preserve the original binding", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-binding-host-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(root));
+  const remote = store.createSession("alice", root, "远端任务", undefined, "session", undefined, { standalone: true, hostId: "ssh:remote" });
+  store.setSessionThread(remote.id, "remote-thread");
+  const replies: string[] = [], hosts: string[] = [];
+  const service = new BridgeService({ config: { ...defaultConfig(root), allowedSenderIds: ["alice"] }, stateStore: store,
+    weixin: { async sendText(input) { replies.push(input.text); return { messageId: "receipt" }; } },
+    runner: { async inspectThread(id: string, host: string) {
+      hosts.push(host);
+      if (id === "unloaded") throw new Error("thread not loaded: unloaded");
+      return { threadId: id, cwd: root, persistence: "active", runtimeStatus: "notLoaded", activeFlags: [] };
+    }, async getHistory() { return []; } } as never
+  });
+  await service.handleMessage({ id: "bind", senderId: "alice", text: "/sessions remote-thread", raw: {} });
+  assert.deepEqual(hosts, ["ssh:remote"]);
+  assert.equal(store.getActiveSession("alice")?.id, remote.id);
+  await service.handleMessage({ id: "unloaded", senderId: "alice", text: "/sessions unloaded", raw: {} });
+  assert.equal(store.getActiveSession("alice")?.id, remote.id);
+  assert.match(replies.at(-1)!, /未更改原绑定.*--host/s);
+});
 for(const backend of ["exec", "app-server"] as const)
   test(`${backend}: global session catalog pages stable choices and binds without any project`, async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-catalog-"));
@@ -106,7 +129,7 @@ test("native project membership, remote host isolation, and unavailable-host war
   assert.equal(store.getActiveSession("alice")?.projectId, undefined);
   await send("/stop");
   assert.equal(routed.at(-1), "remote");
-  await send("/session same");
+  await send("/session same --host local");
   assert.equal(store.listSessions().length, 2, "same thread id on different hosts must not alias");
   await send("/session member");
   assert.equal(store.getActiveSession("alice")?.projectId, project.id);

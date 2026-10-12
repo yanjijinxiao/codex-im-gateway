@@ -4,6 +4,9 @@ All notable changes to Codex IM Gateway are documented in this file.
 
 ## Unreleased
 
+- Separated Codex execution completion from channel delivery acknowledgement in the shared turn delivery journal. Retained failed finals with their original per-turn card identities, isolated new managed streams from old terminal checkpoints, and allowed final-only turns to create their original logical card. Follow status now reports pending final deliveries; legacy false completions are repaired only by exact loaded-backend turn correlation, never by replaying stale saved text.
+- Preserved a chat's known host for unqualified session IDs, requiring explicit host selection for collisions and reporting unloaded binding errors without changing the original binding or starting a task.
+
 - Defaulted busy-session messages to guarded `steer`, preserving explicit per-session overrides; exposed the global policy in settings and updated shared channel help.
 - Added experimental App Server native queue add/list/delete/start adapters, shared account-scoped write-ahead receipts and restart reconciliation by exact client/turn IDs. Queue content/order stay in Codex; ambiguous acknowledgements are never replayed. Added `/queue list` and scoped cancellation, and retained one progress/approval delivery path for queued tasks. Exec and unsupported Desktop follower operations explicitly reject rather than silently falling back.
 

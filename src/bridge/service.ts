@@ -127,7 +127,8 @@ export type BridgeServiceOptions = {
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
-  createTextStream?: (session: ManagedSession) => ChannelTurnTextStream;
+  createTextStream?: (session: ManagedSession) => ChannelTurnTextStream | Promise<ChannelTurnTextStream>;
+  deliverTurnResult?: (session: ManagedSession, turnId: string, text: string) => Promise<boolean>;
   onSubscriptionsChanged?: () => Promise<void>;
   sessionFollow?: SessionFollowPort;
   onTurnStarted?: (session: ManagedSession, turnId: string) => Promise<void> | void;
@@ -1164,7 +1165,7 @@ export class BridgeService {
     } else if (input && !/^(all|unbound|unassigned|project|search\s+.+)$/i.test(input)) {
       const direct = /^(\S+)(?:\s+--host\s+(\S+))?$/.exec(input);
       if (!direct) { await this.reply(senderId, "用法：/sessions [all|unbound|project|search 关键词|more|prev]；/session <会话ID> [--host 主机ID]"); return; }
-      await this.bindCatalogSession(senderId, direct[1], direct[2] ?? "local"); return;
+      await this.bindCatalogSession(senderId, direct[1], direct[2]); return;
     } else {
       const activeProject = this.options.stateStore.getActiveProject(senderId);
       const projectOnly = input.toLowerCase() === "project";
@@ -1250,9 +1251,28 @@ export class BridgeService {
         ...(start + listing.pageSize < listing.rows.length ? [{ label: "下一页", command: "sessions" as const, arg: "more" }] : [])] }));
   }
 
-  private async bindCatalogSession(senderId: string, threadId: string, hostId: string): Promise<void> {
+  private async bindCatalogSession(senderId: string, threadId: string, hostId?: string): Promise<void> {
     if (!await this.requireRole(senderId, "participant")) return;
-    const state = await this.runner.inspectThread(threadId, hostId);
+    // An unqualified ID already known to this chat must retain its host; IDs
+    // alone are not a globally unique routing key. Never probe/resume writers
+    // on another backend to guess ownership.
+    if (!hostId) {
+      const knownHosts = new Set(this.options.stateStore.listSessions()
+        .filter(session => session.senderId === senderId && session.threadId === threadId)
+        .map(session => this.sessionHostId(session) ?? "local"));
+      if (knownHosts.size > 1) {
+        await this.reply(senderId, `这个会话 ID 对应多个主机，请明确指定：/session ${threadId} --host <主机ID>\n主机：${[...knownHosts].join("、")}`);
+        return;
+      }
+      hostId = knownHosts.values().next().value ?? "local";
+    }
+    let state: CodexThreadState;
+    try { state = await this.runner.inspectThread(threadId, hostId); }
+    catch (error) {
+      if (!/thread not loaded:/i.test(String(error))) throw error;
+      await this.reply(senderId, `主机 ${hostId} 尚未加载这个会话，未更改原绑定。若会话在远端，请使用 /session ${threadId} --host <主机ID>，或通过 /sessions 列表选择。绑定和查看历史不会启动任务。`);
+      return;
+    }
     const reason = unavailableProjectSessionChoiceReason({ title: state.title ?? threadId, updatedAt: state.updatedAt ?? "", candidate: codexThreadStateCandidate(state, state.cwd ?? "") });
     if (state.persistence !== "active" || state.internal || reason) { await this.reply(senderId, reason ?? "此会话不可绑定，请选择未归档的普通会话。"); return; }
     if (!state.cwd || !path.isAbsolute(state.cwd)) { await this.reply(senderId, "该会话没有可确认的工作目录，未建立绑定。"); return; }
@@ -2046,7 +2066,7 @@ export class BridgeService {
       && (this.options.stateStore.getSession(session.id)?.streamReplies ?? this.options.config.streamReplies);
     const sentProgress = new Set<string>();
     const replyStream = progressEnabled
-      ? this.options.createTextStream?.(session) ?? new ChannelTurnTextStream(this.channel, message.senderId, {
+      ? await this.options.createTextStream?.(session) ?? new ChannelTurnTextStream(this.channel, message.senderId, {
         save: () => undefined, contextToken: this.options.stateStore.getContextToken(message.senderId),
         onTextDelivered: (part) => this.options.onOutboundMessage?.({ direction: "outbound", id: part.messageId,
           recipientId: message.senderId, text: part.text, attachments: [] })
@@ -2132,12 +2152,16 @@ export class BridgeService {
         }
         const remaining = chunkText(parsed.visibleText);
         const bound = stillBound();
-        const streamed = bound && replyStream
-          ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。")
-          : false;
+        const journaled = bound && result.turnId && this.options.deliverTurnResult;
+        const streamed = journaled
+          ? await this.options.deliverTurnResult!(session, result.turnId!, parsed.visibleText.trim() || "处理完成。")
+          : bound && replyStream ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。") : false;
         if (!bound) {
           await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。");
           await replyStream?.suspend();
+        } else if (journaled) {
+          // Shared delivery owns pending results and error notices. An
+          // unacknowledged card must not fall through to a duplicate reply.
         } else if (!streamed && replyStream?.supported) {
           await replyStream.reportTerminalFailure();
         } else if (remaining.length && !streamed) {

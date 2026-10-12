@@ -189,7 +189,14 @@ export class ChannelTurnTextStream {
     await this.textProgress?.close();
     await this.opening;
     await this.chain.catch(() => undefined);
-    if (!this.supported || !this.messageId || this.terminalBlocked) return false;
+    if (!this.supported || this.suspended || this.terminalBlocked) return false;
+    // Short/offline-completed turns may have no progress frame. Create their
+    // original logical card directly from the final payload, using the same
+    // persisted streamId on retries; never create a replacement/fallback card.
+    if (!this.messageId) {
+      this.latestText = this.terminal!.text;
+      if (!await this.openNow() || !this.messageId) return false;
+    }
     try {
       await this.client.updateTextStream!({
         toUserId: this.toUserId,
@@ -315,12 +322,14 @@ export class ChannelTurnTextStream {
       try {
         const result = await this.client.startTextStream!({ toUserId: this.toUserId, text: this.latestText,
           streamId: this.streamId, ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+        if (!result.messageId?.trim()) throw new Error("Channel returned no card receipt");
         this.messageId = result.messageId;
         this.recovered();
         return true;
       } catch (error) {
         const failure = channelProgressError(error);
         if (failure.messageId) this.messageId = failure.messageId;
+        if (this.terminal) this.terminalBlocked = !failure.retryable;
         this.persistence?.save(this.checkpoint());
         this.unavailable(failure);
         return false;

@@ -22,6 +22,7 @@ export type ThreadSubscription = {
   onTextDelivered?: (part: { messageId: string; text: string }) => void;
 };
 type FollowState = {
+  deliveryVersion?: number;
   eventVersion?: number;
   hostId: string;
   threadId: string;
@@ -33,6 +34,7 @@ type FollowState = {
   retired?: string[];
   startedAt?: string;
   checkpoint?: ChannelStreamCheckpoint;
+  checkpointTurnId?: string;
   initialized: boolean;
   runtime?: CodexThreadState;
   observedAt?: string;
@@ -42,6 +44,9 @@ type FollowState = {
   syncFailure?: FollowSyncFailure;
   presentation?: SessionFollowStatus["presentation"];
   terminalPending?: { turnId: string; text: string; fallbackSent: boolean };
+  /** Failed previous turns own their payload/card; never share a new turn's slot. */
+  pendingTerminals?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
+  repairTurnId?: string;
 };
 type Options = {
   filePath: string;
@@ -68,6 +73,7 @@ export class ThreadEventHub {
   private readonly readVersions = new Map<string, number>();
   private readonly manualSyncs = new Map<string, Promise<SessionFollowStatus>>();
   private readonly errorLogTimes = new Map<string, number>();
+  private readonly preparedStreams = new Set<string>();
   constructor(private readonly options: Options) {
     this.states = readJsonFile(options.filePath, {});
     for (const state of Object.values(this.states)) {
@@ -87,6 +93,21 @@ export class ThreadEventHub {
         state.baseline = state.completed;
         state.completed = state.checkpoint?.finished && state.turnId ? [state.turnId] : [];
       }
+      if (state.deliveryVersion !== 1) {
+        // The old hub could mark an undelivered final as completed and attach
+        // that stale payload to later turns. Never replay the saved text: only
+        // the exact latest turn may be repaired from a loaded backend snapshot.
+        if (state.turnId && state.completed.includes(state.turnId)
+          && state.checkpoint?.terminal && !state.checkpoint.finished) {
+          state.repairTurnId = state.turnId;
+          state.completed = state.completed.filter(id => id !== state.turnId);
+          state.baseline = state.baseline?.filter(id => id !== state.turnId);
+          state.checkpoint = undefined;
+          state.terminalPending = undefined;
+          state.delivered = [];
+        } else if (state.checkpoint) state.checkpointTurnId = state.turnId;
+        state.deliveryVersion = 1;
+      }
     }
   }
   private save(): void { writeJsonFile(this.options.filePath, this.states); }
@@ -94,7 +115,7 @@ export class ThreadEventHub {
     let state = this.states[sub.key];
     if (state && !state.threadId && state.hostId === sub.hostId) state.threadId = sub.threadId;
     if (!state || state.hostId !== sub.hostId || state.threadId !== sub.threadId) {
-      state = { eventVersion: 2, hostId: sub.hostId, threadId: sub.threadId, sequence: 0,
+      state = { eventVersion: 2, deliveryVersion: 1, hostId: sub.hostId, threadId: sub.threadId, sequence: 0,
         delivered: [], completed: [], baseline: [], initialized: false };
       this.states[sub.key] = state;
       this.save();
@@ -131,9 +152,12 @@ export class ThreadEventHub {
     let status: SessionFollowStatus["status"] = sub?.enabled === false || !sub ? "disabled" : matching?.syncStatus ?? "pending";
     if (status === "synced" && matching?.lastSyncedAt
       && Date.now() - Date.parse(matching.lastSyncedAt) > 60_000) status = "stale";
+    const pending = (matching?.terminalPending ? 1 : 0) + Object.keys(matching?.pendingTerminals ?? {}).length
+      + (matching?.repairTurnId && matching.repairTurnId !== matching.terminalPending?.turnId ? 1 : 0);
     return { status, lastAttemptAt: matching?.lastAttemptAt, lastSyncedAt: matching?.lastSyncedAt,
       snapshotAt: matching?.observedAt, runtime: matching?.runtime, failure: matching?.syncFailure,
-      presentation: matching?.presentation };
+      presentation: matching?.presentation,
+      resultDelivery: { pending, lastDeliveredTurnId: matching?.completed.at(-1) } };
   }
 
   /** Targeted read-only synchronization; never waits for unrelated polling reads. */
@@ -262,8 +286,8 @@ export class ThreadEventHub {
             this.failSync(sub, { code: "presentation", message: "后端状态已读取，但当前进度卡片仍不可用；请检查渠道权限和连接后重试。" });
             return this.status(sub.key);
           }
-          if (state.terminalPending) {
-            this.failSync(sub, { code: "presentation", message: "任务已经结束，但原卡片的最终结果尚未送达；将保留原卡片并重试。" });
+          if (this.status(sub.key).resultDelivery?.pending) {
+            this.failSync(sub, { code: "presentation", message: "Codex 状态已读取，但仍有最终答复待送达；保留各轮次的原卡片与结果重试，不会重跑任务。" });
           } else {
             state.syncStatus = "synced";
             state.lastSyncedAt = new Date().toISOString();
@@ -307,9 +331,21 @@ export class ThreadEventHub {
     const state = this.state(sub);
     state.runtime = snapshot.state;
     state.observedAt = new Date().toISOString();
+    if (state.repairTurnId && !["notLoaded", "unknown", "systemError"].includes(snapshot.state.runtimeStatus)
+      && snapshot.state.persistence === "active") {
+      const repair = snapshot.turns.find(turn => turn.id === state.repairTurnId && turn.status !== "inProgress");
+      const text = repair?.messages.filter(message => message.role === "assistant" && message.kind !== "progress")
+        .map(message => message.text).join("\n\n");
+      if (repair && text?.trim()) {
+        (state.pendingTerminals ??= {})[repair.id] = { text: visibleText(text).trim() };
+        delete state.repairTurnId;
+        this.save();
+      }
+    }
+    await this.retryPreviousTerminals(sub);
+    if (!this.isLive(sub)) return;
     if (state.terminalPending) {
       await this.finish(sub, state.terminalPending.turnId, state.terminalPending.text);
-      if (state.terminalPending) return;
     }
     const { turns } = snapshot;
     if (!state.initialized) {
@@ -330,9 +366,11 @@ export class ThreadEventHub {
       await this.finish(sub, state.turnId, "原任务已不在最近记录中。请用 /history 查看结果。");
     }
     for (const turn of turns) {
-      if (state.completed.includes(turn.id) || state.baseline?.includes(turn.id)) continue;
+      if (state.completed.includes(turn.id) || state.baseline?.includes(turn.id) || state.pendingTerminals?.[turn.id]) continue;
       if (sub.managed) {
-        if (turn.status === "inProgress") { state.turnId = turn.id; this.save(); }
+        if (turn.status === "inProgress" && (!state.turnId || state.turnId === turn.id)) {
+          state.turnId = turn.id; this.save();
+        }
         continue;
       }
       if (turn.status === "inProgress") {
@@ -400,20 +438,94 @@ export class ThreadEventHub {
       .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text))));
   }
   /** Reuse the same persistent record for turns initiated from the IM channel. */
+  async managedTurnStarted(sub: ThreadSubscription, turnId: string): Promise<void> {
+    await this.queue.run(sub.key, async () => this.managedStarted(sub, turnId));
+  }
+
   managedStarted(sub: ThreadSubscription, turnId: string): void {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);
+    if (state.turnId !== turnId && !this.preparedStreams.has(sub.key)) this.rotateStream(sub);
     state.turnId = turnId;
+    state.checkpointTurnId = turnId;
+    this.preparedStreams.delete(sub.key);
     state.sequence++;
     this.save();
   }
 
   managedStream(sub: ThreadSubscription): ChannelTurnTextStream {
     const state = this.state(sub);
-    if (state.checkpoint?.finished) state.checkpoint = undefined;
-    this.streams.delete(sub.key);
+    this.rotateStream(sub);
+    state.turnId = undefined;
+    state.sequence++;
+    this.preparedStreams.add(sub.key);
     this.save();
     return this.stream(sub);
+  }
+  /** Serialize presentation rotation with in-flight completion acknowledgements. */
+  async prepareManagedStream(sub: ThreadSubscription): Promise<ChannelTurnTextStream> {
+    return this.queue.run(sub.key, async () => this.managedStream(sub));
+  }
+  /** Execution and following use the same acknowledged delivery journal. */
+  async managedCompletion(sub: ThreadSubscription, turnId: string, text: string): Promise<boolean> {
+    return this.queue.run(sub.key, async () => {
+      if (!this.isLive(sub)) return false;
+      try { await this.finish(sub, turnId, text); }
+      catch { /* A failed transport acknowledgement is not an execution failure. */ }
+      const state = this.state(sub);
+      const delivered = state.completed.includes(turnId);
+      if (!delivered) this.failSync(sub, { code: "presentation", message: "Codex 已完成，但最终答复尚未确认送达；保留原轮次结果重试，不会重新提交任务。" });
+      return delivered;
+    });
+  }
+
+  private archiveTerminal(state: FollowState): void {
+    const pending = state.terminalPending;
+    const turnId = pending?.turnId ?? state.checkpointTurnId;
+    if (turnId && !state.completed.includes(turnId) && (pending || state.checkpoint?.terminal)) {
+      (state.pendingTerminals ??= {})[turnId] = {
+        text: pending?.text ?? state.checkpoint!.terminal!.text,
+        checkpoint: state.checkpoint
+      };
+    }
+    delete state.terminalPending;
+  }
+
+  private rotateStream(sub: ThreadSubscription): void {
+    const state = this.state(sub);
+    this.archiveTerminal(state);
+    const old = this.streams.get(sub.key);
+    this.streams.delete(sub.key);
+    if (old) void old.suspend().catch(report);
+    state.checkpoint = undefined;
+    state.checkpointTurnId = undefined;
+    state.delivered = [];
+    this.save();
+  }
+
+  private async retryPreviousTerminals(sub: ThreadSubscription): Promise<void> {
+    const state = this.state(sub);
+    // Independent records: a failed old card cannot block a current turn.
+    for (const [turnId, pending] of Object.entries(state.pendingTerminals ?? {}).slice(0, 5)) {
+      if (!this.isLive(sub)) return;
+      if (pending.checkpoint?.messageId && !sub.client.resumableTextStream) continue;
+      const stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
+        restore: pending.checkpoint, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
+        save: checkpoint => { pending.checkpoint = checkpoint; this.save(); }
+      });
+      try {
+        let delivered = await stream.finalize(pending.text);
+        if (!stream.supported) { await this.sendText(sub, pending.text); delivered = true; }
+        if (delivered) {
+          delete state.pendingTerminals![turnId];
+          state.completed = [...state.completed, turnId].slice(-200);
+          if (state.repairTurnId === turnId) delete state.repairTurnId;
+          this.logDelivery(sub, turnId, "delivered");
+        } else {
+          await stream.reportTerminalFailure().catch(() => false);
+        }
+      } finally { await stream.suspend(); this.save(); }
+    }
   }
   private stream(sub: ThreadSubscription): ChannelTurnTextStream {
     let stream = this.streams.get(sub.key);
@@ -425,7 +537,16 @@ export class ThreadEventHub {
       ? saved : undefined;
     stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
       restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
-      save: (checkpoint) => { state.checkpoint = checkpoint; this.save(); }
+      save: (checkpoint) => {
+        // A retired stream's late HTTP acknowledgement cannot poison the new
+        // turn. The streamId is the transport-neutral presentation identity.
+        if (this.streams.get(sub.key) !== stream) {
+          const pending = Object.values(state.pendingTerminals ?? {}).find(item => item.checkpoint?.streamId === checkpoint.streamId);
+          if (pending) { pending.checkpoint = checkpoint; this.save(); }
+          return;
+        }
+        state.checkpoint = checkpoint; this.save();
+      }
     });
     this.streams.set(sub.key, stream);
     return stream;
@@ -433,15 +554,23 @@ export class ThreadEventHub {
   private async selectTurn(sub: ThreadSubscription, turnId: string, allowSwitch = false): Promise<FollowState | undefined> {
     const state = this.state(sub);
     if (state.retired?.includes(turnId)) return undefined;
+    if (!state.turnId && this.preparedStreams.has(sub.key)) {
+      state.turnId = turnId;
+      state.checkpointTurnId = turnId;
+      this.preparedStreams.delete(sub.key);
+      this.save();
+      return state;
+    }
     if (state.turnId !== turnId) {
       if (state.turnId && !allowSwitch) return undefined;
-      if (state.terminalPending) return undefined;
       const old = this.streams.get(sub.key)
         ?? (state.checkpoint?.messageId && !state.checkpoint.finished ? this.stream(sub) : undefined);
       if (old) { await old.finalize("已切换到新的任务轮次；上一轮结果可用 /history 查看。"); await old.suspend(); }
       this.streams.delete(sub.key);
+      this.archiveTerminal(state);
       if (state.turnId) state.retired = [...(state.retired ?? []), state.turnId].slice(-200);
       state.turnId = turnId;
+      state.checkpointTurnId = turnId;
       state.checkpoint = undefined;
       state.delivered = [];
       this.save();
@@ -479,27 +608,43 @@ export class ThreadEventHub {
     if (sub.progressEnabled === false && !state.checkpoint?.messageId) {
       await this.sendText(sub, clean);
       state.completed = [...state.completed, turnId].slice(-200);
+      if (state.repairTurnId === turnId) delete state.repairTurnId;
       delete state.terminalPending;
       state.sequence++;
+      this.logDelivery(sub, turnId, "delivered");
       this.save();
       return;
     }
     const stream = this.stream(sub);
     if (!await stream.finalize(clean)) {
       if (!state.terminalPending.fallbackSent) {
-        if (stream.supported) await stream.reportTerminalFailure();
-        else await this.sendText(sub, clean);
+        if (stream.supported) {
+          try { await stream.reportTerminalFailure(); }
+          catch { console.warn("[codex-im-gateway] terminal delivery notice unavailable"); }
+        } else await this.sendText(sub, clean);
         state.terminalPending.fallbackSent = true;
         this.save();
       }
-      if (stream.checkpoint().messageId) return;
+      // A notice is not an answer receipt, including when card creation
+      // failed before returning a handle. Keep the final pending in both cases.
+      if (stream.supported) { this.logDelivery(sub, turnId, "pending"); return; }
     }
     await stream.suspend();
     this.streams.delete(sub.key);
     state.completed = [...state.completed, turnId].slice(-200);
+    if (state.repairTurnId === turnId) delete state.repairTurnId;
     delete state.terminalPending;
     state.sequence++;
+    this.logDelivery(sub, turnId, "delivered");
     this.save();
+  }
+
+  private logDelivery(sub: ThreadSubscription, turnId: string, status: "pending" | "delivered"): void {
+    const key = `${sub.key}:${turnId}:${status}`;
+    if (Date.now() - (this.errorLogTimes.get(key) ?? 0) < 60_000) return;
+    this.errorLogTimes.set(key, Date.now());
+    console.info(`[codex-im-gateway] result delivery ${JSON.stringify({ timestamp: new Date().toISOString(),
+      operation: "final-result-delivery", hostId: sub.hostId, threadId: sub.threadId, turnId, status })}`);
   }
 
   private isLive(sub: ThreadSubscription): boolean {

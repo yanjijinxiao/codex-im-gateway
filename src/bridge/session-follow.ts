@@ -21,6 +21,8 @@ export type SessionFollowStatus = {
   runtime?: CodexThreadState;
   failure?: FollowSyncFailure;
   presentation?: "updated" | "text-only" | "off" | "idle";
+  /** Delivery acknowledgements are independent of the backend execution state. */
+  resultDelivery?: { pending: number; lastDeliveredTurnId?: string };
 };
 
 export function followSyncFailure(error: unknown): FollowSyncFailure {
@@ -44,6 +46,8 @@ export function formatFollowStatus(state: SessionFollowStatus): string[] {
     ...(state.lastAttemptAt ? [`最近尝试：${time(state.lastAttemptAt)}`] : []),
     ...(state.snapshotAt ? [`最近快照读取：${time(state.snapshotAt)}`] : []),
     ...(state.failure ? [`原因：${state.failure.message}（${state.failure.code}）`] : []),
+    ...(state.resultDelivery?.pending ? [`最终答复投递：${state.resultDelivery.pending} 轮待送达；任务完成不等于回答已送达`]
+      : state.resultDelivery?.lastDeliveredTurnId ? ["最终答复投递：已确认送达"] : []),
     ...(state.runtime?.activeFlags.includes("waitingOnApproval") ? [`${runtimeLabel}：等待审批`]
       : state.runtime?.activeFlags.includes("waitingOnUserInput") ? [`${runtimeLabel}：等待用户确认`]
       : state.runtime ? [`${runtimeLabel}：${({ active: "正在执行", idle: "空闲", notLoaded: "未加载，无法确认执行状态", unknown: "未知", systemError: "系统错误" })[state.runtime.runtimeStatus]}`] : []),
