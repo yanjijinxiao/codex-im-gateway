@@ -331,6 +331,16 @@ export class ThreadEventHub {
     const state = this.state(sub);
     state.runtime = snapshot.state;
     state.observedAt = new Date().toISOString();
+    const nativeText = sub.client.capabilities
+      ? sub.client.capabilities.progress === "unsupported"
+      : !sub.client.startTextStream && !sub.client.updateTextStream;
+    if (state.repairTurnId && nativeText) {
+      // The legacy text path did acknowledge its answer before marking the
+      // turn completed. Its handle-less checkpoint is not the card-path bug.
+      state.completed = [...state.completed, state.repairTurnId].slice(-200);
+      delete state.repairTurnId;
+      this.save();
+    }
     if (state.repairTurnId && !["notLoaded", "unknown", "systemError"].includes(snapshot.state.runtimeStatus)
       && snapshot.state.persistence === "active") {
       const repair = snapshot.turns.find(turn => turn.id === state.repairTurnId && turn.status !== "inProgress");

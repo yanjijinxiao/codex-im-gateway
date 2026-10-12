@@ -174,6 +174,24 @@ test("a backend returning a final turn ID without a start notification still use
   assert.equal(f.finals.length, 1);
 });
 
+test("legacy native-text acknowledgements are not mistaken for failed cards or replayed", async t => {
+  const f = fixture(t, false);
+  fs.writeFileSync(f.filePath, JSON.stringify({ [f.sub.key]: {
+    eventVersion: 2, hostId: "local", threadId: "thread", turnId: "turn", sequence: 1, initialized: true,
+    delivered: [], completed: ["turn"], baseline: [], checkpoint: {
+      startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: false,
+      terminal: { text: "ALREADY_DELIVERED_TEXT", error: false }
+    }
+  } }));
+  await f.restart();
+  f.setSnapshot({ state: { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [] }, turns: [
+    { id: "turn", status: "completed", messages: [{ id: "a", role: "assistant", text: "ALREADY_DELIVERED_TEXT" }] }
+  ] });
+  await f.hub.refresh();
+  assert.deepEqual(f.texts, []);
+  assert.equal(f.hub.status(f.sub.key).resultDelivery?.pending, 0);
+});
+
 for (const channel of ["dingtalk", "feishu", "weixin"] as const) {
   test(`${channel}: managed execution and following share final acknowledgements and do not resend`, async t => {
     const f = fixture(t, channel === "dingtalk");
