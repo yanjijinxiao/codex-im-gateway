@@ -8,6 +8,8 @@ import type { FeishuAccount } from "../weixin/accounts.js";
 import type { ChannelMessage } from "./message.js";
 import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
+import { inboundBytes } from "./inbound-bytes.js";
+import { sanitizeFileName } from "../weixin/media.js";
 import { feishuMessageReceipt, assertFeishuSuccess } from "./feishu-result.js";
 import { feishuActionCard } from "./feishu-action-card.js";
 import { cardActionIdentity, formValueFromRawCardAction } from "./feishu-card-action.js";
@@ -23,13 +25,14 @@ type FeishuAdapterOptions = {
       readonly v1: {
         readonly image: Pick<Lark.Client["im"]["v1"]["image"], "create">;
         readonly message: Pick<Lark.Client["im"]["v1"]["message"], "create">
-          & Partial<Pick<Lark.Client["im"]["v1"]["message"], "patch">>;
+          & Partial<Pick<Lark.Client["im"]["v1"]["message"], "patch" | "get">>;
         readonly messageResource: Pick<Lark.Client["im"]["v1"]["messageResource"], "get">;
       };
     };
   };
   readonly wsClient?: Pick<Lark.WSClient, "start" | "close">;
   readonly inboundDir?: string;
+  readonly maxInboundBytes?: number;
 };
 
 export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
@@ -40,6 +43,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   private readonly wsClient: NonNullable<FeishuAdapterOptions["wsClient"]>;
   private readonly cardUpdater: FeishuCardUpdater;
   private readonly inboundDir?: string;
+  private readonly maxInboundBytes: number;
 
   constructor(account: FeishuAccount, options: FeishuAdapterOptions = {}) {
     const config = { appId: account.appId, appSecret: account.appSecret };
@@ -53,10 +57,11 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     });
     this.cardUpdater = new FeishuCardUpdater(this.apiClient.im.v1.message.patch);
     this.inboundDir = options.inboundDir;
+    this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.client = createChannelClient("feishu", {
       ...TEXT_CAPABILITIES,
       tableLayout: "native",
-      inbound: { ...NO_MEDIA, image: options.inboundDir ? "available" : "not-configured" },
+      inbound: { ...NO_MEDIA, image: options.inboundDir ? "available" : "not-configured", file: options.inboundDir ? "available" : "not-configured" },
       outbound: { ...NO_MEDIA, image: "available" },
       actions: "available", tasks: "available",
       cardUpdates: this.apiClient.im.v1.message.patch ? "available" : "not-implemented"
@@ -144,15 +149,17 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           attachments: [],
           raw: { channel: "feishu", event }
         };
+        if (event.message.parent_id) pendingMessage.references = [{ messageId: event.message.parent_id,
+          type: "unknown", attachments: [], availability: "metadata-only", reason: "尚未取得引用正文。" }];
         if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
         try {
-          if (event.message.message_type !== "text" && event.message.message_type !== "image") {
+          if (!["text", "image", "file"].includes(event.message.message_type)) {
             await options.onMessage({ ...pendingMessage, unsupportedMessageType: event.message.message_type });
             return;
           }
           await options.onMessage(await this.normalizeMessage(
             pendingMessage,
-            event.message.message_type,
+            event.message.message_type as "text" | "image" | "file",
             event.message.content
           ));
         } catch (error) {
@@ -228,24 +235,59 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
 
   private async normalizeMessage(
     message: ChannelMessage,
-    messageType: "text" | "image",
+    messageType: "text" | "image" | "file",
     content: string
   ): Promise<ChannelMessage> {
     if (messageType === "text") return { ...message, text: parseText(content) };
-    const imageKey = parseImageKey(content);
-    if (!imageKey) throw new Error("Feishu image message did not include an image_key");
-    if (!this.inboundDir) throw new Error("Feishu inbound directory is not configured");
-    fs.mkdirSync(this.inboundDir, { recursive: true });
-    const targetPath = pathForInboundImage(this.inboundDir, message.id, imageKey);
-    const resource = await this.apiClient.im.v1.messageResource.get({
-      params: { type: "image" },
-      path: { message_id: message.id, file_key: imageKey }
-    });
-    await resource.writeFile(targetPath);
+    const value = JSON.parse(content) as { image_key?: string; file_key?: string; file_name?: string };
+    const key = messageType === "image" ? value.image_key : value.file_key;
+    if (!key) throw new Error("Feishu attachment message did not include a resource key");
     return {
       ...message,
-      attachments: [{ kind: "image", label: path.basename(targetPath), item: {}, path: targetPath }]
+      attachments: [{ kind: messageType, label: messageType === "image" ? "image.png" : value.file_name || "file",
+        item: { fileKey: key, messageId: message.id } }]
     };
+  }
+
+  async resolveReferences(message: ChannelMessage): Promise<ChannelMessage> {
+    const references = [];
+    for (const reference of message.references ?? []) {
+      if (reference.availability === "available" || !reference.messageId || !this.apiClient.im.v1.message.get) {
+        references.push(reference); continue;
+      }
+      try {
+        const result = await this.apiClient.im.v1.message.get({ path: { message_id: reference.messageId } });
+        assertFeishuSuccess(result, "getQuotedMessage");
+        const quoted = result.data?.items?.find(item => item.message_id === reference.messageId);
+        if (!quoted || quoted.chat_id !== (message.replyTargetId ?? message.senderId)
+          || !["text", "image", "file"].includes(quoted.msg_type ?? "")) throw new Error("Quoted resource unavailable");
+        const decoded = await this.normalizeMessage({ ...message, id: reference.messageId, attachments: [], references: [] },
+          quoted.msg_type as "text" | "image" | "file", quoted.body?.content ?? "{}");
+        references.push({ ...reference, type: quoted.msg_type!, text: decoded.text,
+          attachments: decoded.attachments.map(item => ({ ...item, sourceMessageId: reference.messageId })),
+          availability: "available" as const, reason: undefined });
+      } catch { references.push({ ...reference, reason: "无法取得引用原文：请检查机器人消息读取权限，或直接发送原文件。" }); }
+    }
+    return { ...message, references };
+  }
+
+  async resolveAttachments(message: ChannelMessage): Promise<ChannelMessage["attachments"]> {
+    if (!this.inboundDir) throw new Error("Feishu inbound directory is not configured");
+    const attachments: ChannelMessage["attachments"] = [];
+    for (const attachment of message.attachments) {
+      if (attachment.path) { attachments.push(attachment); continue; }
+      const resource = await this.apiClient.im.v1.messageResource.get({
+        params: { type: attachment.kind === "image" ? "image" : "file" },
+        path: { message_id: String(attachment.item.messageId), file_key: String(attachment.item.fileKey) }
+      });
+      const bytes = await inboundBytes(resource.getReadableStream(), this.maxInboundBytes);
+      fs.mkdirSync(this.inboundDir, { recursive: true });
+      const label = sanitizeFileName(attachment.label).slice(0, 180);
+      const targetPath = path.join(this.inboundDir, `${crypto.randomUUID()}-${label}`);
+      fs.writeFileSync(targetPath, bytes, { flag: "wx", mode: 0o600 });
+      attachments.push({ ...attachment, item: {}, path: targetPath, label });
+    }
+    return attachments;
   }
 }
 
@@ -275,20 +317,6 @@ function parseText(content: string): string {
   } catch {
     return content.trim();
   }
-}
-
-function parseImageKey(content: string): string | undefined {
-  try {
-    const value = JSON.parse(content) as { image_key?: unknown };
-    return typeof value.image_key === "string" && value.image_key.trim() ? value.image_key.trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function pathForInboundImage(inboundDir: string, messageId: string, imageKey: string): string {
-  const safeName = `${messageId}-${imageKey}`.replace(/[^a-zA-Z0-9._-]+/g, "_");
-  return path.join(inboundDir, `${safeName || crypto.randomUUID()}.png`);
 }
 
 function untilAborted(signal?: AbortSignal): Promise<void> {

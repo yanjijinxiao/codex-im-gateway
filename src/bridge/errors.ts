@@ -36,8 +36,11 @@ export function userFacingMessageHandlingError(error: unknown): string {
       "该设置会让 Codex 获得本机完整访问权限，请仅在理解并接受安全风险时启用。"
     ].join("\n");
   }
-  if (/timed out|timeout/i.test(message)) {
+  if (/^codex exec timed out after \d+ms$/i.test(message)) {
     return "[codex-im-gateway] 本轮任务执行时间过长，已停止处理。请拆成更小的步骤后重试。";
+  }
+  if (/timed out|timeout/i.test(message)) {
+    return "[codex-im-gateway] 与后端通信或提交确认超时，任务是否已接收尚未确认；Gateway 未自动重发或停止原任务。请先在 Codex App 查看当前会话状态。";
   }
   return "[codex-im-gateway] 本轮消息处理失败，详细错误已写入本机服务输出。";
 }

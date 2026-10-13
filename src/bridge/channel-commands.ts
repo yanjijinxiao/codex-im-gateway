@@ -30,6 +30,7 @@ export const CHANNEL_COMMAND_REGISTRY = [
   { name: "approve", aliases: ["ok"], capability: "approvals" },
   { name: "reject", aliases: ["no"], capability: "approvals" },
   { name: "answer", aliases: [], capability: "userInput" },
+  { name: "skip", aliases: [], capability: "userInput" },
   { name: "stop", aliases: ["x"] },
   { name: "task", aliases: ["tb"] },
   { name: "mode", aliases: ["v", "view"] },
@@ -102,7 +103,10 @@ const BUILT_IN_HELP_LINES = [
   "/prompt done（/pp d）- 提交已合并的消息",
   "/approve（/ok）[A编号] - 批准一次当前渠道收到的 Codex 审批",
   "/reject（/no）[A编号] - 拒绝当前渠道收到的 Codex 审批",
-  "/answer 编号 选项 - 回答 Codex 的待确认问题；格式以问题卡提示为准"
+  "/answer Q编号 回答内容 - 只回复原问题，不作为普通对话或审批",
+  "/answer [list] - 查看当前绑定已恢复的待回答问题",
+  "/answer Q编号 --option 1 - 选择问题中的第 1 个选项",
+  "/skip Q编号 - 跳过原问题，不等于批准操作"
 ] as const;
 
 const BUILT_IN_COMMAND_NAMES: ReadonlySet<string> = new Set([
@@ -129,7 +133,7 @@ export function parseCommand(
   }
   return {
     name: canonicalName,
-    arg: rest.join(" ")
+    arg: canonicalName === "answer" ? trimmed.replace(/^\/\S+\s*/, "") : rest.join(" ")
   };
 }
 

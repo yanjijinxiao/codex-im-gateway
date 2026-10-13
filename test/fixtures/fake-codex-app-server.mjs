@@ -202,6 +202,7 @@ rl.on("line", (line) => {
   if (!message.method && pendingUserInputs.has(message.id)) {
     const pending = pendingUserInputs.get(message.id);
     pendingUserInputs.delete(message.id);
+    send({ method: "serverRequest/resolved", params: { threadId: pending.threadId, requestId: message.id } });
     const text = `input:${message.result?.answers?.direction?.answers?.[0] ?? "none"}`;
     send({ method: "item/completed", params: { threadId: pending.threadId, turnId: pending.turnId, completedAtMs: Date.now(), item: { type: "agentMessage", id: `item-${pending.turnId}`, text, phase: "final_answer", memoryCitation: null } } });
     send({ method: "turn/completed", params: { threadId: pending.threadId, turn: completedTurn(pending.turnId, "completed") } });
@@ -589,10 +590,16 @@ rl.on("line", (line) => {
       send({ id: requestId, method: "item/tool/call", params: { callId: requestId, threadId: message.params.threadId, turnId, namespace: "knowledge", tool: "search", arguments: { query: "fixture", limit: 3 } } });
       return;
     }
-    if (prompt === "request-user-input") {
+    if (prompt === "request-user-input" || prompt === "withdraw-user-input") {
       const requestId = `input-${turnId}`;
       pendingUserInputs.set(requestId, { threadId: message.params.threadId, turnId });
       send({ id: requestId, method: "item/tool/requestUserInput", params: { itemId: requestId, threadId: message.params.threadId, turnId, questions: [{ header: "方向", id: "direction", question: "选择方向", options: [{ label: "方案 A", description: "使用 A" }, { label: "方案 B", description: "使用 B" }] }] } });
+      if (prompt === "withdraw-user-input") setTimeout(() => {
+        pendingUserInputs.delete(requestId);
+        send({ method: "serverRequest/resolved", params: { threadId: message.params.threadId, requestId } });
+        send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: completedTurn(turnId, "interrupted") } });
+        activeTurns.delete(message.params.threadId);
+      }, 20);
       return;
     }
     const sendProgress = () => {

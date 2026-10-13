@@ -9,6 +9,7 @@ import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
 import { CodexBackendCapabilityError, CodexOwnerUnavailableError } from "./backend.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
+import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
 import type {
   CodexAppServerBackend,
   CodexBridgeBackend,
@@ -51,6 +52,7 @@ export type CodexBackendRouterOptions = {
   appServerBackend?: CodexAppServerBackend;
   execBackend?: CodexBackendAdapter;
   remoteTransportResolver?: typeof resolveRemoteCodexTransport;
+  stageAttachments?: StageInboundFiles;
 };
 
 export type { EphemeralCodexRunnerInput } from "./backend.js";
@@ -69,6 +71,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
     Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
+  private readonly remoteTransports = new Map<string, ReturnType<typeof resolveRemoteCodexTransport>>();
   private readonly runTails = new Map<string, Promise<void>>();
   private readonly desktopOwnedThreads = new Set<string>();
   private selectedAutoBackend?: "exec" | "app-server";
@@ -129,6 +132,14 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       }
     }
   }
+
+  stageAttachments: StageInboundFiles = async (files, input) => {
+    if (!files.length || !isRemoteHost(input.hostId)) return files;
+    if (this.selectedBackend === "exec") throw new Error("CLI backend does not support remote attachment staging");
+    if (this.options.stageAttachments) return this.options.stageAttachments(files, input);
+    const transport = this.remoteTransport(input.hostId!);
+    return stageRemoteFiles(files, input.scope, input.maxBytes, transport);
+  };
 
   async steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult> {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
@@ -399,6 +410,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     this.desktop.close();
     for (const runner of this.remoteAppServers.values()) runner.close();
     this.remoteAppServers.clear();
+    this.remoteTransports.clear();
   }
 
   backendInfo(hostId?: string) {
@@ -411,7 +423,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (!isRemoteHost(hostId)) return this.appServer;
     const existing = this.remoteAppServers.get(hostId);
     if (existing) return existing;
-    const transport = (this.options.remoteTransportResolver ?? resolveRemoteCodexTransport)(hostId);
+    const transport = this.remoteTransport(hostId);
     const runner = new AppServerCodexRunner({
       codexHome: this.options.codexHome,
       hostId,
@@ -421,6 +433,15 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     });
     this.remoteAppServers.set(hostId, runner);
     return runner;
+  }
+
+  private remoteTransport(hostId: string): ReturnType<typeof resolveRemoteCodexTransport> {
+    let transport = this.remoteTransports.get(hostId);
+    if (!transport) {
+      transport = (this.options.remoteTransportResolver ?? resolveRemoteCodexTransport)(hostId, { codexHome: this.options.codexHome });
+      this.remoteTransports.set(hostId, transport);
+    }
+    return transport;
   }
 
   private backendForSharedOperation(hostId?: string): CodexBackendAdapter {

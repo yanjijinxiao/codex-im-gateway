@@ -412,17 +412,34 @@ test("routes Codex request_user_input through a channel-native answer handler", 
     requestTimeoutMs: 2_000
   });
   t.after(() => runner.close());
+  const receipts: string[] = [];
 
   const result = await runner.run({
     prompt: "request-user-input",
     cwd: "/tmp/project",
     onUserInput: async (request) => {
       assert.equal(request.questions[0]?.options?.[0]?.label, "方案 A");
+      assert.equal(request.requestId, "input-turn-1");
       return { direction: { answers: ["方案 A"] } };
-    }
+    },
+    onUserInputResult: (_request, result) => { receipts.push(result); }
   });
 
   assert.equal(result.text, "input:方案 A");
+  assert.deepEqual(receipts, ["confirmed"]);
+});
+
+test("App Server resolved request invalidates a pending IM answer without synthetic skip", async t => {
+  const runner = new AppServerCodexRunner({ codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"), requestTimeoutMs: 2000 });
+  t.after(() => runner.close());
+  const receipts: string[] = [];
+  let release!: (answer: Record<string, { answers: string[] }>) => void;
+  await assert.rejects(runner.run({ prompt: "withdraw-user-input", cwd: "/tmp/project",
+    onUserInput: async () => new Promise(resolve => { release = resolve; }),
+    onUserInputResult: (_request, result) => { receipts.push(result); } }), /interrupted/);
+  release({ direction: { answers: ["late"] } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(receipts, ["withdrawn"]);
 });
 
 test("declares experimentalApi before starting plan collaboration mode and manages native thread goals", async (t) => {

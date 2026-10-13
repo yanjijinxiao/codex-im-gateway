@@ -4,7 +4,11 @@ import { ChannelDeliveryError } from "./errors.js";
 export function assertFeishuSuccess(result: unknown, operation: string): void {
   if (!result || typeof result !== "object") throw new ChannelDeliveryError("feishu", operation);
   const code = (result as { code?: unknown }).code;
-  if (code !== undefined && code !== 0) throw new ChannelDeliveryError("feishu", operation, String(code));
+  // The image-upload SDK also supports a decoded image_key-only response.
+  if (operation === "uploadImage" && code === undefined &&
+    typeof (result as { image_key?: unknown }).image_key === "string" &&
+    (result as { image_key: string }).image_key.trim()) return;
+  if (code !== 0) throw new ChannelDeliveryError("feishu", operation, code === undefined ? undefined : String(code));
 }
 
 export function feishuMessageReceipt(result: unknown, operation: string): { messageId: string } {

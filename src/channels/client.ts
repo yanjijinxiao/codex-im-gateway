@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { chunkText } from "../bridge/format.js";
+import { resultPages } from "./result-pages.js";
 import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, InboundMediaTooLargeError, channelProgressError } from "./errors.js";
 import type { ChannelAttachment } from "./message.js";
 import type { Capability, ChannelCapabilities, ChannelClient, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
@@ -27,7 +28,18 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
     if (!result || typeof result.messageId !== "string" || !result.messageId.trim()) throw new ChannelDeliveryError(channel, operation);
     return result;
   };
-  const sendText: ChannelClient["sendText"] = (input) => acknowledged("sendText", driver.sendText(input));
+  const sendText: ChannelClient["sendText"] = async (input) => {
+    const pages = resultPages(input.text, caps.resultPageBytes);
+    if (pages.length === 1) return acknowledged("sendText", driver.sendText(input));
+    const parts: ChannelDeliveryPart[] = [];
+    try {
+      for (const page of pages) {
+        const result = await acknowledged("sendText", driver.sendText({ ...input, text: page.text }));
+        parts.push({ messageId: result.messageId, text: page.text });
+      }
+    } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
+    return { messageId: parts.at(-1)!.messageId, parts };
+  };
   const fallback = async (toUserId: string, text: string, contextToken?: string) => {
     const parts: ChannelDeliveryPart[] = [];
     try {
@@ -89,12 +101,14 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
       return acknowledged("sendMedia", required(driver.sendMedia, `outbound.${input.kind}`).call(driver, input));
     },
     async resolveAttachments(message) {
-      const attachments = message.attachments ?? [];
+      const attachments = [...(message.attachments ?? []), ...(message.references ?? []).flatMap(ref => ref.attachments)];
+      if (attachments.length > 20) throw new Error("Too many inbound attachments (maximum 20)");
       for (const attachment of attachments) requireFeature(`inbound.${attachment.kind}`, caps.inbound[attachment.kind]);
-      if (driver.resolveAttachments) return driver.resolveAttachments(message);
+      if (driver.resolveAttachments) return driver.resolveAttachments({ ...message, attachments, references: [] });
       if (attachments.some((item) => !item.path)) throw new ChannelCapabilityError(channel, "resolveAttachments", "not-implemented");
       return attachments;
-    }
+    },
+    resolveReferences: message => driver.resolveReferences?.(message) ?? Promise.resolve(message)
   };
 }
 

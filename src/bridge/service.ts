@@ -34,6 +34,7 @@ import {
 } from "./channel-intent.js";
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPromptParts, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
+import { InboundReferenceStore, referenceContext } from "./inbound-references.js";
 import { PromptBuffer } from "./prompt-buffer.js";
 import { NEW_SESSION_USAGE, parseNewSessionTarget } from "./new-session.js";
 import { selectChannelProject } from "./project-selection.js";
@@ -144,6 +145,8 @@ export type BridgeServiceOptions = {
   modeSettings?: ChannelModeSettings;
   listCodexProjects?: () => readonly CodexProjectCandidate[] | Promise<readonly CodexProjectCandidate[]>;
   inboundDir?: string;
+  inboundReferences?: InboundReferenceStore;
+  userInputFilePath?: string;
   cdnBaseUrl?: string;
   mediaFetch?: typeof globalThis.fetch;
   taskboard?: TaskboardClient;
@@ -221,7 +224,22 @@ export class BridgeService {
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
     this.modeSettings = normalizeChannelModeSettings(options.modeSettings);
     this.userInputs = new ChannelUserInputController(
-      (senderId, card) => this.replyActionCard(senderId, card)
+      async (senderId, card) => {
+        const receipt = await this.channel.sendActionCard({ toUserId: senderId, card,
+          contextToken: this.options.stateStore.getContextToken(senderId) });
+        this.reportCardDelivery(senderId, receipt, card.fallbackText);
+        return receipt;
+      }, undefined, {
+        filePath: options.userInputFilePath ?? path.join(path.dirname(options.stateStore.controlJournalPath), "user-input.json"),
+        validate: (senderId, request) => {
+          const session = this.executionSession(senderId);
+          return session?.threadId === request.threadId && (this.sessionHostId(session) ?? "local") === request.hostId;
+        },
+        ...(this.channel.capabilities.cardUpdates === "available" ? {
+          updateCard: (messageId: string, card: ChannelActionCard) => this.channel.updateActionCard({ messageId, card })
+        } : {}),
+        sendNotice: (senderId, text) => this.reply(senderId, text)
+      }
     );
     this.taskboardController = new TaskboardChannelController({
       client: options.taskboard,
@@ -278,7 +296,7 @@ export class BridgeService {
 
   private async handleInboundMessage(message: ChannelMessage): Promise<void> {
     const replyTargetId = message.replyTargetId ?? message.senderId;
-    const scopedMessage = replyTargetId === message.senderId
+    let scopedMessage = replyTargetId === message.senderId
       ? message
       : { ...message, senderId: replyTargetId };
     if (scopedMessage.contextToken) {
@@ -291,6 +309,8 @@ export class BridgeService {
       return;
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
+    scopedMessage = this.options.inboundReferences?.resolve(scopedMessage) ?? scopedMessage;
+    scopedMessage = await this.channel.resolveReferences(scopedMessage);
     if (message.unsupportedMessageType) {
       await this.reply(replyTargetId, `当前渠道适配器尚未实现 ${message.unsupportedMessageType} 消息，请改发文字或支持的附件。`);
       return;
@@ -499,6 +519,9 @@ export class BridgeService {
       case "answer":
         await this.reply(message.senderId, this.userInputs.answer(message.senderId, command.arg));
         return;
+      case "skip":
+        await this.reply(message.senderId, this.userInputs.skip(message.senderId, command.arg));
+        return;
       case "new":
         await this.handleNewSessionCommand(message.senderId, command.arg);
         return;
@@ -519,7 +542,13 @@ export class BridgeService {
         await this.handleInterventionChoice(message, command.arg);
         return;
       case "steer":
-        await this.handleSteerCommand(message, command.arg);
+        {
+          const items = await this.promptItemsFromMessageWithNotice({ ...message, text: "" });
+          const session = this.executionSession(message.senderId);
+          if (items && session) await this.handleSteerCommand(message, buildPromptParts(command.arg,
+            await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), []).prompt);
+          else if (!session) await this.handleSteerCommand(message, command.arg);
+        }
         return;
       case "queue":
         await this.handleQueueCommand(message, command.arg);
@@ -1498,12 +1527,12 @@ export class BridgeService {
     const canQueue = state.executionOwner !== "desktop"
       && this.runner.backendInfo?.(hostId).capabilities.nativeQueue !== false
       && typeof this.runner.addQueuedSubmission === "function";
-    const prompt = buildPromptParts("", items, channelPromptSource(this.channel.channel), []).prompt;
     const policy = session.activeMessagePolicy ?? this.options.config.activeMessagePolicy ?? "steer";
     if (policy === "queue") {
       await this.enqueueNativeMessage(message, "", items);
       return true;
     }
+    const prompt = buildPromptParts("", await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), []).prompt;
     if (policy === "steer") {
       await this.handleSteerCommand(message, prompt, state.activeTurnId);
       return true;
@@ -1595,14 +1624,15 @@ export class BridgeService {
     }
     const preview = buildPromptPreview(text, items) ?? text;
     const knowledge = this.options.stateStore.relevantKnowledge(preview, session.projectId);
-    const { prompt } = buildPromptParts(text, items, channelPromptSource(this.channel.channel), knowledge);
+    const { prompt } = buildPromptParts(text, await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), knowledge);
     const receipt = await this.nativeQueue.enqueue({
       accountId: this.options.accountId ?? "standalone", conversationId: message.senderId,
       actorId: this.actor.getStore() ?? message.senderId, messageId: message.id,
       sessionId: session.id, hostId, backend: this.runner.backendInfo(hostId).id, threadId: session.threadId
     }, prompt, this.runner, {
       onApproval: request => this.approvals.request(message.senderId, request),
-      onUserInput: request => this.userInputs.request(message.senderId, request)
+      onUserInput: request => this.requestUserInput(message.senderId, request, hostId),
+      onUserInputResult: (request, result) => this.reportUserInputResult(message.senderId, request, result, hostId)
     });
     this.options.stateStore.setSessionPromptPreview(session.id, preview);
     await this.reply(message.senderId, receipt.status === "queued" || receipt.status === "running"
@@ -1984,13 +2014,17 @@ export class BridgeService {
     if (message.text.trim()) {
       items.push({ kind: "text", text: message.text });
     }
-    const attachments = message.attachments ?? [];
+    const context = referenceContext(message);
+    if (context) items.push({ kind: "text", text: context });
+    const attachments = [...(message.attachments ?? []), ...(message.references ?? []).flatMap(ref => ref.attachments)];
     if (!attachments.length) {
+      this.options.inboundReferences?.remember(message, []);
       return items;
     }
     try {
       const rootDir = this.options.inboundDir ?? path.join(this.options.config.defaultCwd, ".codex-im-gateway-inbound");
       const downloaded = validateLocalAttachments(await this.channel.resolveAttachments(message), rootDir, this.options.config.maxInboundBytes);
+      this.options.inboundReferences?.remember(message, downloaded);
       for (const attachment of downloaded) {
         items.push({
           kind: attachment.kind,
@@ -2008,6 +2042,19 @@ export class BridgeService {
     return items;
   }
 
+  private async stagePromptItems(items: PromptBufferItem[], session: ManagedSession, message: ChannelMessage): Promise<PromptBufferItem[]> {
+    const files = items.filter((item): item is Exclude<PromptBufferItem, { kind: "text" }> => item.kind !== "text");
+    if (!files.length) return items;
+    const hostId = this.sessionHostId(session);
+    if (!hostId || hostId === "local") return items;
+    if (!this.runner.stageAttachments) throw new Error("当前远端后端未实现附件转存，消息未提交；请在远端提供可读取的文件。");
+    const staged = await this.runner.stageAttachments(files, { hostId,
+      scope: JSON.stringify([this.options.accountId, message.senderId, session.id]), maxBytes: this.options.config.maxInboundBytes });
+    if (staged.length !== files.length) throw new Error("Remote backend did not stage every attachment");
+    let index = 0;
+    return items.map(item => item.kind === "text" ? item : { ...item, path: staged[index++].path });
+  }
+
   private async promptItemsFromMessageWithNotice(message: ChannelMessage): Promise<PromptBufferItem[] | undefined> {
     try {
       return await this.promptItemsFromMessage(message);
@@ -2019,7 +2066,8 @@ export class BridgeService {
       }
       if (error instanceof InboundAttachmentDownloadError) {
         await this.reply(message.senderId, "收到附件，但当前渠道下载或读取失败。请重新发送；如果仍失败，请检查该渠道的文件权限和连接状态。");
-        return message.text.trim() ? [{ kind: "text", text: message.text }] : undefined;
+        return message.text.trim() ? [{ kind: "text", text: message.text },
+          { kind: "text", text: "本轮附件下载失败，未取得附件正文。不要声称已读取文件或图片；请用户直接重发。" }] : undefined;
       }
       throw error;
     }
@@ -2081,7 +2129,7 @@ export class BridgeService {
         console.log(`[codex-im-gateway] starting Codex turn for ${message.senderId} in ${workspace}`);
         if (!queued && replyStream?.supported) await replyStream.progress("🤔 正在理解任务并规划下一步…");
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
-        const promptParts = buildPromptParts(text, attachments, channelPromptSource(this.channel.channel), knowledge);
+        const promptParts = buildPromptParts(text, await this.stagePromptItems(attachments, session, message), channelPromptSource(this.channel.channel), knowledge);
         const runInput: CodexRunnerInput = {
           prompt: qaContext ? buildQaPrompt(promptParts.prompt, project!, qaContext) : promptParts.prompt,
           developerInstructions: promptParts.developerInstructions,
@@ -2130,7 +2178,9 @@ export class BridgeService {
             }
           } : {}),
           onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
-          onUserInput: (request: import("../codex/backend.js").CodexUserInputRequest) => this.userInputs.request(message.senderId, request)
+          onUserInput: (request: import("../codex/backend.js").CodexUserInputRequest) => this.requestUserInput(message.senderId, request, this.sessionHostId(session)),
+          onUserInputResult: (request: import("../codex/backend.js").CodexUserInputRequest, result: import("../codex/backend.js").CodexUserInputResult) =>
+            this.reportUserInputResult(message.senderId, request, result, this.sessionHostId(session))
         };
         const result = queued
           ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,
@@ -2150,7 +2200,6 @@ export class BridgeService {
         for (const memory of parsed.actions.remember) {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
-        const remaining = chunkText(parsed.visibleText);
         const bound = stillBound();
         const journaled = bound && result.turnId && this.options.deliverTurnResult;
         const streamed = journaled
@@ -2162,12 +2211,10 @@ export class BridgeService {
         } else if (journaled) {
           // Shared delivery owns pending results and error notices. An
           // unacknowledged card must not fall through to a duplicate reply.
-        } else if (!streamed && replyStream?.supported) {
+        } else if (!streamed && replyStream && (replyStream.supported || replyStream.checkpoint().terminalPages?.length)) {
           await replyStream.reportTerminalFailure();
-        } else if (remaining.length && !streamed) {
-          for (const chunk of remaining) {
-            await this.reply(message.senderId, chunk);
-          }
+        } else if (parsed.visibleText.trim() && !streamed) {
+          await this.reply(message.senderId, parsed.visibleText);
         }
         for (const action of parsed.actions.send) {
           if (!stillBound()) break;
@@ -2186,7 +2233,7 @@ export class BridgeService {
       let failureWasReported = !stillBound() || (await replyStream?.fail(
         stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
       ) ?? false);
-      if (!failureWasReported && replyStream?.supported) {
+      if (!failureWasReported && replyStream && (replyStream.supported || replyStream.checkpoint().terminalPages?.length)) {
         try { failureWasReported = await replyStream.reportTerminalFailure(); }
         catch { console.warn("[codex-im-gateway] terminal delivery-error notice failed"); }
       }
@@ -2474,13 +2521,7 @@ export class BridgeService {
     try {
       console.log(`[codex-im-gateway] sending reply to ${senderId}; text=${text.length} chars`);
       const sent = await this.channel.sendText({ toUserId: senderId, text, contextToken });
-      this.options.onOutboundMessage?.({
-        direction: "outbound",
-        id: sent.messageId,
-        recipientId: senderId,
-        text,
-        attachments: []
-      });
+      this.reportCardDelivery(senderId, sent, text);
       console.log(`[codex-im-gateway] sent reply to ${senderId}`);
     } catch (error) {
       if (error instanceof ChannelContextExpiredError) {
@@ -2590,6 +2631,26 @@ export class BridgeService {
 
   reportApprovalResult(senderId: string, request: CodexApprovalRequest, result: ApprovalDeliveryResult): Promise<void> {
     return this.approvals.reportResult(senderId, request, result);
+  }
+
+  requestUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest, hostId?: string): Promise<import("../codex/backend.js").CodexUserInputAnswer | undefined> {
+    const native = { ...request, hostId: hostId ?? request.hostId ?? "local" };
+    const session = this.executionSession(senderId);
+    if (session?.threadId !== native.threadId || (this.sessionHostId(session) ?? "local") !== native.hostId) return Promise.resolve(undefined);
+    return this.userInputs.request(senderId, native);
+  }
+
+  hasUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest): boolean {
+    return this.userInputs.hasRequest(senderId, request);
+  }
+
+  suspendUserInputs(): void { this.userInputs.close(); }
+
+  reconcileUserInputs(): void { this.userInputs.suspendInvalidBindings(); }
+
+  reportUserInputResult(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest,
+    result: import("../codex/backend.js").CodexUserInputResult, hostId?: string): Promise<void> {
+    return this.userInputs.reportResult(senderId, { ...request, hostId: hostId ?? request.hostId ?? "local" }, result);
   }
 }
 

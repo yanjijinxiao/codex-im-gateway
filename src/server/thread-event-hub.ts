@@ -3,7 +3,6 @@ import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "
 import type { ChannelTextClient } from "../channels/types.js";
 import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
 import { parseActionBlocks } from "../bridge/actions.js";
-import { chunkText } from "../bridge/format.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus } from "../bridge/session-follow.js";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
@@ -268,6 +267,13 @@ export class ThreadEventHub {
         } else if (runtime.runtimeStatus === "active" && !snapshot.turns.some(turn => turn.status === "inProgress"
           && (!runtime.activeTurnId || turn.id === runtime.activeTurnId))) {
           this.failSync(sub, { code: "unconfirmed", message: "后端报告正在执行，但没有可确认的当前轮次；未创建占位卡片。" }, "unconfirmed");
+        } else if (runtime.runtimeStatus === "active" && runtime.activeTurnId
+          && (state.completed.includes(runtime.activeTurnId)
+            || state.checkpointTurnId === runtime.activeTurnId && state.checkpoint?.finished)) {
+          // A stale owner snapshot or a reused turn ID can conflict with an
+          // acknowledged completion. That is NOT an IM permission failure.
+          // Do not reopen a completed card or replay its answer on this evidence.
+          this.failSync(sub, { code: "unconfirmed", message: "Codex 后端报告正在执行，但同一轮次已有完成回执，状态相互冲突；保留原卡片与绑定，等待新的可信轮次状态，不重发结果或重建卡片。" }, "unconfirmed");
         } else {
           let presentation: SessionFollowStatus["presentation"] = sub.progressEnabled === false ? "off"
             : runtime.runtimeStatus === "active" ? state.presentation : "idle";
@@ -520,12 +526,12 @@ export class ThreadEventHub {
       if (!this.isLive(sub)) return;
       if (pending.checkpoint?.messageId && !sub.client.resumableTextStream) continue;
       const stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
-        restore: pending.checkpoint, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
+        restore: pending.checkpoint, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
         save: checkpoint => { pending.checkpoint = checkpoint; this.save(); }
       });
       try {
         let delivered = await stream.finalize(pending.text);
-        if (!stream.supported) { await this.sendText(sub, pending.text); delivered = true; }
+        if (!stream.supported && !stream.checkpoint().terminalPages?.length) { await this.sendText(sub, pending.text); delivered = true; }
         if (delivered) {
           delete state.pendingTerminals![turnId];
           state.completed = [...state.completed, turnId].slice(-200);
@@ -546,7 +552,7 @@ export class ThreadEventHub {
     const restore = saved && (sub.client.resumableTextStream || !saved.messageId)
       ? saved : undefined;
     stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
-      restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
+      restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
       save: (checkpoint) => {
         // A retired stream's late HTTP acknowledgement cannot poison the new
         // turn. The streamId is the transport-neutral presentation identity.
@@ -615,29 +621,19 @@ export class ThreadEventHub {
     const clean = visibleText(text).trim() || "任务已结束。";
     state.terminalPending ??= { turnId, text: clean, fallbackSent: false };
     this.save();
-    if (sub.progressEnabled === false && !state.checkpoint?.messageId) {
-      await this.sendText(sub, clean);
-      state.completed = [...state.completed, turnId].slice(-200);
-      if (state.repairTurnId === turnId) delete state.repairTurnId;
-      delete state.terminalPending;
-      state.sequence++;
-      this.logDelivery(sub, turnId, "delivered");
-      this.save();
-      return;
-    }
     const stream = this.stream(sub);
     if (!await stream.finalize(clean)) {
       if (!state.terminalPending.fallbackSent) {
-        if (stream.supported) {
+        if (stream.supported || stream.checkpoint().terminalPages?.length) {
           try { await stream.reportTerminalFailure(); }
           catch { console.warn("[codex-im-gateway] terminal delivery notice unavailable"); }
-        } else await this.sendText(sub, clean);
+        } else if (!stream.checkpoint().terminalPages?.length) await this.sendText(sub, clean);
         state.terminalPending.fallbackSent = true;
         this.save();
       }
       // A notice is not an answer receipt, including when card creation
       // failed before returning a handle. Keep the final pending in both cases.
-      if (stream.supported) { this.logDelivery(sub, turnId, "pending"); return; }
+      if (stream.supported || stream.checkpoint().terminalPages?.length) { this.logDelivery(sub, turnId, "pending"); return; }
     }
     await stream.suspend();
     this.streams.delete(sub.key);
@@ -667,12 +663,10 @@ export class ThreadEventHub {
   }
 
   private async sendText(sub: ThreadSubscription, text: string): Promise<void> {
-    for (const chunk of chunkText(text)) {
       await sub.client.sendText({
-        toUserId: sub.recipientId, text: chunk,
+        toUserId: sub.recipientId, text,
         ...(sub.contextToken ? { contextToken: sub.contextToken } : {})
       });
-    }
   }
 }
 

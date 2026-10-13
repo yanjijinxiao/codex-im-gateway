@@ -8,6 +8,7 @@ import test from "node:test";
 import { buildPrompt } from "../src/bridge/format.js";
 import { AccountManager } from "../src/server/account-manager.js";
 import type { CodexDesktopApproval } from "../src/server/codex-desktop-approval-monitor.js";
+import type { CodexDesktopUserInput, CodexDesktopRequestMonitorOptions } from "../src/server/codex-desktop-request-monitor.js";
 import type { ApprovalDeliveryResult } from "../src/bridge/approval.js";
 import type {
   CodexSessionActivity,
@@ -60,6 +61,11 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   let externalActivityHandler: ((activity: CodexSessionActivity) => Promise<void>) | undefined;
   let desktopApprovalHandler: ((approval: CodexDesktopApproval) => Promise<"accept" | "decline" | undefined>) | undefined;
   let approvalResultHandler: ((approval: CodexDesktopApproval, result: ApprovalDeliveryResult) => Promise<void> | void) | undefined;
+  let questionHandler: CodexDesktopRequestMonitorOptions["onUserInput"];
+  let questionResultHandler: CodexDesktopRequestMonitorOptions["onUserInputResult"];
+  const channelQuestions: Array<{ accountId: string; senderId: string; request: CodexDesktopUserInput["request"] }> = [];
+  const questionResults: Array<{ senderId: string; result: string }> = [];
+  const recoveredQuestions = new Set<string>();
   const followedDesktopThreads: string[] = [];
   const currentlyFollowed = new Set<string>();
   const approvalResults: Array<{ senderId: string; result: ApprovalDeliveryResult }> = [];
@@ -151,6 +157,14 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       async reportApprovalResult(senderId: string, _request: unknown, result: ApprovalDeliveryResult) {
         approvalResults.push({ senderId, result });
       },
+      async requestUserInput(senderId: string, request: CodexDesktopUserInput["request"]) {
+        channelQuestions.push({ accountId, senderId, request });
+        return { [request.questions[0].id]: { answers: ["回答"] } };
+      },
+      hasUserInput(senderId: string) { return recoveredQuestions.has(`${accountId}:${senderId}`); },
+      async reportUserInputResult(senderId: string, _request: unknown, result: string) {
+        questionResults.push({ senderId, result });
+      },
       allowSender(senderId: string) {
         input.stateStore.setPairedSenderIds([...input.stateStore.listPairedSenderIds(), senderId]);
       },
@@ -175,6 +189,8 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     codexDesktopApprovalMonitorFactory: (handlers) => {
       desktopApprovalHandler = handlers.onApproval;
       approvalResultHandler = handlers.onResult;
+      questionHandler = handlers.onUserInput;
+      questionResultHandler = handlers.onUserInputResult;
       return {
         start() {},
         stop() {},
@@ -225,6 +241,13 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       await approvalResultHandler?.(approval, result);
     },
     approvalResults,
+    async emitDesktopQuestion(input: CodexDesktopUserInput) {
+      assert.ok(questionHandler); return questionHandler(input);
+    },
+    async emitQuestionResult(input: CodexDesktopUserInput, result: "confirmed" | "withdrawn" | "failed") {
+      await questionResultHandler?.(input, result);
+    },
+    channelQuestions, questionResults, recoveredQuestions,
     currentlyFollowed,
     bridges,
     followedDesktopThreads,
@@ -715,6 +738,59 @@ function boundApproval(): CodexDesktopApproval {
     kind: "command", threadId: "bound-approval-thread", turnId: "approval-turn", itemId: "approval-item", command: "echo test"
   } };
 }
+
+function boundQuestion(): CodexDesktopUserInput {
+  return { hostId: "local", requestId: 44, method: "item/tool/requestUserInput", request: {
+    hostId: "local", requestId: 44, threadId: "bound-approval-thread", turnId: "approval-turn", itemId: "question-item",
+    questions: [{ id: "question", header: "问题", question: "farming 在哪里？" }], autoResolutionMs: null
+  } };
+}
+
+test("routes questions and native receipts to the unique originating IM, never an unrelated project target", async t => {
+  const f = setup(t); seedApprovalBinding(f.paths, "account-one", "bound-room", { project: true });
+  await f.manager.startAll();
+  const input = boundQuestion();
+  assert.deepEqual(await f.emitDesktopQuestion(input), { question: { answers: ["回答"] } });
+  assert.equal(f.channelQuestions[0].senderId, "bound-room");
+  assert.match(f.bridges.get("account-one")!.userInputFilePath!, /account-one\/user-input.json$/);
+  await f.emitQuestionResult(input, "confirmed"); await f.emitQuestionResult(input, "failed");
+  assert.deepEqual(f.questionResults, [{ senderId: "bound-room", result: "confirmed" }]);
+  await f.manager.stopAll();
+});
+
+for (const binding of ["remote", "not-following", "ambiguous"] as const) test(`leaves ${binding} questions in the App instead of leaking to another IM`, async t => {
+  const f = setup(t); seedApprovalBinding(f.paths, "account-one", "one-room", {
+    hostId: binding === "remote" ? "remote-host" : undefined, follow: binding !== "not-following", project: true
+  });
+  if (binding === "ambiguous") seedApprovalBinding(f.paths, "account-two", "two-room");
+  await f.manager.startAll();
+  assert.equal(await f.emitDesktopQuestion(boundQuestion()), undefined);
+  assert.deepEqual(f.channelQuestions, []); await f.manager.stopAll();
+});
+
+test("a durable question destination is recovered without broadcasting to every followed group", async t => {
+  const f = setup(t); seedApprovalBinding(f.paths, "account-one", "one-room");
+  seedApprovalBinding(f.paths, "account-two", "two-room");
+  f.recoveredQuestions.add("account-one:one-room");
+  await f.manager.startAll(); await f.emitDesktopQuestion(boundQuestion());
+  assert.deepEqual(f.channelQuestions.map(q => q.senderId), ["one-room"]);
+  await f.manager.stopAll();
+});
+
+test("web-started questions use the same channel handler and native result callback", async t => {
+  const f = setup(t); const session = seedApprovalBinding(f.paths, "account-one", "one-room");
+  await f.manager.startAll();
+  f.setRunHandler(async input => {
+    const question = boundQuestion().request;
+    assert.deepEqual(await (input.onUserInput as (r: unknown) => Promise<unknown>)(question), { question: { answers: ["回答"] } });
+    await (input.onUserInputResult as (r: unknown, result: string) => Promise<void>)(question, "confirmed");
+    return { raw: "", text: "done", threadId: question.threadId };
+  });
+  await f.manager.continueSession("account-one", session.id, "continue");
+  assert.equal(f.channelQuestions[0].senderId, "one-room");
+  assert.deepEqual(f.questionResults, [{ senderId: "one-room", result: "confirmed" }]);
+  await f.manager.stopAll();
+});
 
 test("subscribes standalone bound sessions on startup and reports receipts to their original IM", async (t) => {
   const { manager, paths, followedDesktopThreads, channelApprovals, emitDesktopApproval, emitApprovalResult, approvalResults } = setup(t);

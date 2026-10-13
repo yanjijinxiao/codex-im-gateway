@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { Readable } from "node:stream";
 
 import { z } from "zod";
 
@@ -40,7 +41,7 @@ test("Feishu uploads a local image and sends its image key to the target chat", 
           message: {
             async create(input: Record<string, unknown>) {
               messages.push(input);
-              return { data: { message_id: "message-test" } };
+              return { code: 0, data: { message_id: "message-test" } };
             }
           }
         }
@@ -87,7 +88,7 @@ test("Feishu sends an interactive Taskboard card and routes its button callback 
           message: {
             async create(input: Record<string, unknown>) {
               messages.push(input);
-              return { data: { message_id: "card-message" } };
+              return { code: 0, data: { message_id: "card-message" } };
             }
           },
           messageResource: { async get() { throw new Error("not used"); } }
@@ -199,7 +200,7 @@ test("Bridge sends an explicit image action through a channel image capability",
   assert.equal(replies.some((reply) => reply.includes("暂不支持直接发送")), false);
 });
 
-test("Feishu downloads an inbound image before forwarding it to Bridge", async (t) => {
+test("Feishu resolves an inbound image lazily through the shared authorized attachment boundary", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-feishu-inbound-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let dispatcher: { handles: Map<string, (event: unknown) => unknown> } | undefined;
@@ -227,7 +228,7 @@ test("Feishu downloads an inbound image before forwarding it to Bridge", async (
                 async writeFile(filePath: string) {
                   fs.writeFileSync(filePath, Buffer.from("downloaded image"));
                 },
-                getReadableStream() { throw new Error("not used"); },
+                getReadableStream() { return Readable.from([Buffer.from("downloaded image")]); },
                 headers: {}
               };
             }
@@ -245,7 +246,7 @@ test("Feishu downloads an inbound image before forwarding it to Bridge", async (
   const monitor = adapter.monitor({
     signal: controller.signal,
     async onMessage(message) {
-      messages.push(message);
+      messages.push({ ...message, attachments: await adapter.client.resolveAttachments(message) });
     }
   });
   await new Promise((resolve) => setImmediate(resolve));
@@ -314,4 +315,31 @@ test("Bridge includes a downloaded channel image in the Codex prompt", async (t)
   assert.match(prompts[0], /inbound\.png/);
   assert.match(prompts[0], new RegExp(imagePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(prompts[0], /Attachment download failed/);
+});
+
+test("Feishu resolves a quoted file from the same chat and refuses a cross-chat reference", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-quoted-file-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let chat = "oc_current";
+  const adapter = new FeishuChannelAdapter({ channel: "feishu", accountId: "quoted-file", appId: "app", appSecret: "secret", enabled: true, savedAt: new Date().toISOString() }, {
+    inboundDir: root,
+    apiClient: { im: { v1: {
+      image: { async create() { return { image_key: "unused" }; } },
+      message: { async create() { return { data: { message_id: "unused" } }; }, async get() {
+        return { code: 0, data: { items: [{ message_id: "original", chat_id: chat, msg_type: "file", body: { content: JSON.stringify({ file_key: "file-key", file_name: "MCT.md" }) } }] } };
+      } },
+      messageResource: { async get(input) { assert.equal(input.params.type, "file"); assert.equal(input.path.message_id, "original"); return {
+        async writeFile() { throw new Error("streaming only"); }, getReadableStream() { return Readable.from([Buffer.from("Inventory 完整文件")]); }, headers: {}
+      }; } }
+    } } }, wsClient: { async start() {}, close() {} }
+  });
+  const message = { id: "reply", senderId: "actor", replyTargetId: "oc_current", text: "读取", attachments: [], raw: {},
+    references: [{ messageId: "original", type: "unknown", attachments: [], availability: "metadata-only" as const }] };
+  const resolved = await adapter.client.resolveReferences(message);
+  const media = await adapter.client.resolveAttachments(resolved);
+  assert.equal(fs.readFileSync(media[0].path!, "utf8"), "Inventory 完整文件");
+  chat = "oc_other";
+  const refused = await adapter.client.resolveReferences(message);
+  assert.equal(refused.references![0].attachments.length, 0);
+  assert.equal(refused.references![0].availability, "metadata-only");
 });

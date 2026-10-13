@@ -8,6 +8,8 @@ export type ChannelMessage = {
   contextToken?: string;
   interaction?: { readonly kind: "card"; readonly messageId: string };
   text: string;
+  /** Quoted content is context/data, never an executable slash command. */
+  references?: ChannelReference[];
   /** Known message received, but this adapter cannot decode that format yet. */
   unsupportedMessageType?: string;
   attachments: ChannelAttachment[];
@@ -21,4 +23,15 @@ export type ChannelAttachment = {
   label: string;
   item: Record<string, unknown>;
   path?: string;
+  sourceMessageId?: string;
+};
+
+export type ChannelReference = {
+  messageId?: string;
+  senderId?: string;
+  type: string;
+  text?: string;
+  attachments: ChannelAttachment[];
+  availability: "available" | "metadata-only" | "unavailable";
+  reason?: string;
 };

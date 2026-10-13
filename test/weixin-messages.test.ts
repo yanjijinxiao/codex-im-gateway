@@ -106,7 +106,7 @@ test("normalizes inbound voice media as audio when transcription is unavailable"
   ]);
 });
 
-test("normalizes an image referenced by a text message as an attachment", () => {
+test("normalizes a quoted image as reference context without mixing it into direct attachments", () => {
   const message = normalizeWeixinMessage({
     message_id: "msg-ref-image",
     from_user_id: "alice@im.wechat",
@@ -126,7 +126,8 @@ test("normalizes an image referenced by a text message as an attachment", () => 
   });
 
   assert.equal(message?.text, "看看这张图");
-  assert.deepEqual(message?.attachments.map((attachment) => ({
+  assert.equal(message?.attachments.length, 0);
+  assert.deepEqual(message?.references?.[0].attachments.map((attachment) => ({
     kind: attachment.kind,
     label: attachment.label
   })), [{ kind: "image", label: "image" }]);

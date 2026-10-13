@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
+import { parseUserInputRequest } from "./user-input.js";
+import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
 import { readDesktopSessionCatalog, isDesktopCatalogThread } from "./desktop-session-catalog.js";
 
@@ -146,6 +148,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly approvalHandlersByThread = new Map<string, CodexApprovalHandler>();
   private readonly dynamicToolHandlersByThread = new Map<string, CodexDynamicToolHandler>();
   private readonly userInputHandlersByThread = new Map<string, CodexUserInputHandler>();
+  private readonly userInputResultHandlersByThread = new Map<string, CodexUserInputResultHandler>();
+  private readonly userInputRequests = new Map<string, { request: CodexUserInputRequest;
+    submitted: boolean; notify?: CodexUserInputResultHandler }>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
   private readonly turnEvents = new Map<string, string[]>();
   private readonly turnTexts = new Map<string, string>();
@@ -290,7 +295,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     let turnResponse: Record<string, unknown>;
     if (input.onApproval) this.approvalHandlersByThread.set(threadId, input.onApproval);
     if (input.onDynamicToolCall) this.dynamicToolHandlersByThread.set(threadId, input.onDynamicToolCall);
-    if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
+    this.bindUserInputHandlers(threadId, input);
     try {
       if (input.queuedSubmissionId) {
         // Resume itself can cause Codex to drain its native queue. Observe
@@ -322,6 +327,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         this.approvalHandlersByThread.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
+        this.userInputResultHandlersByThread.delete(threadId);
         throw error;
       }
       await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
@@ -332,6 +338,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         this.approvalHandlersByThread.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
+        this.userInputResultHandlersByThread.delete(threadId);
         throw retryError;
       }
     }
@@ -341,6 +348,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       this.approvalHandlersByThread.delete(threadId);
       this.dynamicToolHandlersByThread.delete(threadId);
       this.userInputHandlersByThread.delete(threadId);
+      this.userInputResultHandlersByThread.delete(threadId);
       throw new Error("Codex app-server did not return a turn id");
     }
 
@@ -911,7 +919,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         if (input.observeOnly && existing.status === "inProgress") throw new Error("轮次仍在执行；只读恢复不会接管任务。");
         if (existing.status === "inProgress" && !this.subscribedThreads.has(input.threadId)) {
           if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
-          if (input.onUserInput) this.userInputHandlersByThread.set(input.threadId, input.onUserInput);
+          this.bindUserInputHandlers(input.threadId, input);
           await this.request("thread/resume", { threadId: input.threadId });
           this.subscribedThreads.add(input.threadId);
           const refreshed = await this.findQueuedTurn(input.threadId, undefined, String(existing.id));
@@ -966,7 +974,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const turnId = String(turn.id), key = turnKey(input.threadId, turnId);
     if (turn.status === "inProgress") {
       if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
-      if (input.onUserInput) this.userInputHandlersByThread.set(input.threadId, input.onUserInput);
+      this.bindUserInputHandlers(input.threadId, input);
     }
     this.turnStreams.set(key, { onDelta: input.onDelta, onProgress: input.onProgress, chain: Promise.resolve() });
     for (const event of this.queuedTurnEvents.get(key) ?? []) this.enqueueTurnEvent(key, event);
@@ -1252,10 +1260,19 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (method === "serverRequest/resolved") {
+      const key = JSON.stringify([params.threadId, typeof params.requestId, params.requestId]);
+      const pending = this.userInputRequests.get(key);
+      if (pending) this.resolveUserInput(key, pending.submitted ? "confirmed" : "withdrawn");
+      return;
+    }
     if (method === "turn/started") {
       const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
       const turn = params.turn as { id?: string } | undefined;
-      if (threadId && turn?.id) this.activeTurns.set(threadId, turn.id);
+      if (threadId && turn?.id) {
+        for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId && pending.request.turnId !== turn.id) this.resolveUserInput(key, "withdrawn");
+        this.activeTurns.set(threadId, turn.id);
+      }
     }
     if (method === "thread/status/changed") {
       const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
@@ -1313,7 +1330,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           this.nativeTurnClients.set(key, item.clientId);
           this.activeTurns.set(threadId, turnId);
           if (origin.onApproval) this.approvalHandlersByThread.set(threadId, origin.onApproval);
-          if (origin.onUserInput) this.userInputHandlersByThread.set(threadId, origin.onUserInput);
+          this.bindUserInputHandlers(threadId, origin);
           void Promise.resolve(origin.onAccepted?.(turnId)).catch(() => {
             console.warn("[codex-im-gateway] native turn acknowledgement callback failed; no input replayed");
           });
@@ -1396,6 +1413,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!threadId || !turnId) {
       return;
     }
+    for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId
+      && pending.request.turnId === turnId) this.resolveUserInput(key, pending.submitted ? "failed" : "withdrawn");
     const key = turnKey(threadId, turnId);
     this.appendTurnEvent(key, raw);
     const status = typeof turn?.status === "string" ? turn.status : "completed";
@@ -1424,6 +1443,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.approvalHandlersByThread.delete(threadId);
     this.dynamicToolHandlersByThread.delete(threadId);
     this.userInputHandlersByThread.delete(threadId);
+    this.userInputResultHandlersByThread.delete(threadId);
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
@@ -1624,15 +1644,36 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>): void {
-    const request = parseUserInputRequest(params);
+    const parsed = parseUserInputRequest(params);
+    const request = parsed ? { ...parsed, requestId: id } : undefined;
     const handler = request ? this.userInputHandlersByThread.get(request.threadId) : undefined;
     if (!request || !handler) {
-      this.send({ id, result: { answers: {} } });
+      console.warn("[codex-im-gateway] user-input request has no valid channel handler; left unanswered");
       return;
     }
-    Promise.resolve(handler(request))
-      .then((answers) => this.send({ id, result: { answers } }))
-      .catch(() => this.send({ id, result: { answers: {} } }));
+    const key = JSON.stringify([request.threadId, typeof id, id]);
+    if (this.userInputRequests.has(key)) return;
+    const pending = { request, submitted: false, notify: this.userInputResultHandlersByThread.get(request.threadId) };
+    this.userInputRequests.set(key, pending);
+    Promise.resolve(handler(request)).then(answers => {
+      if (answers === undefined || this.userInputRequests.get(key) !== pending) return;
+      pending.submitted = true;
+      this.send({ id, result: { answers } });
+    }).catch(() => this.resolveUserInput(key, "failed"));
+  }
+
+  private bindUserInputHandlers(threadId: string, input: Pick<CodexRunnerInput, "onUserInput" | "onUserInputResult">): void {
+    if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
+    if (input.onUserInputResult) this.userInputResultHandlersByThread.set(threadId, input.onUserInputResult);
+  }
+
+  private resolveUserInput(key: string, result: CodexUserInputResult): void {
+    const pending = this.userInputRequests.get(key);
+    if (!pending) return;
+    this.userInputRequests.delete(key);
+    void Promise.resolve(pending.notify?.(pending.request, result)).catch(() => {
+      console.warn("[codex-im-gateway] user-input resolution notice failed");
+    });
   }
 
   private handleChildFailure(child: ChildProcessWithoutNullStreams, error: Error): void {
@@ -1667,6 +1708,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.approvalHandlersByThread.clear();
     this.dynamicToolHandlersByThread.clear();
     this.userInputHandlersByThread.clear();
+    for (const [key, pending] of this.userInputRequests) this.resolveUserInput(key, pending.submitted ? "failed" : "suspended");
+    this.userInputResultHandlersByThread.clear();
     this.turnEvents.clear();
     this.turnTexts.clear();
     this.completedTurns.clear();
@@ -1807,46 +1850,6 @@ function parseDynamicToolCall(params: Record<string, unknown>): CodexDynamicTool
   };
 }
 
-function parseUserInputRequest(params: Record<string, unknown>): CodexUserInputRequest | undefined {
-  if (
-    typeof params.itemId !== "string"
-    || typeof params.threadId !== "string"
-    || typeof params.turnId !== "string"
-    || !Array.isArray(params.questions)
-  ) {
-    return undefined;
-  }
-  const questions = params.questions.flatMap((raw) => {
-    if (!raw || typeof raw !== "object") return [];
-    const item = raw as Record<string, unknown>;
-    if (typeof item.header !== "string" || typeof item.id !== "string" || typeof item.question !== "string") {
-      return [];
-    }
-    const options = Array.isArray(item.options)
-      ? item.options.flatMap((rawOption) => {
-          if (!rawOption || typeof rawOption !== "object") return [];
-          const option = rawOption as Record<string, unknown>;
-          return typeof option.label === "string" && typeof option.description === "string"
-            ? [{ label: option.label, description: option.description }]
-            : [];
-        })
-      : [];
-    return [{
-      header: item.header,
-      id: item.id,
-      question: item.question,
-      ...(options.length ? { options } : {})
-    }];
-  });
-  if (!questions.length) return undefined;
-  return {
-    itemId: params.itemId,
-    threadId: params.threadId,
-    turnId: params.turnId,
-    questions,
-    ...(typeof params.autoResolutionMs === "number" ? { autoResolutionMs: params.autoResolutionMs } : {})
-  };
-}
 
 function parseThreadGoal(value: unknown): CodexThreadGoal | undefined {
   if (!value || typeof value !== "object") return undefined;

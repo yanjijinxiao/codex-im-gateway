@@ -25,6 +25,17 @@ test("returns a retry hint for timeouts", () => {
   );
 });
 
+test("IPC acceptance and transport timeouts never claim a task was stopped", () => {
+  for (const detail of ["Codex Desktop IPC thread-follower-start-turn failed: thread-follower-start-turn-timeout",
+    "Codex Desktop IPC connection timed out after 30000ms", "app-server request turn/start timed out after 30000ms",
+    "Remote attachment staging timed out"]) {
+    const message = userFacingMessageHandlingError(new Error(detail));
+    assert.match(message, /尚未确认/);
+    assert.match(message, /未自动重发或停止/);
+    assert.doesNotMatch(message, /执行时间过长|已停止处理|拆成更小/);
+  }
+});
+
 test("returns an actionable DingTalk image download error without exposing details", () => {
   const message = userFacingMessageHandlingError(
     new Error("DingTalk inbound image download failed: signed URL contained secret-code")

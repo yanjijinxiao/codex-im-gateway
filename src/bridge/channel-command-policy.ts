@@ -13,6 +13,7 @@ const PROJECT_OPTIONAL_COMMANDS = new Set<string>([
   "approve",
   "reject",
   "answer",
+  "skip",
   "role", "session", "sessions", "s", "ss", "history", "hist",
   "follow", "leave", "policy", "steer", "iv", "intervene", "queue", "stop", "status", "where"
 ]);

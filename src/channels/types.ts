@@ -32,10 +32,14 @@ export type ChannelTextClient = {
   sendTyping?(input: { toUserId: string; contextToken?: string; typing?: boolean }): Promise<void>;
   sendMedia?(input: ChannelMediaInput): Promise<{ messageId: string }>;
   resolveAttachments?(message: ChannelMessage): Promise<ChannelAttachment[]>;
+  /** Fetch quoted-message resources only after the Bridge access check. */
+  resolveReferences?(message: ChannelMessage): Promise<ChannelMessage>;
 };
 
 export type Capability = "available" | "not-configured" | "not-implemented" | "unsupported";
 export type ChannelCapabilities = {
+  /** Conservative UTF-8 budget for each complete-result page. */
+  readonly resultPageBytes?: number;
   /** Presentation supported by this adapter, independent of actionable buttons. */
   readonly tableLayout: ChannelTableLayout;
   readonly inbound: Readonly<Record<AttachmentKind, Capability>>;

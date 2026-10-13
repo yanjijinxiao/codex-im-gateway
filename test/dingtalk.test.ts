@@ -25,6 +25,7 @@ import { createChoiceCard } from "../src/channels/action-card.js";
 import { parseCommand } from "../src/bridge/channel-commands.js";
 import { ChannelTurnTextStream } from "../src/channels/progress.js";
 import { ChannelProgressError } from "../src/channels/errors.js";
+import { PinnedNetworkLifecycleTransport } from "../src/channels/network-family.js";
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -80,7 +81,8 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
       method: init?.method,
       body: JSON.parse(String(init?.body)) as Record<string, unknown>
     });
-    return new Response(JSON.stringify({ success: true }), {
+    return new Response(JSON.stringify({ success: true,
+      result: init?.method === "POST" ? String(input).endsWith("/deliver") ? [{ success: true }] : "card-instance" : true }), {
       status: 200,
       headers: { "Content-Type": "application/json" }
     });
@@ -133,7 +135,7 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
   assert.deepEqual(calls[0]?.body, {
     cardTemplateId: "template.schema",
     outTrackId: "card-https",
-    cardData: { cardParamMap: { config: JSON.stringify({ autoLayout: true }) } },
+    cardData: { cardParamMap: dingTalkCardStateParamMap({ contentKey: "msgContent", text: "initial", flowStatus: "2" }) },
     callbackType: "STREAM",
     imGroupOpenSpaceModel: { supportForward: true },
     imRobotOpenSpaceModel: { supportForward: true }
@@ -159,11 +161,179 @@ test("DingTalk rejects HTTP 200 card responses whose business result failed", ()
     statusCode: 200,
     headers: { "x-acs-request-id": "request-1" },
     body: { success: false, result: false }
-  }), /request-1.*success=false/);
+  }), /BusinessRejected.*request-1/);
   assert.throws(() => assertDingTalkCardMutationSucceeded("deliver", {
     statusCode: 200,
     body: { success: true, result: [{ success: false, errorMsg: "carrier rejected" }] }
-  }), /carrier rejected/);
+  }), /InvalidAcknowledgement/);
+});
+
+test("DingTalk requires operation-specific receipts, not just HTTP 200", () => {
+  for (const operation of ["create", "deliver", "stream", "state"] as const) {
+    for (const body of [undefined, null, [], {}, { code: "business.failure" }, { success: true },
+      { success: true, result: null }, { success: "true", result: true }]) {
+      assert.throws(() => assertDingTalkCardMutationSucceeded(operation, { statusCode: 200, body }));
+    }
+    assert.throws(() => assertDingTalkCardMutationSucceeded(operation, { statusCode: 500, body: { success: true, result: true } }));
+  }
+  for (const result of [[], [{}], [null], [{ success: true }, { success: false }], [{ success: "true" }]]) {
+    assert.throws(() => assertDingTalkCardMutationSucceeded("deliver", { statusCode: 200, body: { success: true, result } }));
+  }
+  for (const [operation, result] of [["create", "instance"], ["deliver", [{ success: true }]],
+    ["stream", true], ["state", true]] as const) {
+    assert.doesNotThrow(() => assertDingTalkCardMutationSucceeded(operation, { statusCode: 200, body: { success: true, result } }));
+  }
+  assert.throws(() => assertDingTalkCardMutationSucceeded("state", { statusCode: 200, body: {
+    success: false, result: false, message: "SECRET_TOKEN", requestId: "https://secret", code: "https://secret"
+  } }), error => error instanceof Error && !/SECRET_TOKEN|https/.test(error.message));
+});
+
+test("DingTalk uncertain creation cannot be replayed by finalization or checkpoint recovery", async (t) => {
+  for (const uncertainPhase of ["create", "deliver"] as const) {
+    let creates = 0, deliveries = 0;
+    const client = new DingTalkHttpsAICardClient(async (url, init) => {
+      if (String(url).endsWith("/deliver")) {
+        deliveries++;
+        return new Response("{}", { status: 200 });
+      }
+      if (init?.method === "POST") {
+        creates++;
+        return new Response(JSON.stringify(uncertainPhase === "create" ? {} : { success: true, result: "instance" }), { status: 200 });
+      }
+      throw new Error("no update without delivery acknowledgement");
+    }, [0], async () => undefined);
+    const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
+      clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
+      streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient: client,
+      async webhookSender() { throw new Error("must not fall back"); }
+    });
+    const stream = new ChannelTurnTextStream(adapter.client, "cid-test", { save() {} });
+    t.after(() => stream.suspend());
+    await stream.progress("开始");
+    assert.equal(stream.checkpoint().messageId, undefined);
+    assert.equal(stream.checkpoint().creationAttempted, true);
+    assert.equal(await stream.finalize("完成"), false);
+    const restored = new ChannelTurnTextStream(adapter.client, "cid-test", { restore: stream.checkpoint(), save() {} });
+    t.after(() => restored.suspend());
+    assert.equal(await restored.finalize("完成"), false);
+    assert.equal(creates, 1);
+    assert.equal(deliveries, uncertainPhase === "create" ? 0 : 1);
+  }
+});
+
+test("DingTalk missing final acknowledgement keeps the original card and terminal payload", async (t) => {
+  let creates = 0, deliveries = 0, rejected = false;
+  const cardClient = new DingTalkHttpsAICardClient(async (url, init) => {
+    if (init?.method === "POST") {
+      if (String(url).endsWith("/deliver")) deliveries++; else creates++;
+      return new Response(JSON.stringify({ success: true, result: String(url).endsWith("/deliver") ? [{ success: true }] : "instance" }), { status: 200 });
+    }
+    return new Response(JSON.stringify(rejected ? {} : { success: true, result: true }), { status: 200 });
+  }, [0], async () => undefined);
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true }, {
+    streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient,
+    async webhookSender() { throw new Error("must not fall back"); }
+  });
+  const stream = new ChannelTurnTextStream(adapter.client, "cid-test", { save() {} });
+  t.after(() => stream.suspend());
+  await stream.progress("开始");
+  const id = stream.checkpoint().messageId;
+  rejected = true;
+  assert.equal(await stream.finalize("完整最终回复"), false);
+  assert.equal(stream.checkpoint().finished, false);
+  assert.equal(stream.checkpoint().messageId, id);
+  assert.equal(stream.checkpoint().terminal?.text, "完整最终回复");
+  rejected = false;
+  const restored = new ChannelTurnTextStream(adapter.client, "cid-test", { restore: stream.checkpoint(), save() {} });
+  t.after(() => restored.suspend());
+  assert.equal(await restored.finalize("完整最终回复"), true);
+  assert.equal(restored.checkpoint().messageId, id);
+  assert.equal(creates, 1); assert.equal(deliveries, 1);
+});
+
+test("DingTalk HTTPS uses ordered stream GUIDs and reuses the GUID on transport retries", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const guids: string[] = [];
+  const client = new DingTalkHttpsAICardClient(async (url, init) => {
+    if (String(url).endsWith("/streaming")) guids.push(JSON.parse(String(init?.body)).guid);
+    return new Response(JSON.stringify({ success: guids.length !== 1, result: guids.length !== 1 }), { status: 200 });
+  }, [0, 0], async () => undefined);
+  const input = { accessToken: "fake", contentKey: "content", outTrackId: "existing-card", error: false, finalize: false };
+  await client.update({ ...input, text: "第一帧" });
+  await client.update({ ...input, text: "第二帧", finalize: true });
+  assert.equal(guids[0], guids[1]);
+  assert.ok(guids[2] > guids[1], "same-millisecond updates must be ordered, not random");
+});
+
+test("DingTalk delivered one-shot card failure never creates a webhook replacement", async () => {
+  let creates = 0, webhooks = 0;
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true }, {
+    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    cardClient: { async create() { creates++; }, async update() { throw new Error("HTTP 503"); } },
+    async webhookSender() { webhooks++; return { messageId: "replacement" }; }
+  });
+  await assert.rejects(adapter.client.sendText({ toUserId: "cid-test", text: "最终结果" }),
+    error => error instanceof ChannelProgressError && Boolean(error.messageId));
+  assert.equal(creates, 1); assert.equal(webhooks, 0);
+});
+
+test("DingTalk SDK publishes the same nonempty first frame and complete snapshots as HTTPS", async () => {
+  let initial: Record<string, string> | undefined;
+  let delivery: { robotCode?: string } | undefined;
+  const states: Array<{ text?: string; keyed?: boolean }> = [];
+  const client = new DingTalkSdkAICardClient({
+    async createCardWithOptions(request) {
+      initial = request.cardData.cardParamMap;
+      return { statusCode: 200, body: { success: true, result: "instance" } };
+    },
+    async deliverCardWithOptions(request) {
+      delivery = request.imRobotOpenDeliverModel;
+      return { statusCode: 200, body: { success: true, result: [{ success: true }] } };
+    },
+    async updateCardWithOptions(request) {
+      states.push({ text: request.cardData.cardParamMap.msgContent, keyed: request.cardUpdateOptions?.updateCardDataByKey ?? false });
+      return { statusCode: 200, body: { success: true, result: true } };
+    },
+    async streamingUpdateWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; }
+  } as never, [0], async () => undefined);
+  const base = { accessToken: "fake", contentKey: "msgContent", outTrackId: "card-sdk", error: false, finalize: false };
+  await client.create({ ...base, cardTemplateId: "template", robotCode: "robot-code",
+    target: { type: "user", staffId: "staff" }, text: "首帧\n正文" });
+  assert.deepEqual(initial, dingTalkCardStateParamMap({ contentKey: "msgContent", text: "首帧<br>正文", flowStatus: "2" }));
+  assert.equal(delivery?.robotCode, "robot-code");
+  await client.update({ ...base, text: "第一帧" });
+  await client.update({ ...base, text: "第二帧" });
+  await client.update({ ...base, text: "完成", finalize: true });
+  assert.deepEqual(states, [{ text: "第一帧", keyed: false }, { text: "第二帧", keyed: true }, { text: "完成", keyed: true }]);
+});
+
+test("DingTalk session webhook requires errcode zero before creating a local receipt", async () => {
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  let body: unknown = {};
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
+    clientSecret: "fake", savedAt: "", enabled: true }, {
+    apiTransport: new PinnedNetworkLifecycleTransport("ipv4", async () => new Response(JSON.stringify(body), { status: 200 })),
+    emotionClient: noEmotionClient(),
+    streamClient: { registerCallbackListener(_topic, callback) { listener = callback; }, async connect() {},
+      disconnect() {}, async getAccessToken() { return "fake"; }, off() {}, socketCallBackResponse() {} }
+  });
+  const controller = new AbortController();
+  const received = Promise.withResolvers<void>();
+  const monitoring = adapter.monitor({ signal: controller.signal, async onMessage() { received.resolve(); } });
+  listener!(frame(robotMessage()));
+  await received.promise;
+  try {
+    for (const rejected of [{}, { errcode: "0" }, { errcode: 400, errmsg: "SECRET_URL" }]) {
+      body = rejected;
+      await assert.rejects(adapter.client.sendText({ toUserId: "conversation-123", text: "test" }),
+        error => error instanceof Error && !error.message.includes("SECRET_URL"));
+    }
+    body = { errcode: 0 };
+    assert.match((await adapter.client.sendText({ toUserId: "conversation-123", text: "test" })).messageId,
+      /^dingtalk-webhook-receipt:/);
+  } finally { controller.abort(); await monitoring; }
 });
 
 test("DingTalk card state snapshots use the configured content key", () => {
@@ -186,7 +356,7 @@ test("DingTalk serializes updates, uses ordered GUIDs, and retries a rejected bu
   let firstAttempt = true;
   const client = new DingTalkSdkAICardClient({
     async createCardWithOptions() { return { statusCode: 200, body: { success: true, result: "ok" } }; },
-    async deliverCardWithOptions() { return { statusCode: 200, body: { success: true, result: [] } }; },
+    async deliverCardWithOptions() { return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
     async updateCardWithOptions(request) {
       states.push({
         text: request.cardData?.cardParamMap?.content ?? "",
@@ -445,7 +615,7 @@ test("DingTalk downloads a picture message and passes its local path into the cu
   const received = Promise.withResolvers<NormalizedWeixinMessage>();
   const monitoring = adapter.monitor({
     signal: controller.signal,
-    onMessage: async (message) => received.resolve(message)
+    onMessage: async (message) => received.resolve({ ...message, attachments: await adapter.client.resolveAttachments(message) })
   });
   assert.ok(listener);
   listener(frame({
@@ -498,7 +668,8 @@ test("DingTalk preserves text and downloads pictures embedded in richText messag
   });
   const controller = new AbortController();
   const received = Promise.withResolvers<NormalizedWeixinMessage>();
-  const monitoring = adapter.monitor({ signal: controller.signal, onMessage: async (message) => received.resolve(message) });
+  const monitoring = adapter.monitor({ signal: controller.signal,
+    onMessage: async (message) => received.resolve({ ...message, attachments: await adapter.client.resolveAttachments(message) }) });
   assert.ok(listener);
   listener(frame({
     ...robotMessage(),
@@ -516,6 +687,36 @@ test("DingTalk preserves text and downloads pictures embedded in richText messag
   assert.equal(message.attachments[0]?.label, "dingtalk-image-1.jpg");
   controller.abort();
   await monitoring;
+});
+
+test("DingTalk receives direct and quoted files without downloading until the shared resolver is invoked", async t => {
+  const inboundDir = fs.mkdtempSync(path.join(os.tmpdir(), "dingtalk-inbound-files-"));
+  t.after(() => fs.rmSync(inboundDir, { recursive: true, force: true }));
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  let downloads = 0;
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "files",
+    clientId: "ding-client", clientSecret: "secret", enabled: true, savedAt: new Date().toISOString() }, {
+    inboundDir, emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }),
+    mediaClient: { async download(input) { downloads++; assert.equal(input.downloadCode, "file-code"); return { buffer: Buffer.from("Inventory 中文全文"), contentType: "text/markdown" }; } }
+  });
+  for (const quoted of [false, true]) {
+    const controller = new AbortController();
+    const received = Promise.withResolvers<NormalizedWeixinMessage>();
+    const monitoring = adapter.monitor({ signal: controller.signal, async onMessage(message) { received.resolve(message); } });
+    const body = quoted ? { msgtype: "text", text: { content: "读引用", repliedMsg: {
+      msgType: "file", msgId: "original", content: JSON.stringify({ fileName: "MCT.md", downloadCode: "file-code" })
+    } } } : { msgtype: "file", content: { fileName: "MCT.md", downloadCode: "file-code" } };
+    listener!(frame({ ...robotMessage(), ...body }));
+    const message = await received.promise;
+    assert.equal(downloads, quoted ? 1 : 0);
+    const attachments = await adapter.client.resolveAttachments(message);
+    assert.equal(attachments.length, 1);
+    assert.equal(attachments[0].kind, "file");
+    assert.equal(fs.readFileSync(attachments[0].path!, "utf8"), "Inventory 中文全文");
+    assert.equal(attachments[0].sourceMessageId, quoted ? "original" : undefined);
+    assert.equal(fs.statSync(attachments[0].path!).mode & 0o777, 0o600);
+    controller.abort(); await monitoring;
+  }
 });
 
 test("DingTalk reports picture download failures instead of silently dropping the message", async () => {
@@ -536,7 +737,7 @@ test("DingTalk reports picture download failures instead of silently dropping th
   const reported = Promise.withResolvers<unknown>();
   const monitoring = adapter.monitor({
     signal: controller.signal,
-    async onMessage() { assert.fail("failed picture must not enter Codex without its attachment"); },
+    async onMessage(message) { await adapter.client.resolveAttachments(message); assert.fail("failed picture must not enter Codex without its attachment"); },
     onMessageError(error) { reported.resolve(error); }
   });
   assert.ok(listener);
@@ -546,7 +747,7 @@ test("DingTalk reports picture download failures instead of silently dropping th
     content: { downloadCode: "bad-picture" }
   }));
 
-  assert.match(String(await reported.promise), /DingTalk inbound image download failed: download unavailable/);
+  assert.match(String(await reported.promise), /DingTalk inbound image download failed; check attachment access/);
   controller.abort();
   await monitoring;
 });
@@ -794,7 +995,8 @@ test("DingTalk HTTPS allowlist recovery reuses its delivered card without multip
     calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
     return String(url).endsWith("/streaming") && rejected
       ? new Response(JSON.stringify({ code: "Forbidden.AccessDenied.IpNotInWhiteList", message: "DO_NOT_LOG_PROVIDER_BODY", requestId: "req-test" }), { status: 403 })
-      : new Response(JSON.stringify({ success: true }), { status: 200 });
+      : new Response(JSON.stringify({ success: true,
+        result: init?.method === "POST" ? String(url).endsWith("/deliver") ? [{ success: true }] : "instance" : true }), { status: 200 });
   }, [0, 0, 0], async () => undefined);
   const adapter = new DingTalkChannelAdapter({
     channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",

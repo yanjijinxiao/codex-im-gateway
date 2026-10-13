@@ -1,11 +1,10 @@
-import crypto from "node:crypto";
-
 import AiBot, { type TextMessage, type WsFrame } from "@wecom/aibot-node-sdk";
 
 import type { WeComAccount } from "../weixin/accounts.js";
 import type { ChannelMessage } from "./message.js";
 import type { ChannelAdapter, ChannelClient, ChannelMonitorOptions, ChannelTextClient } from "./types.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "./client.js";
+import { ChannelDeliveryError } from "./errors.js";
 
 export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
   readonly client: ChannelClient;
@@ -21,7 +20,11 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
       msgtype: "markdown",
       markdown: { content: input.text }
     });
-    return { messageId: String(response.headers.req_id ?? crypto.randomUUID()) };
+    const id = response?.headers?.req_id;
+    if (response?.errcode !== 0 || typeof id !== "string" || !id.trim()) {
+      throw new ChannelDeliveryError("wecom", "sendText", response?.errcode);
+    }
+    return { messageId: id };
   }
 
   async monitor(options: ChannelMonitorOptions): Promise<void> {

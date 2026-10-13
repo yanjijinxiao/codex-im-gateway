@@ -110,6 +110,7 @@ export type CodexQueueAddInput = {
   threadId: string; prompt: string; clientUserMessageId: string;
   onApproval?: CodexApprovalHandler;
   onUserInput?: CodexUserInputHandler;
+  onUserInputResult?: CodexUserInputResultHandler;
   onAccepted?: (turnId: string) => Promise<void> | void;
 };
 /** Queue execution consumes a server-owned item, never resubmits its prompt. */
@@ -226,18 +227,25 @@ export type CodexUserInputQuestion = {
   id: string;
   question: string;
   options?: Array<{ label: string; description: string }>;
+  isSecret?: boolean;
+  isOther?: boolean;
 };
 
 export type CodexUserInputRequest = {
+  kind?: "sync" | "async";
+  requestId?: string | number;
+  hostId?: string;
   itemId: string;
   threadId: string;
   turnId: string;
-  autoResolutionMs?: number;
+  autoResolutionMs?: number | null;
   questions: CodexUserInputQuestion[];
 };
 
 export type CodexUserInputAnswer = Record<string, { answers: string[] }>;
-export type CodexUserInputHandler = (request: CodexUserInputRequest) => Promise<CodexUserInputAnswer>;
+export type CodexUserInputHandler = (request: CodexUserInputRequest) => Promise<CodexUserInputAnswer | undefined>;
+export type CodexUserInputResult = "confirmed" | "failed" | "withdrawn" | "suspended";
+export type CodexUserInputResultHandler = (request: CodexUserInputRequest, result: CodexUserInputResult) => Promise<void> | void;
 
 export type CodexRunnerInput = {
   prompt: string;
@@ -262,6 +270,7 @@ export type CodexRunnerInput = {
   onApproval?: CodexApprovalHandler;
   onDynamicToolCall?: CodexDynamicToolHandler;
   onUserInput?: CodexUserInputHandler;
+  onUserInputResult?: CodexUserInputResultHandler;
   dynamicTools?: readonly Record<string, unknown>[];
   collaborationMode?: "default" | "plan";
   ephemeral?: boolean;
@@ -405,6 +414,7 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  stageAttachments?: import("./inbound-files.js").StageInboundFiles;
   backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;

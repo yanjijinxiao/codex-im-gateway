@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { InboundReferenceStore } from "../bridge/inbound-references.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -50,10 +51,12 @@ import {
   type CodexSessionTask
 } from "./codex-session-monitor.js";
 import {
-  CodexDesktopApprovalMonitor,
+  CodexDesktopRequestMonitor,
   type CodexDesktopApproval,
-  type CodexDesktopApprovalMonitorOptions
-} from "./codex-desktop-approval-monitor.js";
+  type CodexDesktopUserInput,
+  type CodexDesktopRequestMonitorOptions
+} from "./codex-desktop-request-monitor.js";
+import type { CodexUserInputAnswer, CodexUserInputResult } from "../codex/backend.js";
 import {
   RuntimeStateStore,
   type ManagedProject,
@@ -249,14 +252,18 @@ export type AccountManagerOptions = {
     }
   ) => CodexSessionCompletionMonitor;
   codexDesktopApprovalMonitorFactory?: (
-    handlers: CodexDesktopApprovalMonitorOptions
-  ) => CodexDesktopApprovalMonitor;
+    handlers: CodexDesktopRequestMonitorOptions
+  ) => CodexDesktopRequestMonitor;
+  codexDesktopRequestMonitorFactory?: (
+    handlers: CodexDesktopRequestMonitorOptions
+  ) => CodexDesktopRequestMonitor;
   taskboardClientFactory?: (url: string) => TaskboardClient;
   llmWiki?: LlmWikiMcpClientPool;
   channelCapabilities?: ChannelCapabilityProvider;
 };
 
 export class AccountManager {
+  private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
   private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
   private readonly approvalOrigins = new Map<string, { accountId: string; sessionId: string; turnId: string }>();
   private readonly entries = new Map<string, RuntimeEntry>();
@@ -266,7 +273,7 @@ export class AccountManager {
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
   private readonly runnerFactory: (config: CodexImGatewayConfig) => CodexBridgeBackend;
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
-  private readonly codexDesktopApprovalMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopApprovalMonitorFactory"]>;
+  private readonly codexDesktopRequestMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopRequestMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly threadEvents: ThreadEventHub;
@@ -281,7 +288,7 @@ export class AccountManager {
   private readonly channelCapabilities: ChannelCapabilityProvider;
   private runner?: CodexBridgeBackend;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
-  private codexDesktopApprovalMonitor?: CodexDesktopApprovalMonitor;
+  private codexDesktopRequestMonitor?: CodexDesktopRequestMonitor;
   private taskboard?: TaskboardClient;
   private taskboardController?: AbortController;
   private taskboardTask?: Promise<void>;
@@ -305,8 +312,8 @@ export class AccountManager {
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
-    this.codexDesktopApprovalMonitorFactory = options.codexDesktopApprovalMonitorFactory
-      ?? ((handlers) => new CodexDesktopApprovalMonitor(handlers));
+    this.codexDesktopRequestMonitorFactory = options.codexDesktopRequestMonitorFactory ?? options.codexDesktopApprovalMonitorFactory
+      ?? ((handlers) => new CodexDesktopRequestMonitor(handlers));
     this.taskboardClientFactory = options.taskboardClientFactory ?? ((url) => new TaskboardClient({ baseUrl: url }));
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
     this.channelCapabilities = options.channelCapabilities ?? createInstalledSkillCapabilitiesProvider();
@@ -325,15 +332,15 @@ export class AccountManager {
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => account.enabled)
       .map((account) => this.startAccount(account.accountId, false)));
-    this.ensureCodexDesktopApprovalMonitor();
+    this.ensureCodexDesktopRequestMonitor();
     this.ensureCodexSessionMonitor();
     this.threadEvents.start();
     this.startTaskboardMonitor();
   }
 
   async stopAll(): Promise<void> {
-    this.codexDesktopApprovalMonitor?.stop();
-    this.codexDesktopApprovalMonitor = undefined;
+    this.codexDesktopRequestMonitor?.stop();
+    this.codexDesktopRequestMonitor = undefined;
     await this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
@@ -410,19 +417,19 @@ export class AccountManager {
             status: "failed" as const, failure: { code: "binding-changed" as const, message: "当前对话已切换绑定，未同步旧会话。" }
           };
           this.ensureCodexSessionMonitor();
-          this.refreshDesktopApprovalSubscriptions();
+          this.refreshDesktopRequestSubscriptions();
           return this.threadEvents.synchronize(JSON.stringify([account.accountId, session.id]));
         }
       },
       onSubscriptionsChanged: () => {
         this.ensureCodexSessionMonitor();
-        this.refreshDesktopApprovalSubscriptions();
+        this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.refresh();
       },
       onTurnStarted: (session, turnId) => {
         this.rememberApprovalOrigin(account.accountId, session, turnId);
         this.ensureCodexSessionMonitor();
-        this.refreshDesktopApprovalSubscriptions();
+        this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.managedTurnStarted({
           key: JSON.stringify([account.accountId, session.id]),
           hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
@@ -447,6 +454,8 @@ export class AccountManager {
       stateStore: store,
       channel: client,
       inboundDir: statePaths.inboundDir,
+      inboundReferences: new InboundReferenceStore(path.join(statePaths.inboundDir, "references.json")),
+      userInputFilePath: path.join(this.options.paths.runtimeDir, account.accountId, "user-input.json"),
       runner,
       intentResolver: createCodexChannelIntentResolver({
         runner,
@@ -473,7 +482,7 @@ export class AccountManager {
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
     this.ensureNativeQueueRecovery();
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
 
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
       const authorizedConversation = message.source === "native-menu"
@@ -542,12 +551,13 @@ export class AccountManager {
     const account = persist ? setAccountEnabled(this.options.paths, accountId, false) : loadAccount(this.options.paths, accountId);
     const entry = this.entries.get(account.accountId);
     if (entry) {
+      entry.service?.suspendUserInputs?.();
       entry.controller?.abort();
       await entry.task;
       entry.status = "stopped";
       entry.connection = { state: "stopped" };
     }
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
     return this.summary(account);
   }
 
@@ -881,7 +891,7 @@ export class AccountManager {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
     const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title, project?.id);
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
 
@@ -908,20 +918,20 @@ export class AccountManager {
       assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, pending.hostId ?? project?.hostId));
     }
     const session = store.activateSession(sessionId);
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
 
   resetSession(accountId: string, sessionId: string): AccountSession {
     const session = this.storeFor(accountId).resetSession(sessionId);
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
     return this.sessionSummary(accountId, session, this.isActive(accountId, session.id));
   }
 
   deleteSession(accountId: string, sessionId: string): void {
     this.storeFor(accountId).deleteSession(sessionId);
     this.respondingSessions.delete(sessionRuntimeKey(accountId, sessionId));
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
   }
 
   async getSessionMessages(accountId: string, sessionId: string): Promise<SessionHistoryMessage[]> {
@@ -1015,16 +1025,18 @@ export class AccountManager {
         onThreadCreated: (createdThreadId) => {
           store.setSessionThread(session.id, createdThreadId);
           this.ensureCodexSessionMonitor();
-          this.refreshDesktopApprovalSubscriptions();
+          this.refreshDesktopRequestSubscriptions();
         },
         onTurnStarted: ({ threadId, turnId }) => {
           this.rememberApprovalOrigin(accountId, { ...session, threadId }, turnId);
-          this.refreshDesktopApprovalSubscriptions();
+          this.refreshDesktopRequestSubscriptions();
         },
         queueKey: session.threadId ?? session.id,
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
         onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
+        onUserInput: request => this.entries.get(accountId)?.service?.requestUserInput(session.senderId, request, session.hostId) ?? Promise.resolve(undefined),
+        onUserInputResult: (request, result) => this.entries.get(accountId)?.service?.reportUserInputResult(session.senderId, request, result, session.hostId),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
           ? { onProgress }
           : {})
@@ -1169,7 +1181,7 @@ export class AccountManager {
     } else {
       this.respondingSessions.delete(key);
     }
-    this.refreshDesktopApprovalSubscriptions();
+    this.refreshDesktopRequestSubscriptions();
   }
 
   private runnerFor(config = this.configProvider()): CodexBridgeBackend {
@@ -1231,7 +1243,7 @@ export class AccountManager {
 
   private ensureCodexSessionMonitor(): void {
     if (this.codexSessionMonitor || !this.hasManagedProjects()) return;
-    this.ensureCodexDesktopApprovalMonitor();
+    this.ensureCodexDesktopRequestMonitor();
     this.codexSessionMonitor = this.codexSessionMonitorFactory({
       onCompletion: (completion) => this.notifyExternalCodexCompletion(completion),
       onTaskChanged: (task) => this.updateExternalCodexTask(task),
@@ -1253,11 +1265,11 @@ export class AccountManager {
     const key = `${task.sessionId}\n${task.turnId}`;
     if (task.status === "running") {
       this.externalCodexTasks.set(key, task);
-      this.refreshDesktopApprovalSubscriptions();
+      this.refreshDesktopRequestSubscriptions();
       await this.threadEvents.started("local", task.sessionId, task.turnId, task.startedAt);
     } else {
       this.externalCodexTasks.delete(key);
-      this.refreshDesktopApprovalSubscriptions();
+      this.refreshDesktopRequestSubscriptions();
     }
   }
 
@@ -1294,19 +1306,22 @@ export class AccountManager {
     return result;
   }
 
-  private ensureCodexDesktopApprovalMonitor(): void {
+  private ensureCodexDesktopRequestMonitor(): void {
     if (this.configProvider().codexBackend === "exec") return;
-    if (this.codexDesktopApprovalMonitor || !this.hasManagedProjects()) return;
-    this.codexDesktopApprovalMonitor = this.codexDesktopApprovalMonitorFactory({
+    if (this.codexDesktopRequestMonitor || !this.hasManagedProjects()) return;
+    this.codexDesktopRequestMonitor = this.codexDesktopRequestMonitorFactory({
       onApproval: (approval) => this.handleDesktopApproval(approval),
-      onResult: (approval, result) => this.reportDesktopApprovalResult(approval, result)
+      onResult: (approval, result) => this.reportDesktopApprovalResult(approval, result),
+      onUserInput: (input) => this.handleDesktopUserInput(input),
+      onUserInputResult: (input, result) => this.reportDesktopUserInputResult(input, result)
     });
-    this.codexDesktopApprovalMonitor.start();
-    this.refreshDesktopApprovalSubscriptions();
+    this.codexDesktopRequestMonitor.start();
+    this.refreshDesktopRequestSubscriptions();
   }
 
-  private refreshDesktopApprovalSubscriptions(): void {
-    const monitor = this.codexDesktopApprovalMonitor;
+  private refreshDesktopRequestSubscriptions(): void {
+    for (const entry of this.entries.values()) entry.service?.reconcileUserInputs?.();
+    const monitor = this.codexDesktopRequestMonitor;
     if (!monitor) return;
     const threadIds = new Set(this.threadSubscriptions()
       .filter((binding) => binding.enabled && binding.hostId === "local" && binding.threadId)
@@ -1343,17 +1358,54 @@ export class AccountManager {
     await route.service.reportApprovalResult(route.recipientId, approval.request, result);
   }
 
-  private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
+  private interactionBinding(threadId: string, turnId: string): ThreadSubscription | undefined {
     const bindings = this.threadSubscriptions().filter(binding => binding.enabled
-      && binding.hostId === "local" && binding.threadId === approval.request.threadId);
-    const origin = this.approvalOrigins.get(JSON.stringify(["local", approval.request.threadId]));
-    const originatingBinding = origin?.turnId === approval.request.turnId
+      && binding.hostId === "local" && binding.threadId === threadId);
+    const origin = this.approvalOrigins.get(JSON.stringify(["local", threadId]));
+    const originatingBinding = origin?.turnId === turnId
       ? bindings.find(binding => binding.key === JSON.stringify([origin.accountId, origin.sessionId])) : undefined;
     const destinations = new Map(bindings.map(binding => {
       const [accountId] = JSON.parse(binding.key) as [string, string];
       return [JSON.stringify([accountId, binding.recipientId]), binding];
     }));
-    const binding = originatingBinding ?? (destinations.size === 1 ? [...destinations.values()][0] : undefined);
+    return originatingBinding ?? (destinations.size === 1 ? [...destinations.values()][0] : undefined);
+  }
+
+  private async handleDesktopUserInput(input: CodexDesktopUserInput): Promise<CodexUserInputAnswer | undefined> {
+    let binding = this.interactionBinding(input.request.threadId, input.request.turnId);
+    if (!binding) {
+      // The previous destination is durable even if the in-memory origin was
+      // lost on restart. Never broadcast the same prompt to every binding.
+      const recovered = this.threadSubscriptions().filter(candidate => {
+        if (!candidate.enabled || candidate.hostId !== "local" || candidate.threadId !== input.request.threadId) return false;
+        const [accountId] = JSON.parse(candidate.key) as [string, string];
+        return this.entries.get(accountId)?.service?.hasUserInput(candidate.recipientId, input.request);
+      });
+      if (recovered.length === 1) binding = recovered[0];
+    }
+    if (!binding) return undefined;
+    const [accountId] = JSON.parse(binding.key) as [string, string];
+    const service = this.entries.get(accountId)?.service;
+    if (!service) return undefined;
+    this.userInputRoutes.set(input, { service, recipientId: binding.recipientId });
+    const answers = await service.requestUserInput(binding.recipientId, input.request);
+    if (!this.threadSubscriptions().some(candidate => candidate.key === binding!.key && candidate.enabled
+      && candidate.threadId === binding!.threadId && candidate.hostId === "local")) {
+      await service.reportUserInputResult(binding.recipientId, input.request, "suspended");
+      return undefined;
+    }
+    return answers;
+  }
+
+  private async reportDesktopUserInputResult(input: CodexDesktopUserInput, result: CodexUserInputResult): Promise<void> {
+    const route = this.userInputRoutes.get(input);
+    if (!route) return;
+    this.userInputRoutes.delete(input);
+    await route.service.reportUserInputResult(route.recipientId, input.request, result);
+  }
+
+  private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
+    const binding = this.interactionBinding(approval.request.threadId, approval.request.turnId);
     if (binding) {
       const [accountId] = JSON.parse(binding.key) as [string, string];
       const service = this.entries.get(accountId)?.service;

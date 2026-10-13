@@ -52,7 +52,7 @@ test("Feishu renders a generic action card as buttons", async () => {
           message: {
             async create(input: Record<string, unknown>) {
               messages.push(input);
-              return { data: { message_id: "action-card-message" } };
+              return { code: 0, data: { message_id: "action-card-message" } };
             }
           },
           messageResource: { async get() { throw new Error("not used"); } }
@@ -99,7 +99,7 @@ test("Feishu patches a generic action card without creating another message", as
           image: { async create() { return { image_key: "unused" }; } },
           message: {
             async create() { return { data: { message_id: "unused" } }; },
-            async patch(input: Record<string, unknown>) { patches.push(input); return { data: {} }; }
+            async patch(input: Record<string, unknown>) { patches.push(input); return { code: 0, data: {} }; }
           },
           messageResource: { async get() { throw new Error("not used"); } }
         }

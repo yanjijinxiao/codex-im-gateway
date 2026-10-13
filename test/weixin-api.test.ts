@@ -3,6 +3,19 @@ import test from "node:test";
 
 import { WeixinApiClient, isStaleContextError } from "../src/weixin/api.js";
 
+test("iLink mutation receipts require explicit success and never expose provider bodies", async () => {
+  for (const body of ["", "not json SECRET_TOKEN", "null", "[]", "{}",
+    JSON.stringify({ ret: 0, errcode: 400, errmsg: "SECRET_TOKEN" }), JSON.stringify({ ret: "0" })]) {
+    const client = new WeixinApiClient({ baseUrl: "https://example.invalid", token: "fake",
+      fetch: async () => new Response(body, { status: 200 }) });
+    await assert.rejects(client.sendText({ toUserId: "user", text: "test" }), error =>
+      error instanceof Error && !error.message.includes("SECRET_TOKEN"));
+  }
+  const client = new WeixinApiClient({ baseUrl: "https://example.invalid", token: "fake",
+    fetch: async () => new Response(JSON.stringify({ ret: 0 }), { status: 200 }) });
+  assert.ok((await client.sendText({ toUserId: "user", text: "test" })).messageId);
+});
+
 test("builds authenticated sendmessage requests with context token", async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const client = new WeixinApiClient({

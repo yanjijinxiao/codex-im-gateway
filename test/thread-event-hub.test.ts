@@ -6,6 +6,32 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
+test("an active owner conflicting with acknowledged completion is not blamed on IM permissions", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-owner-conflict-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filePath = path.join(root, "follow.json");
+  fs.writeFileSync(filePath, JSON.stringify({ binding: {
+    eventVersion: 2, deliveryVersion: 1, hostId: "local", threadId: "thread", turnId: "turn",
+    checkpointTurnId: "turn", initialized: true, sequence: 0, delivered: [], completed: ["turn"], baseline: [],
+    checkpoint: { streamId: "original", messageId: "original", startedAt: Date.now(), progressEntries: [],
+      thought: "", answerPreview: "", terminal: { text: "already delivered", error: false }, finished: true }
+  } }));
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+    client: { resumableTextStream: true, async sendText() { throw new Error("must not resend"); },
+      async startTextStream() { throw new Error("must not replace"); }, async updateTextStream() { throw new Error("must not reopen"); } } };
+  const hub = new ThreadEventHub({ filePath, subscriptions: () => [sub], backend: () => ({
+    async readThreadSnapshot() { return { state: { threadId: "thread", persistence: "active", runtimeStatus: "active",
+      activeFlags: [], activeTurnId: "turn" }, turns: [{ id: "turn", status: "inProgress", messages: [] }] }; }
+  }) });
+  t.after(() => hub.stop());
+  const result = await hub.synchronize("binding");
+  assert.equal(result.status, "unconfirmed");
+  assert.equal(result.failure?.code, "unconfirmed");
+  assert.match(result.failure?.message ?? "", /完成回执.*状态相互冲突/);
+  assert.doesNotMatch(result.failure?.message ?? "", /权限/);
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.checkpoint.messageId, "original");
+});
+
 test("/stream off suppresses followed progress but sends the final result exactly once", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-stream-off-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

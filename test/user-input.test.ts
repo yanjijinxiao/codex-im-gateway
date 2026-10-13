@@ -1,0 +1,233 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { ChannelUserInputController } from "../src/bridge/user-input-controller.js";
+import type { CodexUserInputRequest } from "../src/codex/backend.js";
+import { parseUserInputRequest } from "../src/codex/user-input.js";
+import { desktopAsyncUserInputs, asyncUserInputReply } from "../src/codex/async-user-input.js";
+import { formatChannelActionCommand, parseChannelActionValue, type ChannelActionCard } from "../src/channels/action-card.js";
+import { feishuActionCard } from "../src/channels/feishu-action-card.js";
+import { parseCommand } from "../src/bridge/channel-commands.js";
+
+const request: CodexUserInputRequest = { hostId: "local", requestId: 42, threadId: "thread", turnId: "turn", itemId: "item",
+  questions: [{ id: "native-question", header: "问题", question: "farming 是项目还是目录？" }], autoResolutionMs: null };
+const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+function fixture(t: test.TestContext, options: ConstructorParameters<typeof ChannelUserInputController>[2] = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "question-journal-"));
+  const filePath = path.join(root, "questions.json");
+  const cards: ChannelActionCard[] = [];
+  const notices: string[] = [];
+  const create = () => new ChannelUserInputController(async (_sender, card) => {
+    cards.push(card); return { messageId: `card-${cards.length}` };
+  }, undefined, { filePath, sendNotice: async (_sender, text) => { notices.push(text); }, ...options });
+  const controller = create();
+  t.after(() => { controller.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  return { controller, create, filePath, cards, notices };
+}
+
+test("free-form question includes all IM instructions, form and durable native identity", async t => {
+  const f = fixture(t);
+  const result = f.controller.request("room", request);
+  assert.match(f.cards[0].fallbackText, /farming 是项目还是目录/);
+  assert.match(f.cards[0].fallbackText, /\/answer Q1 回答内容/);
+  assert.match(f.cards[0].fallbackText, /\/skip Q1/);
+  assert.equal(f.cards[0].form?.submit.value.version, 4);
+  assert.match(f.controller.answer("room", "Q1 我已创建 farming\n路径含  两个空格"), /回执/);
+  assert.deepEqual(await result, { "native-question": { answers: ["我已创建 farming\n路径含  两个空格"] } });
+  assert.match(f.controller.answer("room", "Q1 再次回答"), /未提交/);
+  const journal = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  assert.equal(journal.records[0].threadId, "thread");
+  assert.equal(journal.records[0].status, "submitting");
+  assert.equal(fs.statSync(f.filePath).mode & 0o777, 0o600);
+  await f.controller.reportResult("room", request, "confirmed");
+  assert.match(f.notices[0], /Codex 已确认/);
+  assert.ok(!fs.readFileSync(f.filePath, "utf8").includes("我已创建"));
+});
+
+test("literal numeric answer is not silently interpreted as an option", async t => {
+  const f = fixture(t);
+  const r = { ...request, questions: [{ ...request.questions[0], options: [{ label: "目录", description: "文件夹" }] }] };
+  const result = f.controller.request("room", r);
+  f.controller.answer("room", "Q1 1");
+  assert.deepEqual(await result, { "native-question": { answers: ["1"] } });
+  await f.controller.reportResult("room", r, "confirmed");
+  const r2 = { ...r, requestId: "second" };
+  const selected = f.controller.request("room", r2);
+  assert.match(f.controller.answer("room", "Q2 --option 3"), /选项不存在/);
+  f.controller.answer("room", "Q2 --option 1");
+  assert.deepEqual(await selected, { "native-question": { answers: ["目录"] } });
+});
+
+test("wrong conversation or switched binding cannot answer or skip a question", async t => {
+  let bound = true;
+  const f = fixture(t, { validate: () => bound });
+  const result = f.controller.request("room", request);
+  assert.match(f.controller.answer("other-room", "Q1 answer"), /未提交/);
+  bound = false;
+  assert.match(f.controller.answer("room", "Q1 answer"), /未提交/);
+  assert.match(f.controller.skip("room", "Q1"), /未提交/);
+  bound = true;
+  f.controller.skip("room", "Q1");
+  assert.deepEqual(await result, {});
+});
+
+test("secret question never includes content, options or answer form in IM", async t => {
+  const f = fixture(t);
+  const result = f.controller.request("room", { ...request, questions: [{ ...request.questions[0], isSecret: true }] });
+  assert.doesNotMatch(f.cards[0].fallbackText, /farming/);
+  assert.equal(f.cards[0].form, undefined);
+  assert.equal(f.cards[0].actionGroups.length, 0);
+  assert.match(f.controller.answer("room", "Q1 secret"), /敏感/);
+  f.controller.close();
+  assert.equal(await result, undefined);
+  assert.ok(!fs.readFileSync(f.filePath, "utf8").includes('"answer":"secret"'));
+});
+
+test("App withdrawal releases the handler without sending a synthetic skip", async t => {
+  const f = fixture(t);
+  const result = f.controller.request("room", request);
+  await f.controller.reportResult("room", request, "withdrawn");
+  assert.equal(await result, undefined);
+  assert.match(f.controller.answer("room", "Q1 late"), /未提交/);
+  assert.match(f.notices[0], /已失效/);
+});
+
+test("switching a binding releases its waiting handler so another correct route can attach", async t => {
+  let bound = true; const f = fixture(t, { validate: () => bound });
+  const pending = f.controller.request("room", request);
+  bound = false; f.controller.suspendInvalidBindings();
+  assert.equal(await pending, undefined);
+  assert.match(f.controller.answer("room", "Q1 late"), /未提交/);
+  bound = true;
+  const resumed = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 correct");
+  assert.deepEqual(await resumed, { "native-question": { answers: ["correct"] } });
+  assert.equal(f.cards.length, 1);
+});
+
+test("restart resumes the same Q ID, does not repeat its card or a partial answer", async t => {
+  const f = fixture(t);
+  const r = { ...request, questions: [...request.questions, { id: "second", header: "路径", question: "路径在哪？" }] };
+  const old = f.controller.request("room", r);
+  assert.equal(f.controller.request("room", r), old);
+  f.controller.answer("room", "Q1 目录");
+  await tick();
+  assert.equal(f.cards.length, 2);
+  f.controller.close();
+  assert.equal(await old, undefined);
+  const restarted = f.create();
+  const resumed = restarted.request("room", r);
+  assert.equal(f.cards.length, 2);
+  assert.match(restarted.answer("room", "list"), /Q2/);
+  restarted.answer("room", "Q2 /workspace/farming");
+  assert.deepEqual(await resumed, { "native-question": { answers: ["目录"] }, second: { answers: ["/workspace/farming"] } });
+  restarted.close();
+});
+
+test("restart never replays a submission without a native receipt", async t => {
+  const f = fixture(t);
+  const initial = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 answer");
+  await initial;
+  f.controller.close();
+  const restarted = f.create();
+  assert.equal(restarted.hasRequest("room", request), true);
+  assert.equal(await restarted.request("room", request), undefined);
+  assert.equal(f.cards.length, 1);
+  assert.match(restarted.answer("room", "Q1 answer"), /未提交/);
+  restarted.close();
+});
+
+test("failed notice delivery leaves the native request unanswered and manually discoverable", async () => {
+  const controller = new ChannelUserInputController(async () => { throw new Error("provider timeout"); });
+  const pending = controller.request("room", request);
+  await tick();
+  assert.match(controller.answer("room", "list"), /farming/);
+  controller.close();
+  assert.equal(await pending, undefined);
+});
+
+test("only an explicit native timeout expires a question; null has no default expiry", async t => {
+  const cards: ChannelActionCard[] = [];
+  const controller = new ChannelUserInputController(async (_, card) => { cards.push(card); }, 1);
+  const first = controller.request("room", request);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.match(controller.answer("room", "list"), /Q1/);
+  controller.close();
+  assert.equal(await first, undefined);
+  const timed = controller.request("room", { ...request, requestId: 99, autoResolutionMs: 5 });
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.deepEqual(await timed, {});
+  assert.match(controller.answer("room", "Q2 late"), /未提交/);
+  controller.close();
+});
+
+test("question form actions validate exact Q IDs and preserve free text/newlines", () => {
+  const value = parseChannelActionValue({ version: 4, command: "answer", arg: "submit", questionId: "Q7" })!;
+  const command = formatChannelActionCommand(value, { answer: "我增加了目录\n里面有  两个文件" })!;
+  assert.deepEqual(parseCommand(command), { name: "answer", arg: "Q7 我增加了目录\n里面有  两个文件" });
+  assert.equal(formatChannelActionCommand(value, { answer: " " }), undefined);
+  assert.equal(formatChannelActionCommand(value, { answer: "x".repeat(2001) }), undefined);
+  assert.equal(parseChannelActionValue({ ...value, questionId: "A1" }), undefined);
+});
+
+test("Feishu question form uses the shared callback payload and never hides text instructions", async () => {
+  let card!: ChannelActionCard;
+  const controller = new ChannelUserInputController(async (_, value) => { card = value; });
+  const pending = controller.request("room", request);
+  const payload = feishuActionCard(card);
+  const form = payload.elements.find(element => element.tag === "form") as { elements: Array<Record<string, unknown>> };
+  assert.equal(form.elements[0].name, "answer");
+  assert.equal(form.elements[1].action_type, "form_submit");
+  assert.deepEqual(form.elements[1].value, card.form?.submit.value);
+  assert.ok(JSON.stringify(payload).includes("/answer Q1"));
+  controller.close(); await pending;
+});
+
+test("native request parser preserves free-form/secret semantics and rejects malformed identities", () => {
+  assert.equal(parseUserInputRequest(request)?.autoResolutionMs, null);
+  assert.equal(parseUserInputRequest({ ...request, questions: [{ ...request.questions[0], isSecret: true }] })?.questions[0].isSecret, true);
+  for (const invalid of [{ ...request, turnId: "" }, { ...request, questions: [request.questions[0], request.questions[0]] },
+    { ...request, autoResolutionMs: -1 }, { ...request, questions: [{ ...request.questions[0], options: "wrong" }] }]) {
+    assert.equal(parseUserInputRequest(invalid), undefined);
+  }
+});
+
+function asyncState() {
+  return { threadRuntimeStatus: { type: "active" }, turns: [{ turnId: "old", status: "completed", items: [] },
+    { turnId: "turn", status: "inProgress", items: [{ type: "agentMessage", id: "call_123",
+      questions: [{ title: "farming 在哪里？" }, { title: "继续吗？", options: ["继续", "停止"] }] }] }] };
+}
+
+test("Desktop async widgets have independent stable identities and the exact native answer envelope", () => {
+  const state = asyncState();
+  const requests = desktopAsyncUserInputs("thread", state);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].kind, "async");
+  assert.equal(requests[0].turnId, "turn");
+  assert.equal(requests[0].questions[0].id, '["request_user_input_async","call_123",0]');
+  const reply = asyncUserInputReply(requests[0], { [requests[0].questions[0].id]: { answers: ["目录"] } });
+  assert.match(reply, /^<send_user_message_question_reply>/);
+  const row = JSON.parse(reply.split("\n")[1])[0];
+  assert.deepEqual(row, { questionItemId: requests[0].questions[0].id, question: "farming 在哪里？", answer: "目录" });
+  state.turns[1].items.push({ type: "steeringUserMessage", id: "answer", status: "accepted",
+    input: [{ type: "text", text: reply }] } as never);
+  const remaining = desktopAsyncUserInputs("thread", state);
+  assert.deepEqual(remaining.map(r => r.requestId), [requests[1].requestId]);
+  assert.throws(() => asyncUserInputReply(requests[0], { wrong: { answers: ["bad"] } }), /another question/);
+  const skip = JSON.parse(asyncUserInputReply(requests[1], {}).split("\n")[1]);
+  assert.equal(skip[0].answer, "");
+});
+
+test("only live unanswered async widgets are forwarded; canonical turn history wins over old turns", () => {
+  const state = asyncState();
+  assert.equal(desktopAsyncUserInputs("thread", { ...state, threadRuntimeStatus: { type: "idle" } }).length, 0);
+  assert.equal(desktopAsyncUserInputs("thread", { ...state, turnHistory: { history: { entitiesByKey: {} } } }).length, 0);
+  assert.equal(desktopAsyncUserInputs("thread", { ...state, turns: [], turnHistory: { history: {
+    entitiesByKey: { turn: state.turns[1] } } } }).length, 2);
+  state.turns[1].status = "completed";
+  assert.equal(desktopAsyncUserInputs("thread", state).length, 0);
+});

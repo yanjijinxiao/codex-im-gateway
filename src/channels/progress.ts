@@ -3,12 +3,15 @@ import type { ChannelTextClient } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
 import { summarizeProgress } from "./progress-summary.js";
+import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 
 const MAX_RECOVERY_PROBES = 3;
 
 export type ChannelStreamCheckpoint = {
   streamId?: string;
   messageId?: string;
+  /** Persist before a create POST; missing acknowledgement must not be replayed after a crash. */
+  creationAttempted?: boolean;
   startedAt: number;
   progressEntries: string[];
   thought: string;
@@ -18,12 +21,17 @@ export type ChannelStreamCheckpoint = {
   terminal?: { text: string; error: boolean };
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
   terminalNoticeSent?: boolean;
+  /** Pinned layout and acknowledged pages survive a restart/partial failure. */
+  resultPageBytes?: number;
+  resultPresentation?: "card" | "native-text";
+  terminalPages?: Array<{ messageId?: string; delivered: boolean; attempted?: boolean }>;
 };
 
 export class ChannelTurnTextStream {
   private readonly textProgress?: TextProgressBatcher;
   readonly supported: boolean;
   private messageId?: string;
+  private creationAttempted = false;
   private readonly streamId: string;
   private phase: "active" | "backoff" | "unavailable" = "active";
   private failures = 0;
@@ -34,6 +42,9 @@ export class ChannelTurnTextStream {
   private finalizing?: Promise<boolean>;
   private terminalBlocked = false;
   private terminalNoticeSent = false;
+  private resultPageBytes?: number;
+  private resultPresentation?: "card" | "native-text";
+  private terminalPages: Array<{ messageId?: string; delivered: boolean; attempted?: boolean }> = [];
   private notifying?: Promise<boolean>;
   private latestText = "";
   private startedAt = Date.now();
@@ -57,16 +68,19 @@ export class ChannelTurnTextStream {
       save: (checkpoint: ChannelStreamCheckpoint) => void;
       contextToken?: string;
       onTextDelivered?: (part: { messageId: string; text: string }) => void;
+      progressEnabled?: boolean;
     }
   ) {
     const saved = persistence?.restore;
-    this.supported = Boolean(saved?.messageId) || (client.capabilities
-      ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream));
+    this.supported = saved?.resultPresentation === "native-text" ? false
+      : saved?.resultPresentation === "card" || Boolean(saved?.messageId) || (persistence?.progressEnabled !== false && (client.capabilities
+        ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream)));
     // Choose presentation once per turn. Card failures never switch to text.
     if (!this.supported) this.textProgress = new TextProgressBatcher((text) => this.sendPlainText(text));
     this.streamId = saved?.streamId ?? saved?.messageId ?? `codex_bridge_${crypto.randomUUID().replaceAll("-", "")}`;
     if (saved) {
       this.messageId = saved.messageId;
+      this.creationAttempted = saved.creationAttempted ?? false;
       this.startedAt = saved.startedAt;
       this.progressEntries.push(...saved.progressEntries.map((entry) => summarizeProgress(entry)));
       this.thought = saved.thought;
@@ -74,14 +88,19 @@ export class ChannelTurnTextStream {
       this.finished = saved.finished;
       this.terminal = saved.terminal;
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
+      this.resultPageBytes = saved.resultPageBytes;
+      this.resultPresentation = saved.resultPresentation;
+      this.terminalPages = saved.terminalPages?.map(page => ({ ...page })) ?? [];
     }
   }
 
   checkpoint(): ChannelStreamCheckpoint {
-    return { streamId: this.streamId, messageId: this.messageId, startedAt: this.startedAt,
+    return { streamId: this.streamId, messageId: this.messageId, creationAttempted: this.creationAttempted, startedAt: this.startedAt,
       progressEntries: [...this.progressEntries], thought: this.thought,
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.terminal ? { terminal: this.terminal } : {}),
+      ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
+        terminalPages: this.terminalPages.map(page => ({ ...page })) } : {}),
       ...(this.terminalNoticeSent ? { terminalNoticeSent: true } : {}) };
   }
 
@@ -189,22 +208,68 @@ export class ChannelTurnTextStream {
     await this.textProgress?.close();
     await this.opening;
     await this.chain.catch(() => undefined);
-    if (!this.supported || this.suspended || this.terminalBlocked) return false;
-    // Short/offline-completed turns may have no progress frame. Create their
-    // original logical card directly from the final payload, using the same
-    // persisted streamId on retries; never create a replacement/fallback card.
+    if (this.suspended || this.terminalBlocked) return false;
+    this.resultPageBytes ??= this.client.capabilities?.resultPageBytes ?? DEFAULT_RESULT_PAGE_BYTES;
+    this.resultPresentation ??= this.supported ? "card" : "native-text";
+    const pages = resultPages(this.terminal!.text, this.resultPageBytes);
+    while (this.terminalPages.length < pages.length) this.terminalPages.push({ delivered: false });
+    this.persistence?.save(this.checkpoint());
+    if (!this.supported) {
+      for (const [index, page] of pages.entries()) {
+        const receipt = this.terminalPages[index];
+        if (receipt.delivered) continue;
+        // Native text has no stable logical creation ID. An uncertain send must
+        // not be automatically replayed after a restart and duplicate a result.
+        if (receipt.attempted) return false;
+        receipt.attempted = true;
+        this.persistence?.save(this.checkpoint());
+        try {
+          const sent = await this.client.sendText({ toUserId: this.toUserId, text: page.text,
+            ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+          if (!sent.messageId?.trim()) throw new Error("Channel returned no text receipt");
+          receipt.messageId = sent.messageId;
+          receipt.delivered = true;
+          this.persistence?.save(this.checkpoint());
+          this.persistence?.onTextDelivered?.({ messageId: sent.messageId, text: page.text });
+        } catch { return false; }
+      }
+      this.finished = true;
+      this.persistence?.save(this.checkpoint());
+      return true;
+    }
+    // Page 1 reuses the original progress card. Only a completed long answer
+    // creates continuation cards, each with its own stable logical identity.
     if (!this.messageId) {
-      this.latestText = this.terminal!.text;
+      this.latestText = pages[0].text;
       if (!await this.openNow() || !this.messageId) return false;
     }
+    this.terminalPages[0].messageId = this.messageId;
     try {
-      await this.client.updateTextStream!({
-        toUserId: this.toUserId,
-        messageId: this.messageId,
-        text: this.terminal!.text,
-        finalize: true,
-        ...(this.terminal!.error ? { error: true } : {})
-      });
+      for (const [index, page] of pages.entries()) {
+        const receipt = this.terminalPages[index];
+        if (receipt.delivered) continue;
+        if (!receipt.messageId) {
+          if (receipt.attempted) return false;
+          receipt.attempted = true;
+          this.persistence?.save(this.checkpoint());
+          try {
+            const created = await this.client.startTextStream!({ toUserId: this.toUserId, text: page.text,
+              streamId: `${this.streamId}_page_${index + 1}`,
+              ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+            if (!created.messageId?.trim()) throw new Error("Channel returned no continuation receipt");
+            receipt.messageId = created.messageId;
+          } catch (error) {
+            const failure = channelProgressError(error);
+            if (failure.messageId) receipt.messageId = failure.messageId;
+            if (failure.retryable) receipt.attempted = false;
+            throw error;
+          } finally { this.persistence?.save(this.checkpoint()); }
+        }
+        await this.client.updateTextStream!({ toUserId: this.toUserId, messageId: receipt.messageId!,
+          text: page.text, finalize: true, ...(this.terminal!.error ? { error: true } : {}) });
+        receipt.delivered = true;
+        this.persistence?.save(this.checkpoint());
+      }
       this.finished = true;
       this.lastUpdateAt = Date.now();
       this.persistence?.save(this.checkpoint());
@@ -223,11 +288,13 @@ export class ChannelTurnTextStream {
 
   /** Report failed terminal delivery once; never resend the answer as a new card. */
   async reportTerminalFailure(): Promise<boolean> {
-    if (!this.supported || !this.terminal || this.finished || this.suspended) return false;
+    if (!this.terminal || this.finished || this.suspended) return false;
     if (this.terminalNoticeSent) return true;
     if (this.notifying) return this.notifying;
     this.notifying = (async () => {
-      await this.sendPlainText(this.terminal!.error
+      await this.sendPlainText(!this.supported
+        ? "最终答复有页面未确认送达，未自动重发以避免重复。可用 /history 查看完整结果。"
+        : this.terminal!.error
         ? "任务执行失败，原 AI Card 也未能更新。请到原 Codex 会话查看详细错误。"
         : "最终答复未能更新原 AI Card。请到原 Codex 会话查看结果。");
       this.terminalNoticeSent = true;
@@ -318,6 +385,9 @@ export class ChannelTurnTextStream {
 
   private async openNow(): Promise<boolean> {
     if (this.opening) return this.opening;
+    if (this.creationAttempted && !this.messageId) return false;
+    this.creationAttempted = true;
+    this.persistence?.save(this.checkpoint());
     this.opening = (async () => {
       try {
         const result = await this.client.startTextStream!({ toUserId: this.toUserId, text: this.latestText,
@@ -329,6 +399,7 @@ export class ChannelTurnTextStream {
       } catch (error) {
         const failure = channelProgressError(error);
         if (failure.messageId) this.messageId = failure.messageId;
+        if (failure.retryable) this.creationAttempted = false;
         if (this.terminal) this.terminalBlocked = !failure.retryable;
         this.persistence?.save(this.checkpoint());
         this.unavailable(failure);

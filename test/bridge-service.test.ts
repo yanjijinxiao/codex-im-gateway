@@ -1933,7 +1933,7 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
   assert.equal(replies[0], "【进展】\n\n• 正在检索论文。");
   const finalChunks = replies.slice(1);
   assert.equal(finalChunks.length, 2);
-  assert.equal(finalChunks.every((chunk) => chunk.length <= 1_800), true);
-  assert.equal(finalChunks.join(""), finalText);
+  assert.equal(finalChunks.every((chunk) => Buffer.byteLength(chunk) <= 6_000), true);
+  assert.equal(finalChunks.map(chunk => chunk.replace(/^\*\*完整答复 · \d+\/\d+\*\*\n\n/, "")).join(""), finalText);
   assert.match(finalChunks.at(-1) ?? "", /来源：arXiv 官方作者检索。$/);
 });

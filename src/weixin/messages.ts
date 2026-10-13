@@ -27,13 +27,25 @@ export function normalizeWeixinMessage(raw: WeixinRawMessage): NormalizedWeixinM
       textParts.push(text);
     }
   }
-  const attachments = extractAttachments(raw.item_list ?? []);
+  const attachments = extractDirectAttachments(raw.item_list ?? []);
+  const references: import("../channels/message.js").ChannelReference[] = [];
+  for (const item of raw.item_list ?? []) {
+    const quoted = referencedMessageItem(item);
+    if (!quoted) continue;
+    const metadata = item.ref_msg as Record<string, unknown>;
+    const id = metadata.message_id === undefined ? undefined : String(metadata.message_id);
+    const text = extractTextItem(quoted);
+    const media = extractDirectAttachments([quoted]).map(attachment => ({ ...attachment, sourceMessageId: id || "reference" }));
+    references.push({ messageId: id, type: String(quoted.type ?? "unknown"), text, attachments: media,
+      availability: text || media.length ? "available" : "metadata-only" });
+  }
   return {
     id: String(raw.message_id ?? `${senderId}:${Date.now()}`),
     senderId,
     contextToken: raw.context_token,
     text: textParts.join("\n").trim(),
     attachments,
+    ...(references.length ? { references } : {}),
     raw
   };
 }

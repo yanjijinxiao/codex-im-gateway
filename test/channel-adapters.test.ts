@@ -39,7 +39,7 @@ for (const account of accounts) {
     const adapter = createChannelAdapter(account, { inboundDir: "/tmp", maxInboundBytes: 1024 });
     const client = adapter.client;
     assert.equal(client.channel, account.channel);
-    for (const method of ["sendText", "sendProgressText", "sendMedia", "resolveAttachments", "startTextStream", "updateTextStream", "sendActionCard", "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping"] as const) {
+    for (const method of ["sendText", "sendProgressText", "sendMedia", "resolveReferences", "resolveAttachments", "startTextStream", "updateTextStream", "sendActionCard", "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping"] as const) {
       assert.equal(typeof client[method], "function", method);
     }
     assert.equal(client.capabilities.progress, account.channel === "dingtalk" ? "not-configured" : "not-implemented");
@@ -62,7 +62,7 @@ function fakeAdapters() {
     wsClient: { async start() {}, close() {} }
   });
   const wc = new WeComChannelAdapter(accounts[3] as never, { wsClient: {
-    async sendMessage(_id: string, input: { markdown: { content: string } }) { writes.push(input.markdown.content); return { headers: { req_id: "ack" } }; }
+    async sendMessage(_id: string, input: { markdown: { content: string } }) { writes.push(input.markdown.content); return { errcode: 0, headers: { req_id: "ack" } }; }
   } as never });
   return { adapters: [wx, dt, fs, wc], writes };
 }
@@ -120,6 +120,23 @@ test("Feishu business errors propagate from text, cards, image uploads and card 
   await assert.rejects(new FeishuCardUpdater(async () => rejected).update("card", {} as never), ChannelDeliveryError);
 });
 
+test("Feishu and WeCom reject incomplete receipts instead of assuming success", async () => {
+  for (const result of [undefined, {}, { data: { message_id: "unconfirmed" } }]) {
+    const adapter = new FeishuChannelAdapter(accounts[2] as never, { apiClient: { im: { v1: {
+      message: { async create() { return result; } }
+    } } } as never, wsClient: { async start() {}, close() {} } });
+    await assert.rejects(adapter.client.sendText({ toUserId: "chat", text: "test" }), ChannelDeliveryError);
+    await assert.rejects(new FeishuCardUpdater(async () => result as never).update("card", {} as never), ChannelDeliveryError);
+  }
+  for (const result of [undefined, {}, { errcode: 0 }, { headers: { req_id: "unconfirmed" } },
+    { errcode: 400, headers: { req_id: "rejected" } }, { errcode: 0, headers: { req_id: " " } }]) {
+    const adapter = new WeComChannelAdapter(accounts[3] as never, { wsClient: {
+      async sendMessage() { return result; }
+    } as never });
+    await assert.rejects(adapter.client.sendText({ toUserId: "chat", text: "test" }), ChannelDeliveryError);
+  }
+});
+
 test("Weixin adapter owns polling checkpoints and forwards connection health", async () => {
   const statuses: string[] = [];
   const checkpoints: string[] = [];
@@ -153,9 +170,9 @@ test("Feishu unsupported input is normalized rather than silently ignored, and S
   const monitor = adapter.monitor({ signal: controller.signal, async onMessage(message) { messages.push(message); } });
   await tick();
   await dispatcher!.handles.get("im.message.receive_v1")!({ sender: { sender_id: { open_id: "human" } },
-    message: { message_id: "file-one", chat_id: "oc_group", message_type: "file", content: "{}" } });
+    message: { message_id: "audio-one", chat_id: "oc_group", message_type: "audio", content: "{}" } });
   controller.abort(); await monitor;
-  assert.equal(messages[0].unsupportedMessageType, "file");
+  assert.equal(messages[0].unsupportedMessageType, "audio");
   assert.equal(messages[0].senderId, "human");
   assert.equal(messages[0].replyTargetId, "oc_group");
   assert.equal(closed, 1);

@@ -113,7 +113,7 @@ test("patches an existing Feishu task card instead of creating another message",
   const patches: Array<Record<string, unknown>> = [];
   const messageApi = {
     async create() { return { data: { message_id: "unused" } }; },
-    async patch(input: Record<string, unknown>) { patches.push(input); return { data: {} }; }
+    async patch(input: Record<string, unknown>) { patches.push(input); return { code: 0, data: {} }; }
   };
   const adapter = new FeishuChannelAdapter(account(), {
     apiClient: {
@@ -135,6 +135,24 @@ test("patches an existing Feishu task card instead of creating another message",
   assert.deepEqual(patches[0]?.path, { message_id: "om_task_card" });
   const data = z.object({ content: z.string() }).parse(patches[0]?.data);
   assert.equal(JSON.parse(data.content).header.title.content, "PROJECT-1 · 处理中");
+});
+
+test("question answer form preserves operator, chat, multiline text and the canonical answer command", async () => {
+  let dispatcher: { handles: Map<string, (event: unknown) => unknown> } | undefined;
+  const inbound: NormalizedWeixinMessage[] = [];
+  const adapter = new FeishuChannelAdapter(account(), { apiClient: { im: { v1: { message: {} } } } as never,
+    wsClient: { async start(input) { dispatcher = input.eventDispatcher; }, close() {} } });
+  const controller = new AbortController();
+  const pending = adapter.monitor({ signal: controller.signal, async onMessage(message) { inbound.push(message); } });
+  await new Promise(resolve => setImmediate(resolve));
+  await dispatcher!.handles.get("card.action.trigger")?.({ token: "question-callback",
+    context: { open_message_id: "om_question", open_chat_id: "oc_question" }, operator: { open_id: "ou_actor" },
+    action: { tag: "button", name: "submit_answer", value: { version: 4, command: "answer", arg: "submit", questionId: "Q12" },
+      form_value: { answer: "farming\n是目录" } } });
+  await new Promise(resolve => setImmediate(resolve)); controller.abort(); await pending;
+  assert.equal(inbound.length, 1);
+  assert.equal(inbound[0].text, "/answer Q12 farming\n是目录");
+  assert.equal(inbound[0].senderId, "ou_actor"); assert.equal(inbound[0].replyTargetId, "oc_question");
 });
 
 test("renders required Taskboard inputs as a native Feishu form", () => {

@@ -15,6 +15,7 @@ const channelCommandActionValueSchema = z.object({
     "plan",
     "goal",
     "answer",
+    "skip",
     "new",
     "sessions",
     "session",
@@ -70,10 +71,16 @@ const channelGoalFormActionValueSchema = z.object({
   }).strict()
 }).strict();
 
+const channelAnswerFormActionValueSchema = z.object({
+  version: z.literal(4), command: z.literal("answer"), arg: z.literal("submit"),
+  questionId: z.string().regex(/^Q[1-9]\d*$/)
+}).strict();
+
 const channelActionValueSchema = z.discriminatedUnion("version", [
   channelCommandActionValueSchema,
   channelFormActionValueSchema,
-  channelGoalFormActionValueSchema
+  channelGoalFormActionValueSchema,
+  channelAnswerFormActionValueSchema
 ]);
 
 export type ChannelActionValue = z.infer<typeof channelActionValueSchema>;
@@ -96,6 +103,8 @@ export type ChannelActionCard = {
   readonly note?: string;
   readonly actionGroups: readonly (readonly ChannelCardAction[])[];
   readonly fallbackText: string;
+  readonly form?: { readonly name: "answer"; readonly label: string; readonly maximumLength: number;
+    readonly submit: ChannelCardAction };
 };
 
 export type ChannelChoice = {
@@ -172,6 +181,12 @@ export function formatChannelActionCommand(value: ChannelActionValue, formValue?
       const objective = raw.trim();
       if (!objective || objective.length > value.field.maximumLength) return undefined;
       return `/goal ${objective}`;
+    }
+    case 4: {
+      const fields = z.record(z.string(), z.unknown()).safeParse(formValue ?? {});
+      const answer = fields.success ? fields.data.answer : undefined;
+      if (typeof answer !== "string" || !answer.trim() || answer.length > 2_000) return undefined;
+      return `/answer ${value.questionId} ${answer.trim()}`;
     }
     default:
       return assertNever(value);

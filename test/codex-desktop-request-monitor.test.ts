@@ -1,0 +1,175 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { CodexDesktopRequestMonitor, type CodexDesktopRequestMonitorOptions, type CodexDesktopUserInput } from "../src/server/codex-desktop-request-monitor.js";
+import { asyncUserInputReply } from "../src/codex/async-user-input.js";
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error("question fixture condition timed out");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+function frame(socket: net.Socket, data: unknown) {
+  const payload = Buffer.from(JSON.stringify(data));
+  const header = Buffer.alloc(4); header.writeUInt32LE(payload.length);
+  socket.write(Buffer.concat([header, payload]));
+}
+async function fixture(t: test.TestContext, options: Partial<CodexDesktopRequestMonitorOptions> = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-question-"));
+  const socketPath = path.join(root, "ipc.sock");
+  const messages: Array<Record<string, any>> = [];
+  const inputs: CodexDesktopUserInput[] = [];
+  const results: string[] = [];
+  const sockets = new Set<net.Socket>();
+  let peer!: net.Socket;
+  const server = net.createServer(socket => {
+    peer = socket; sockets.add(socket); socket.on("close", () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0);
+    socket.on("data", chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 4) {
+        const length = buffer.readUInt32LE(0);
+        if (buffer.length < length + 4) break;
+        const message = JSON.parse(buffer.subarray(4, length + 4).toString("utf8"));
+        buffer = buffer.subarray(length + 4); messages.push(message);
+        if (message.method === "initialize") frame(socket, { type: "response", method: "initialize",
+          requestId: message.requestId, resultType: "success", result: { clientId: "test-client" } });
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
+  const monitor = new CodexDesktopRequestMonitor({ socketPath, reconnectDelayMs: 10_000, decisionTimeoutMs: 100,
+    onApproval: async () => { throw new Error("question is not an approval"); }, ...options,
+    onUserInput: async input => {
+      inputs.push(input);
+      return options.onUserInput ? options.onUserInput(input) : { [input.request.questions[0].id]: { answers: ["我的回答"] } };
+    },
+    onUserInputResult: async (input, result) => { results.push(result); await options.onUserInputResult?.(input, result); }
+  });
+  t.after(() => { monitor.stop(); for (const socket of sockets) socket.destroy(); server.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  monitor.followThread("thread"); monitor.start();
+  await waitFor(() => messages.some(m => m.method === "thread-stream-following-changed"));
+  const send = (change: unknown) => frame(peer, { type: "broadcast", method: "thread-stream-state-changed",
+    params: { conversationId: "thread", change } });
+  const snapshot = (state: unknown) => send({ type: "snapshot", conversationState: state });
+  const patches = (patches: unknown[]) => send({ type: "patches", patches });
+  const writes = () => messages.filter(m => ["thread-follower-submit-user-input", "thread-follower-steer-turn"].includes(m.method));
+  const respond = (result: unknown) => { const m = writes().at(-1)!;
+    frame(peer, { type: "response", method: m.method, requestId: m.requestId, resultType: "success", result }); };
+  return { monitor, peer, messages, inputs, results, snapshot, patches, writes, respond };
+}
+
+const native = { id: 42, method: "item/tool/requestUserInput", params: {
+  threadId: "thread", turnId: "turn", itemId: "item", autoResolutionMs: null,
+  questions: [{ id: "native-question", header: "问题", question: "目录在哪？" }]
+} };
+const asyncTurn = { turnId: "turn", status: "inProgress", items: [{ type: "agentMessage", id: "call",
+  questions: [{ title: "farming 在哪里？" }] }] };
+function asyncState(canonical = false) {
+  return { requests: [], threadRuntimeStatus: { type: "active" }, ...(canonical
+    ? { turnHistory: { history: { entitiesByKey: { turn: asyncTurn } } } } : { turns: [asyncTurn] }) };
+}
+
+test("native pending request replies by requestId and waits for an explicit receipt", async t => {
+  const f = await fixture(t);
+  f.snapshot({ requests: [native] }); f.snapshot({ requests: [native] });
+  await waitFor(() => f.writes().length === 1);
+  assert.equal(f.inputs.length, 1);
+  assert.deepEqual(f.writes()[0].params, { conversationId: "thread", requestId: 42,
+    response: { answers: { "native-question": { answers: ["我的回答"] } } } });
+  assert.deepEqual(f.results, []);
+  f.snapshot({ requests: [] }); f.respond({ ok: true });
+  await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]);
+});
+
+for (const canonical of [false, true]) test(`screenshot-style async widget uses native questionItemId: canonical=${canonical}`, async t => {
+  const f = await fixture(t);
+  f.snapshot(asyncState(canonical));
+  await waitFor(() => f.writes().length === 1);
+  const rpc = f.writes()[0];
+  assert.equal(rpc.method, "thread-follower-steer-turn");
+  // Legacy native schema does not support a compare-and-steer parameter.
+  assert.equal(rpc.params.expectedTurnId, undefined);
+  assert.match(rpc.params.input[0].text, /^<send_user_message_question_reply>/);
+  const row = JSON.parse(rpc.params.input[0].text.split("\n")[1])[0];
+  assert.equal(row.questionItemId, '["request_user_input_async","call",0]');
+  assert.equal(row.question, "farming 在哪里？");
+  assert.equal(row.answer, "我的回答");
+  f.respond({ result: { turnId: "turn" } });
+  await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]);
+  f.snapshot(asyncState(canonical)); await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(f.writes().length, 1);
+});
+
+for (const failure of ["missing-receipt", "wrong-turn", "timeout", "disconnect"] as const) {
+  test(`async answer remains unconfirmed and is never retried after ${failure}`, async t => {
+    const f = await fixture(t, { decisionTimeoutMs: 25 });
+    f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);
+    if (failure === "missing-receipt") f.respond({});
+    if (failure === "wrong-turn") f.respond({ result: { turnId: "another-turn" } });
+    if (failure === "disconnect") f.peer.destroy();
+    await waitFor(() => f.results.length > 0);
+    assert.deepEqual(f.results, ["failed"]);
+    if (failure !== "disconnect") {
+      f.snapshot(asyncState()); await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(f.writes().length, 1);
+  });
+}
+
+for (const reason of ["App-answer", "turn-end", "unfollow", "disconnect"] as const) {
+  test(`pending async question is invalidated without sending a late answer: ${reason}`, async t => {
+    let answer!: (value: Record<string, { answers: string[] }>) => void;
+    const f = await fixture(t, { onUserInput: async () => new Promise(resolve => { answer = resolve; }) });
+    f.snapshot(asyncState(true)); await waitFor(() => f.inputs.length === 1);
+    if (reason === "App-answer") f.patches([{ op: "add", path: ["turnHistory", "history", "entitiesByKey", "turn", "items", 1],
+      value: { type: "steeringUserMessage", status: "accepted", input: [{ type: "text", text: asyncUserInputReply(f.inputs[0].request,
+        { [f.inputs[0].request.questions[0].id]: { answers: ["来自 App"] } }) }] } }]);
+    if (reason === "turn-end") f.patches([{ op: "replace", path: ["turnHistory", "history", "entitiesByKey", "turn", "status"], value: "completed" }]);
+    if (reason === "unfollow") f.monitor.setFollowedThreads([]);
+    if (reason === "disconnect") f.peer.destroy();
+    await waitFor(() => f.results.length > 0);
+    assert.equal(f.results[0], reason === "unfollow" || reason === "disconnect" ? "suspended" : "withdrawn");
+    answer({ [f.inputs[0].request.questions[0].id]: { answers: ["too late"] } });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(f.writes().length, 0);
+  });
+}
+
+test("a sibling async question survives another question being answered in the App", async t => {
+  const f = await fixture(t, { onUserInput: async () => undefined });
+  const state = asyncState();
+  state.turns![0] = structuredClone(asyncTurn);
+  state.turns![0].items[0].questions.push({ title: "第二个问题？" });
+  f.snapshot(state); await waitFor(() => f.inputs.length === 2);
+  f.patches([{ op: "add", path: ["turns", 0, "items", 1], value: { type: "userMessage", content: [{ type: "text",
+    text: asyncUserInputReply(f.inputs[0].request, { [f.inputs[0].request.questions[0].id]: { answers: ["App"] } }) }] } }]);
+  await waitFor(() => f.results.length === 1);
+  assert.equal(f.inputs.length, 2);
+  assert.deepEqual(f.results, ["withdrawn"]);
+});
+
+test("pending sync request removal cancels the handler rather than manufacturing skip", async t => {
+  let answer!: (value: Record<string, { answers: string[] }>) => void;
+  const f = await fixture(t, { onUserInput: async () => new Promise(resolve => { answer = resolve; }) });
+  f.snapshot({ requests: [native] }); await waitFor(() => f.inputs.length === 1);
+  f.patches([{ op: "remove", path: ["requests", 0] }]);
+  await waitFor(() => f.results.length === 1);
+  answer({ "native-question": { answers: ["late"] } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(f.results, ["withdrawn"]); assert.equal(f.writes().length, 0);
+});
+
+test("native question without an ok receipt is not marked confirmed", async t => {
+  const f = await fixture(t); f.snapshot({ requests: [native] });
+  await waitFor(() => f.writes().length === 1); f.respond({});
+  await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["failed"]);
+});

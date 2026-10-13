@@ -224,15 +224,23 @@ export class WeixinApiClient {
 
     const text = await response.text();
     if (!response.ok) {
-      throw new WeixinApiError(`${endpoint} failed with HTTP ${response.status}: ${text}`, shortEndpoint(endpoint));
+      throw new WeixinApiError(`${shortEndpoint(endpoint)} failed with HTTP ${response.status}`, shortEndpoint(endpoint));
     }
 
-    const parsed = text ? JSON.parse(text) as Record<string, unknown> : {};
-    const ret = typeof parsed.ret === "number" ? parsed.ret : 0;
+    let value: unknown;
+    try { value = text ? JSON.parse(text) : undefined; }
+    catch { throw new WeixinApiError(`${shortEndpoint(endpoint)} returned invalid JSON`, shortEndpoint(endpoint)); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new WeixinApiError(`${shortEndpoint(endpoint)} returned no acknowledgement`, shortEndpoint(endpoint));
+    }
+    const parsed = value as Record<string, unknown>;
+    const ret = typeof parsed.ret === "number" ? parsed.ret : undefined;
     const errcode = typeof parsed.errcode === "number" ? parsed.errcode : undefined;
-    if (ret !== 0) {
+    const mutation = ["sendmessage", "sendtyping"].includes(shortEndpoint(endpoint));
+    if (ret !== undefined && ret !== 0 || errcode !== undefined && errcode !== 0
+      || mutation && ret !== 0 && errcode !== 0) {
       throw new WeixinApiError(
-        `${shortEndpoint(endpoint)} failed: ret=${ret} errcode=${errcode ?? "undefined"} errmsg=${String(parsed.errmsg ?? "")}`,
+        `${shortEndpoint(endpoint)} failed: ret=${ret ?? "unconfirmed"} errcode=${errcode ?? "unconfirmed"}`,
         shortEndpoint(endpoint),
         ret,
         errcode

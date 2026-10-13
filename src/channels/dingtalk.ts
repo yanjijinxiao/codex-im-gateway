@@ -19,9 +19,14 @@ import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMon
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
-import { ChannelCapabilityError, ChannelPartialDeliveryError, ChannelProgressError, channelProgressError } from "./errors.js";
+import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, ChannelProgressError, channelProgressError } from "./errors.js";
 import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
 import { DiagnosticDingTalkStreamClient } from "./dingtalk-stream-diagnostics.js";
+import { decodeDingTalkInbound } from "./dingtalk-inbound.js";
+import { responseBytes } from "./inbound-bytes.js";
+import { InboundMediaTooLargeError } from "./errors.js";
+import { assertDingTalkCardMutationSucceeded, DingTalkCardMutationError } from "./dingtalk-card-response.js";
+export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import {
   PinnedNetworkLifecycleTransport,
@@ -112,11 +117,6 @@ type DingTalkRobotMessage = Omit<RobotMessage, "msgtype" | "text"> & {
   readonly content?: unknown;
 };
 
-type DingTalkInboundImage = {
-  readonly downloadCode?: string;
-  readonly downloadUrl?: string;
-};
-
 type ReplyTarget = {
   readonly webhookUrl: string;
   readonly expiresAt?: number;
@@ -170,7 +170,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.now = options.now ?? Date.now;
     this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
     this.client = createChannelClient("dingtalk", {
-      ...TEXT_CAPABILITIES, inbound: { ...NO_MEDIA, image: "available" },
+      ...TEXT_CAPABILITIES, inbound: { ...NO_MEDIA, image: "available", file: "available" },
       outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
@@ -183,6 +183,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       try {
         return await this.createTextCard(this.cardTarget(input.toUserId), input.text, true);
       } catch (error) {
+        if (error instanceof ChannelProgressError) throw error;
         console.warn(`[codex-im-gateway] DingTalk AI Card unavailable, falling back to text: ${errorDetail(error)}`);
       }
     }
@@ -226,6 +227,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       try {
         return await this.createTextCard(this.cardTarget(input.toUserId), text, true);
       } catch (error) {
+        if (error instanceof ChannelProgressError) throw error;
         console.warn(`[codex-im-gateway] DingTalk table card unavailable, falling back to a compact list: ${errorDetail(error)}`);
       }
     }
@@ -251,7 +253,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         accessToken,
         lifecycleId
       });
-      return { messageId: result?.messageId ?? crypto.randomUUID() };
+      if (typeof result?.messageId !== "string" || !result.messageId.trim()) throw new ChannelDeliveryError("dingtalk", "sendText");
+      return { messageId: result.messageId };
     } finally {
       if (ownedLifecycle) this.apiTransport.close(lifecycleId);
     }
@@ -306,7 +309,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       const webhookUrl = body.sessionWebhook?.trim();
       if (!actorId || !conversationId || !webhookUrl) return;
 
-      const content = dingTalkMessageContent(body);
+      let decoded: ReturnType<typeof decodeDingTalkInbound>;
+      try { decoded = decodeDingTalkInbound(body as unknown as Record<string, unknown>); }
+      catch { console.warn("[codex-im-gateway] rejected malformed or excessive DingTalk attachments"); return; }
 
       const expiresAt = normalizeExpiry(body.sessionWebhookExpiredTime);
       const replyTarget: ReplyTarget = {
@@ -325,9 +330,10 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,
         replyTargetId: conversationId,
-        text: content?.text ?? "",
-        ...(!content ? { unsupportedMessageType: body.msgtype } : {}),
-        attachments: [],
+        text: dingTalkCommandText(body, decoded.text),
+        ...(!decoded.supported ? { unsupportedMessageType: body.msgtype } : {}),
+        attachments: decoded.attachments,
+        references: decoded.references,
         raw: { channel: "dingtalk", event: body }
       };
       if (options.claimMessage && !options.claimMessage(message)) return;
@@ -341,7 +347,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
           robotCode: typeof body.robotCode === "string" ? body.robotCode : null
         })}`);
       }
-      void this.replyContext.run(replyTarget, () => this.handleMessageWithEmotion(message, replyTarget, options, content?.images));
+      void this.replyContext.run(replyTarget, () => this.handleMessageWithEmotion(message, replyTarget, options));
     };
 
     this.streamClient.registerCallbackListener(TOPIC_ROBOT, handle);
@@ -385,7 +391,6 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     message: ChannelMessage,
     target: ReplyTarget,
     options: ChannelMonitorOptions,
-    images: readonly DingTalkInboundImage[] = []
   ): Promise<void> {
     this.activeNetworkLifecycles.add(target.messageId);
     const thinking = this.sendThinkingEmotion("reply", target)
@@ -395,10 +400,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         return false;
     });
     try {
-      const attachments = images.length
-        ? await this.downloadInboundImages(message.id, target.robotCode, images)
-        : [];
-      await options.onMessage({ ...message, attachments });
+      // Download only after the application has checked actor/conversation ACL.
+      await options.onMessage(message);
     } catch (error) {
       console.error(
         `[codex-im-gateway] DingTalk message handling failed for ${message.senderId}: ${errorDetail(error)}`
@@ -419,34 +422,33 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
   }
 
-  private async downloadInboundImages(
-    messageId: string,
-    robotCode: string,
-    images: readonly DingTalkInboundImage[]
-  ): Promise<ChannelMessage["attachments"]> {
-    const accessToken = await this.accessToken();
-    const attachments: ChannelMessage["attachments"] = [];
-    fs.mkdirSync(this.inboundDir, { recursive: true });
-    for (const [index, image] of images.entries()) {
+  async resolveAttachments(message: ChannelMessage): Promise<ChannelMessage["attachments"]> {
+    const target = this.replyContext.getStore() ?? this.replyTargets.get(message.replyTargetId ?? message.senderId);
+    if (!target) throw new Error("DingTalk attachment context unavailable");
+    const supplied = message.attachments;
+    if (supplied.length > 20) throw new Error("DingTalk message has too many attachments");
+    const output: ChannelMessage["attachments"] = [];
+    for (const [index, attachment] of supplied.entries()) {
+      if (attachment.path) { output.push(attachment); continue; }
       try {
-        const downloaded = await this.mediaClient.download({
-          accessToken,
-          robotCode,
-          downloadCode: image.downloadCode,
-          downloadUrl: image.downloadUrl,
-          maxBytes: this.maxInboundBytes,
-          lifecycleId: messageId
-        });
-        const extension = dingTalkImageExtension(downloaded.buffer, downloaded.contentType);
-        const label = sanitizeFileName(`dingtalk-image-${index + 1}${extension}`);
-        const targetPath = uniqueDingTalkInboundPath(this.inboundDir, messageId, label);
-        fs.writeFileSync(targetPath, downloaded.buffer, { flag: "wx" });
-        attachments.push({ kind: "image", label, item: {}, path: targetPath });
+        const downloaded = await this.mediaClient.download({ accessToken: await this.accessToken(), robotCode: target.robotCode,
+          downloadCode: typeof attachment.item.downloadCode === "string" ? attachment.item.downloadCode : undefined,
+          downloadUrl: typeof attachment.item.downloadUrl === "string" ? attachment.item.downloadUrl : undefined,
+          maxBytes: this.maxInboundBytes, lifecycleId: message.id });
+        if (downloaded.buffer.length > this.maxInboundBytes) throw new InboundMediaTooLargeError(this.maxInboundBytes, downloaded.buffer.length);
+        const label = attachment.kind === "image"
+          ? `dingtalk-image-${index + 1}${dingTalkImageExtension(downloaded.buffer, downloaded.contentType)}`
+          : sanitizeFileName(attachment.label) || `dingtalk-file-${index + 1}`;
+        fs.mkdirSync(this.inboundDir, { recursive: true });
+        const filePath = uniqueDingTalkInboundPath(this.inboundDir, message.id, label);
+        fs.writeFileSync(filePath, downloaded.buffer, { flag: "wx", mode: 0o600 });
+        output.push({ ...attachment, label, item: {}, path: filePath });
       } catch (error) {
-        throw new Error(`DingTalk inbound image download failed: ${errorDetail(error)}`);
+        if (error instanceof InboundMediaTooLargeError) throw error;
+        throw new Error(`DingTalk inbound ${attachment.kind} download failed; check attachment access and download-code validity`);
       }
     }
-    return attachments;
+    return output;
   }
 
   private async sendThinkingEmotion(action: "reply" | "recall", target: ReplyTarget): Promise<void> {
@@ -507,8 +509,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       await this.cardClient.update({ accessToken, contentKey, outTrackId, text, finalize, error: false });
     } catch (error) {
       // Creation/delivery succeeded: retry this card, never create its replacement.
-      if (!finalize) throw dingTalkProgressError(error, outTrackId);
-      throw error;
+      throw dingTalkProgressError(error, outTrackId);
     }
     return { messageId: outTrackId };
   }
@@ -559,6 +560,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
   private readonly updateChains = new Map<string, Promise<void>>();
   private readonly inputingCards = new Set<string>();
   private readonly cardLifecycles = new Map<string, { id: string; owned: boolean }>();
+  private readonly streamGuids = new DingTalkStreamSequence();
   private readonly transport: PinnedNetworkLifecycleTransport;
   private readonly retryDelaysMs: readonly number[];
   private readonly sleep: (milliseconds: number) => Promise<void>;
@@ -596,15 +598,17 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     const suppliedLifecycleId = input.lifecycleId?.trim();
     const lifecycle = { id: suppliedLifecycleId || input.outTrackId, owned: !suppliedLifecycleId };
     this.cardLifecycles.set(input.outTrackId, lifecycle);
+    let operation: "create" | "deliver" = "create";
     try {
       await this.mutate(lifecycle.id, "create", "/v1.0/card/instances", "POST", input.accessToken, {
         cardTemplateId: input.cardTemplateId,
         outTrackId: input.outTrackId,
-        cardData: { cardParamMap: { config: JSON.stringify({ autoLayout: true }) } },
+        cardData: { cardParamMap: initialDingTalkCardData(input) },
         callbackType: "STREAM",
         imGroupOpenSpaceModel: { supportForward: true },
         imRobotOpenSpaceModel: { supportForward: true }
       });
+      operation = "deliver";
       await this.mutate(lifecycle.id, "deliver", "/v1.0/card/instances/deliver", "POST", input.accessToken, {
         outTrackId: input.outTrackId,
         userIdType: 1,
@@ -624,7 +628,10 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     } catch (error) {
       this.cardLifecycles.delete(input.outTrackId);
       if (lifecycle.owned) this.transport.close(lifecycle.id);
-      throw error;
+      // An uncertain POST must not trigger another card or an alternative send.
+      // Updates of an acknowledged card are independently safe to retry.
+      if (operation === "create" && error instanceof DingTalkCardMutationError && !error.uncertain) throw error;
+      throw new ChannelProgressError(false, undefined, undefined, error);
     }
   }
 
@@ -661,7 +668,8 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     finalize: boolean;
     error: boolean;
   }, lifecycleId: string): Promise<void> {
-    const content = normalizeDingTalkCardContent(input.text).slice(0, 50_000);
+    const content = normalizeDingTalkCardContent(input.text);
+    if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
     if (firstUpdate) {
       await this.updateCardState(lifecycleId, input, content, "2", false);
@@ -673,12 +681,12 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       text: input.finalize ? content : content.replace(/\n+$/, ""),
       finalize: input.finalize,
       error: input.error,
-      guid: `${Date.now()}_${crypto.randomBytes(4).toString("hex")}`
+      guid: this.streamGuids.next()
     });
     await this.mutateWithRetry(lifecycleId, "stream", "/v1.0/card/streaming", input.accessToken, streamBody);
     console.log(
       `[codex-im-gateway] DingTalk AI Card HTTPS streamed finalize=${input.finalize} `
-      + `error=${input.error} outTrackId=${input.outTrackId} content=${oneLineCardPreview(content, 180)}`
+      + `error=${input.error} outTrackId=${input.outTrackId} ${cardContentDiagnostic(content)}`
     );
     if (input.finalize) {
       await this.updateCardState(lifecycleId, input, content, input.error ? "5" : "3", true);
@@ -758,40 +766,31 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
   ): Promise<void> {
     const response = await this.transport.request(lifecycleId, `https://api.dingtalk.com${pathname}`, {
       method,
+      signal: AbortSignal.timeout(30_000),
       headers: {
         "Content-Type": "application/json",
         "x-acs-dingtalk-access-token": accessToken
       },
       body: JSON.stringify(body)
     });
-    const result = await response.json().catch(() => undefined) as {
-      success?: unknown;
-      result?: unknown;
-      code?: unknown;
-      message?: unknown;
-      requestId?: unknown;
-    } | undefined;
-    if (response.ok && result?.success !== false && result?.result !== false) return;
-    const code = typeof result?.code === "string" ? result.code : undefined;
-    const message = typeof result?.message === "string" ? result.message : undefined;
-    const requestId = typeof result?.requestId === "string"
-      ? result.requestId
-      : response.headers.get("x-acs-request-id") ?? undefined;
-    throw new Error(
-      `钉钉 AI Card ${operation} 请求失败（HTTP ${response.status}`
-      + `${code ? `, code=${code}` : ""}${requestId ? `, requestId=${requestId}` : ""}）`
-      + `${message ? `：${message}` : ""}`
-    );
+    const result: unknown = await response.json().catch(() => undefined);
+    assertDingTalkCardMutationSucceeded(operation, {
+      statusCode: response.status, headers: Object.fromEntries(response.headers), body: result
+    });
+    console.log(`[codex-im-gateway] DingTalk AI Card ${JSON.stringify({
+      timestamp: new Date().toISOString(), event: "api_acknowledged", operation,
+      outTrackId: (body as { outTrackId?: string }).outTrackId, httpStatus: response.status,
+      requestId: safeCardRequestId(response.headers.get("x-acs-request-id"))
+    })}`);
   }
 }
 
 export class DingTalkSdkAICardClient implements DingTalkAICardClient {
   private readonly client: DingTalkCardSdkClient;
-  private readonly runtime = new RuntimeOptions({});
+  private readonly runtime = new RuntimeOptions({ connectTimeout: 30_000, readTimeout: 30_000 });
   private readonly updateChains = new Map<string, Promise<void>>();
   private readonly inputingCards = new Set<string>();
-  private lastStreamGuidTimestamp = 0;
-  private streamGuidSequence = 0;
+  private readonly streamGuids = new DingTalkStreamSequence();
 
   constructor(
     client?: DingTalkCardSdkClient,
@@ -813,50 +812,54 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     target: DingTalkAICardTarget;
     text: string;
   }): Promise<void> {
-    const createRequest = new DingTalk.card_1_0.CreateCardRequest({
-      cardTemplateId: input.cardTemplateId,
-      outTrackId: input.outTrackId,
-      cardData: new DingTalk.card_1_0.CreateCardRequestCardData({
-        cardParamMap: {
-          [input.contentKey]: "",
-          config: JSON.stringify({ autoLayout: true })
-        }
-      }),
-      callbackType: "STREAM",
-      imGroupOpenSpaceModel: new DingTalk.card_1_0.CreateCardRequestImGroupOpenSpaceModel({
-        supportForward: true
-      }),
-      imRobotOpenSpaceModel: new DingTalk.card_1_0.CreateCardRequestImRobotOpenSpaceModel({
-        supportForward: true
-      })
-    });
-    const createHeaders = new DingTalk.card_1_0.CreateCardHeaders({
-      xAcsDingtalkAccessToken: input.accessToken
-    });
-    const createResponse = await this.client.createCardWithOptions(createRequest, createHeaders, this.runtime);
-    assertDingTalkCardMutationSucceeded("create", createResponse);
+    let operation: "create" | "deliver" = "create";
+    try {
+      const createRequest = new DingTalk.card_1_0.CreateCardRequest({
+        cardTemplateId: input.cardTemplateId,
+        outTrackId: input.outTrackId,
+        cardData: new DingTalk.card_1_0.CreateCardRequestCardData({
+          cardParamMap: initialDingTalkCardData(input)
+        }),
+        callbackType: "STREAM",
+        imGroupOpenSpaceModel: new DingTalk.card_1_0.CreateCardRequestImGroupOpenSpaceModel({
+          supportForward: true
+        }),
+        imRobotOpenSpaceModel: new DingTalk.card_1_0.CreateCardRequestImRobotOpenSpaceModel({
+          supportForward: true
+        })
+      });
+      const createHeaders = new DingTalk.card_1_0.CreateCardHeaders({
+        xAcsDingtalkAccessToken: input.accessToken
+      });
+      const createResponse = await this.client.createCardWithOptions(createRequest, createHeaders, this.runtime);
+      assertDingTalkCardMutationSucceeded("create", createResponse);
+      operation = "deliver";
 
-    const deliverRequest = new DingTalk.card_1_0.DeliverCardRequest({
-      outTrackId: input.outTrackId,
-      userIdType: 1,
-      ...(input.target.type === "group" ? {
-        openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
-        imGroupOpenDeliverModel: new DingTalk.card_1_0.DeliverCardRequestImGroupOpenDeliverModel({
-          robotCode: input.robotCode
+      const deliverRequest = new DingTalk.card_1_0.DeliverCardRequest({
+        outTrackId: input.outTrackId,
+        userIdType: 1,
+        ...(input.target.type === "group" ? {
+          openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
+          imGroupOpenDeliverModel: new DingTalk.card_1_0.DeliverCardRequestImGroupOpenDeliverModel({
+            robotCode: input.robotCode
+          })
+        } : {
+          openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
+          imRobotOpenDeliverModel: new DingTalk.card_1_0.DeliverCardRequestImRobotOpenDeliverModel({
+            spaceType: "IM_ROBOT", robotCode: input.robotCode, extension: { dynamicSummary: "true" }
+          })
         })
-      } : {
-        openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
-        imRobotOpenDeliverModel: new DingTalk.card_1_0.DeliverCardRequestImRobotOpenDeliverModel({
-          spaceType: "IM_ROBOT"
-        })
-      })
-    });
-    const deliverHeaders = new DingTalk.card_1_0.DeliverCardHeaders({
-      xAcsDingtalkAccessToken: input.accessToken
-    });
-    const deliverResponse = await this.client.deliverCardWithOptions(deliverRequest, deliverHeaders, this.runtime);
-    assertDingTalkCardMutationSucceeded("deliver", deliverResponse);
-    this.inputingCards.delete(input.outTrackId);
+      });
+      const deliverHeaders = new DingTalk.card_1_0.DeliverCardHeaders({
+        xAcsDingtalkAccessToken: input.accessToken
+      });
+      const deliverResponse = await this.client.deliverCardWithOptions(deliverRequest, deliverHeaders, this.runtime);
+      assertDingTalkCardMutationSucceeded("deliver", deliverResponse);
+      this.inputingCards.delete(input.outTrackId);
+    } catch (error) {
+      if (operation === "create" && error instanceof DingTalkCardMutationError && !error.uncertain) throw error;
+      throw new ChannelProgressError(false, undefined, undefined, error);
+    }
   }
 
   async update(input: {
@@ -889,12 +892,14 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     finalize: boolean;
     error: boolean;
   }): Promise<void> {
-    const content = normalizeDingTalkCardContent(input.text).slice(0, 50_000);
-    if (!this.inputingCards.has(input.outTrackId)) {
+    const content = normalizeDingTalkCardContent(input.text);
+    if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
+    const firstUpdate = !this.inputingCards.has(input.outTrackId);
+    if (firstUpdate) {
       await this.updateCardStateWithRetry(input, content, "2", false);
       this.inputingCards.add(input.outTrackId);
     }
-    const guid = this.nextStreamGuid();
+    const guid = this.streamGuids.next();
     let lastError: unknown;
     for (const [attempt, retryDelay] of this.retryDelaysMs.entries()) {
       if (retryDelay > 0) await this.sleep(retryDelay);
@@ -915,19 +920,22 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         console.log(
           `[codex-im-gateway] DingTalk AI Card streamed attempt=${attempt + 1} `
           + `finalize=${input.finalize} error=${input.error} outTrackId=${input.outTrackId} guid=${guid} `
-          + `content=${oneLineCardPreview(content, 180)}`
+          + cardContentDiagnostic(content)
         );
         if (input.finalize) {
           await this.updateCardStateWithRetry(input, content, input.error ? "5" : "3", true);
           this.inputingCards.delete(input.outTrackId);
+        } else if (!firstUpdate) {
+          await this.updateCardStateWithRetry(input, content, "2", true);
         }
         return;
       } catch (error) {
         lastError = error;
+        if (!channelProgressError(error).retryable) throw error;
         if (attempt + 1 < this.retryDelaysMs.length) {
           console.warn(
             `[codex-im-gateway] DingTalk AI Card stream attempt ${attempt + 1} failed; retrying: `
-            + errorDetail(error)
+            + safeCardSdkError(error)
           );
         }
       }
@@ -976,10 +984,11 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         return;
       } catch (error) {
         lastError = error;
+        if (!channelProgressError(error).retryable) throw error;
         if (attempt + 1 < this.retryDelaysMs.length) {
           console.warn(
             `[codex-im-gateway] DingTalk AI Card state attempt ${attempt + 1} failed; retrying: `
-            + errorDetail(error)
+            + safeCardSdkError(error)
           );
         }
       }
@@ -987,7 +996,13 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     throw lastError instanceof Error ? lastError : new Error(errorDetail(lastError));
   }
 
-  private nextStreamGuid(): string {
+}
+
+/** Same ordering and retry identity for HTTPS and SDK transports. */
+class DingTalkStreamSequence {
+  private lastStreamGuidTimestamp = 0;
+  private streamGuidSequence = 0;
+  next(): string {
     const timestamp = Math.max(Date.now(), this.lastStreamGuidTimestamp);
     if (timestamp === this.lastStreamGuidTimestamp) {
       this.streamGuidSequence += 1;
@@ -995,39 +1010,16 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       this.lastStreamGuidTimestamp = timestamp;
       this.streamGuidSequence = 0;
     }
-    return `${timestamp}_${this.streamGuidSequence.toString(36).padStart(6, "0")}`;
+    return `${timestamp}_${this.streamGuidSequence.toString(36).padStart(10, "0")}`;
   }
 }
 
-type DingTalkCardMutationResponse = {
-  readonly statusCode?: number;
-  readonly headers?: Record<string, string>;
-  readonly body?: {
-    readonly success?: boolean;
-    readonly result?: unknown;
-  };
-};
-
-export function assertDingTalkCardMutationSucceeded(
-  operation: "create" | "deliver" | "stream" | "state",
-  response: DingTalkCardMutationResponse
-): void {
-  const result = response.body?.result;
-  const failedDelivery = Array.isArray(result)
-    ? result.find((item) => item && typeof item === "object" && (item as { success?: boolean }).success === false)
-    : undefined;
-  if (response.body?.success !== false && result !== false && !failedDelivery) return;
-  const requestId = response.headers?.["x-acs-request-id"] ?? response.headers?.["x-acs-trace-id"];
-  const deliveryMessage = failedDelivery && typeof failedDelivery === "object"
-    ? (failedDelivery as { errorMsg?: unknown }).errorMsg
-    : undefined;
-  const detail = typeof deliveryMessage === "string" && deliveryMessage.trim()
-    ? deliveryMessage.trim()
-    : `success=${String(response.body?.success)} result=${JSON.stringify(result)}`;
-  throw new Error(
-    `钉钉 AI Card ${operation} 业务响应失败（HTTP ${response.statusCode ?? "unknown"}`
-    + `${requestId ? `, requestId=${requestId}` : ""}）：${detail}`
-  );
+function initialDingTalkCardData(input: { contentKey: string; text: string }): Record<string, string> {
+  const text = normalizeDingTalkCardContent(input.text);
+  if (!text.trim()) throw new Error("DingTalk card initial content must not be empty");
+  if (text.length > 50_000) throw new Error("DingTalk card payload requires pagination");
+  // Publish a populated first frame, not an empty template awaiting a second request.
+  return dingTalkCardStateParamMap({ contentKey: input.contentKey, text, flowStatus: "2" });
 }
 
 export function dingTalkCardStateParamMap(input: {
@@ -1071,9 +1063,16 @@ export function dingTalkCardStreamingUpdateBody(input: {
   };
 }
 
-function oneLineCardPreview(value: string, max: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length <= max ? normalized : `${normalized.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+function cardContentDiagnostic(value: string): string {
+  return `contentBytes=${Buffer.byteLength(value)} contentSha256=${crypto.createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
+}
+
+function safeCardRequestId(value: string | null): string | undefined {
+  return value && /^[A-Za-z0-9_.-]{1,100}$/.test(value) ? value : undefined;
+}
+
+function safeCardSdkError(error: unknown): string {
+  return error instanceof DingTalkCardMutationError ? error.message : "SDK transport error (raw response withheld)";
 }
 
 function delayMilliseconds(milliseconds: number): Promise<void> {
@@ -1126,7 +1125,7 @@ class DingTalkRestInboundMediaClient implements DingTalkInboundMediaClient {
     let downloadUrl = input.downloadUrl?.trim();
     if (!downloadUrl) {
       const downloadCode = input.downloadCode?.trim();
-      if (!downloadCode) throw new Error("钉钉图片缺少 downloadCode 和 pictureUrl");
+      if (!downloadCode) throw new Error("钉钉附件缺少下载凭据");
       const response = await this.transport.request(lifecycleId, "https://api.dingtalk.com/v1.0/robot/messageFiles/download", {
         method: "POST",
         headers: {
@@ -1152,14 +1151,7 @@ class DingTalkRestInboundMediaClient implements DingTalkInboundMediaClient {
     const parsedUrl = normalizeDingTalkDownloadUrl(downloadUrl, Boolean(input.downloadCode && !input.downloadUrl));
     const response = await this.transport.request(lifecycleId, parsedUrl);
     if (!response.ok) throw new Error(`钉钉图片文件下载失败：HTTP ${response.status}`);
-    const contentLength = Number(response.headers.get("content-length"));
-    if (Number.isFinite(contentLength) && contentLength > input.maxBytes) {
-      throw new Error(`钉钉图片超过 ${Math.floor(input.maxBytes / 1024 / 1024)} MiB 上限`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length > input.maxBytes) {
-      throw new Error(`钉钉图片超过 ${Math.floor(input.maxBytes / 1024 / 1024)} MiB 上限`);
-    }
+    const buffer = await responseBytes(response, input.maxBytes);
     const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim();
     return { buffer, ...(contentType ? { contentType } : {}) };
   }
@@ -1175,52 +1167,6 @@ export function normalizeDingTalkDownloadUrl(raw: string, allowOfficialHttpUpgra
   return parsedUrl;
 }
 
-function dingTalkMessageContent(
-  body: DingTalkRobotMessage
-): { text: string; images: DingTalkInboundImage[] } | undefined {
-  if (body.msgtype === "text") {
-    return { text: dingTalkCommandText(body, stringValue(body.text?.content)), images: [] };
-  }
-  const content = parseDingTalkContent(body.content);
-  if (body.msgtype === "picture") {
-    return {
-      text: "",
-      images: [{
-        ...(stringValue(content.downloadCode).trim()
-          ? { downloadCode: stringValue(content.downloadCode).trim() }
-          : {}),
-        ...(stringValue(content.pictureUrl).trim()
-          ? { downloadUrl: stringValue(content.pictureUrl).trim() }
-          : {})
-      }]
-    };
-  }
-  if (body.msgtype === "richText") {
-    const richText = Array.isArray(content.richText) ? content.richText : [];
-    const textParts: string[] = [];
-    const images: DingTalkInboundImage[] = [];
-    for (const value of richText) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const part = value as Record<string, unknown>;
-      const text = stringValue(part.text);
-      if (text) textParts.push(text);
-      if (part.type === "picture" || part.pictureUrl || part.downloadCode) {
-        images.push({
-          ...(stringValue(part.downloadCode).trim()
-            ? { downloadCode: stringValue(part.downloadCode).trim() }
-            : {}),
-          ...(stringValue(part.pictureUrl).trim()
-            ? { downloadUrl: stringValue(part.pictureUrl).trim() }
-            : {})
-        });
-      }
-    }
-    if (!textParts.length && !images.length) return undefined;
-    return { text: dingTalkCommandText(body, textParts.join("")), images: uniqueDingTalkImages(images) };
-  }
-  return undefined;
-}
-
 function dingTalkCommandText(body: DingTalkRobotMessage, text: string): string {
   const trimmed = text.trim();
   if (body.conversationType !== "2") return trimmed;
@@ -1231,32 +1177,6 @@ function dingTalkCommandText(body: DingTalkRobotMessage, text: string): string {
     /^(?:(?:<@[^<>\s]+>|@[^@<>/\s]+)[^\S\r\n]+)+(?=\/[a-z][a-z0-9_-]*(?:\s|$))/iu,
     ""
   );
-}
-
-function parseDingTalkContent(value: unknown): Record<string, unknown> {
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? parsed as Record<string, unknown>
-        : {};
-    } catch {
-      return {};
-    }
-  }
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
-function uniqueDingTalkImages(images: readonly DingTalkInboundImage[]): DingTalkInboundImage[] {
-  const seen = new Set<string>();
-  return images.filter((image) => {
-    const key = image.downloadUrl || image.downloadCode || `missing-${seen.size}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 function uniqueDingTalkInboundPath(rootDir: string, messageId: string, label: string): string {
@@ -1434,13 +1354,13 @@ async function sendSessionWebhook(transport: PinnedNetworkLifecycleTransport, in
     errmsg?: unknown;
     processQueryKey?: unknown;
   } | undefined;
-  if (!response.ok || (typeof result?.errcode === "number" && result.errcode !== 0)) {
-    const detail = typeof result?.errmsg === "string" ? result.errmsg : `HTTP ${response.status}`;
-    throw new Error(`钉钉消息发送失败：${detail}`);
+  if (!response.ok || result?.errcode !== 0) {
+    throw new ChannelDeliveryError("dingtalk", "sendSessionWebhook",
+      typeof result?.errcode === "number" ? result.errcode : undefined);
   }
   return typeof result?.processQueryKey === "string" && result.processQueryKey
     ? { messageId: result.processQueryKey }
-    : {};
+    : { messageId: `dingtalk-webhook-receipt:${crypto.randomUUID()}` };
 }
 
 function normalizeExpiry(value: number): number | undefined {
