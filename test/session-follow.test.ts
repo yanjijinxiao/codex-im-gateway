@@ -330,3 +330,20 @@ test("a viewer can inspect follow health but cannot force delivery or change the
   assert.equal(syncs, 0);
   assert.match(texts.at(-1)!, /权限/);
 });
+
+test("only explicit controller confirmation opts into unknown-instance redelivery", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "follow-redelivery-role-")); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(root)); const session = store.createSession("group", root);
+  store.setSessionThread(session.id, "thread"); store.setRole("group", "actor", "participant");
+  const options: unknown[] = []; const texts: string[] = [];
+  const bridge = new BridgeService({ stateStore: store, config: { ...defaultConfig(root), allowedSenderIds: ["actor"] },
+    channel: createChannelClient("dingtalk", TEXT_CAPABILITIES, { async sendText(input) { texts.push(input.text); return { messageId: "text" }; } }),
+    sessionFollow: { status: () => ({ status: "pending" }), async synchronize(_session, recovery) { options.push(recovery); return { status: "synced" }; } },
+    runner: { backendInfo: () => ({ id: "app-server", capabilities: APP_SERVER_BACKEND_CAPABILITIES }) } as never });
+  const send = (text: string) => bridge.handleMessage({ id: String(texts.length), senderId: "actor", replyTargetId: "group", text, raw: {}, attachments: [] });
+  await send("/follow sync --retry-delivery"); assert.equal(options.length, 0); assert.match(texts.at(-1)!, /controller 权限/);
+  store.setRole("group", "actor", "controller");
+  await send("/follow sync"); assert.equal(options[0], undefined);
+  await send("/follow sync --retry-delivery"); assert.deepEqual(options[1], { confirmUncertainDelivery: true });
+  assert.equal(store.getActiveSession("group")!.id, session.id); assert.equal(store.getSession(session.id)!.threadId, "thread");
+});

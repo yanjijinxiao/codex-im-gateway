@@ -4,6 +4,7 @@ import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
 import { summarizeProgress } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
+import { restoredBootstrap, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
 const MAX_RECOVERY_PROBES = 3;
 
@@ -12,6 +13,8 @@ export type ChannelStreamCheckpoint = {
   messageId?: string;
   /** Persist before a create POST; missing acknowledgement must not be replayed after a crash. */
   creationAttempted?: boolean;
+  bootstrap?: ChannelStreamBootstrap;
+  presentationFailure?: ChannelStreamFailure;
   startedAt: number;
   progressEntries: string[];
   thought: string;
@@ -24,7 +27,7 @@ export type ChannelStreamCheckpoint = {
   /** Pinned layout and acknowledged pages survive a restart/partial failure. */
   resultPageBytes?: number;
   resultPresentation?: "card" | "native-text";
-  terminalPages?: Array<{ messageId?: string; delivered: boolean; attempted?: boolean }>;
+  terminalPages?: Array<{ messageId?: string; delivered: boolean; attempted?: boolean; bootstrap?: ChannelStreamBootstrap }>;
 };
 
 export class ChannelTurnTextStream {
@@ -32,6 +35,8 @@ export class ChannelTurnTextStream {
   readonly supported: boolean;
   private messageId?: string;
   private creationAttempted = false;
+  private bootstrap?: ChannelStreamBootstrap;
+  private presentationFailure?: ChannelStreamFailure;
   private readonly streamId: string;
   private phase: "active" | "backoff" | "unavailable" = "active";
   private failures = 0;
@@ -44,7 +49,7 @@ export class ChannelTurnTextStream {
   private terminalNoticeSent = false;
   private resultPageBytes?: number;
   private resultPresentation?: "card" | "native-text";
-  private terminalPages: Array<{ messageId?: string; delivered: boolean; attempted?: boolean }> = [];
+  private terminalPages: NonNullable<ChannelStreamCheckpoint["terminalPages"]> = [];
   private notifying?: Promise<boolean>;
   private latestText = "";
   private startedAt = Date.now();
@@ -73,7 +78,7 @@ export class ChannelTurnTextStream {
   ) {
     const saved = persistence?.restore;
     this.supported = saved?.resultPresentation === "native-text" ? false
-      : saved?.resultPresentation === "card" || Boolean(saved?.messageId) || (persistence?.progressEnabled !== false && (client.capabilities
+      : saved?.resultPresentation === "card" || Boolean(saved?.messageId || saved?.bootstrap || saved?.creationAttempted) || (persistence?.progressEnabled !== false && (client.capabilities
         ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream)));
     // Choose presentation once per turn. Card failures never switch to text.
     if (!this.supported) this.textProgress = new TextProgressBatcher((text) => this.sendPlainText(text));
@@ -81,6 +86,9 @@ export class ChannelTurnTextStream {
     if (saved) {
       this.messageId = saved.messageId;
       this.creationAttempted = saved.creationAttempted ?? false;
+      this.bootstrap = saved.bootstrap ? restoredBootstrap(saved.bootstrap) : undefined;
+      this.presentationFailure = saved.presentationFailure;
+      if (this.bootstrap?.stage === "delivered") this.messageId ??= this.bootstrap.messageId;
       this.startedAt = saved.startedAt;
       this.progressEntries.push(...saved.progressEntries.map((entry) => summarizeProgress(entry)));
       this.thought = saved.thought;
@@ -90,12 +98,14 @@ export class ChannelTurnTextStream {
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
       this.resultPageBytes = saved.resultPageBytes;
       this.resultPresentation = saved.resultPresentation;
-      this.terminalPages = saved.terminalPages?.map(page => ({ ...page })) ?? [];
+      this.terminalPages = saved.terminalPages?.map(page => ({ ...page, ...(page.bootstrap ? { bootstrap: restoredBootstrap(page.bootstrap) } : {}) })) ?? [];
     }
   }
 
   checkpoint(): ChannelStreamCheckpoint {
     return { streamId: this.streamId, messageId: this.messageId, creationAttempted: this.creationAttempted, startedAt: this.startedAt,
+      ...(this.bootstrap ? { bootstrap: structuredClone(this.bootstrap) } : {}),
+      ...(this.presentationFailure ? { presentationFailure: this.presentationFailure } : {}),
       progressEntries: [...this.progressEntries], thought: this.thought,
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.terminal ? { terminal: this.terminal } : {}),
@@ -107,6 +117,7 @@ export class ChannelTurnTextStream {
   deliveryState(): "active" | "pending" | "unavailable" | "finished" {
     if (this.finished || this.terminal) return "finished";
     if (this.phase !== "active" || this.suspended) return "unavailable";
+    if (this.creationAttempted && !this.messageId && !this.opening) return "unavailable";
     return this.messageId || !this.supported ? "active" : "pending";
   }
 
@@ -123,7 +134,7 @@ export class ChannelTurnTextStream {
   }
 
   /** Explicit recovery probe using the persisted handle, never a replacement card. */
-  async synchronize(): Promise<"updated" | "text-only" | "unavailable" | "finished"> {
+  async synchronize(options: { confirmUncertainDelivery?: boolean } = {}): Promise<"updated" | "text-only" | "unavailable" | "finished"> {
     if (this.finished || this.terminal) return "finished";
     if (this.suspended) return "unavailable";
     if (!this.supported) return "text-only";
@@ -141,7 +152,7 @@ export class ChannelTurnTextStream {
       this.startHeartbeat();
       await this.updateNow();
     } else {
-      await this.openNow();
+      await this.openNow(true, options.confirmUncertainDelivery);
     }
     return this.phase === "active" && this.messageId ? "updated" : "unavailable";
   }
@@ -187,7 +198,7 @@ export class ChannelTurnTextStream {
     return true;
   }
 
-  async finalize(text: string, error = false): Promise<boolean> {
+  async finalize(text: string, error = false, recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean } = {}): Promise<boolean> {
     const content = text.trim();
     if (this.finished) return true;
     // A shutdown-detached writer must not poison the checkpoint that its
@@ -200,11 +211,12 @@ export class ChannelTurnTextStream {
     this.stopTimers();
     this.persistence?.save(this.checkpoint());
     if (this.finalizing) return this.finalizing;
-    this.finalizing = this.finalizeNow();
+    if (recovery.recoverBootstrap) this.terminalBlocked = false;
+    this.finalizing = this.finalizeNow(recovery.recoverBootstrap, recovery.confirmUncertainDelivery);
     try { return await this.finalizing; } finally { this.finalizing = undefined; }
   }
 
-  private async finalizeNow(): Promise<boolean> {
+  private async finalizeNow(recoverBootstrap = false, confirmUncertainDelivery = false): Promise<boolean> {
     await this.textProgress?.close();
     await this.opening;
     await this.chain.catch(() => undefined);
@@ -241,7 +253,7 @@ export class ChannelTurnTextStream {
     // creates continuation cards, each with its own stable logical identity.
     if (!this.messageId) {
       this.latestText = pages[0].text;
-      if (!await this.openNow() || !this.messageId) return false;
+      if (!await this.openNow(recoverBootstrap, confirmUncertainDelivery) || !this.messageId) return false;
     }
     this.terminalPages[0].messageId = this.messageId;
     try {
@@ -249,19 +261,30 @@ export class ChannelTurnTextStream {
         const receipt = this.terminalPages[index];
         if (receipt.delivered) continue;
         if (!receipt.messageId) {
-          if (receipt.attempted) return false;
+          const resume = recoverBootstrap && receipt.bootstrap && ["created", "delivery-rejected", "delivery-unconfirmed"].includes(receipt.bootstrap.stage);
+          if (receipt.bootstrap?.stage === "delivered") receipt.messageId = receipt.bootstrap.messageId;
+          if (receipt.attempted && !receipt.messageId && !(resume || recoverBootstrap && receipt.bootstrap?.stage === "create-rejected")) return false;
+          if (receipt.bootstrap?.stage === "delivery-unconfirmed" && !confirmUncertainDelivery) return false;
           receipt.attempted = true;
           this.persistence?.save(this.checkpoint());
           try {
-            const created = await this.client.startTextStream!({ toUserId: this.toUserId, text: page.text,
-              streamId: `${this.streamId}_page_${index + 1}`,
-              ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+            const pageId = `${this.streamId}_page_${index + 1}`;
+            const input = { toUserId: this.toUserId, text: page.text, streamId: pageId,
+              onBootstrap: (state: ChannelStreamBootstrap) => {
+                if (state.instanceId !== pageId || state.recipientId !== this.toUserId) throw new Error("Continuation bootstrap identity mismatch");
+                receipt.bootstrap = structuredClone(state);
+                if (state.stage === "delivered") receipt.messageId = state.messageId;
+                this.persistence?.save(this.checkpoint());
+              }, ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) };
+            const created = receipt.messageId ? { messageId: receipt.messageId } : resume
+              ? await this.client.resumeTextStream!({ ...input, bootstrap: receipt.bootstrap!, confirmUncertainDelivery })
+              : await this.client.startTextStream!(input);
             if (!created.messageId?.trim()) throw new Error("Channel returned no continuation receipt");
             receipt.messageId = created.messageId;
           } catch (error) {
             const failure = channelProgressError(error);
             if (failure.messageId) receipt.messageId = failure.messageId;
-            if (failure.retryable) receipt.attempted = false;
+            if (failure.retryable && !receipt.bootstrap) receipt.attempted = false;
             throw error;
           } finally { this.persistence?.save(this.checkpoint()); }
         }
@@ -278,6 +301,7 @@ export class ChannelTurnTextStream {
       // The hub retains terminalPending and retries only the final frame.
       console.warn("[codex-im-gateway] channel terminal progress update failed");
       this.terminalBlocked = !channelProgressError(error).retryable;
+      this.recordFailure(error);
       return false;
     }
   }
@@ -383,15 +407,22 @@ export class ChannelTurnTextStream {
     return !this.finished && !this.terminal && !this.suspended && this.phase !== "unavailable";
   }
 
-  private async openNow(): Promise<boolean> {
+  private async openNow(recover = false, confirmUncertainDelivery = false): Promise<boolean> {
     if (this.opening) return this.opening;
-    if (this.creationAttempted && !this.messageId) return false;
+    const resume = this.bootstrap && ["created", "delivery-rejected", "delivery-unconfirmed"].includes(this.bootstrap.stage);
+    if (this.creationAttempted && !this.messageId && !(recover && (resume && this.client.resumeTextStream
+      || this.bootstrap?.stage === "create-rejected"))) return false;
+    if (this.bootstrap?.stage === "delivery-unconfirmed" && !confirmUncertainDelivery) return false;
     this.creationAttempted = true;
     this.persistence?.save(this.checkpoint());
     this.opening = (async () => {
       try {
-        const result = await this.client.startTextStream!({ toUserId: this.toUserId, text: this.latestText,
-          streamId: this.streamId, ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) });
+        const input = { toUserId: this.toUserId, text: this.latestText, streamId: this.streamId,
+          onBootstrap: (state: ChannelStreamBootstrap) => this.saveBootstrap(state),
+          ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) };
+        const result = resume && recover
+          ? await this.client.resumeTextStream!({ ...input, bootstrap: this.bootstrap!, confirmUncertainDelivery })
+          : await this.client.startTextStream!(input);
         if (!result.messageId?.trim()) throw new Error("Channel returned no card receipt");
         this.messageId = result.messageId;
         this.recovered();
@@ -399,7 +430,7 @@ export class ChannelTurnTextStream {
       } catch (error) {
         const failure = channelProgressError(error);
         if (failure.messageId) this.messageId = failure.messageId;
-        if (failure.retryable) this.creationAttempted = false;
+        if (failure.retryable && !this.bootstrap) this.creationAttempted = false;
         if (this.terminal) this.terminalBlocked = !failure.retryable;
         this.persistence?.save(this.checkpoint());
         this.unavailable(failure);
@@ -409,12 +440,20 @@ export class ChannelTurnTextStream {
     try { return await this.opening; } finally { this.opening = undefined; }
   }
 
+  private saveBootstrap(state: ChannelStreamBootstrap): void {
+    if (state.instanceId !== this.streamId || state.recipientId !== this.toUserId) throw new Error("Stream bootstrap identity mismatch");
+    this.bootstrap = structuredClone(state);
+    if (state.stage === "delivered") this.messageId = state.messageId;
+    this.persistence?.save(this.checkpoint());
+  }
+
   private recovered(): void {
     const wasUnavailable = this.phase !== "active";
     this.phase = "active";
     this.failures = 0;
     this.recoveryProbes = 0;
     this.retryAt = 0;
+    this.presentationFailure = undefined;
     this.lastUpdateAt = Date.now();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
@@ -424,6 +463,7 @@ export class ChannelTurnTextStream {
   }
 
   private unavailable(error: unknown): void {
+    this.recordFailure(error);
     if (this.finished || this.terminal || this.suspended) return;
     const failure = channelProgressError(error);
     const probe = !failure.retryable && failure.recoveryProbe && Boolean(this.messageId)
@@ -450,6 +490,11 @@ export class ChannelTurnTextStream {
     }, delay);
     this.retryTimer.unref?.();
     this.reportRecovery(probe ? "recovery_probe_scheduled" : "retry_scheduled", delay);
+  }
+
+  private recordFailure(error: unknown): void {
+    const diagnostic = channelProgressError(error).diagnostic;
+    if (diagnostic) { this.presentationFailure = diagnostic; this.persistence?.save(this.checkpoint()); }
   }
 
   private reportRecovery(event: string, delayMs?: number): void {

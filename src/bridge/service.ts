@@ -536,7 +536,7 @@ export class BridgeService {
       case "policy":
       case "leave":
       case "role":
-        await this.handleInterventionSetting(message.senderId, command);
+        await this.handleInterventionSetting(message.senderId, command, message.text);
         return;
       case "intervene":
         await this.handleInterventionChoice(message, command.arg);
@@ -1425,7 +1425,7 @@ export class BridgeService {
     ].join("\n"));
   }
 
-  private async handleInterventionSetting(senderId: string, command: ChannelCommand): Promise<void> {
+  private async handleInterventionSetting(senderId: string, command: ChannelCommand, sourceText = ""): Promise<void> {
     const arg = command.arg.trim();
     if (command.name === "role") {
       if (!arg) {
@@ -1454,27 +1454,34 @@ export class BridgeService {
       return;
     }
     if (command.name === "follow") {
-      if (arg && !["on", "off", "sync"].includes(arg)) {
-        await this.reply(senderId, "用法：/follow [on|off|sync]；sync 只同步当前绑定，不创建新任务。");
+      const retryDelivery = arg === "sync --retry-delivery";
+      const action = retryDelivery ? "sync" : arg;
+      if (retryDelivery && !/^\/follow\s+sync\s+--retry-delivery\s*$/i.test(sourceText.trim())) {
+        await this.reply(senderId, "未知投递可能重复通知，请使用显式命令 /follow sync --retry-delivery 确认；未尝试投递。");
         return;
       }
-      if (arg === "on" || arg === "sync") this.assertSessionCapability(senderId, "liveFollow");
-      if (arg === "on" || arg === "off") this.options.stateStore.setSessionFollow(session.id, arg === "on");
+      if (action && !["on", "off", "sync"].includes(action)) {
+        await this.reply(senderId, "用法：/follow [on|off|sync]；未知投递由控制者明确使用 /follow sync --retry-delivery 重试原实例（可能重复通知），不创建新任务。");
+        return;
+      }
+      if (retryDelivery && !await this.requireRole(senderId, "controller")) return;
+      if (action === "on" || action === "sync") this.assertSessionCapability(senderId, "liveFollow");
+      if (action === "on" || action === "off") this.options.stateStore.setSessionFollow(session.id, action === "on");
       const current = this.options.stateStore.getSession(session.id)!;
       const enabled = current.follow !== false;
-      if (arg === "sync" && !enabled) {
+      if (action === "sync" && !enabled) {
         await this.reply(senderId, "实时跟随已关闭，未执行同步。发送 /follow on 开启并同步；/follow sync 不会改变开关或绑定。");
         return;
       }
       const supported = this.runner.backendInfo?.(this.sessionHostId(current)).capabilities.liveFollow !== false;
-      const status = (arg === "on" || arg === "sync") && current.threadId && this.options.sessionFollow
-        ? await this.options.sessionFollow.synchronize(current)
+      const status = (action === "on" || action === "sync") && current.threadId && this.options.sessionFollow
+        ? await this.options.sessionFollow.synchronize(current, retryDelivery ? { confirmUncertainDelivery: true } : undefined)
         : this.options.sessionFollow?.status(current);
       await this.reply(senderId, [
         `实时跟随：${enabled ? "已开启" : "已关闭"}${supported ? "" : "（当前后端不支持）"}。`,
         ...(!current.threadId ? ["当前绑定尚未创建 Codex thread，暂时没有可同步的任务。"]
           : supported && status ? formatFollowStatus(status) : supported ? ["同步状态：当前部署未接入跟随协调器，未确认同步成功。"] : []),
-        ...(arg === "on" || arg === "sync" ? ["未创建新任务、未介入或停止原任务。"] : ["发送 /follow sync 立即同步当前状态；/stream on 开启过程进度。"])
+        ...(action === "on" || action === "sync" ? ["未创建新任务、未介入或停止原任务。"] : ["发送 /follow sync 立即同步当前状态；/stream on 开启过程进度。"])
       ].join("\n\n"));
       return;
     }

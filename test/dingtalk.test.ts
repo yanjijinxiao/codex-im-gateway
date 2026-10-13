@@ -26,6 +26,8 @@ import { parseCommand } from "../src/bridge/channel-commands.js";
 import { ChannelTurnTextStream } from "../src/channels/progress.js";
 import { ChannelProgressError } from "../src/channels/errors.js";
 import { PinnedNetworkLifecycleTransport } from "../src/channels/network-family.js";
+import { DingTalkCardRouting } from "../src/channels/dingtalk-card-routing.js";
+function cardRouting() { const routes = new DingTalkCardRouting("fake"); routes.remember("cid-test", "2", "staff-123", "fake"); return routes; }
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
   assert.deepEqual(dingTalkCardStreamingUpdateBody({
@@ -165,7 +167,7 @@ test("DingTalk rejects HTTP 200 card responses whose business result failed", ()
   assert.throws(() => assertDingTalkCardMutationSucceeded("deliver", {
     statusCode: 200,
     body: { success: true, result: [{ success: false, errorMsg: "carrier rejected" }] }
-  }), /InvalidAcknowledgement/);
+  }), /DeliveryRejected/);
 });
 
 test("DingTalk requires operation-specific receipts, not just HTTP 200", () => {
@@ -204,7 +206,7 @@ test("DingTalk uncertain creation cannot be replayed by finalization or checkpoi
     }, [0], async () => undefined);
     const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
       clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
-      streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient: client,
+      cardRouting: cardRouting(), streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient: client,
       async webhookSender() { throw new Error("must not fall back"); }
     });
     const stream = new ChannelTurnTextStream(adapter.client, "cid-test", { save() {} });
@@ -232,7 +234,7 @@ test("DingTalk missing final acknowledgement keeps the original card and termina
   }, [0], async () => undefined);
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
     cardTemplateId: "template", savedAt: "", enabled: true }, {
-    streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient,
+    cardRouting: cardRouting(), streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient,
     async webhookSender() { throw new Error("must not fall back"); }
   });
   const stream = new ChannelTurnTextStream(adapter.client, "cid-test", { save() {} });
@@ -270,7 +272,7 @@ test("DingTalk delivered one-shot card failure never creates a webhook replaceme
   let creates = 0, webhooks = 0;
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
     cardTemplateId: "template", savedAt: "", enabled: true }, {
-    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    cardRouting: cardRouting(), streamClient: { async getAccessToken() { return "fake"; } } as never,
     cardClient: { async create() { creates++; }, async update() { throw new Error("HTTP 503"); } },
     async webhookSender() { webhooks++; return { messageId: "replacement" }; }
   });
@@ -964,7 +966,7 @@ test("DingTalk retains an acknowledged card when its first progress update fails
     channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
     cardTemplateId: "template", savedAt: "", enabled: true
   }, {
-    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    cardRouting: cardRouting(), streamClient: { async getAccessToken() { return "fake"; } } as never,
     cardClient: {
       async create() { creates++; },
       async update(input) {
@@ -1001,7 +1003,7 @@ test("DingTalk HTTPS allowlist recovery reuses its delivered card without multip
   const adapter = new DingTalkChannelAdapter({
     channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
     cardTemplateId: "template", savedAt: "", enabled: true
-  }, { streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient });
+  }, { cardRouting: cardRouting(), streamClient: { async getAccessToken() { return "fake"; } } as never, cardClient });
   const stream = new ChannelTurnTextStream(adapter.client, "cid-test");
   t.after(() => stream.suspend());
   await stream.progress("开始检查");

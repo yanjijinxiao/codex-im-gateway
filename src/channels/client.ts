@@ -9,7 +9,7 @@ import type { Capability, ChannelCapabilities, ChannelClient, ChannelTextClient,
 export const NO_MEDIA = Object.freeze({ image: "not-implemented", file: "not-implemented", video: "not-implemented", audio: "not-implemented" } as const);
 export const TEXT_CAPABILITIES: ChannelCapabilities = Object.freeze({
   tableLayout: "list",
-  inbound: NO_MEDIA, outbound: NO_MEDIA, progress: "not-implemented", resumableProgress: false,
+  inbound: NO_MEDIA, outbound: NO_MEDIA, progress: "not-implemented", resumableProgress: false, streamBootstrapRecovery: "not-implemented",
   actions: "not-implemented", tasks: "not-implemented", cardUpdates: "not-implemented", typing: "not-implemented"
 });
 
@@ -71,6 +71,11 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
       try {
         await update.call(driver, input);
       } catch (error) { throw channelProgressError(error, input.messageId); }
+    },
+    async resumeTextStream(input) {
+      requireFeature("streamBootstrapRecovery", caps.streamBootstrapRecovery ?? "not-implemented");
+      try { return await acknowledged("resumeTextStream", required(driver.resumeTextStream, "streamBootstrapRecovery").call(driver, input)); }
+      catch (error) { throw channelProgressError(error); }
     },
     sendActionCard(input) {
       // Rendering a table does not imply support for interactive buttons.

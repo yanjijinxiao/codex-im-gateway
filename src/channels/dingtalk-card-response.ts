@@ -22,6 +22,12 @@ export function assertDingTalkCardMutationSucceeded(operation: DingTalkCardOpera
   const body = response.body && typeof response.body === "object" && !Array.isArray(response.body)
     ? response.body as Record<string, unknown> : undefined;
   const result = body?.result;
+  const rejectedDelivery = operation === "deliver" && Array.isArray(result)
+    ? result.find(item => item && typeof item === "object" && item.success === false) as Record<string, unknown> | undefined : undefined;
+  const allDeliveryRejected = operation === "deliver" && Array.isArray(result) && result.length > 0
+    && result.every(item => item && typeof item === "object" && item.success === false);
+  const partialDelivery = operation === "deliver" && Array.isArray(result)
+    && result.some(item => item && typeof item === "object" && item.success === true);
   const acknowledged = operation === "create" ? typeof result === "string" && Boolean(result.trim())
     : operation === "deliver" ? Array.isArray(result) && result.length > 0 && result.every(item =>
       item !== null && typeof item === "object" && (item as { success?: unknown }).success === true)
@@ -31,10 +37,14 @@ export function assertDingTalkCardMutationSucceeded(operation: DingTalkCardOpera
   if (httpOk && body?.success === true && acknowledged && body.code === undefined) return;
   const requestId = safeDiagnosticId(body?.requestId)
     ?? safeDiagnosticId(response.headers?.["x-acs-request-id"] ?? response.headers?.["x-acs-trace-id"]);
-  const code = safeDiagnosticId(body?.code)
+  const safeNestedMessage = typeof rejectedDelivery?.errorMsg === "string"
+    && ["IpNotInWhiteList", "Forbidden.AccessDenied.IpNotInWhiteList", "InvalidRobotCode", "RobotNotInGroup", "PermissionDenied", "RecipientRejected"].includes(rejectedDelivery.errorMsg)
+    ? rejectedDelivery.errorMsg : undefined;
+  const code = safeDiagnosticId(body?.code) ?? safeDiagnosticId(rejectedDelivery?.errorCode ?? rejectedDelivery?.code ?? safeNestedMessage)
+    ?? (rejectedDelivery ? "DeliveryRejected" : undefined)
     ?? (body?.success === false || result === false ? "BusinessRejected" : "InvalidAcknowledgement");
   // Never include provider messages, raw result objects, URLs, or credentials.
-  const explicitRejection = body?.success === false || typeof body?.code === "string" && Boolean(body.code.trim());
+  const explicitRejection = !partialDelivery && (allDeliveryRejected || result === false || body?.success === false || typeof body?.code === "string" && Boolean(body.code.trim()));
   const uncertain = !body || !explicitRejection && (body.success !== true || !acknowledged)
     || status === undefined || status >= 500;
   throw new DingTalkCardMutationError(operation, status, code, requestId, uncertain);

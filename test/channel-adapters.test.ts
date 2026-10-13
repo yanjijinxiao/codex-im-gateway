@@ -12,6 +12,7 @@ import { FeishuCardUpdater } from "../src/channels/feishu-card-updater.js";
 import { WeComChannelAdapter } from "../src/channels/wecom.js";
 import { WeixinChannelAdapter } from "../src/channels/weixin.js";
 import { DingTalkChannelAdapter } from "../src/channels/dingtalk.js";
+import { DingTalkCardRouting } from "../src/channels/dingtalk-card-routing.js";
 import { createChoiceCard } from "../src/channels/action-card.js";
 import type { ChannelAccount } from "../src/weixin/accounts.js";
 import type { ChannelConnectionStatus } from "../src/channels/types.js";
@@ -53,7 +54,9 @@ function fakeAdapters() {
   const text = async ({ text }: { text: string }) => { writes.push(text); return { messageId: "ack" }; };
   const wx = new WeixinChannelAdapter(accounts[0] as never, { inboundDir: "/tmp", maxInboundBytes: 1024,
     apiClient: { sendText: text, async sendTyping() {} } as never });
+  const routing = new DingTalkCardRouting("fake"); routing.remember("user", "1", "user", "fake");
   const dt = new DingTalkChannelAdapter({ ...accounts[1], cardTemplateId: "fake-template" } as never, {
+    cardRouting: routing,
     streamClient: { async getAccessToken() { return "fake"; } } as never,
     cardClient: { async create(input) { writes.push(input.text); }, async update() {} }
   });

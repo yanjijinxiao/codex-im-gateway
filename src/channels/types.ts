@@ -2,6 +2,7 @@ import type { AttachmentKind, ChannelAttachment, ChannelMessage } from "./messag
 import type { ChannelActionCard } from "./action-card.js";
 import type { ChannelTaskCard } from "./task-card.js";
 import type { ChannelTableLayout } from "./table.js";
+import type { ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 
 export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
@@ -16,7 +17,9 @@ export type ChannelTextClient = {
   /** Plain delivery for native text progress or a terminal error notice; never create an AI Card. */
   sendProgressText?(input: ChannelTextInput): Promise<{ messageId: string }>;
   /** Repeated starts with the same streamId must target the same logical card. */
-  startTextStream?(input: ChannelTextInput & { streamId?: string }): Promise<{ messageId: string }>;
+  startTextStream?(input: ChannelStreamStartInput): Promise<{ messageId: string }>;
+  /** Resume a known instance without issuing another create request. */
+  resumeTextStream?(input: ChannelStreamResumeInput): Promise<{ messageId: string }>;
   updateTextStream?(input: {
     toUserId: string;
     messageId: string;
@@ -46,6 +49,7 @@ export type ChannelCapabilities = {
   readonly outbound: Readonly<Record<AttachmentKind, Capability>>;
   readonly progress: Capability;
   readonly resumableProgress: boolean;
+  readonly streamBootstrapRecovery?: Capability;
   readonly actions: Capability;
   readonly tasks: Capability;
   readonly cardUpdates: Capability;

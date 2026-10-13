@@ -8,6 +8,7 @@ import { compactTableCell, renderMarkdownTable, renderTextTable } from "../src/c
 import { feishuActionCard } from "../src/channels/feishu-action-card.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu.js";
 import { DingTalkChannelAdapter, normalizeDingTalkCardContent } from "../src/channels/dingtalk.js";
+import { DingTalkCardRouting } from "../src/channels/dingtalk-card-routing.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import { BridgeService } from "../src/bridge/service.js";
 import { defaultConfig } from "../src/state/config.js";
@@ -36,7 +37,9 @@ test("table rendering bounds Unicode titles and cannot inject Markdown rows or m
 
 test("DingTalk uses a finalized Markdown table without claiming native action buttons", async () => {
   const texts: string[] = [], finals: boolean[] = [];
+  const routes = new DingTalkCardRouting("fake"); routes.remember("user", "1", "user", "fake");
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "t", clientId: "fake", clientSecret: "fake", cardTemplateId: "fake", savedAt: "", enabled: true }, {
+    cardRouting: routes,
     streamClient: { async getAccessToken() { return "fake"; } } as never,
     cardClient: { async create(x) { texts.push(x.text); }, async update(x) { finals.push(x.finalize); } }
   });

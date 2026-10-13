@@ -11,7 +11,7 @@ export function adaptLegacyClient(driver: ChannelTextClient, options: {
   if (driver.capabilities && "channel" in driver) return driver as ChannelClient;
   const api = driver as ChannelTextClient & Partial<WeixinApiClient>;
   const available = (yes: unknown) => yes ? "available" as const : "not-implemented" as const;
-  const native = Object.fromEntries(["sendText", "sendProgressText", "startTextStream", "updateTextStream", "sendImage", "sendActionCard",
+  const native = Object.fromEntries(["sendText", "sendProgressText", "startTextStream", "resumeTextStream", "updateTextStream", "sendImage", "sendActionCard",
     "updateActionCard", "sendTaskCard", "updateTaskCard", "sendTyping", "sendMedia"].flatMap((name) => {
     const method = driver[name as keyof ChannelTextClient];
     return typeof method === "function" ? [[name, method.bind(driver)]] : [];
@@ -22,6 +22,7 @@ export function adaptLegacyClient(driver: ChannelTextClient, options: {
     outbound: { image: available(driver.sendImage || (api.getUploadUrl && api.sendImageMessage)),
       file: available(api.getUploadUrl && api.sendFileMessage), video: available(api.getUploadUrl && api.sendVideoMessage), audio: "not-implemented" },
     progress: available(driver.startTextStream && driver.updateTextStream), resumableProgress: Boolean(driver.resumableTextStream),
+    streamBootstrapRecovery: available(driver.resumeTextStream),
     actions: available(driver.sendActionCard), tasks: available(driver.sendTaskCard),
     cardUpdates: available(driver.updateActionCard || driver.updateTaskCard), typing: available(driver.sendTyping)
   }, {

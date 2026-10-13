@@ -1,3 +1,5 @@
+import type { ChannelStreamFailure } from "./stream-bootstrap.js";
+
 export class ChannelCapabilityError extends Error {
   readonly name = "ChannelCapabilityError";
   constructor(readonly channel: string, readonly capability: string, readonly reason: string) {
@@ -23,7 +25,7 @@ export class ChannelProgressError extends Error {
   readonly name = "ChannelProgressError";
   constructor(readonly retryable: boolean, readonly messageId?: string, readonly retryAfterMs?: number, cause?: unknown,
     /** Adapter opt-in: a route-dependent rejection may be probed on an existing card only. */
-    readonly recoveryProbe = false) {
+    readonly recoveryProbe = false, readonly diagnostic?: ChannelStreamFailure) {
     super(retryable ? "Channel progress temporarily unavailable" : "Channel progress unavailable", { cause });
   }
 }
@@ -31,7 +33,7 @@ export class ChannelProgressError extends Error {
 export function channelProgressError(error: unknown, messageId?: string): ChannelProgressError {
   if (error instanceof ChannelProgressError) {
     return messageId && !error.messageId
-      ? new ChannelProgressError(error.retryable, messageId, error.retryAfterMs, error, error.recoveryProbe)
+      ? new ChannelProgressError(error.retryable, messageId, error.retryAfterMs, error, error.recoveryProbe, error.diagnostic)
       : error;
   }
   if (error instanceof ChannelCapabilityError || error instanceof ChannelContextExpiredError || error instanceof ChannelDeliveryError) {

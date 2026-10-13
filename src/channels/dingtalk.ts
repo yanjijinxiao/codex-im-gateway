@@ -28,6 +28,8 @@ import { InboundMediaTooLargeError } from "./errors.js";
 import { assertDingTalkCardMutationSucceeded, DingTalkCardMutationError } from "./dingtalk-card-response.js";
 export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js";
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
+import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
+import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
 import {
   PinnedNetworkLifecycleTransport,
   type NetworkFamilyPolicy
@@ -65,7 +67,10 @@ export type DingTalkAICardClient = {
     target: DingTalkAICardTarget;
     text: string;
     lifecycleId?: string;
+    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void>;
+  /** Reuses a created outTrackId; never calls createCard. */
+  deliver?(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void>;
   update(input: {
     accessToken: string;
     contentKey: string;
@@ -109,6 +114,7 @@ type DingTalkAdapterOptions = {
   readonly maxInboundBytes?: number;
   readonly now?: () => number;
   readonly apiTransport?: PinnedNetworkLifecycleTransport;
+  readonly cardRouting?: DingTalkCardRouting;
 };
 
 type DingTalkRobotMessage = Omit<RobotMessage, "msgtype" | "text"> & {
@@ -151,6 +157,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   private readonly replyTargets = new Map<string, ReplyTarget>();
   private readonly replyContext = new AsyncLocalStorage<ReplyTarget>();
   private readonly activeNetworkLifecycles = new Set<string>();
+  private readonly cardRouting: DingTalkCardRouting;
 
   constructor(private readonly account: DingTalkAccount, options: DingTalkAdapterOptions = {}) {
     this.streamClient = options.streamClient ?? new DiagnosticDingTalkStreamClient(account.accountId, {
@@ -166,6 +173,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.emotionClient = options.emotionClient ?? new DingTalkRestEmotionClient(this.apiTransport);
     this.mediaClient = options.mediaClient ?? new DingTalkRestInboundMediaClient(this.apiTransport);
     this.inboundDir = options.inboundDir ?? path.join(process.cwd(), ".codex-im-gateway-inbound", account.accountId);
+    this.cardRouting = options.cardRouting ?? new DingTalkCardRouting(account.clientId, options.inboundDir ? path.join(options.inboundDir, "card-routing.json") : undefined);
     this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.now = options.now ?? Date.now;
     this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
@@ -174,7 +182,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
-      resumableProgress: Boolean(account.cardTemplateId)
+      resumableProgress: Boolean(account.cardTemplateId),
+      streamBootstrapRecovery: !this.cardClient.deliver ? "not-implemented" : account.cardTemplateId ? "available" : "not-configured"
     }, this);
   }
 
@@ -264,9 +273,64 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     return this.sendWebhookText(input);
   }
 
-  async startTextStream(input: { toUserId: string; text: string; streamId?: string }): Promise<{ messageId: string }> {
-    if (!this.account.cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
-    return this.createTextCard(this.cardTarget(input.toUserId), input.text, false, input.streamId);
+  async startTextStream(input: ChannelStreamStartInput): Promise<{ messageId: string }> { return this.bootstrapTextStream(input); }
+
+  async resumeTextStream(input: ChannelStreamResumeInput): Promise<{ messageId: string }> {
+    return this.bootstrapTextStream(input, input.bootstrap, input.confirmUncertainDelivery);
+  }
+
+  private async bootstrapTextStream(input: ChannelStreamStartInput, saved?: ChannelStreamBootstrap, confirmUncertainDelivery = false): Promise<{ messageId: string }> {
+    const instanceId = input.streamId ?? `codex_bridge_${crypto.randomUUID().replaceAll("-", "")}`;
+    if (saved && (saved.instanceId !== instanceId || saved.recipientId !== input.toUserId)) throw new ChannelCapabilityError("dingtalk", "streamRecovery", "identity mismatch");
+    let state: ChannelStreamBootstrap = saved ? structuredClone(saved) : { version: 1, instanceId, recipientId: input.toUserId, stage: "create-rejected" };
+    if (saved && (!["created", "delivery-rejected", "delivery-unconfirmed"].includes(saved.stage)
+      || saved.stage === "delivery-unconfirmed" && !confirmUncertainDelivery)) throw new ChannelCapabilityError("dingtalk", "streamRecovery", "unconfirmed delivery requires explicit confirmation");
+    const publish = (stage: ChannelStreamBootstrap["stage"], failure?: ChannelStreamFailure) => {
+      state = { ...state, stage, ...(failure ? { failure } : {}) }; if (!failure) delete state.failure;
+      if (stage === "delivered") state.messageId = instanceId; else delete state.messageId;
+      input.onBootstrap?.(structuredClone(state));
+    };
+    let target: CardTargetContext;
+    try {
+      const data = state.adapterData;
+      if (saved && data) {
+        if (data.accountId !== this.account.accountId || data.clientId !== this.account.clientId
+          || !["group", "user"].includes(data.type) || !data.targetId || !data.robotCode) throw new ChannelCapabilityError("dingtalk", "streamRecovery", "route mismatch");
+        target = { conversationId: data.targetId, conversationType: data.type === "group" ? "2" : "1", actorId: data.targetId, robotCode: data.robotCode };
+      } else target = this.cardTarget(input.toUserId);
+    } catch (error) { publish(state.stage, { operation: saved ? "deliver" : "create", code: "RouteUnconfirmed", uncertain: false }); throw error; }
+    state.adapterData = { accountId: this.account.accountId, clientId: this.account.clientId,
+      type: target.conversationType === "2" ? "group" : "user", targetId: target.conversationType === "2" ? target.conversationId : target.actorId, robotCode: target.robotCode };
+    const providerTarget: DingTalkAICardTarget = target.conversationType === "2"
+      ? { type: "group", conversationId: target.conversationId } : { type: "user", staffId: target.actorId };
+    let operation: ChannelStreamFailure["operation"] = saved ? "deliver" : "create";
+    try {
+      const accessToken = await this.accessToken();
+      if (saved) {
+        if (!this.cardClient.deliver) throw new ChannelCapabilityError("dingtalk", "streamRecovery", "not-implemented");
+        publish("delivery-pending");
+        await this.cardClient.deliver({ accessToken, outTrackId: instanceId, robotCode: target.robotCode, target: providerTarget });
+        publish("delivered");
+      } else {
+        publish("create-pending");
+        await this.cardClient.create({ accessToken, cardTemplateId: this.account.cardTemplateId!, contentKey: this.account.cardContentKey?.trim() || "content",
+          outTrackId: instanceId, robotCode: target.robotCode, target: providerTarget, text: input.text,
+          onStage: stage => { if (stage === "delivery-pending") operation = "deliver"; publish(stage); } });
+        publish("delivered");
+      }
+      operation = "update";
+      await this.cardClient.update({ accessToken, contentKey: this.account.cardContentKey?.trim() || "content", outTrackId: instanceId,
+        text: input.text, finalize: false, error: false });
+      return { messageId: instanceId };
+    } catch (error) {
+      const failure = cardStreamFailure(error, operation);
+      const stage = state.stage === "delivered" ? "delivered" : operation === "create"
+        ? failure.uncertain ? "create-unconfirmed" : "create-rejected"
+        : state.stage === "created" ? "created" : failure.uncertain ? "delivery-unconfirmed" : "delivery-rejected";
+      publish(stage, failure);
+      if (stage === "delivered") throw dingTalkProgressError(error, instanceId);
+      throw new ChannelProgressError(false, undefined, undefined, error, false, failure);
+    }
   }
 
   readonly resumableTextStream = true;
@@ -326,6 +390,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       };
       this.replyTargets.set(conversationId, replyTarget);
       this.replyTargets.set(actorId, replyTarget);
+      this.cardRouting.remember(conversationId, body.conversationType, body.senderStaffId?.trim(), replyTarget.robotCode);
       const message: ChannelMessage = {
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,
@@ -516,14 +581,17 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
 
   private cardTarget(toUserId: string): CardTargetContext {
     const established = this.replyTargets.get(toUserId);
-    if (established) return established;
-    const recipient = toUserId.trim();
-    if (!recipient) throw new Error("钉钉 AI Card 接收目标不能为空");
+    if (established) {
+      if (established.conversationType === "1" && !established.staffId) throw new ChannelCapabilityError("dingtalk", "cardRoute", "单聊员工 ID 尚未确认");
+      return established;
+    }
+    const route = this.cardRouting.get(toUserId.trim());
+    if (!route) throw new ChannelCapabilityError("dingtalk", "cardRoute", "RouteUnconfirmed：请先向当前机器人发送消息确认群聊/单聊路由");
     return {
-      conversationId: recipient,
-      conversationType: recipient.startsWith("cid") ? "2" : "1",
-      actorId: recipient,
-      robotCode: this.account.clientId
+      conversationId: route.targetId,
+      conversationType: route.type === "group" ? "2" : "1",
+      actorId: route.targetId,
+      robotCode: route.robotCode
     };
   }
 }
@@ -532,9 +600,28 @@ function dingTalkProgressError(error: unknown, messageId: string): ChannelProgre
   // IP routing/allowlist state can recover during a turn. Only an acknowledged
   // card may be probed; actual permission/template failures remain permanent.
   if (/\bIpNotInWhiteList\b/i.test(errorDetail(error))) {
-    return new ChannelProgressError(false, messageId, 30_000, error, true);
+    return new ChannelProgressError(false, messageId, 30_000, error, true, cardStreamFailure(error, "update"));
   }
-  return channelProgressError(error, messageId);
+  const policy = channelProgressError(error, messageId);
+  return new ChannelProgressError(policy.retryable, policy.messageId, policy.retryAfterMs, error, policy.recoveryProbe, cardStreamFailure(error, "update"));
+}
+
+function cardStreamFailure(error: unknown, operation: ChannelStreamFailure["operation"]): ChannelStreamFailure {
+  let current = error;
+  for (let i = 0; i < 5; i++) {
+    if (current instanceof DingTalkCardMutationError) return { operation, code: current.code,
+      httpStatus: current.statusCode, requestId: current.requestId, uncertain: current.uncertain };
+    if (current instanceof Error && current.cause) current = current.cause; else break;
+  }
+  const record = current && typeof current === "object" ? current as { code?: unknown; statusCode?: unknown } : undefined;
+  const code = typeof record?.code === "string" && /^[A-Za-z0-9_.-]{1,100}$/.test(record.code) ? record.code : "TransportUnconfirmed";
+  const httpStatus = typeof record?.statusCode === "number" ? record.statusCode : undefined;
+  return { operation, code, httpStatus, uncertain: httpStatus === undefined || httpStatus >= 500 };
+}
+
+function logCardFailure(error: unknown, operation: ChannelStreamFailure["operation"], instanceId?: string): void {
+  console.warn(`[codex-im-gateway] DingTalk AI Card ${JSON.stringify({ timestamp: new Date().toISOString(),
+    event: "operation_failed", outTrackId: instanceId, ...cardStreamFailure(error, operation) })}`);
 }
 
 type DingTalkCardSdkClient = Pick<
@@ -594,6 +681,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     target: DingTalkAICardTarget;
     text: string;
     lifecycleId?: string;
+    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void> {
     const suppliedLifecycleId = input.lifecycleId?.trim();
     const lifecycle = { id: suppliedLifecycleId || input.outTrackId, owned: !suppliedLifecycleId };
@@ -609,21 +697,10 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
         imRobotOpenSpaceModel: { supportForward: true }
       });
       operation = "deliver";
-      await this.mutate(lifecycle.id, "deliver", "/v1.0/card/instances/deliver", "POST", input.accessToken, {
-        outTrackId: input.outTrackId,
-        userIdType: 1,
-        ...(input.target.type === "group" ? {
-          openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
-          imGroupOpenDeliverModel: { robotCode: input.robotCode }
-        } : {
-          openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
-          imRobotOpenDeliverModel: {
-            spaceType: "IM_ROBOT",
-            robotCode: input.robotCode,
-            extension: { dynamicSummary: "true" }
-          }
-        })
-      });
+      input.onStage?.("created");
+      input.onStage?.("delivery-pending");
+      await this.deliver(input);
+      input.onStage?.("delivered");
       this.inputingCards.delete(input.outTrackId);
     } catch (error) {
       this.cardLifecycles.delete(input.outTrackId);
@@ -633,6 +710,19 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       if (operation === "create" && error instanceof DingTalkCardMutationError && !error.uncertain) throw error;
       throw new ChannelProgressError(false, undefined, undefined, error);
     }
+  }
+
+  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void> {
+    const lifecycle = this.cardLifecycles.get(input.outTrackId) ?? { id: input.outTrackId, owned: true };
+    this.cardLifecycles.set(input.outTrackId, lifecycle);
+    await this.mutate(lifecycle.id, "deliver", "/v1.0/card/instances/deliver", "POST", input.accessToken, {
+      outTrackId: input.outTrackId, userIdType: 1,
+      ...(input.target.type === "group" ? { openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
+        imGroupOpenDeliverModel: { robotCode: input.robotCode } } : {
+        openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
+        imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode: input.robotCode, extension: { dynamicSummary: "true" } }
+      })
+    });
   }
 
   async update(input: {
@@ -764,6 +854,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     accessToken: string,
     body: unknown
   ): Promise<void> {
+    try {
     const response = await this.transport.request(lifecycleId, `https://api.dingtalk.com${pathname}`, {
       method,
       signal: AbortSignal.timeout(30_000),
@@ -782,6 +873,8 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       outTrackId: (body as { outTrackId?: string }).outTrackId, httpStatus: response.status,
       requestId: safeCardRequestId(response.headers.get("x-acs-request-id"))
     })}`);
+    } catch (error) { logCardFailure(error, operation === "stream" || operation === "state" ? "update" : operation,
+      (body as { outTrackId?: string }).outTrackId); throw error; }
   }
 }
 
@@ -811,6 +904,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     robotCode: string;
     target: DingTalkAICardTarget;
     text: string;
+    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void> {
     let operation: "create" | "deliver" = "create";
     try {
@@ -834,7 +928,19 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       const createResponse = await this.client.createCardWithOptions(createRequest, createHeaders, this.runtime);
       assertDingTalkCardMutationSucceeded("create", createResponse);
       operation = "deliver";
+      input.onStage?.("created");
+      input.onStage?.("delivery-pending");
+      await this.deliver(input);
+      input.onStage?.("delivered");
+      this.inputingCards.delete(input.outTrackId);
+    } catch (error) {
+      logCardFailure(error, operation, input.outTrackId);
+      if (operation === "create" && error instanceof DingTalkCardMutationError && !error.uncertain) throw error;
+      throw new ChannelProgressError(false, undefined, undefined, error);
+    }
+  }
 
+  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void> {
       const deliverRequest = new DingTalk.card_1_0.DeliverCardRequest({
         outTrackId: input.outTrackId,
         userIdType: 1,
@@ -855,11 +961,6 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       });
       const deliverResponse = await this.client.deliverCardWithOptions(deliverRequest, deliverHeaders, this.runtime);
       assertDingTalkCardMutationSucceeded("deliver", deliverResponse);
-      this.inputingCards.delete(input.outTrackId);
-    } catch (error) {
-      if (operation === "create" && error instanceof DingTalkCardMutationError && !error.uncertain) throw error;
-      throw new ChannelProgressError(false, undefined, undefined, error);
-    }
   }
 
   async update(input: {

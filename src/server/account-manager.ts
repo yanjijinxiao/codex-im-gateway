@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { migrateCardBootstrap } from "./migrate-card-bootstrap.js";
 import { InboundReferenceStore } from "../bridge/inbound-references.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -296,6 +297,7 @@ export class AccountManager {
   constructor(private readonly options: AccountManagerOptions) {
     this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
+    migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       subscriptions: () => this.threadSubscriptions(),
@@ -412,13 +414,13 @@ export class AccountManager {
       sessionControls: this.sessionControls,
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
-        synchronize: async (session) => {
+        synchronize: async (session, recovery) => {
           if (store.getActiveSession(session.senderId)?.id !== session.id) return {
             status: "failed" as const, failure: { code: "binding-changed" as const, message: "当前对话已切换绑定，未同步旧会话。" }
           };
           this.ensureCodexSessionMonitor();
           this.refreshDesktopRequestSubscriptions();
-          return this.threadEvents.synchronize(JSON.stringify([account.accountId, session.id]));
+          return this.threadEvents.synchronize(JSON.stringify([account.accountId, session.id]), recovery);
         }
       },
       onSubscriptionsChanged: () => {
