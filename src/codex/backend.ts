@@ -84,10 +84,23 @@ export type CodexSessionCatalog = {
 };
 
 export type CodexStopResult = "interrupted" | "not-active";
-export type CodexSteerResult = {
+export type CodexInputReceipt = {
   status: "accepted";
   threadId: string;
   turnId: string;
+};
+export type CodexSteerResult = CodexInputReceipt;
+
+/** Ordinary input targets a conversation, not a caller-selected execution.
+ * The native owner selects its receiving turn; this is NOT compare-and-steer.
+ */
+export type CodexThreadMessageInput = {
+  threadId: string;
+  prompt: string;
+  cwd: string;
+  clientUserMessageId: string;
+  /** Recheck binding identity immediately before the native write. */
+  assertCurrent?: () => void;
 };
 
 export type CodexSteerInput = {
@@ -382,6 +395,7 @@ export interface CodexThreadContinuation {
   readonly id: "desktop-relay";
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
   steer(input: CodexSteerInput): Promise<CodexSteerResult>;
+  submitThreadMessage?(input: CodexThreadMessageInput): Promise<CodexInputReceipt>;
   stop(threadId?: string): Promise<CodexStopResult>;
   close(): void;
 }
@@ -421,6 +435,8 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
   steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult>;
+  /** Thread-scoped ordinary input; never falls back to starting or queuing a task. */
+  submitThreadMessage?(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt>;
   stop(threadId?: string, hostId?: string): Promise<CodexStopResult>;
   runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult>;
   warmUp(cwd: string, hostId?: string): Promise<void>;

@@ -5,7 +5,7 @@ import path from "node:path";
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
-import { CodexTurnExecutionError } from "../codex/backend.js";
+import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
 import { ChannelApprovalController, type ApprovalDeliveryResult } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
@@ -1506,7 +1506,7 @@ export class BridgeService {
       const hostId = this.sessionHostId(session);
       const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
         && (await this.runner.inspectThread(session.threadId, hostId)).executionOwner === "desktop";
-      if (desktopOwned || this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
+      if ((desktopOwned && !this.runner.submitThreadMessage) || this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
         await this.reply(senderId, "当前后端不支持安全介入，处理策略未改变。请在实际持有会话的 Codex 中操作，或等当前任务完成后发送。");
         return;
       }
@@ -1533,6 +1533,10 @@ export class BridgeService {
     let state: Awaited<ReturnType<NonNullable<CodexBridgeBackend["inspectThread"]>>>;
     try { state = await this.runner.inspectThread(session.threadId, hostId); }
     catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId: session.threadId }); }
+    if (state.threadId !== session.threadId || state.persistence !== "active" || state.internal) {
+      await this.reply(message.senderId, "绑定的会话当前不可接收消息，未提交；绑定未删除，请查看 /status。");
+      return true;
+    }
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
       return true;
@@ -1556,6 +1560,10 @@ export class BridgeService {
     }
     const prompt = buildPromptParts("", await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), []).prompt;
     if (policy === "steer") {
+      if (state.executionOwner === "desktop" && this.runner.submitThreadMessage) {
+        await this.submitActiveThreadMessage(message, session, prompt);
+        return true;
+      }
       await this.handleSteerCommand(message, prompt, state.activeTurnId);
       return true;
     }
@@ -1581,6 +1589,33 @@ export class BridgeService {
       ].join("，") + "。"
     }));
     return true;
+  }
+
+  private async submitActiveThreadMessage(message: ChannelMessage, session: ManagedSession, prompt: string): Promise<void> {
+    const hostId = this.sessionHostId(session);
+    const assertCurrent = () => {
+      const current = this.executionSession(message.senderId);
+      if (current?.id !== session.id || current.threadId !== session.threadId
+        || (this.sessionHostId(current) ?? "local") !== (hostId ?? "local")) {
+        throw new CodexInterventionError("绑定已切换，未向旧会话提交消息，请重新发送。");
+      }
+    };
+    assertCurrent();
+    const result = await this.controls.submit(
+      JSON.stringify([hostId ?? "local", session.threadId]),
+      JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
+      async () => {
+        assertCurrent();
+        const receipt = await this.runner.submitThreadMessage!({ threadId: session.threadId!, prompt, cwd: session.workspace,
+          clientUserMessageId: message.id, assertCurrent }, hostId);
+        if (receipt.status !== "accepted" || receipt.threadId !== session.threadId || !receipt.turnId) {
+          throw new CodexCommunicationError("submission", "thread/message", session.threadId, undefined,
+            { code: "InvalidAcknowledgement" });
+        }
+        return receipt;
+      });
+    this.options.stateStore.setSessionPromptPreview(session.id, prompt);
+    await this.reply(message.senderId, `消息已由原 Codex 会话接收。\nTurn：${result.turnId}\n继续跟随原会话；未新建任务或自动排队。`);
   }
 
   private async handleInterventionChoice(message: ChannelMessage, arg: string): Promise<void> {

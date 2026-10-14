@@ -11,6 +11,8 @@ import type {
   CodexRunnerInput,
   CodexSteerInput,
   CodexSteerResult,
+  CodexThreadMessageInput,
+  CodexInputReceipt,
   CodexStopResult,
   CodexThreadContinuation,
   CodexThreadSnapshot,
@@ -86,20 +88,8 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private async readThreadSnapshotOnce(threadId: string): Promise<CodexThreadSnapshot | undefined> {
     const connection = new DesktopIpcConnection(this.socketPath, this.observationTimeoutMs);
     this.observationConnections.add(connection);
-    let timer: NodeJS.Timeout | undefined;
     try {
-      const snapshot = await Promise.race([(async () => {
-        await connection.initialize();
-        await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
-        return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
-      })(), new Promise<never>((_, reject) => {
-        // A single end-to-end budget, not one full timeout per handshake phase.
-        timer = setTimeout(() => {
-          reject(new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
-            new Error("Desktop owner observation timed out")));
-          connection.close();
-        }, this.observationTimeoutMs);
-      })]);
+      const snapshot = await observeDesktopOwner(connection, threadId, this.observationTimeoutMs);
       this.unavailableOwnerLogTimes.delete(threadId);
       return snapshot;
     } catch (error) {
@@ -119,7 +109,6 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       if (isDesktopOwnerUnavailable(error) || /thread-owner-discovery timed out/.test(String(error))) return undefined;
       throw error;
     } finally {
-      if (timer) clearTimeout(timer);
       connection.close();
       this.observationConnections.delete(connection);
     }
@@ -246,6 +235,37 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     // It ignores expectedTurnId, so even a read-before-write check is unsafe.
     // Only the shared daemon's official turn/steer can enforce this guard.
     throw new CodexInterventionError("当前 Desktop 转发协议不支持指定任务的安全介入。请使用 /queue 排到下一轮，或通过共享 App Server 后端介入。");
+  }
+
+  async submitThreadMessage(input: CodexThreadMessageInput): Promise<CodexInputReceipt> {
+    if (this.closed) throw new Error("Codex Desktop runner is closed");
+    const connection = new DesktopIpcConnection(this.socketPath, this.requestTimeoutMs);
+    let phase: "preflight" | "submission" = "preflight";
+    try {
+      const snapshot = await observeDesktopOwner(connection, input.threadId, this.observationTimeoutMs);
+      if (snapshot.state.runtimeStatus !== "active" || !snapshot.state.activeTurnId) {
+        throw new CodexInterventionError("当前会话已经没有可确认的活动轮次，消息未提交。未新建任务或自动排队，请查看 /status 后重新发送。");
+      }
+      input.assertCurrent?.();
+      phase = "submission";
+      // A conversation-targeted user message, like ordinary native UI input.
+      // Do not put expectedTurnId here: v1 ignores it. Guarded /steer remains
+      // unsupported. Never retry or fall back to start-turn after this write.
+      const response = await connection.request("thread-follower-steer-turn", 1, {
+        conversationId: input.threadId,
+        input: [{ type: "text", text: input.prompt, text_elements: [] }],
+        restoreMessage: { context: {} },
+        clientUserMessageId: input.clientUserMessageId
+      });
+      const turnId = followerTurnId(response);
+      if (!turnId) throw new CodexCommunicationError("submission", "thread-follower-steer-turn", input.threadId,
+        undefined, { code: "InvalidAcknowledgement" });
+      return { status: "accepted", threadId: input.threadId, turnId };
+    } catch (error) {
+      throw communicationError(error, { phase, operation: phase === "submission" ? "thread-follower-steer-turn" : "desktop/thread-state", threadId: input.threadId });
+    } finally {
+      connection.close();
+    }
   }
 
   /**
@@ -376,6 +396,26 @@ type FollowerRequest = {
   request: Record<string, unknown>;
   onSnapshot?: (snapshot: CodexThreadSnapshot) => void;
 };
+
+/** One read-only preflight deadline shared by observation and ordinary input. */
+async function observeDesktopOwner(connection: DesktopIpcConnection, threadId: string, timeoutMs: number): Promise<CodexThreadSnapshot> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([(async () => {
+      await connection.initialize();
+      await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
+      return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+    })(), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
+          new Error("Desktop owner observation timed out")));
+        connection.close();
+      }, timeoutMs);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);

@@ -8,11 +8,12 @@ import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.j
 import type { ChannelActionCard } from "../src/channels/action-card.js";
 import { APP_SERVER_BACKEND_CAPABILITIES, EXEC_BACKEND_CAPABILITIES,
   type CodexRunnerInput, type CodexThreadState } from "../src/codex/backend.js";
+import type { CodexThreadMessageInput, CodexInputReceipt } from "../src/codex/backend.js";
 import { defaultConfig } from "../src/state/config.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 
-function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" = "dingtalk", backend: "app-server" | "exec" = "app-server") {
+function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" = "dingtalk", backend: "app-server" | "exec" = "app-server", nativeThreadMessages = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-message-lifecycle-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(path.join(root, "state"));
@@ -23,6 +24,11 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
   const texts: string[] = [], cards: ChannelActionCard[] = [], runs: CodexRunnerInput[] = [];
   let subscriptionsChanged = 0, steers = 0, sequence = 0;
   const queued: Array<{ id: string; clientUserMessageId: string; input: Array<{ type: string; text: string }> }> = [];
+  const threadMessages: CodexThreadMessageInput[] = [];
+  let threadMessageImpl = async (input: CodexThreadMessageInput): Promise<CodexInputReceipt> => {
+    input.assertCurrent?.(); threadMessages.push(input);
+    return { status: "accepted", threadId: input.threadId, turnId: "native-turn" };
+  };
   let state: CodexThreadState = { threadId: "thread", persistence: "active", runtimeStatus: "active", activeFlags: [], activeTurnId: "old-turn" };
   let runImpl = async (input: CodexRunnerInput) => ({ threadId: input.threadId ?? "new-thread", turnId: "new-turn", text: "完成", raw: "" });
   const build = (stateStore = store) => new BridgeService({
@@ -38,6 +44,7 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
       async inspectThread() { return state; },
       async run(input: CodexRunnerInput) { runs.push(input); return runImpl(input); },
       async steer() { steers++; return { status: "accepted", threadId: "thread", turnId: "old-turn" }; },
+      ...(nativeThreadMessages ? { submitThreadMessage: (input: CodexThreadMessageInput) => threadMessageImpl(input) } : {}),
       async getRuntimeInfo() { return {}; },
       async getHistory() { return []; },
       async getHistoryPage() { return { messages: [] }; },
@@ -56,12 +63,13 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
     } as never
   });
   let service = build();
-  return { paths, store, project, session, texts, cards, runs, queued,
+  return { paths, store, project, session, texts, cards, runs, queued, threadMessages,
     get changes() { return subscriptionsChanged; }, get steers() { return steers; },
     setState(next: Partial<CodexThreadState>) { state = { ...state, ...next }; },
     setRun(fn: typeof runImpl) { runImpl = fn; },
+    setThreadMessage(fn: typeof threadMessageImpl) { threadMessageImpl = fn; },
     restart() { service = build(new RuntimeStateStore(paths)); },
-    send(text: string) { return service.handleMessage({ id: String(++sequence), senderId: "actor", replyTargetId: "chat", text, attachments: [], raw: {} }); }
+    send(text: string, id = String(++sequence)) { return service.handleMessage({ id, senderId: "actor", replyTargetId: "chat", text, attachments: [], raw: {} }); }
   };
 }
 
@@ -120,6 +128,20 @@ test("Desktop-owned messages do not offer unsupported actions; an orphan UI tail
 });
 
 for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
+  test(`${channel}: ordinary busy Desktop input uses the native conversation port, not /steer or queue`, async t => {
+    const f = fixture(t, channel, "app-server", true); f.setState({ executionOwner: "desktop" });
+    await f.send("补充要求", "same-im-message");
+    assert.equal(f.threadMessages.length, 1); assert.match(f.threadMessages[0].prompt, /补充要求/);
+    assert.equal(f.threadMessages[0].threadId, "thread"); assert.equal(f.threadMessages[0].clientUserMessageId, "same-im-message");
+    assert.equal("expectedTurnId" in f.threadMessages[0], false);
+    assert.match(f.texts.at(-1)!, /原 Codex 会话接收.*\nTurn：native-turn/);
+    f.restart(); await f.send("补充要求", "same-im-message");
+    assert.equal(f.threadMessages.length, 1, "accepted native input is not replayed after restart");
+    await f.send("/policy steer"); assert.match(f.texts.at(-1)!, /运行中消息处理方式：steer/);
+    await f.send("/steer 仅介入指定任务"); assert.match(f.texts.at(-1)!, /不支持指定轮次的安全介入/);
+    assert.equal(f.threadMessages.length, 1); assert.equal(f.steers, 0); assert.equal(f.runs.length, 0);
+    assert.equal(f.queued.length, 0); assert.equal(f.cards.length, 0);
+  });
   test(`${channel}: the default busy-message policy is steer, with no ask card or new turn`, async t => {
     const f = fixture(t, channel);
     await f.send("补充要求");
@@ -133,6 +155,44 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
     f.restart(); await f.send("/queue list"); assert.match(f.texts.at(-1)!, /queue-1.*queued/);
   });
 }
+
+test("unknown native ordinary-message receipts are not replayed on gateway restart", async t => {
+  const f = fixture(t, "dingtalk", "app-server", true); f.setState({ executionOwner: "desktop" });
+  let writes = 0;
+  f.setThreadMessage(async () => { writes++; throw new Error("IPC connection closed before response"); });
+  await assert.rejects(f.send("follow-up", "lost-receipt"));
+  f.restart(); await assert.rejects(f.send("follow-up", "lost-receipt"), /结果尚未确认/);
+  assert.equal(writes, 1); assert.equal(f.runs.length, 0); assert.equal(f.queued.length, 0);
+  assert.equal(f.store.getActiveSession("chat")?.threadId, "thread");
+});
+
+test("ordinary message input rejects a cross-thread receipt and retains it as uncertain", async t => {
+  const f = fixture(t, "dingtalk", "app-server", true); f.setState({ executionOwner: "desktop" });
+  let writes = 0;
+  f.setThreadMessage(async () => { writes++; return { status: "accepted", threadId: "other-thread", turnId: "turn" }; });
+  await assert.rejects(f.send("message", "invalid-scope"), { name: "CodexCommunicationError", submission: "unconfirmed" });
+  f.restart(); await assert.rejects(f.send("message", "invalid-scope"), /结果尚未确认/);
+  assert.equal(writes, 1); assert.equal(f.runs.length, 0); assert.equal(f.store.getActiveSession("chat")?.threadId, "thread");
+});
+
+test("binding changes during native ordinary-message preflight invalidate the write", async t => {
+  const f = fixture(t, "dingtalk", "app-server", true); f.setState({ executionOwner: "desktop" });
+  let release!: () => void, entered!: () => void;
+  const starting = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let writes = 0;
+  f.setThreadMessage(async input => {
+    entered(); await gate; input.assertCurrent?.(); writes++;
+    return { status: "accepted", threadId: input.threadId, turnId: "turn" };
+  });
+  const message = f.send("ordinary message");
+  // Attach a rejection handler before releasing the suspended preflight.
+  const rejected = assert.rejects(message, /绑定已切换/);
+  await starting; await f.send("/new"); release(); await rejected;
+  assert.equal(writes, 0); assert.equal(f.runs.length, 0); assert.equal(f.queued.length, 0);
+  assert.notEqual(f.store.getActiveSession("chat")?.id, f.session.id);
+  assert.equal(f.store.getSession(f.session.id)?.threadId, "thread");
+});
 
 test("default steer never silently falls back for Desktop or exec", async t => {
   const desktop = fixture(t); desktop.setState({ executionOwner: "desktop" });

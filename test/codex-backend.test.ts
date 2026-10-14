@@ -99,6 +99,29 @@ test("declares the protocol capabilities of the two Codex backends explicitly", 
   assert.equal(APP_SERVER_BACKEND_CAPABILITIES.developerInstructions, true);
 });
 
+test("thread-scoped input keeps App Server's guarded writer and never falls back on failure", async t => {
+  let turnId = "current", fail = false, writes = 0, desktopWrites = 0;
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: {
+    async inspectThread() { return { threadId: "thread", persistence: "active", runtimeStatus: turnId ? "active" : "idle",
+      activeTurnId: turnId || undefined, activeFlags: [] }; },
+    async steer(input: import("../src/codex/backend.js").CodexSteerInput) {
+      writes++; assert.equal(input.expectedTurnId, turnId);
+      if (fail) throw new Error("active writer changed");
+      return { status: "accepted", threadId: input.threadId, turnId };
+    }, close() {}
+  } as never, desktopRunner: {
+    async submitThreadMessage() { desktopWrites++; }, async inspectThread() { return undefined; }, close() {}
+  } as never });
+  t.after(() => router.close());
+  const input = { threadId: "thread", prompt: "message", cwd: "/tmp", clientUserMessageId: "id" };
+  assert.equal((await router.submitThreadMessage(input)).turnId, "current");
+  fail = true;
+  await assert.rejects(router.submitThreadMessage(input), /active writer changed/);
+  turnId = "";
+  await assert.rejects(router.submitThreadMessage(input), /没有可确认的活动任务/);
+  assert.equal(writes, 2); assert.equal(desktopWrites, 0);
+});
+
 test("auto app-server transport uses stdio when the managed daemon is unavailable", () => {
   const transport = resolveLocalAppServerTransport({
     mode: "auto",
@@ -254,6 +277,11 @@ test("Desktop observations and writes use the real owner while CLI remains isola
     async readThreadSnapshot() { calls.push("desktop-read"); return { state: desktopState, turns: [] }; },
     async run(input: CodexRunnerInput) { calls.push("desktop-run"); assert.equal(input.prompt, "你是 GPT？"); return { text: "ok", raw: "" }; },
     async steer() { calls.push("desktop-steer"); throw new Error("safe steering unsupported"); },
+    async submitThreadMessage(input: import("../src/codex/backend.js").CodexThreadMessageInput) {
+      calls.push("desktop-message"); input.assertCurrent?.();
+      assert.equal("expectedTurnId" in input, false);
+      return { status: "accepted" as const, threadId: input.threadId, turnId: "native-selected" };
+    },
     async stop(_thread?: string, expectedTurnId?: string) { calls.push("desktop-stop:" + expectedTurnId); return "interrupted" as const; },
     close() {}
   };
@@ -269,6 +297,10 @@ test("Desktop observations and writes use the real owner while CLI remains isola
   assert.equal((await router.readThreadSnapshot("thread")).state.executionOwner, "desktop");
   await router.run({ threadId: "thread", cwd: "/tmp", prompt: "你是 GPT？" });
   await assert.rejects(router.steer({ threadId: "thread", prompt: "extra", expectedTurnId: "desktop-turn" }), /safe steering unsupported/);
+  let checked = 0;
+  assert.equal((await router.submitThreadMessage({ threadId: "thread", prompt: "ordinary", cwd: "/tmp",
+    clientUserMessageId: "im-id", assertCurrent: () => { checked++; } })).turnId, "native-selected");
+  assert.equal(checked, 2, "the facade and actual writer both revalidate the binding");
   assert.equal(await router.stop("thread"), "interrupted");
   desktopState.runtimeStatus = "idle";
   desktopState.activeTurnId = undefined;
@@ -284,6 +316,7 @@ test("Desktop observations and writes use the real owner while CLI remains isola
   t.after(() => cliRouter.close());
   await cliRouter.inspectThread("thread");
   await cliRouter.readThreadSnapshot("thread");
+  await assert.rejects(cliRouter.submitThreadMessage({ threadId: "thread", prompt: "ordinary", cwd: "/tmp", clientUserMessageId: "im-id" }), /turnSteering/);
   await cliRouter.run({ threadId: "thread", cwd: "/tmp", prompt: "ordinary" });
   await cliRouter.stop("thread");
   assert.deepEqual(calls, ["cli-inspect", "cli-read", "cli-run", "cli-stop"]);

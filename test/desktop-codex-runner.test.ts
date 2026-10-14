@@ -251,7 +251,7 @@ test("Desktop paginated owner history is ordered by turn time, and orphan UI tai
 });
 
 async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<string, unknown>, accepted: unknown = {}, earlySnapshot = false,
-  options: { wrongHostFirst?: boolean; delayMs?: number; observationTimeoutMs?: number } = {}) {
+  options: { wrongHostFirst?: boolean; delayMs?: number; observationTimeoutMs?: number; steerReply?: unknown } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-desktop-state-"));
   fs.mkdirSync(path.join(root, "sessions"));
   const socketPath = path.join(root, "ipc.sock");
@@ -284,6 +284,9 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
           send(ownerSnapshot("thread", snapshot()));
         }
         if (message.method === "thread-follower-start-turn" && accepted !== null) writeFrame(socket, response(message, accepted));
+        if (message.method === "thread-follower-steer-turn" && options.steerReply !== null) {
+          writeFrame(socket, response(message, options.steerReply ?? { result: { turnId: "native-selected-turn" } }));
+        }
       }
     });
   });
@@ -298,6 +301,55 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
   });
   return { runner, received };
 }
+
+test("ordinary Desktop input uses one native thread-scoped write, without changing guarded steering", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "active" },
+    turns: [{ turnId: "observed-turn", status: "inProgress", items: [] }] }));
+  let checks = 0;
+  const receipt = await runner.submitThreadMessage({ threadId: "thread", prompt: "ordinary follow-up", cwd: "/tmp/project",
+    clientUserMessageId: "original-im-id", assertCurrent: () => { checks++; } });
+  assert.deepEqual(receipt, { status: "accepted", threadId: "thread", turnId: "native-selected-turn" });
+  assert.equal(checks, 1);
+  const writes = received.filter(m => m.method === "thread-follower-steer-turn");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].version, 1);
+  assert.deepEqual(writes[0].params, { conversationId: "thread", input: [{ type: "text", text: "ordinary follow-up", text_elements: [] }],
+    restoreMessage: { context: {} }, clientUserMessageId: "original-im-id" });
+  await assert.rejects(runner.steer({ threadId: "thread", expectedTurnId: "observed-turn", prompt: "guarded" }), /不支持指定任务的安全介入/);
+  assert.equal(received.filter(m => /start-turn|interrupt-turn/.test(String(m.method))).length, 0);
+  assert.equal(received.filter(m => m.method === "thread-follower-steer-turn").length, 1);
+});
+
+for (const invalid of [null, {}]) {
+  test(`Desktop ordinary input preserves an unknown receipt (${invalid === null ? "timeout" : "invalid"}) without replay or task start`, async t => {
+    const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "active" },
+      turns: [{ turnId: "active", status: "inProgress", items: [] }] }), {}, false, { steerReply: invalid });
+    await assert.rejects(runner.submitThreadMessage({ threadId: "thread", prompt: "message", cwd: "/tmp", clientUserMessageId: "id" }),
+      error => error instanceof CodexCommunicationError && error.phase === "submission" && error.submission === "unconfirmed");
+    assert.equal(received.filter(m => m.method === "thread-follower-steer-turn").length, 1);
+    assert.equal(received.filter(m => /start-turn|interrupt-turn/.test(String(m.method))).length, 0);
+  });
+}
+
+test("Desktop ordinary input rejects idle/orphan runtime and changed bindings before writing", async t => {
+  let active = false;
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: active ? "active" : "idle" },
+    turns: [{ turnId: active ? "turn" : null, status: "inProgress", items: [] }] }));
+  const input = { threadId: "thread", prompt: "message", cwd: "/tmp", clientUserMessageId: "id" };
+  await assert.rejects(runner.submitThreadMessage(input), /没有可确认的活动轮次/);
+  active = true;
+  await assert.rejects(runner.submitThreadMessage({ ...input, assertCurrent: () => { throw new Error("binding changed"); } }), /binding changed/);
+  assert.equal(received.filter(m => /steer-turn|start-turn|interrupt-turn/.test(String(m.method))).length, 0);
+});
+
+test("ordinary Desktop input uses the shared total preflight budget and does not write after expiry", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "active" },
+    turns: [{ turnId: "active", status: "inProgress", items: [] }] }), {}, false, { delayMs: 100, observationTimeoutMs: 250 });
+  await assert.rejects(runner.submitThreadMessage({ threadId: "thread", prompt: "message", cwd: "/tmp", clientUserMessageId: "id" }),
+    error => error instanceof CodexCommunicationError && error.operation === "thread/owner-snapshot" && error.submission === "not-submitted");
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(received.filter(m => /steer-turn|start-turn|interrupt-turn/.test(String(m.method))).length, 0);
+});
 
 test("owner snapshots published before the discovery response are not lost", async t => {
   const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }), {}, true);

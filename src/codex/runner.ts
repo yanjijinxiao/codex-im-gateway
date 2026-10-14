@@ -7,7 +7,7 @@ import {
 import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
-import { CodexBackendCapabilityError, CodexOwnerUnavailableError } from "./backend.js";
+import { CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError } from "./backend.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
@@ -24,6 +24,8 @@ import type {
   CodexRunnerInput,
   CodexSteerInput,
   CodexSteerResult,
+  CodexThreadMessageInput,
+  CodexInputReceipt,
   CodexNativeQueue,
   CodexQueueAddInput,
   CodexQueuedRunInput,
@@ -49,7 +51,7 @@ export type CodexBackendRouterOptions = {
   timeoutMs?: number;
   codexHome?: string;
   desktopRunner?: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage">>;
   appServerBackend?: CodexAppServerBackend;
   execBackend?: CodexBackendAdapter;
   remoteTransportResolver?: typeof resolveRemoteCodexTransport;
@@ -70,7 +72,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly appServer: CodexAppServerBackend;
   private readonly exec: CodexBackendAdapter;
   private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
   private readonly remoteTransports = new Map<string, ReturnType<typeof resolveRemoteCodexTransport>>();
   private readonly runTails = new Map<string, Promise<void>>();
@@ -155,6 +157,22 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       if (!isDesktopSteerCandidateError(error)) throw error;
       return this.desktop.steer(input);
     }
+  }
+
+  async submitThreadMessage(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt> {
+    if (this.selectedBackend === "exec") throw new CodexBackendCapabilityError("turnSteering", "exec");
+    const state = await this.inspectThread(input.threadId, hostId);
+    if (state.threadId !== input.threadId || state.persistence !== "active" || state.runtimeStatus !== "active" || !state.activeTurnId) {
+      throw new CodexInterventionError("目标会话没有可确认的活动任务，消息未提交；未启动或排队新任务。");
+    }
+    input.assertCurrent?.();
+    if (!isRemoteHost(hostId) && state.executionOwner === "desktop") {
+      if (!this.desktop.submitThreadMessage) throw new CodexInterventionError("当前 Desktop 适配器不支持普通会话消息，未提交。");
+      return this.desktop.submitThreadMessage(input);
+    }
+    // Other owners retain official compare-and-steer, with no foreign writer
+    // fallback if ownership or turn identity changes during the request.
+    return this.appServerFor(hostId).steer({ ...input, expectedTurnId: state.activeTurnId });
   }
 
   private nativeQueue(hostId?: string): CodexAppServerBackend & CodexNativeQueue {
