@@ -6,7 +6,7 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
-test("background follow recovers five locally unsent old results without force or duplicate notices", async t => {
+test("background and forced follow retain five unsent historical results without creating a notification burst", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-unsent-route-recovery-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const filePath = path.join(root, "follow.json");
@@ -21,14 +21,16 @@ test("background follow recovers five locally unsent old results without force o
   }]));
   fs.writeFileSync(filePath, JSON.stringify({ binding: {
     eventVersion: 2, deliveryVersion: 1, hostId: "local", threadId: "thread", initialized: true,
-    sequence: 0, delivered: [], completed: [], baseline: [], pendingTerminals
+    sequence: 0, delivered: [], completed: [], baseline: [], pendingTerminals: { ...pendingTerminals,
+      "visible-old-turn": { text: "原卡真实答案", checkpoint: { streamId: "visible-card", messageId: "visible-card", startedAt: Date.now(),
+        progressEntries: [], thought: "", answerPreview: "", finished: false } } }
   } }));
-  const starts: string[] = [], notices: string[] = [];
+  const starts: string[] = [], notices: string[] = [], updates: string[] = [];
   const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
     client: { resumableTextStream: true,
       async sendText(input) { notices.push(input.text); return { messageId: "notice" }; },
       async startTextStream(input) { starts.push(input.streamId!); return { messageId: input.streamId! }; },
-      async updateTextStream() {}
+      async updateTextStream(input) { assert.equal(input.messageId, "visible-card"); updates.push(input.text); }
     }
   };
   const hub = new ThreadEventHub({ filePath, subscriptions: () => [sub], backend: () => ({
@@ -36,13 +38,73 @@ test("background follow recovers five locally unsent old results without force o
   }) });
   t.after(() => hub.stop());
   await hub.refresh();
-  for (let i=0; i<20 && Object.keys(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.pendingTerminals).length; i++) {
-    await new Promise(resolve => setImmediate(resolve));
-  }
-  assert.deepEqual(starts.sort(), ["logical-0", "logical-1", "logical-2", "logical-3", "logical-4"]);
+  await hub.synchronize("binding");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(starts, []);
   assert.deepEqual(notices, []);
-  assert.equal(Object.keys(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.pendingTerminals).length, 0);
-  await hub.refresh(); assert.equal(starts.length, 5);
+  assert.deepEqual(updates, ["原卡真实答案"]);
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.pendingTerminals).length, 5);
+  assert.equal(hub.status("binding").resultDelivery?.deferred, 5);
+  await hub.refresh(); assert.equal(starts.length, 0);
+});
+
+for (const unavailable of ["archived", "missing", "systemError", "absent-history"] as const) {
+  test(`${unavailable} observations never become a synthetic final result`, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-observation-not-final-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const writes: Array<{ text: string; finalize?: boolean }> = [];
+    const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+      client: { resumableTextStream: true,
+        async sendText(input) { writes.push(input); return { messageId: "notice" }; },
+        async startTextStream(input) { writes.push(input); return { messageId: "original" }; },
+        async updateTextStream(input) { writes.push(input); } } };
+    const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub], backend: () => ({
+      async readThreadSnapshot(): Promise<CodexThreadSnapshot> { return { state: { threadId: "thread",
+        persistence: unavailable === "archived" || unavailable === "missing" ? unavailable : "active",
+        runtimeStatus: unavailable === "systemError" ? "systemError" : "idle", activeFlags: [] }, turns: [] }; }
+    }) });
+    t.after(() => hub.stop());
+    await hub.started("local", "thread", "turn", new Date().toISOString());
+    await hub.activity("local", "thread", "turn", "正常进展");
+    const count = writes.length;
+    await hub.refresh(); await hub.synchronize("binding");
+    assert.equal(writes.length, count);
+    assert.equal(hub.status("binding").resultDelivery?.pending, 0);
+    assert.equal(hub.status("binding").resultDelivery?.lastDeliveredTurnId, undefined);
+    assert.equal(hub.status("binding").failure?.code, unavailable === "absent-history" ? "unconfirmed" : "unavailable");
+    await hub.completion("local", "thread", "turn", "实际最终结果");
+    assert.equal(writes.at(-1)?.text, "实际最终结果");
+    assert.equal(writes.at(-1)?.finalize, true);
+  });
+}
+
+test("legacy synthetic observation receipts are quarantined and the same card receives only the real final", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-legacy-observation-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filePath = path.join(root, "follow.json");
+  const notice = "会话已归档、不可用或发生系统错误；请在 Codex 中检查。";
+  const checkpoint = { streamId: "original", messageId: "original", startedAt: Date.now(), progressEntries: [],
+    thought: "", answerPreview: notice, finished: true, terminal: { text: notice, error: false } };
+  fs.writeFileSync(filePath, JSON.stringify({ binding: { eventVersion: 2, deliveryVersion: 1, hostId: "local", threadId: "thread",
+    turnId: "turn", checkpointTurnId: "turn", sequence: 0, initialized: true, delivered: [], completed: ["turn"], baseline: [], checkpoint,
+    pendingTerminals: { old: { text: notice, checkpoint } } } }));
+  const updates: string[] = [];
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+    client: { resumableTextStream: true,
+      async sendText() { throw new Error("must not send notices"); }, async startTextStream() { throw new Error("must not create"); },
+      async updateTextStream(input) { assert.equal(input.messageId, "original"); updates.push(input.text); } } };
+  const hub = new ThreadEventHub({ filePath, subscriptions: () => [sub], backend: () => ({ async readThreadSnapshot() {
+    return { state: { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [] },
+      turns: [{ id: "turn", status: "completed", messages: [{ id: "answer", role: "assistant", text: "真实结果" }] }] } as CodexThreadSnapshot;
+  } }) });
+  t.after(() => hub.stop());
+  await hub.refresh(); await hub.refresh();
+  assert.deepEqual(updates, ["真实结果"]);
+  const saved = JSON.parse(fs.readFileSync(filePath, "utf8")).binding;
+  assert.equal(saved.observationNotices.old.text, notice);
+  assert.equal(saved.observationNotices.turn.text, notice);
+  assert.deepEqual(saved.pendingTerminals, {});
+  assert.equal(saved.completed.at(-1), "turn");
 });
 
 test("an active owner conflicting with acknowledged completion is not blamed on IM permissions", async t => {

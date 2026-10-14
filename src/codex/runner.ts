@@ -75,6 +75,8 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly remoteTransports = new Map<string, ReturnType<typeof resolveRemoteCodexTransport>>();
   private readonly runTails = new Map<string, Promise<void>>();
   private readonly desktopOwnedThreads = new Set<string>();
+  /** Only in-flight read sharing; never reuse an old snapshot to authorize a write. */
+  private readonly observations = new Map<string, Promise<unknown>>();
   private selectedAutoBackend?: "exec" | "app-server";
   private get selectedBackend() { return this.options.backend === "auto" ? this.selectedAutoBackend ?? "app-server" : this.options.backend; }
 
@@ -309,12 +311,16 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     return this.backendForSharedOperation(hostId).getHistory(threadId);
   }
 
-  async readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot> {
+  readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot> {
+    return this.observeOnce("snapshot", threadId, hostId, () => this.readThreadSnapshotOnce(threadId, hostId));
+  }
+
+  private async readThreadSnapshotOnce(threadId: string, hostId?: string): Promise<CodexThreadSnapshot> {
     if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
       return this.backendForSharedOperation(hostId).readThreadSnapshot(threadId);
     }
-    let snapshot: CodexThreadSnapshot;
-    try { snapshot = await this.appServer.readThreadSnapshot(threadId); }
+    let state: CodexThreadState;
+    try { state = await this.readMetadata(threadId); }
     catch (error) {
       if (isCodexCommunicationFailure(error)) {
         const owner = await this.desktop.readThreadSnapshot?.(threadId).catch(() => undefined);
@@ -324,18 +330,29 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       }
       throw error;
     }
-    if (["archived", "missing"].includes(snapshot.state.persistence)) {
+    if (["archived", "missing"].includes(state.persistence)) {
       this.desktopOwnedThreads.delete(threadId);
-      return snapshot;
+      return { state, turns: [] };
     }
     // An active task on this connection is authoritative. A persisted idle or
     // notLoaded record is not: ask the Desktop owner before using it.
-    if (snapshot.state.runtimeStatus !== "active") {
+    if (state.runtimeStatus !== "active") {
       const owner = await this.desktop.readThreadSnapshot?.(threadId);
-      if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
+      if (owner && confirmedDesktopObservation(threadId, owner.state)) { this.desktopOwnedThreads.add(threadId); return owner; }
     }
     this.desktopOwnedThreads.delete(threadId);
-    return snapshot;
+    // Only hydrate private turns when that backend is the owner, or no live
+    // Desktop owner was confirmed. Foreign history can be arbitrarily large.
+    try { return await this.appServer.readThreadSnapshot(threadId); }
+    catch (error) {
+      if (isCodexCommunicationFailure(error)) {
+        const owner = await this.desktop.readThreadSnapshot?.(threadId).catch(() => undefined);
+        if (owner && confirmedDesktopObservation(threadId, owner.state)) {
+          this.desktopOwnedThreads.add(threadId); return owner;
+        }
+      }
+      throw error;
+    }
   }
 
   async getHistoryPage(
@@ -374,18 +391,22 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     await this.backendForSharedOperation(hostId).clearGoal(threadId);
   }
 
-  async inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
+  inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
+    return this.observeOnce("inspect", threadId, hostId, () => this.inspectThreadOnce(threadId, hostId));
+  }
+
+  private async inspectThreadOnce(threadId: string, hostId?: string): Promise<CodexThreadState> {
     try {
       if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
         return await this.backendForSharedOperation(hostId).inspectThread(threadId);
       }
       // Most IM messages only need metadata. Fetch turns only if a live writer
       // needs a concrete compare-and-steer guard that metadata cannot supply.
-      let state = await this.appServer.inspectThread(threadId, { includeTurns: false, timeoutMs: 15_000 });
+      let state = await this.readMetadata(threadId);
       if (state.runtimeStatus === "active" && !state.activeTurnId) state = await this.appServer.inspectThread(threadId);
       if (state.runtimeStatus !== "active" && state.persistence !== "missing" && state.persistence !== "archived") {
         const owner = await this.desktop.inspectThread?.(threadId);
-        if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
+        if (owner && confirmedDesktopObservation(threadId, owner)) { this.desktopOwnedThreads.add(threadId); return owner; }
       }
       this.desktopOwnedThreads.delete(threadId);
       return state;
@@ -405,6 +426,22 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       })}`);
       throw failure;
     }
+  }
+
+  private readMetadata(threadId: string): Promise<CodexThreadState> {
+    return this.observeOnce("metadata", threadId, "local", () =>
+      this.appServer.inspectThread(threadId, { includeTurns: false, timeoutMs: 5_000 }));
+  }
+
+  private observeOnce<T>(operation: string, threadId: string, hostId: string | undefined, read: () => Promise<T>): Promise<T> {
+    const key = JSON.stringify([this.selectedBackend, hostId ?? "local", threadId, operation]);
+    const existing = this.observations.get(key);
+    if (existing) return existing as Promise<T>;
+    const work = Promise.resolve().then(read).finally(() => {
+      if (this.observations.get(key) === work) this.observations.delete(key);
+    });
+    this.observations.set(key, work);
+    return work;
   }
 
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]> {

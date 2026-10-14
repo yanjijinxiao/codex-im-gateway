@@ -56,17 +56,12 @@ export function desktopAsyncUserInputs(threadId: string, state: Record<string, u
   const active = rawTurns.map(object).filter(turn => turn?.status === "inProgress" && typeof turn.turnId === "string")
     .sort((a, b) => Number(a?.turnStartedAtMs ?? 0) - Number(b?.turnStartedAtMs ?? 0)).at(-1);
   if (!active || !Array.isArray(active.items)) return [];
-  const answered = new Set<string>();
-  for (const rawItem of active.items) {
-    const item = object(rawItem);
-    if (!item || !["userMessage", "steeringUserMessage"].includes(String(item.type))) continue;
-    if (item.type === "steeringUserMessage" && item.status !== "accepted") continue;
-    const input = item.type === "userMessage" ? item.content : item.input;
-    if (!Array.isArray(input) || input.length !== 1) continue;
-    const text = object(input[0]);
-    if (text?.type !== "text" || typeof text.text !== "string") continue;
-    for (const id of answeredQuestionIds(text.text)) answered.add(id);
-  }
+  // Question discovery and delivery confirmation use the same native receipt
+  // contract. Seeing an optimistic/bare reply is not an answered widget, and a
+  // confirmed answer must not be forwarded again just because the UI remains
+  // visible for editing ("Send update").
+  const answered = new Set(desktopAsyncAnswerReceipts(threadId, { turns: [active] }, hostId)
+    .map(receipt => receipt.questionId));
   const requests: CodexUserInputRequest[] = [];
   for (const rawItem of active.items) {
     const item = object(rawItem);
@@ -99,10 +94,6 @@ export function asyncUserInputReply(request: CodexUserInputRequest, answers: Cod
   return `${OPEN}\n${JSON.stringify(request.questions.map(question => ({
     questionItemId: question.id, question: question.question, answer: answers[question.id]?.answers[0] ?? ""
   })))}\n${CLOSE}`;
-}
-
-function answeredQuestionIds(text: string): string[] {
-  return answerRows(text).map(row => row.questionItemId);
 }
 
 function answerRows(text: string): Array<{ questionItemId: string; question: string; answer: string }> {

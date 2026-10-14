@@ -281,3 +281,18 @@ test("only live unanswered async widgets are forwarded; canonical turn history w
   state.turns[1].status = "completed";
   assert.equal(desktopAsyncUserInputs("thread", state).length, 0);
 });
+
+test("an editable answered widget is not redispatched; optimistic or mismatched answers are not confirmations", () => {
+  const state = asyncState();
+  const request = desktopAsyncUserInputs("thread", state)[0];
+  const text = asyncUserInputReply(request, { [request.questions[0].id]: { answers: ["钉钉答案"] } });
+  const answer = { type: "steeringUserMessage", id: "answer", status: "pending", input: [{ type: "text", text }] };
+  state.turns[1].items.push(answer as never);
+  assert.equal(desktopAsyncUserInputs("thread", state).length, 2);
+  answer.status = "accepted";
+  assert.equal(desktopAsyncUserInputs("thread", state).length, 1);
+  assert.equal(desktopAsyncAnswerReceipts("thread", state).length, 1);
+  answer.input[0].text = text.replace("farming 在哪里？", "不同的问题");
+  assert.equal(desktopAsyncUserInputs("thread", state).length, 2);
+  assert.equal(desktopAsyncAnswerReceipts("thread", state).length, 0);
+});

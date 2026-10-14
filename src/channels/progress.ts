@@ -205,7 +205,7 @@ export class ChannelTurnTextStream {
     return true;
   }
 
-  async finalize(text: string, error = false, recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean } = {}): Promise<boolean> {
+  async finalize(text: string, error = false, recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; existingOnly?: boolean } = {}): Promise<boolean> {
     const content = text.trim();
     if (this.finished) return true;
     // A shutdown-detached writer must not poison the checkpoint that its
@@ -220,11 +220,11 @@ export class ChannelTurnTextStream {
     if (this.finalizing) return this.finalizing;
     const recoverBootstrap = recovery.recoverBootstrap || canRetryUnsentCreation(this.bootstrap);
     if (recoverBootstrap) this.terminalBlocked = false;
-    this.finalizing = this.finalizeNow(recoverBootstrap, recovery.confirmUncertainDelivery);
+    this.finalizing = this.finalizeNow(recoverBootstrap, recovery.confirmUncertainDelivery, recovery.existingOnly);
     try { return await this.finalizing; } finally { this.finalizing = undefined; }
   }
 
-  private async finalizeNow(recoverBootstrap = false, confirmUncertainDelivery = false): Promise<boolean> {
+  private async finalizeNow(recoverBootstrap = false, confirmUncertainDelivery = false, existingOnly = false): Promise<boolean> {
     await this.textProgress?.close();
     await this.opening;
     await this.chain.catch(() => undefined);
@@ -232,6 +232,11 @@ export class ChannelTurnTextStream {
     this.resultPageBytes ??= this.client.capabilities?.resultPageBytes ?? DEFAULT_RESULT_PAGE_BYTES;
     this.resultPresentation ??= this.supported ? "card" : "native-text";
     const pages = resultPages(this.terminal!.text, this.resultPageBytes);
+    // Historical recovery may update acknowledged cards, but must not create
+    // new notifications (including continuation pages or native text). Check
+    // the complete layout before updating page 1 so partial recovery is quiet.
+    if (existingOnly && (!this.supported || !this.messageId || pages.some((_, index) => index > 0
+      && !this.terminalPages[index]?.messageId && this.terminalPages[index]?.bootstrap?.stage !== "delivered"))) return false;
     while (this.terminalPages.length < pages.length) this.terminalPages.push({ delivered: false });
     this.persistence?.save(this.checkpoint());
     if (!this.supported) {

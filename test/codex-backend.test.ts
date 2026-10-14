@@ -47,10 +47,33 @@ test("message inspection reads metadata first and hydrates turns only for an act
     desktopRunner: { async inspectThread() { return undefined; }, close() {} } as never });
   t.after(() => router.close());
   assert.equal((await router.inspectThread("thread")).runtimeStatus, "idle");
-  assert.deepEqual(reads, [{ includeTurns: false, timeoutMs: 15000 }]);
+  assert.deepEqual(reads, [{ includeTurns: false, timeoutMs: 5000 }]);
   active = true;
   assert.equal((await router.inspectThread("thread")).activeTurnId, "turn");
-  assert.deepEqual(reads.slice(1), [{ includeTurns: false, timeoutMs: 15000 }, undefined]);
+  assert.deepEqual(reads.slice(1), [{ includeTurns: false, timeoutMs: 5000 }, undefined]);
+});
+
+test("inspection and following share in-flight metadata, select the real owner before expensive private history, and never cache old state", async t => {
+  let metadata = 0, fullReads = 0, snapshots = 0;
+  let release!: () => void;
+  let gate = new Promise<void>(resolve => { release = resolve; });
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: {
+    async inspectThread() { metadata++; await gate; return { threadId: "thread", persistence: "active", runtimeStatus: "notLoaded", activeFlags: [] }; },
+    async readThreadSnapshot() { fullReads++; throw new Error("must not hydrate foreign history"); }, close() {}
+  } as never, desktopRunner: {
+    async inspectThread() { return { threadId: "thread", persistence: "active", runtimeStatus: "idle", executionOwner: "desktop", activeFlags: [] }; },
+    async readThreadSnapshot() { snapshots++; return { state: { threadId: "thread", persistence: "active", runtimeStatus: "active",
+      executionOwner: "desktop", activeFlags: [], activeTurnId: "native-turn" }, turns: [] }; }, close() {}
+  } as never });
+  t.after(() => router.close());
+  const inspecting = router.inspectThread("thread");
+  const following = router.readThreadSnapshot("thread");
+  const secondFollower = router.readThreadSnapshot("thread", "local");
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(metadata, 1);
+  release(); await Promise.all([inspecting, following, secondFollower]);
+  assert.equal(fullReads, 0); assert.equal(snapshots, 1);
+  gate = Promise.resolve(); await router.readThreadSnapshot("thread");
+  assert.equal(metadata, 2); assert.equal(snapshots, 2);
 });
 
 test("declares the protocol capabilities of the two Codex backends explicitly", () => {

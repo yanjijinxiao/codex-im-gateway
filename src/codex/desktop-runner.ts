@@ -34,6 +34,7 @@ export type DesktopCodexRunnerOptions = {
   timeoutMs?: number;
   completionPollIntervalMs?: number;
   busyRetryDelayMs?: number;
+  observationTimeoutMs?: number;
 };
 
 type CompletionWaiter = {
@@ -65,14 +66,39 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private readonly monitor: CodexSessionCompletionMonitor;
   private monitorStarted = false;
   private closed = false;
+  private readonly observationTimeoutMs: number;
+  private readonly snapshotReads = new Map<string, Promise<CodexThreadSnapshot | undefined>>();
+  private readonly observationConnections = new Set<DesktopIpcConnection>();
 
   /** Read the actual Desktop writer, not an unrelated private app-server. */
-  async readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot | undefined> {
-    const connection = new DesktopIpcConnection(this.socketPath, Math.min(this.requestTimeoutMs, 20_000));
+  readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot | undefined> {
+    if (this.closed) return Promise.reject(new Error("Codex Desktop runner is closed"));
+    const existing = this.snapshotReads.get(threadId);
+    if (existing) return existing;
+    const work = this.readThreadSnapshotOnce(threadId).finally(() => {
+      if (this.snapshotReads.get(threadId) === work) this.snapshotReads.delete(threadId);
+    });
+    this.snapshotReads.set(threadId, work);
+    return work;
+  }
+
+  private async readThreadSnapshotOnce(threadId: string): Promise<CodexThreadSnapshot | undefined> {
+    const connection = new DesktopIpcConnection(this.socketPath, this.observationTimeoutMs);
+    this.observationConnections.add(connection);
+    let timer: NodeJS.Timeout | undefined;
     try {
-      await connection.initialize();
-      await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
-      const snapshot = parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+      const snapshot = await Promise.race([(async () => {
+        await connection.initialize();
+        await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
+        return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+      })(), new Promise<never>((_, reject) => {
+        // A single end-to-end budget, not one full timeout per handshake phase.
+        timer = setTimeout(() => {
+          reject(new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
+            new Error("Desktop owner observation timed out")));
+          connection.close();
+        }, this.observationTimeoutMs);
+      })]);
       this.unavailableOwnerLogTimes.delete(threadId);
       return snapshot;
     } catch (error) {
@@ -92,7 +118,9 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       if (isDesktopOwnerUnavailable(error) || /thread-owner-discovery timed out/.test(String(error))) return undefined;
       throw error;
     } finally {
+      if (timer) clearTimeout(timer);
       connection.close();
+      this.observationConnections.delete(connection);
     }
   }
 
@@ -104,6 +132,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     this.socketPath = options.socketPath ?? path.join(os.homedir(), ".codex", "ipc", "ipc.sock");
     this.requestTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.busyRetryDelayMs = options.busyRetryDelayMs ?? 1_000;
+    this.observationTimeoutMs = Math.min(this.requestTimeoutMs, options.observationTimeoutMs ?? 10_000);
     this.monitor = new CodexSessionCompletionMonitor({
       codexHome: options.codexHome,
       pollIntervalMs: options.completionPollIntervalMs ?? 1_000,
@@ -249,6 +278,8 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
 
   close(): void {
     this.closed = true;
+    for (const connection of this.observationConnections) connection.close();
+    this.observationConnections.clear();
     for (const waiter of this.waiters.values()) {
       waiter.reject(new Error("Codex Desktop runner closed"));
     }
@@ -550,6 +581,9 @@ class DesktopIpcConnection {
   private handleMessage(message: IpcMessage): void {
     if (message.type === "broadcast" && message.method === "thread-stream-state-changed") {
       const params = recordValue(message.params);
+      // This connection observes only the local owner; a remote broadcast with
+      // the same conversation ID must never authorize a local write.
+      if (params?.hostId !== undefined && params.hostId !== "local") return;
       const change = recordValue(params?.change);
       const state = recordValue(change?.conversationState);
       if (typeof params?.conversationId === "string" && change?.type === "snapshot" && state) {

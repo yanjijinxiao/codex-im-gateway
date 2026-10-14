@@ -46,6 +46,8 @@ type FollowState = {
   terminalPending?: { turnId: string; text: string; fallbackSent: boolean };
   /** Failed previous turns own their payload/card; never share a new turn's slot. */
   pendingTerminals?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
+  /** Legacy observation notices are not model answers or completion receipts. */
+  observationNotices?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
   repairTurnId?: string;
 };
 type Options = {
@@ -110,6 +112,25 @@ export class ThreadEventHub {
         } else if (state.checkpoint) state.checkpointTurnId = state.turnId;
         state.deliveryVersion = 1;
       }
+      for (const [turnId, pending] of Object.entries(state.pendingTerminals ?? {})) {
+        if (!isLegacyObservationNotice(pending.text)) continue;
+        (state.observationNotices ??= {})[turnId] = pending;
+        delete state.pendingTerminals![turnId];
+      }
+      const terminal = state.terminalPending;
+      const checkpointTurn = state.checkpointTurnId ?? state.turnId;
+      const notice = terminal?.text ?? state.checkpoint?.terminal?.text;
+      if (checkpointTurn && notice && isLegacyObservationNotice(notice)) {
+        (state.observationNotices ??= {})[checkpointTurn] = { text: notice, checkpoint: state.checkpoint };
+        delete state.terminalPending;
+        state.completed = state.completed.filter(id => id !== checkpointTurn);
+        state.baseline = state.baseline?.filter(id => id !== checkpointTurn);
+        state.retired = state.retired?.filter(id => id !== checkpointTurn);
+        if (state.checkpoint) {
+          const { terminal: _terminal, terminalNoticeSent: _notice, terminalPages: _pages, ...checkpoint } = state.checkpoint;
+          state.checkpoint = { ...checkpoint, finished: false, answerPreview: "" };
+        }
+      }
     }
   }
   private save(): void { writeJsonFile(this.options.filePath, this.states); }
@@ -166,7 +187,9 @@ export class ThreadEventHub {
         requiresConfirmation: matching.checkpoint.bootstrap?.stage === "delivery-unconfirmed",
         failure: matching.checkpoint.presentationFailure ?? matching.checkpoint.bootstrap?.failure
       } } : {}),
-      resultDelivery: { pending, lastDeliveredTurnId: matching?.completed.at(-1) } };
+      resultDelivery: { pending, deferred: Object.values(matching?.pendingTerminals ?? {})
+        .filter(item => !hasDeliveredCard(item.checkpoint)).length,
+        lastDeliveredTurnId: matching?.completed.at(-1) } };
   }
 
   /** Targeted read-only synchronization; never waits for unrelated polling reads. */
@@ -304,6 +327,9 @@ export class ThreadEventHub {
           // acknowledged completion. That is NOT an IM permission failure.
           // Do not reopen a completed card or replay its answer on this evidence.
           this.failSync(sub, { code: "unconfirmed", message: "Codex 后端报告正在执行，但同一轮次已有完成回执，状态相互冲突；保留原卡片与绑定，等待新的可信轮次状态，不重发结果或重建卡片。" }, "unconfirmed");
+        } else if (runtime.runtimeStatus === "idle" && state.turnId && !state.completed.includes(state.turnId)
+          && !state.terminalPending && !snapshot.turns.some(turn => turn.id === state.turnId)) {
+          this.failSync(sub, { code: "unconfirmed", message: "最近历史未包含原轮次，无法确认其结束或最终答复；保留绑定与原卡片，请用 /history 查询，不生成任务结束通知。" }, "unconfirmed");
         } else {
           let presentation: SessionFollowStatus["presentation"] = sub.progressEnabled === false ? "off"
             : runtime.runtimeStatus === "active" ? state.presentation : "idle";
@@ -381,6 +407,9 @@ export class ThreadEventHub {
     const state = this.state(sub);
     state.runtime = snapshot.state;
     state.observedAt = new Date().toISOString();
+    // Runtime availability is an observation, never evidence that a particular
+    // turn completed. Keep its binding, card and real result journal untouched.
+    if (["archived", "missing"].includes(snapshot.state.persistence) || snapshot.state.runtimeStatus === "systemError") return;
     const currentTurn = snapshot.state.runtimeStatus === "active" ? snapshot.turns.filter(turn => turn.status === "inProgress"
       && (!snapshot.state.activeTurnId || turn.id === snapshot.state.activeTurnId)).at(-1) : undefined;
     if (!sub.managed && currentTurn && state.turnId && state.turnId !== currentTurn.id && !state.terminalPending) {
@@ -405,7 +434,8 @@ export class ThreadEventHub {
       const text = repair?.messages.filter(message => message.role === "assistant" && message.kind !== "progress")
         .map(message => message.text).join("\n\n");
       if (repair && text?.trim()) {
-        (state.pendingTerminals ??= {})[repair.id] = { text: visibleText(text).trim() };
+        if (repair.id === state.turnId) state.terminalPending = { turnId: repair.id, text: visibleText(text).trim(), fallbackSent: false };
+        else (state.pendingTerminals ??= {})[repair.id] = { text: visibleText(text).trim() };
         delete state.repairTurnId;
         this.save();
       }
@@ -424,16 +454,7 @@ export class ThreadEventHub {
       state.initialized = true;
       this.save();
     }
-    const unavailable = ["archived", "missing"].includes(snapshot.state.persistence)
-      || snapshot.state.runtimeStatus === "systemError";
-    if (unavailable) {
-      if (state.turnId) await this.finish(sub, state.turnId, "会话已归档、不可用或发生系统错误；请在 Codex 中检查。");
-      return;
-    }
-    if (state.turnId && !turns.some((turn) => turn.id === state.turnId)
-      && snapshot.state.runtimeStatus === "idle") {
-      await this.finish(sub, state.turnId, "原任务已不在最近记录中。请用 /history 查看结果。");
-    }
+    // A bounded history window omitting a turn is not a completion event either.
     for (const turn of turns) {
       if (state.completed.includes(turn.id) || state.baseline?.includes(turn.id) || state.pendingTerminals?.[turn.id]) continue;
       if (sub.managed) {
@@ -575,8 +596,12 @@ export class ThreadEventHub {
   private retryPreviousTerminals(sub: ThreadSubscription, force = false): void {
     const state = this.state(sub);
     // Independent records: a failed old card cannot block a current turn.
-    for (const [turnId, pending] of Object.entries(state.pendingTerminals ?? {}).slice(0, 5)) {
+    for (const [turnId, pending] of Object.entries(state.pendingTerminals ?? {})
+      .filter(([, item]) => hasDeliveredCard(item.checkpoint)).slice(0, 5)) {
       if (!this.isLive(sub)) return;
+      // Do not burst old uncreated answers into a chat after restart/routing
+      // repair. They remain durable and discoverable through /status /history.
+      // Current-turn delivery still uses finish(), with its original lifecycle.
       const recoveryKey = JSON.stringify([sub.key, sub.hostId, sub.threadId, turnId]);
       if (this.previousRecoveries.has(recoveryKey) || !force && Date.now() < (this.previousRetryAt.get(recoveryKey) ?? 0)) continue;
       if (pending.checkpoint?.messageId && !sub.client.resumableTextStream) continue;
@@ -589,15 +614,12 @@ export class ThreadEventHub {
         }
       });
       try {
-        let delivered = await stream.finalize(pending.text, false, { recoverBootstrap: force });
-        if (!stream.supported && !stream.checkpoint().terminalPages?.length) { await this.sendText(sub, pending.text); delivered = true; }
+        const delivered = await stream.finalize(pending.text, false, { recoverBootstrap: force, existingOnly: true });
         if (delivered && this.isLive(sub) && state.pendingTerminals?.[turnId] === pending) {
           delete state.pendingTerminals![turnId];
           state.completed = [...state.completed, turnId].slice(-200);
           if (state.repairTurnId === turnId) delete state.repairTurnId;
           this.logDelivery(sub, turnId, "delivered");
-        } else {
-          await stream.reportTerminalFailure().catch(() => false);
         }
       } finally { await stream.suspend(); this.save(); }
       })().catch(() => { /* Preserve the old record independently of current progress. */ }).finally(() => {
@@ -741,6 +763,12 @@ export class ThreadEventHub {
 
 function visibleText(text: string): string {
   return parseActionBlocks(text).visibleText;
+}
+function hasDeliveredCard(checkpoint?: ChannelStreamCheckpoint): boolean {
+  return Boolean(checkpoint?.messageId || checkpoint?.bootstrap?.stage === "delivered" && checkpoint.bootstrap.messageId);
+}
+function isLegacyObservationNotice(text: string): boolean {
+  return ["会话已归档、不可用或发生系统错误；请在 Codex 中检查。", "原任务已不在最近记录中。请用 /history 查看结果。"].includes(text.trim());
 }
 function report(error: unknown): void {
   console.warn("[codex-im-gateway] thread follow reconciliation failed: " + followSyncFailure(error).code);

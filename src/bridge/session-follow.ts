@@ -25,7 +25,7 @@ export type SessionFollowStatus = {
   failure?: FollowSyncFailure;
   presentation?: "updated" | "text-only" | "off" | "idle";
   /** Delivery acknowledgements are independent of the backend execution state. */
-  resultDelivery?: { pending: number; lastDeliveredTurnId?: string };
+  resultDelivery?: { pending: number; deferred?: number; lastDeliveredTurnId?: string };
   progressDelivery?: { stage: ChannelStreamBootstrap["stage"] | "legacy-unconfirmed"; requiresConfirmation: boolean; failure?: ChannelStreamFailure };
 };
 
@@ -60,6 +60,7 @@ export function formatFollowStatus(state: SessionFollowStatus): string[] {
       ...(state.progressDelivery.requiresConfirmation ? ["未自动重发未知投递。确认允许重试原实例后，可发送 /follow sync --retry-delivery（可能产生重复通知）。"] : [])] : []),
     ...(state.resultDelivery?.pending ? [`最终答复投递：${state.resultDelivery.pending} 轮待送达；任务完成不等于回答已送达`]
       : state.resultDelivery?.lastDeliveredTurnId ? ["最终答复投递：已确认送达"] : []),
+    ...(state.resultDelivery?.deferred ? [`其中 ${state.resultDelivery.deferred} 轮为未建立卡片的历史答复，已保留，不自动补发新消息；用 /history（及 /history more）查看完整结果。`] : []),
     ...(state.runtime?.activeFlags.includes("waitingOnApproval") ? [`${runtimeLabel}：等待审批`]
       : state.runtime?.activeFlags.includes("waitingOnUserInput") ? [`${runtimeLabel}：等待用户确认`]
       : state.runtime ? [`${runtimeLabel}：${({ active: "正在执行", idle: "空闲", notLoaded: "未加载，无法确认执行状态", unknown: "未知", systemError: "系统错误" })[state.runtime.runtimeStatus]}`] : []),

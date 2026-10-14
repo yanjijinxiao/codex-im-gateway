@@ -250,7 +250,8 @@ test("Desktop paginated owner history is ordered by turn time, and orphan UI tai
   assert.equal(result.turns[0].messages[0].createdAt, "1970-01-01T00:00:01.000Z");
 });
 
-async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<string, unknown>, accepted: unknown = {}, earlySnapshot = false) {
+async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<string, unknown>, accepted: unknown = {}, earlySnapshot = false,
+  options: { wrongHostFirst?: boolean; delayMs?: number; observationTimeoutMs?: number } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-desktop-state-"));
   fs.mkdirSync(path.join(root, "sessions"));
   const socketPath = path.join(root, "ipc.sock");
@@ -259,6 +260,9 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
   const server = net.createServer(socket => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
+    const send = (value: Record<string, unknown>) => options.delayMs
+      ? setTimeout(() => { if (!socket.destroyed) writeFrame(socket, value); }, options.delayMs)
+      : writeFrame(socket, value);
     let buffer = Buffer.alloc(0);
     socket.on("data", chunk => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -268,18 +272,24 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
         const message = JSON.parse(buffer.subarray(4, size + 4).toString()) as Record<string, unknown>;
         buffer = buffer.subarray(size + 4);
         received.push(message);
-        if (message.method === "initialize") writeFrame(socket, response(message, { clientId: "test" }));
+        if (message.method === "initialize") send(response(message, { clientId: "test" }));
         if (message.method === "thread-owner-discovery") {
           if (earlySnapshot) writeFrame(socket, ownerSnapshot("thread", snapshot()));
-          writeFrame(socket, response(message, {}));
+          send(response(message, {}));
         }
-        if (message.method === "thread-stream-following-changed") writeFrame(socket, ownerSnapshot("thread", snapshot()));
+        if (message.method === "thread-stream-following-changed") {
+          if (options.wrongHostFirst) send({ type: "broadcast", method: "thread-stream-state-changed", version: 11,
+            params: { conversationId: "thread", hostId: "remote-host", change: { type: "snapshot",
+              conversationState: { title: "WRONG_HOST", threadRuntimeStatus: { type: "idle" }, turns: [] } } } });
+          send(ownerSnapshot("thread", snapshot()));
+        }
         if (message.method === "thread-follower-start-turn" && accepted !== null) writeFrame(socket, response(message, accepted));
       }
     });
   });
   await new Promise<void>((resolve, reject) => server.listen(socketPath, resolve).once("error", reject));
-  const runner = new DesktopCodexRunner({ codexHome: root, socketPath, timeoutMs: 300, busyRetryDelayMs: 5 });
+  const runner = new DesktopCodexRunner({ codexHome: root, socketPath, timeoutMs: 300, busyRetryDelayMs: 5,
+    observationTimeoutMs: options.observationTimeoutMs });
   t.after(async () => {
     runner.close();
     for (const socket of sockets) socket.destroy();
@@ -294,6 +304,32 @@ test("owner snapshots published before the discovery response are not lost", asy
   const snapshot = await runner.readThreadSnapshot("thread");
   assert.equal(snapshot?.state.runtimeStatus, "idle");
   assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 0);
+});
+
+test("Desktop preflight and follow share only the current observation, not a stale snapshot", async t => {
+  let reads = 0;
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" },
+    title: `read-${++reads}`, turns: [] }));
+  const [state, first, second] = await Promise.all([runner.inspectThread("thread"), runner.readThreadSnapshot("thread"), runner.readThreadSnapshot("thread")]);
+  assert.equal(state?.title, "read-1"); assert.equal(first?.state.title, second?.state.title);
+  assert.equal(received.filter(message => message.method === "initialize").length, 1);
+  assert.equal((await runner.readThreadSnapshot("thread"))?.state.title, "read-2");
+  assert.equal(received.filter(message => message.method === "initialize").length, 2);
+  assert.equal(received.filter(message => /start-turn|steer|interrupt/.test(String(message.method))).length, 0);
+});
+
+test("local owner reads ignore a remote snapshot with the same thread ID", async t => {
+  const { runner } = await desktopOwnerFixture(t, () => ({ title: "LOCAL_OWNER", threadRuntimeStatus: { type: "idle" }, turns: [] }),
+    {}, false, { wrongHostFirst: true });
+  assert.equal((await runner.readThreadSnapshot("thread"))?.state.title, "LOCAL_OWNER");
+});
+
+test("owner observation has one end-to-end deadline and does not submit on timeout", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }),
+    {}, false, { delayMs: 100, observationTimeoutMs: 250 });
+  await assert.rejects(runner.readThreadSnapshot("thread"), error => error instanceof CodexCommunicationError
+    && error.operation === "thread/owner-snapshot" && error.code === "timeout" && error.submission === "not-submitted");
+  assert.equal(received.filter(message => /start-turn|steer|interrupt/.test(String(message.method))).length, 0);
 });
 
 test("ordinary Desktop messages wait for idle instead of invoking start while the old turn is active", async t => {

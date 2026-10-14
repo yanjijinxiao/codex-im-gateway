@@ -8,6 +8,30 @@ import { summarizeProgress } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("quiet historical recovery never creates a card, native text or missing continuation pages", async t => {
+  const io = transport();
+  for (const messageId of [undefined, "original"]) {
+    const stream = new ChannelTurnTextStream(io.client, "chat", { save() {}, restore: {
+      streamId: "historical", messageId, startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: false,
+      resultPageBytes: 1024, terminal: { text: "历史结果很长。".repeat(200), error: false }
+    } });
+    t.after(() => stream.suspend());
+    assert.equal(await stream.finalize("历史结果很长。".repeat(200), false, { existingOnly: true }), false);
+  }
+  assert.equal(io.starts.length, 0); assert.equal(io.frames.length, 0); assert.equal(io.texts.length, 0);
+});
+
+test("quiet historical recovery updates an existing short-result card without a new notification", async t => {
+  const io = transport();
+  const stream = new ChannelTurnTextStream(io.client, "chat", { save() {}, restore: {
+    streamId: "historical", messageId: "original", startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: false
+  } });
+  t.after(() => stream.suspend());
+  assert.equal(await stream.finalize("旧结果", false, { existingOnly: true }), true);
+  assert.equal(io.starts.length, 0); assert.equal(io.texts.length, 0);
+  assert.equal(io.frames.length, 1); assert.equal(io.frames[0].messageId, "original");
+});
+
 test("locally rejected legacy route restores automatically without replacing or notifying a nonexistent card", async t => {
   const io = transport();
   const stream = new ChannelTurnTextStream(io.client, "chat", { save() {}, restore: {
