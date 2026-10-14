@@ -14,17 +14,28 @@ import { parseCommand } from "../src/bridge/channel-commands.js";
 const request: CodexUserInputRequest = { hostId: "local", requestId: 42, threadId: "thread", turnId: "turn", itemId: "item",
   questions: [{ id: "native-question", header: "问题", question: "farming 是项目还是目录？" }], autoResolutionMs: null };
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+async function until(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, "question notice fixture timed out");
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
 
 function fixture(t: test.TestContext, options: ConstructorParameters<typeof ChannelUserInputController>[2] = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "question-journal-"));
   const filePath = path.join(root, "questions.json");
   const cards: ChannelActionCard[] = [];
   const notices: string[] = [];
-  const create = () => new ChannelUserInputController(async (_sender, card) => {
+  const controllers: ChannelUserInputController[] = [];
+  const create = () => {
+    const controller = new ChannelUserInputController(async (_sender, card) => {
     cards.push(card); return { messageId: `card-${cards.length}` };
   }, undefined, { filePath, sendNotice: async (_sender, text) => { notices.push(text); }, ...options });
+    controllers.push(controller); return controller;
+  };
   const controller = create();
-  t.after(() => { controller.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { for (const instance of controllers) instance.close(); fs.rmSync(root, { recursive: true, force: true }); });
   return { controller, create, filePath, cards, notices };
 }
 
@@ -158,11 +169,15 @@ test("only an explicit native timeout expires a question; null has no default ex
   assert.match(controller.answer("room", "list"), /Q1/);
   controller.close();
   assert.equal(await first, undefined);
-  const timed = controller.request("room", { ...request, requestId: 99, autoResolutionMs: 5 });
+  // close ends this controller's lifetime; a restarted account creates a new
+  // controller rather than reopening old callbacks against its replacement.
+  const restored = new ChannelUserInputController(async (_, card) => { cards.push(card); }, 1);
+  const timed = restored.request("room", { ...request, requestId: 99, autoResolutionMs: 5 });
   await new Promise(resolve => setTimeout(resolve, 15));
   assert.deepEqual(await timed, {});
-  assert.match(controller.answer("room", "Q2 late"), /未提交/);
-  controller.close();
+  assert.match(restored.answer("room", "Q1 late"), /未提交/);
+  assert.equal(await controller.request("room", request), undefined);
+  restored.close();
 });
 
 test("question form actions validate exact Q IDs and preserve free text/newlines", () => {
@@ -250,6 +265,139 @@ test("native evidence cannot confirm a never-submitted answer or cross a changed
   f.controller.answer("room", "Q1 目录"); await pending; await f.controller.reportResult("room", r, "failed");
   bound = false; await f.controller.observeNativeAnswers([receipt]);
   assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "unconfirmed");
+});
+
+test("native acceptance survives acknowledgement-card failure and retries only the same question card", async t => {
+  const updates: Array<{ id: string; title: string }> = [];
+  const f = fixture(t, { noticeRetryDelayMs: 5, updateCard: async (id, card) => {
+    updates.push({ id, title: card.title });
+    if (updates.length === 1) throw new Error("HTTP 503");
+  } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  await f.controller.reportResult("room", request, "confirmed");
+  let row = JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0];
+  assert.equal(row.status, "confirmed"); assert.equal(row.noticeDelivery, "unconfirmed");
+  assert.match(f.controller.answer("room", "list"), /Codex 已确认.*IM 确认通知尚未送达/);
+  assert.match(f.controller.answer("room", "Q1 再次回答"), /已确认.*未提交/);
+  await until(() => JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].noticeDelivery === "delivered");
+  row = JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0];
+  assert.equal(row.status, "confirmed"); assert.equal(row.noticeAttempts, 2);
+  assert.deepEqual(updates.map(update => update.id), ["card-1", "card-1"]);
+  assert.ok(updates.every(update => update.title.includes("回答已接收")));
+  assert.equal(f.cards.length, 1); assert.equal(f.notices.length, 0);
+  assert.equal(await f.controller.request("room", request), undefined, "the native answer is never resubmitted");
+});
+
+test("restart restores an unsent confirmation-card update without replaying the native answer", async t => {
+  let attempts = 0, recovered = false;
+  const f = fixture(t, { noticeRetryDelayMs: 10_000, updateCard: async id => {
+    assert.equal(id, "card-1"); attempts++;
+    if (!recovered) throw new Error("connection disconnected");
+  } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  await f.controller.reportResult("room", request, "confirmed");
+  f.controller.close();
+  // Model a crash during a replace-card request; its retry is idempotent.
+  const journal = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  journal.records[0].noticeDelivery = "pending";
+  fs.writeFileSync(f.filePath, JSON.stringify(journal));
+  recovered = true;
+  const restored = f.create(); t.after(() => restored.close());
+  await until(() => JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].noticeDelivery === "delivered");
+  assert.equal(attempts, 2); assert.equal(f.cards.length, 1); assert.equal(f.notices.length, 0);
+  assert.equal(await restored.request("room", request), undefined);
+});
+
+test("failed plain acknowledgement is recorded as uncertain, not resent after restart", async t => {
+  let sends = 0;
+  const f = fixture(t, { sendNotice: async () => { sends++; throw new Error("lost response"); } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  await f.controller.reportResult("room", request, "confirmed");
+  f.controller.close(); const restored = f.create(); t.after(() => restored.close());
+  await restored.reportResult("room", request, "confirmed");
+  await tick(); assert.equal(sends, 1);
+  const row = JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0];
+  assert.equal(row.status, "confirmed"); assert.equal(row.noticeDelivery, "unconfirmed");
+  assert.equal(row.noticeRetryAt, undefined);
+});
+
+test("confirmation-card retries stop for a changed binding and do not leak into another conversation", async t => {
+  let bound = true, attempts = 0;
+  const f = fixture(t, { noticeRetryDelayMs: 5, validate: () => bound, updateCard: async () => { attempts++; throw new Error("HTTP 503"); } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  await f.controller.reportResult("room", request, "confirmed");
+  bound = false; f.controller.suspendInvalidBindings();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(attempts, 1);
+  assert.doesNotMatch(f.controller.answer("other-room", "list"), /Q1/);
+  assert.doesNotMatch(f.controller.answer("room", "list"), /Q1/);
+});
+
+test("confirmation-card retry is bounded and permanent rejection is not retried", async t => {
+  for (const detail of ["HTTP 503", "HTTP 403"]) {
+    let attempts = 0;
+    const f = fixture(t, { noticeRetryDelayMs: 5, updateCard: async () => { attempts++; throw new Error(detail); } });
+    const pending = f.controller.request("room", request);
+    f.controller.answer("room", "Q1 回答"); await pending;
+    await f.controller.reportResult("room", request, "confirmed");
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(attempts, detail === "HTTP 503" ? 3 : 1);
+    const row = JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0];
+    assert.equal(row.status, "confirmed"); assert.equal(row.noticeRetryAt, undefined);
+  }
+});
+
+test("unconfirmed answer and later acceptance use distinct truthful question-card statuses", async t => {
+  const titles: string[] = [];
+  const f = fixture(t, { updateCard: async (_id, card) => { titles.push(card.title); } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  await f.controller.reportResult("room", request, "failed");
+  assert.match(titles[0], /等待接收确认/);
+  assert.match(f.controller.answer("room", "list"), /未获 Codex 确认/);
+  await f.controller.reportResult("room", request, "confirmed");
+  await f.controller.reportResult("room", request, "failed");
+  assert.deepEqual(titles.map(title => title.split(" · ")[1]), ["等待接收确认", "回答已接收"]);
+});
+
+test("late acknowledgement updates cannot overwrite a restarted question journal", async t => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = fixture(t, { updateCard: async () => { await gate; } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  const acknowledgement = f.controller.reportResult("room", request, "confirmed");
+  await tick(); f.controller.close();
+  const restored = f.create();
+  const next = restored.request("room", { ...request, requestId: "new-request" });
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records.length, 2);
+  release(); await acknowledgement;
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records.length, 2);
+  await f.controller.reportResult("room", request, "failed");
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "confirmed");
+  assert.equal(await f.controller.request("room", request), undefined);
+  restored.close(); assert.equal(await next, undefined);
+});
+
+test("a stale failed-state update cannot supersede the newer native confirmation", async t => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const titles: string[] = [];
+  const f = fixture(t, { updateCard: async (_id, card) => {
+    titles.push(card.title); if (titles.length === 1) await gate;
+  } });
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 回答"); await pending;
+  const failed = f.controller.reportResult("room", request, "failed");
+  await tick(); const confirmed = f.controller.reportResult("room", request, "confirmed");
+  release(); await Promise.all([failed, confirmed]);
+  assert.deepEqual(titles.map(title => title.split(" · ")[1]), ["等待接收确认", "回答已接收"]);
+  const row = JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0];
+  assert.equal(row.status, "confirmed"); assert.equal(row.noticeOutcome, "confirmed"); assert.equal(row.noticeDelivery, "delivered");
 });
 
 test("Desktop async widgets have independent stable identities and the exact native answer envelope", () => {

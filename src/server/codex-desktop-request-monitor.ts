@@ -428,6 +428,9 @@ export class CodexDesktopRequestMonitor {
   }
 
   private async reportInput(input: CodexDesktopUserInput, result: CodexUserInputResult): Promise<void> {
+    console.info(`[codex-im-gateway] native question result ${JSON.stringify({ timestamp: new Date().toISOString(),
+      hostId: input.hostId, threadId: input.request.threadId, turnId: input.request.turnId,
+      kind: input.request.kind ?? "sync", result })}`);
     try { await this.options.onUserInputResult?.(input, result); }
     catch { console.warn("[codex-im-gateway] unable to deliver question resolution notice"); }
   }
