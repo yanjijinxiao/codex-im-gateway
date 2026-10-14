@@ -4,12 +4,14 @@ import path from "node:path";
 import type { CodexUserInputAnswer, CodexUserInputQuestion, CodexUserInputRequest, CodexUserInputResult } from "../codex/backend.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
 import type { ChannelReceipt } from "../channels/types.js";
+import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
 
 type QuestionStatus = "pending" | "answered" | "submitting" | "confirmed" | "withdrawn" | "unconfirmed" | "expired";
 type QuestionRecord = {
   id: string; key: string; requestKey: string; senderId: string; hostId: string; threadId: string; turnId: string;
   question: CodexUserInputQuestion; status: QuestionStatus; deadline?: number;
   answer?: string; skipped?: boolean; messageId?: string; deliveryAttempted?: boolean; noticeAttempted?: boolean;
+  kind?: "sync" | "async"; answerDigest?: string; noticeOutcome?: CodexUserInputResult;
 };
 type Waiter = { resolve: (answer: string | undefined) => void; timer?: NodeJS.Timeout };
 type Options = {
@@ -54,9 +56,10 @@ export class ChannelUserInputController {
         const timeout = request.autoResolutionMs === null ? undefined : request.autoResolutionMs ?? this.defaultTimeoutMs;
         record = { id: `Q${++this.state.sequence}`, key: recordKey, requestKey: key, senderId,
           hostId: request.hostId ?? "local", threadId: request.threadId, turnId: request.turnId,
-          question, status: "pending", ...(timeout !== undefined ? { deadline: Date.now() + timeout } : {}) };
+          question, kind: request.kind, status: "pending", ...(timeout !== undefined ? { deadline: Date.now() + timeout } : {}) };
         this.state.records.push(record); this.save();
       }
+      record.kind ??= request.kind;
       if (!["pending", "answered"].includes(record.status)) return undefined;
       if (record.status === "pending") {
         const answer = await this.ask(record, index, request.questions.length);
@@ -104,6 +107,7 @@ export class ChannelUserInputController {
 
   private settle(record: QuestionRecord, answer: string | undefined): void {
     record.status = "answered"; record.skipped = answer === undefined; record.answer = answer;
+    if (record.kind === "async" && !record.question.isSecret) record.answerDigest = asyncAnswerDigest(record.question.id, record.question.question, answer ?? "");
     this.save(); this.release(record.id, answer);
   }
 
@@ -132,11 +136,12 @@ export class ChannelUserInputController {
   async reportResult(senderId: string, request: CodexUserInputRequest, result: CodexUserInputResult): Promise<void> {
     const key = requestKey(senderId, request);
     for (const record of this.state.records.filter(record => record.requestKey === key)) {
+      if (record.status === "confirmed") continue; // Native evidence is monotonic; late RPC failure cannot undo it.
       if (result === "suspended") { this.release(record.id); continue; }
       record.status = result === "failed" ? "unconfirmed" : result;
       delete record.answer; this.release(record.id); this.save();
-      if (record.noticeAttempted || !record.deliveryAttempted) continue;
-      record.noticeAttempted = true; this.save();
+      if ((record.noticeAttempted && !(result === "confirmed" && record.noticeOutcome !== "confirmed")) || !record.deliveryAttempted) continue;
+      record.noticeAttempted = true; record.noticeOutcome = result; this.save();
       const text = result === "confirmed" ? `Codex 已确认接收问题 ${record.id} 的回答。`
         : result === "withdrawn" ? `问题 ${record.id} 已失效或已在 Codex 中处理。`
         : `问题 ${record.id} 的回答尚未获 Codex 确认，未自动重发；请在 Codex App 核对。`;
@@ -144,6 +149,19 @@ export class ChannelUserInputController {
         await this.options.updateCard(record.messageId, createChoiceCard({ title: `Codex 问题 ${record.id} · 已处理`,
           body: text, fallbackText: text, choices: [], template: "grey" })).catch(() => {});
       } else await this.options.sendNotice?.(senderId, text).catch(() => {});
+    }
+  }
+
+  /** Read-only receipt recovery also works after restart; never resends an answer. */
+  async observeNativeAnswers(receipts: readonly NativeAsyncAnswerReceipt[]): Promise<void> {
+    for (const receipt of receipts) for (const record of this.state.records) {
+      if (record.kind !== "async" || record.status === "confirmed" || !record.answerDigest
+        || record.hostId !== receipt.hostId || record.threadId !== receipt.threadId || record.turnId !== receipt.turnId
+        || record.question.id !== receipt.questionId || record.answerDigest !== receipt.digest
+        || this.options.validate && !this.options.validate(record.senderId, record)) continue;
+      const [, , , , itemId, , requestId] = JSON.parse(record.requestKey) as unknown[];
+      await this.reportResult(record.senderId, { kind: "async", hostId: record.hostId, threadId: record.threadId,
+        turnId: record.turnId, itemId: String(itemId), requestId: requestId as string | number, questions: [record.question] }, "confirmed");
     }
   }
 

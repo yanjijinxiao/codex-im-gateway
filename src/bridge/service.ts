@@ -2689,6 +2689,10 @@ export class BridgeService {
 
   reconcileUserInputs(): void { this.userInputs.suspendInvalidBindings(); }
 
+  observeNativeUserInputAnswers(receipts: readonly import("../codex/async-user-input.js").NativeAsyncAnswerReceipt[]): Promise<void> {
+    return this.userInputs.observeNativeAnswers(receipts);
+  }
+
   reportUserInputResult(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest,
     result: import("../codex/backend.js").CodexUserInputResult, hostId?: string): Promise<void> {
     return this.userInputs.reportResult(senderId, { ...request, hostId: hostId ?? request.hostId ?? "local" }, result);

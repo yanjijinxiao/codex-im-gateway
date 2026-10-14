@@ -1338,7 +1338,10 @@ export class AccountManager {
       onApproval: (approval) => this.handleDesktopApproval(approval),
       onResult: (approval, result) => this.reportDesktopApprovalResult(approval, result),
       onUserInput: (input) => this.handleDesktopUserInput(input),
-      onUserInputResult: (input, result) => this.reportDesktopUserInputResult(input, result)
+      onUserInputResult: (input, result) => this.reportDesktopUserInputResult(input, result),
+      onObservedUserInputAnswers: async receipts => {
+        await Promise.all([...this.entries.values()].map(entry => entry.service?.observeNativeUserInputAnswers?.(receipts)));
+      }
     });
     this.codexDesktopRequestMonitor.start();
     this.refreshDesktopRequestSubscriptions();

@@ -5,7 +5,7 @@ import path from "node:path";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import type { CodexUserInputAnswer, CodexUserInputRequest, CodexUserInputResult } from "../codex/backend.js";
 import { parseUserInputRequest } from "../codex/user-input.js";
-import { desktopAsyncUserInputs, asyncUserInputReply } from "../codex/async-user-input.js";
+import { desktopAsyncUserInputs, asyncUserInputReply, asyncAnswerDigest, desktopAsyncAnswerReceipts, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
 
 import {
   isAppServerApprovalMethod,
@@ -42,6 +42,7 @@ export type CodexDesktopRequestMonitorOptions = {
   onResult?: (approval: CodexDesktopApproval, result: ApprovalDeliveryResult) => Promise<void> | void;
   onUserInput?: (input: CodexDesktopUserInput) => Promise<CodexUserInputAnswer | undefined>;
   onUserInputResult?: (input: CodexDesktopUserInput, result: CodexUserInputResult) => Promise<void> | void;
+  onObservedUserInputAnswers?: (receipts: NativeAsyncAnswerReceipt[]) => Promise<void> | void;
 };
 
 type IpcMessage = Record<string, unknown>;
@@ -59,6 +60,7 @@ export class CodexDesktopRequestMonitor {
   private readonly rerouteRequests = new Set<string>();
   private readonly pendingDecisions = new Map<string, {
     method: string; expectedTurnId?: string; resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout;
+    answerReceipts?: NativeAsyncAnswerReceipt[];
   }>();
   private socket?: net.Socket;
   private reconnectTimer?: NodeJS.Timeout;
@@ -188,11 +190,11 @@ export class CodexDesktopRequestMonitor {
     }
     if (message.type === "response" && typeof message.requestId === "string") {
       const pending = this.pendingDecisions.get(message.requestId);
-      if (!pending || message.method !== pending.method) return;
+      if (!pending || message.method !== undefined && message.method !== pending.method) return;
       this.pendingDecisions.delete(message.requestId);
       clearTimeout(pending.timer);
       const acknowledged = pending.method === "thread-follower-steer-turn"
-        ? recordValue(recordValue(message.result)?.result)?.turnId === pending.expectedTurnId
+        ? (recordValue(recordValue(message.result)?.result)?.turnId ?? recordValue(message.result)?.turnId) === pending.expectedTurnId
         : recordValue(message.result)?.ok === true;
       if (message.resultType === "success" && !message.error && acknowledged) {
         pending.resolve();
@@ -237,6 +239,16 @@ export class CodexDesktopRequestMonitor {
   }
 
   private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }): void {
+    const receipts = desktopAsyncAnswerReceipts(threadId, snapshot as unknown as Record<string, unknown>);
+    for (const [id, pending] of this.pendingDecisions) if (pending.answerReceipts?.length
+      && pending.answerReceipts.every(expected => receipts.some(actual => actual.hostId === expected.hostId
+        && actual.threadId === expected.threadId && actual.turnId === expected.turnId
+        && actual.questionId === expected.questionId && actual.digest === expected.digest))) {
+      clearTimeout(pending.timer); this.pendingDecisions.delete(id); pending.resolve();
+    }
+    if (receipts.length) void Promise.resolve(this.options.onObservedUserInputAnswers?.(receipts)).catch(() => {
+      console.warn("[codex-im-gateway] native question receipt reconciliation failed");
+    });
     const asyncRequests = desktopAsyncUserInputs(threadId, snapshot as unknown as Record<string, unknown>);
     this.processRequests(threadId, [...(snapshot.requests ?? []), ...asyncRequests.map(request => ({
       method: "item/tool/requestUserInput", id: request.requestId, params: request, async: true
@@ -319,12 +331,17 @@ export class CodexDesktopRequestMonitor {
             clientUserMessageId: crypto.createHash("sha256").update(JSON.stringify([
               approval.request.threadId, approval.request.turnId, approval.requestId
             ])).digest("hex")
-          }, approval.request.turnId);
+          }, approval.request.turnId, approval.request.questions.map(question => ({ hostId: "local",
+            threadId: approval.request.threadId, turnId: approval.request.turnId, questionId: question.id,
+            digest: asyncAnswerDigest(question.id, question.question, answers[question.id]?.answers[0] ?? "") })));
         } else await this.submitDecision("thread-follower-submit-user-input", {
             conversationId: approval.request.threadId, requestId: approval.requestId, response: { answers }
           });
         await this.reportInput(approval, "confirmed");
-      } catch {
+      } catch (error) {
+        console.warn(`[codex-im-gateway] native question RPC unconfirmed ${JSON.stringify({ timestamp: new Date().toISOString(),
+          threadId: approval.request.threadId, turnId: approval.request.turnId,
+          code: /timed out/.test(error instanceof Error ? error.message : "") ? "timeout" : "invalid-or-disconnected-receipt" })}`);
         await this.reportInput(approval, "failed");
       }
       return;
@@ -360,7 +377,7 @@ export class CodexDesktopRequestMonitor {
     }
   }
 
-  private submitDecision(method: string, params: IpcMessage, expectedTurnId?: string): Promise<void> {
+  private submitDecision(method: string, params: IpcMessage, expectedTurnId?: string, answerReceipts?: NativeAsyncAnswerReceipt[]): Promise<void> {
     if (!this.clientId || !this.socket?.writable) return Promise.reject(new Error("Desktop IPC disconnected"));
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
@@ -368,7 +385,7 @@ export class CodexDesktopRequestMonitor {
         this.pendingDecisions.delete(requestId);
         reject(new Error("Desktop interaction receipt timed out"));
       }, this.options.decisionTimeoutMs ?? 15_000);
-      this.pendingDecisions.set(requestId, { method, expectedTurnId,
+      this.pendingDecisions.set(requestId, { method, expectedTurnId, answerReceipts,
         resolve, reject, timer });
       try {
         this.send({ type: "request", requestId, sourceClientId: this.clientId, version: 1, method, params });

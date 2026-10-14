@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ChannelUserInputController } from "../src/bridge/user-input-controller.js";
+import { desktopAsyncUserInputs, desktopAsyncAnswerReceipts, asyncUserInputReply } from "../src/codex/async-user-input.js";
 import { BridgeService } from "../src/bridge/service.js";
 import { followSyncFailure, formatFollowStatus, type SessionFollowStatus } from "../src/bridge/session-follow.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
@@ -93,6 +95,38 @@ test("restart restores the same active card even when every progress message was
   assert.equal(f.writes.at(-1)?.messageId, "original-card");
   assert.match(f.writes.at(-1)!.text, /当前公开进展/);
   assert.equal(f.hub.status("binding").status, "synced");
+});
+
+test("answering a native question resumes progress and final delivery on the same AI Card", async t => {
+  const f = hubFixture(t); await f.hub.refresh();
+  const controller = new ChannelUserInputController(async () => ({ messageId: "separate-question-notice" }));
+  t.after(() => controller.close());
+  const native = { threadRuntimeStatus: { type: "active" }, turns: [{ turnId: "turn", status: "inProgress", items: [
+    { type: "agentMessage", id: "call", questions: [{ title: "继续吗？" }] }
+  ] }] };
+  const question = desktopAsyncUserInputs("thread", native)[0];
+  const pending = controller.request("group", question);
+  f.setRead(async () => { const s = snapshot(); s.state.activeFlags = ["waitingOnUserInput"]; return s; });
+  await f.hub.refresh();
+  controller.answer("group", "Q1 继续"); const answers = await pending;
+  native.turns[0].items.push({ type: "userMessage", content: [{ type: "text", text: asyncUserInputReply(question, answers!) }] } as never);
+  await controller.observeNativeAnswers(desktopAsyncAnswerReceipts("thread", native));
+  f.setRead(async () => ({ ...snapshot("thread", "已收到问题回答，继续执行后续步骤"), turns: [{ id: "turn", status: "inProgress", messages: [
+    { id: "after-answer-progress", role: "assistant", kind: "progress", text: "已收到问题回答，继续执行后续步骤" }
+  ] }] }));
+  await f.hub.refresh();
+  const deadline = Date.now() + 3_000;
+  while (!f.writes.some(write => write.messageId === "original-card" && write.text.includes("继续执行后续步骤"))) {
+    assert.ok(Date.now() < deadline, "automatic original-card progress update timed out");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(f.starts, 1); assert.equal(f.writes.at(-1)?.messageId, "original-card");
+  assert.match(f.writes.at(-1)!.text, /继续执行后续步骤/); assert.notEqual(f.writes.at(-1)?.finalize, true);
+  f.setRead(async () => ({ state: { ...snapshot().state, runtimeStatus: "idle", activeTurnId: undefined }, turns: [
+    { id: "turn", status: "completed", messages: [{ id: "final", role: "assistant", text: "回答后完成的最终结果" }] }
+  ] }));
+  await f.hub.refresh(); assert.equal(f.starts, 1); assert.equal(f.writes.at(-1)?.messageId, "original-card");
+  assert.equal(f.writes.at(-1)?.finalize, true); assert.equal(f.writes.at(-1)?.text, "回答后完成的最终结果");
 });
 
 test("a live writer can recover a pre-upgrade local shutdown error without replacing the card", async t => {

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { CodexDesktopRequestMonitor, type CodexDesktopRequestMonitorOptions, type CodexDesktopUserInput } from "../src/server/codex-desktop-request-monitor.js";
-import { asyncUserInputReply } from "../src/codex/async-user-input.js";
+import { asyncUserInputReply, type NativeAsyncAnswerReceipt } from "../src/codex/async-user-input.js";
 
 async function waitFor(condition: () => boolean): Promise<void> {
   const deadline = Date.now() + 2000;
@@ -59,8 +59,8 @@ async function fixture(t: test.TestContext, options: Partial<CodexDesktopRequest
   const snapshot = (state: unknown) => send({ type: "snapshot", conversationState: state });
   const patches = (patches: unknown[]) => send({ type: "patches", patches });
   const writes = () => messages.filter(m => ["thread-follower-submit-user-input", "thread-follower-steer-turn"].includes(m.method));
-  const respond = (result: unknown) => { const m = writes().at(-1)!;
-    frame(peer, { type: "response", method: m.method, requestId: m.requestId, resultType: "success", result }); };
+  const respond = (result: unknown, includeMethod = true) => { const m = writes().at(-1)!;
+    frame(peer, { type: "response", ...(includeMethod ? { method: m.method } : {}), requestId: m.requestId, resultType: "success", result }); };
   return { monitor, peer, messages, inputs, results, snapshot, patches, writes, respond };
 }
 
@@ -74,6 +74,30 @@ function asyncState(canonical = false) {
   return { requests: [], threadRuntimeStatus: { type: "active" }, ...(canonical
     ? { turnHistory: { history: { entitiesByKey: { turn: asyncTurn } } } } : { turns: [asyncTurn] }) };
 }
+
+for (const includeMethod of [true, false]) test(`flat async receipts require the same turn: method=${includeMethod}`, async t => {
+  const f = await fixture(t); f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);
+  f.respond({ turnId: "turn" }, includeMethod); await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]); assert.equal(f.writes().length, 1);
+});
+
+test("matching accepted native answer settles a missing RPC receipt without resending the answer", async t => {
+  const receipts: NativeAsyncAnswerReceipt[] = [];
+  const f = await fixture(t, { onObservedUserInputAnswers: values => { receipts.push(...values); } });
+  f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);
+  f.patches([{ op: "add", path: ["turns", 0, "items", 1], value: { type: "userMessage", content: [{ type: "text", text: f.writes()[0].params.input[0].text }] } }]);
+  await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]); assert.equal(receipts.length, 1); assert.equal(f.writes().length, 1);
+  await new Promise(resolve => setTimeout(resolve, 110)); assert.deepEqual(f.results, ["confirmed"]);
+});
+
+test("different accepted answer cannot acknowledge our submitted answer", async t => {
+  const f = await fixture(t, { decisionTimeoutMs: 25 }); f.snapshot(asyncState());
+  await waitFor(() => f.writes().length === 1);
+  f.patches([{ op: "add", path: ["turns", 0, "items", 1], value: { type: "userMessage", content: [{ type: "text",
+    text: f.writes()[0].params.input[0].text.replace("我的回答", "不同回答") }] } }]);
+  await waitFor(() => f.results.length > 0); assert.deepEqual(f.results, ["failed"]);
+});
 
 test("native pending request replies by requestId and waits for an explicit receipt", async t => {
   const f = await fixture(t);

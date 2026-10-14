@@ -6,7 +6,7 @@ import test from "node:test";
 import { ChannelUserInputController } from "../src/bridge/user-input-controller.js";
 import type { CodexUserInputRequest } from "../src/codex/backend.js";
 import { parseUserInputRequest } from "../src/codex/user-input.js";
-import { desktopAsyncUserInputs, asyncUserInputReply } from "../src/codex/async-user-input.js";
+import { desktopAsyncUserInputs, asyncUserInputReply, asyncAnswerDigest, desktopAsyncAnswerReceipts } from "../src/codex/async-user-input.js";
 import { formatChannelActionCommand, parseChannelActionValue, type ChannelActionCard } from "../src/channels/action-card.js";
 import { feishuActionCard } from "../src/channels/feishu-action-card.js";
 import { parseCommand } from "../src/bridge/channel-commands.js";
@@ -201,6 +201,56 @@ function asyncState() {
     { turnId: "turn", status: "inProgress", items: [{ type: "agentMessage", id: "call_123",
       questions: [{ title: "farming 在哪里？" }, { title: "继续吗？", options: ["继续", "停止"] }] }] }] };
 }
+
+test("native answer evidence requires the original widget, exact question and accepted structured envelope", () => {
+  const state = asyncState(); const r = desktopAsyncUserInputs("thread", state)[0];
+  const text = asyncUserInputReply(r, { [r.questions[0].id]: { answers: ["目录"] } });
+  const accepted = { type: "steeringUserMessage", status: "accepted", input: [{ type: "text", text }] };
+  state.turns[1].items.push(accepted as never);
+  const receipts = desktopAsyncAnswerReceipts("thread", state);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].digest, asyncAnswerDigest(r.questions[0].id, r.questions[0].question, "目录"));
+  accepted.status = "pending"; assert.equal(desktopAsyncAnswerReceipts("thread", state).length, 0);
+  accepted.status = "accepted";
+  accepted.input[0].text = `quoted ${text}`; assert.equal(desktopAsyncAnswerReceipts("thread", state).length, 0);
+  accepted.input[0].text = text.replace("farming 在哪里？", "另一个问题"); assert.equal(desktopAsyncAnswerReceipts("thread", state).length, 0);
+  accepted.input[0].text = text;
+  state.turns[1].status = "completed";
+  assert.equal(desktopAsyncAnswerReceipts("thread", { threadRuntimeStatus: { type: "idle" }, turnHistory: { history: {
+    entitiesByKey: { turn: state.turns[1] } } } }).length, 1);
+});
+
+test("native evidence repairs an uncertain answer after restart without replay and confirmation never regresses", async t => {
+  const f = fixture(t); const r = desktopAsyncUserInputs("thread", asyncState())[0];
+  const pending = f.controller.request("room", r);
+  f.controller.answer("room", "Q1 目录"); await pending;
+  await f.controller.reportResult("room", r, "failed");
+  assert.doesNotMatch(fs.readFileSync(f.filePath, "utf8"), /\"answer\"\s*:/);
+  f.controller.close(); const restored = f.create(); t.after(() => restored.close());
+  const receipt = { hostId: "local" as const, threadId: r.threadId, turnId: r.turnId, questionId: r.questions[0].id,
+    digest: asyncAnswerDigest(r.questions[0].id, r.questions[0].question, "目录") };
+  for (const wrong of [{ ...receipt, turnId: "other" }, { ...receipt, threadId: "other" },
+    { ...receipt, digest: "wrong" }, { ...receipt, questionId: "other" }]) await restored.observeNativeAnswers([wrong]);
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "unconfirmed");
+  await restored.observeNativeAnswers([receipt]);
+  await restored.observeNativeAnswers([receipt]);
+  await restored.reportResult("room", r, "failed"); await restored.reportResult("room", r, "withdrawn");
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "confirmed");
+  assert.equal(f.cards.length, 1); assert.equal(f.notices.filter(n => n.includes("已确认接收")).length, 1);
+});
+
+test("native evidence cannot confirm a never-submitted answer or cross a changed binding", async t => {
+  let bound = true; const f = fixture(t, { validate: () => bound });
+  const r = desktopAsyncUserInputs("thread", asyncState())[0];
+  const pending = f.controller.request("room", r);
+  const receipt = { hostId: "local" as const, threadId: r.threadId, turnId: r.turnId, questionId: r.questions[0].id,
+    digest: asyncAnswerDigest(r.questions[0].id, r.questions[0].question, "目录") };
+  await f.controller.observeNativeAnswers([receipt]);
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "pending");
+  f.controller.answer("room", "Q1 目录"); await pending; await f.controller.reportResult("room", r, "failed");
+  bound = false; await f.controller.observeNativeAnswers([receipt]);
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records[0].status, "unconfirmed");
+});
 
 test("Desktop async widgets have independent stable identities and the exact native answer envelope", () => {
   const state = asyncState();

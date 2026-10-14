@@ -1,7 +1,51 @@
 import type { CodexUserInputAnswer, CodexUserInputRequest } from "./backend.js";
+import crypto from "node:crypto";
 
 const OPEN = "<send_user_message_question_reply>";
 const CLOSE = "</send_user_message_question_reply>";
+
+export type NativeAsyncAnswerReceipt = {
+  hostId: "local"; threadId: string; turnId: string; questionId: string; digest: string;
+};
+/** Durable comparison token, not the answer or an arbitrary success response. */
+export function asyncAnswerDigest(questionId: string, question: string, answer: string): string {
+  return crypto.createHash("sha256").update(JSON.stringify([questionId, question, answer])).digest("hex");
+}
+
+/** Only a canonical, accepted native answer to an existing widget is evidence. */
+export function desktopAsyncAnswerReceipts(threadId: string, state: Record<string, unknown>): NativeAsyncAnswerReceipt[] {
+  const history = object(object(state.turnHistory)?.history);
+  const entities = object(history?.entitiesByKey);
+  const rawTurns = entities ? Object.values(entities) : Array.isArray(state.turns) ? state.turns : [];
+  const receipts: NativeAsyncAnswerReceipt[] = [];
+  for (const rawTurn of rawTurns) {
+    const turn = object(rawTurn);
+    if (typeof turn?.turnId !== "string" || !turn.turnId || !Array.isArray(turn.items)) continue;
+    const questions = new Map<string, string>();
+    for (const rawItem of turn.items) {
+      const item = object(rawItem);
+      if (item?.type !== "agentMessage" || typeof item.id !== "string" || !Array.isArray(item.questions)) continue;
+      for (const [index, value] of item.questions.entries()) {
+        const question = object(value);
+        if (typeof question?.title === "string") questions.set(JSON.stringify(["request_user_input_async", item.id, index]), question.title);
+      }
+    }
+    for (const rawItem of turn.items) {
+      const item = object(rawItem);
+      if (!item || !["userMessage", "steeringUserMessage"].includes(String(item.type))) continue;
+      if (item.type === "steeringUserMessage" && item.status !== "accepted") continue;
+      const input = item.type === "userMessage" ? item.content : item.input;
+      if (!Array.isArray(input) || input.length !== 1) continue;
+      const text = object(input[0]);
+      if (text?.type !== "text" || typeof text.text !== "string") continue;
+      for (const row of answerRows(text.text)) if (questions.get(row.questionItemId) === row.question) {
+        receipts.push({ hostId: "local", threadId, turnId: turn.turnId, questionId: row.questionItemId,
+          digest: asyncAnswerDigest(row.questionItemId, row.question, row.answer) });
+      }
+    }
+  }
+  return receipts;
+}
 
 /** Desktop represents request_user_input_async questions on agentMessage items. */
 export function desktopAsyncUserInputs(threadId: string, state: Record<string, unknown>): CodexUserInputRequest[] {
@@ -58,6 +102,10 @@ export function asyncUserInputReply(request: CodexUserInputRequest, answers: Cod
 }
 
 function answeredQuestionIds(text: string): string[] {
+  return answerRows(text).map(row => row.questionItemId);
+}
+
+function answerRows(text: string): Array<{ questionItemId: string; question: string; answer: string }> {
   const value = text.trim();
   if (!value.startsWith(OPEN) || !value.endsWith(CLOSE)) return [];
   try {
@@ -66,7 +114,7 @@ function answeredQuestionIds(text: string): string[] {
     return rows.flatMap(row => {
       const item = object(row);
       return typeof item?.questionItemId === "string" && typeof item.question === "string" && typeof item.answer === "string"
-        ? [item.questionItemId] : [];
+        ? [{ questionItemId: item.questionItemId, question: item.question, answer: item.answer }] : [];
     });
   } catch { return []; }
 }
