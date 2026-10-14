@@ -8,6 +8,39 @@ import { summarizeProgress } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("locally rejected legacy route restores automatically without replacing or notifying a nonexistent card", async t => {
+  const io = transport();
+  const stream = new ChannelTurnTextStream(io.client, "chat", { save() {}, restore: {
+    streamId: "preserved-logical-id", creationAttempted: true, startedAt: Date.now(),
+    progressEntries: [], thought: "", answerPreview: "", finished: false,
+    bootstrap: { version: 1, instanceId: "preserved-logical-id", recipientId: "chat", stage: "create-rejected",
+      failure: { operation: "create", code: "RouteUnconfirmed", uncertain: false } },
+    terminal: { text: "result", error: false }
+  } });
+  t.after(() => stream.suspend());
+  assert.equal(await stream.reportTerminalFailure(), false); assert.equal(io.texts.length, 0);
+  assert.equal(await stream.finalize("result"), true);
+  assert.equal(io.starts.length, 1); assert.equal(io.starts[0].streamId, "preserved-logical-id");
+  assert.equal(io.frames.at(-1)?.finalize, true);
+  assert.equal(await stream.finalize("result"), true); assert.equal(io.starts.length, 1);
+});
+
+for (const stage of ["create-unconfirmed", "delivery-unconfirmed", "create-rejected"] as const) {
+  test(`background recovery never replays ${stage} provider requests`, async t => {
+    const io = transport();
+    const stream = new ChannelTurnTextStream(io.client, "chat", { save() {}, restore: {
+      streamId: "original", creationAttempted: true, startedAt: Date.now(), progressEntries: [],
+      thought: "", answerPreview: "", finished: false,
+      bootstrap: { version: 1, instanceId: "original", recipientId: "chat", stage,
+        failure: { operation: "create", code: stage === "create-rejected" ? "PermissionDenied" : "TransportUnconfirmed", uncertain: stage !== "create-rejected" } },
+      terminal: { text: "result", error: false }
+    } });
+    t.after(() => stream.suspend());
+    assert.equal(await stream.finalize("result"), false); assert.equal(io.starts.length, 0);
+    await stream.reportTerminalFailure(); assert.doesNotMatch(io.texts[0] ?? "", /未能更新原 AI Card/);
+  });
+}
+
 function transport() {
   const starts: Array<{ text: string; streamId?: string }> = [];
   const frames: Array<{ messageId: string; text: string; finalize?: boolean; error?: boolean }> = [];

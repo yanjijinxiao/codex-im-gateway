@@ -54,10 +54,10 @@ async function fixture(t: test.TestContext, options: Partial<CodexDesktopRequest
   t.after(() => { monitor.stop(); for (const socket of sockets) socket.destroy(); server.close(); fs.rmSync(root, { recursive: true, force: true }); });
   monitor.followThread("thread"); monitor.start();
   await waitFor(() => messages.some(m => m.method === "thread-stream-following-changed"));
-  const send = (change: unknown) => frame(peer, { type: "broadcast", method: "thread-stream-state-changed",
-    params: { conversationId: "thread", change } });
-  const snapshot = (state: unknown) => send({ type: "snapshot", conversationState: state });
-  const patches = (patches: unknown[]) => send({ type: "patches", patches });
+  const send = (change: unknown, hostId = "local") => frame(peer, { type: "broadcast", method: "thread-stream-state-changed",
+    params: { conversationId: "thread", hostId, change } });
+  const snapshot = (state: unknown, hostId = "local") => send({ type: "snapshot", conversationState: state }, hostId);
+  const patches = (patches: unknown[], hostId = "local") => send({ type: "patches", patches }, hostId);
   const writes = () => messages.filter(m => ["thread-follower-submit-user-input", "thread-follower-steer-turn"].includes(m.method));
   const respond = (result: unknown, includeMethod = true) => { const m = writes().at(-1)!;
     frame(peer, { type: "response", ...(includeMethod ? { method: m.method } : {}), requestId: m.requestId, resultType: "success", result }); };
@@ -74,6 +74,37 @@ function asyncState(canonical = false) {
   return { requests: [], threadRuntimeStatus: { type: "active" }, ...(canonical
     ? { turnHistory: { history: { entitiesByKey: { turn: asyncTurn } } } } : { turns: [asyncTurn] }) };
 }
+
+test("remote async answers use host-scoped follower v2 and cannot be confirmed by a local twin", async t => {
+  const remote = "remote-ssh-discovered:test";
+  const f = await fixture(t);
+  f.monitor.followThread("thread", remote);
+  await waitFor(() => f.messages.some(m => m.method === "thread-stream-following-changed" && m.params.hostId === remote));
+  f.snapshot(asyncState(), remote); await waitFor(() => f.writes().length === 1);
+  const rpc = f.writes()[0];
+  assert.equal(f.inputs[0].hostId, remote); assert.equal(f.inputs[0].request.hostId, remote);
+  assert.equal(rpc.hostId, remote); assert.equal(rpc.version, 2); assert.equal(rpc.params.hostId, undefined);
+  assert.deepEqual(rpc.params.restoreMessage, { context: {} });
+  const answered = { ...asyncState(), turns: [{ ...asyncTurn, items: [...asyncTurn.items,
+    { type: "steeringUserMessage", status: "accepted", input: rpc.params.input }] }] };
+  f.snapshot(answered, "local"); await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(f.results, []);
+  f.snapshot(answered, remote); await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]); assert.equal(f.writes().length, 1);
+});
+
+test("unfollowing a local twin does not withdraw a pending remote question", async t => {
+  const remote = "remote-host";
+  let answer!: (value: Record<string, { answers: string[] }>) => void;
+  const f = await fixture(t, { onUserInput: async () => new Promise(resolve => { answer = resolve; }) });
+  f.monitor.followThread("thread", remote); f.snapshot(asyncState(), remote);
+  await waitFor(() => f.inputs.length === 1);
+  f.monitor.setFollowedThreads([{ threadId: "thread", hostId: remote }]);
+  assert.deepEqual(f.results, []);
+  answer({ [f.inputs[0].request.questions[0].id]: { answers: ["回答"] } });
+  await waitFor(() => f.writes().length === 1); f.respond({ result: { turnId: "turn" } });
+  await waitFor(() => f.results.length === 1); assert.deepEqual(f.results, ["confirmed"]);
+});
 
 for (const includeMethod of [true, false]) test(`flat async receipts require the same turn: method=${includeMethod}`, async t => {
   const f = await fixture(t); f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);

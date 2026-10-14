@@ -17,6 +17,8 @@ export type ChannelStreamFailure = {
   httpStatus?: number;
   requestId?: string;
   uncertain: boolean;
+  /** Local validation blocked the request before any provider mutation. */
+  requestNotSent?: true;
 };
 
 export type ChannelStreamStartInput = {
@@ -34,5 +36,17 @@ export function restoredBootstrap(value: ChannelStreamBootstrap): ChannelStreamB
   const copy = structuredClone(value);
   if (copy.stage === "create-pending") copy.stage = "create-unconfirmed";
   if (copy.stage === "delivery-pending") copy.stage = "delivery-unconfirmed";
+  // Legacy RouteUnconfirmed was emitted only by local route validation,
+  // before create or token retrieval. Never upgrade provider rejections.
+  if (copy.stage === "create-rejected" && !copy.messageId && !copy.adapterData
+    && copy.failure?.operation === "create" && copy.failure.code === "RouteUnconfirmed"
+    && copy.failure.uncertain === false && copy.failure.httpStatus === undefined && !copy.failure.requestId) {
+    copy.failure.requestNotSent = true;
+  }
   return copy;
+}
+
+export function canRetryUnsentCreation(value?: ChannelStreamBootstrap): boolean {
+  return value?.stage === "create-rejected" && !value.messageId && value.failure?.operation === "create"
+    && value.failure.requestNotSent === true && value.failure.uncertain === false;
 }

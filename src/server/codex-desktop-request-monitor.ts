@@ -19,15 +19,15 @@ const IPC_MESSAGE_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RECONNECT_DELAY_MS = 2_000;
 
 export type CodexDesktopApproval = {
-  /** This monitor uses the local Desktop IPC socket, never a remote host. */
-  hostId?: "local";
+  /** Execution host; the local Desktop peer proxies remote followers. */
+  hostId?: string;
   requestId: string | number;
   method: AppServerApprovalMethod;
   request: CodexApprovalRequest;
 };
 
 export type CodexDesktopUserInput = {
-  hostId: "local";
+  hostId: string;
   requestId: string | number;
   method: "item/tool/requestUserInput";
   request: CodexUserInputRequest;
@@ -46,12 +46,14 @@ export type CodexDesktopRequestMonitorOptions = {
 };
 
 type IpcMessage = Record<string, unknown>;
+export type DesktopFollowTarget = { hostId: string; threadId: string };
+const followKey = (threadId: string, hostId: string) => JSON.stringify([hostId, threadId]);
 
 /** One follower connection for all pending native interactions. */
 export class CodexDesktopRequestMonitor {
   private readonly socketPath: string;
   private readonly reconnectDelayMs: number;
-  private readonly followedThreads = new Set<string>();
+  private readonly followedThreads = new Map<string, DesktopFollowTarget>();
   private readonly handledRequests = new Set<string>();
   private readonly activeRequests = new Map<string, DesktopRequest>();
   private readonly requestSnapshots = new Map<string, { requests: unknown[]; cwd?: string; turns?: unknown[];
@@ -92,24 +94,28 @@ export class CodexDesktopRequestMonitor {
     this.requestSnapshots.clear();
   }
 
-  followThread(threadId: string): void {
-    if (!threadId.trim() || this.followedThreads.has(threadId)) return;
-    this.followedThreads.add(threadId);
-    if (this.clientId) this.sendFollow(threadId, true);
+  followThread(threadId: string, hostId = "local"): void {
+    const key = followKey(threadId, hostId);
+    if (!threadId.trim() || !hostId.trim() || this.followedThreads.has(key)) return;
+    this.followedThreads.set(key, { threadId, hostId });
+    if (this.clientId) this.sendFollow(threadId, true, hostId);
   }
 
-  setFollowedThreads(threadIds: Iterable<string>): void {
-    const next = new Set(threadIds);
-    for (const threadId of this.followedThreads) {
-      if (next.has(threadId)) continue;
-      this.followedThreads.delete(threadId);
-      this.requestSnapshots.delete(threadId);
-      if (this.clientId) this.sendFollow(threadId, false);
+  setFollowedThreads(threadIds: Iterable<string | DesktopFollowTarget>): void {
+    const next = new Map(Array.from(threadIds, value => {
+      const target = typeof value === "string" ? { threadId: value, hostId: "local" } : value;
+      return [followKey(target.threadId, target.hostId), target] as const;
+    }));
+    for (const [scope, { threadId, hostId }] of this.followedThreads) {
+      if (next.has(scope)) continue;
+      this.followedThreads.delete(scope);
+      this.requestSnapshots.delete(scope);
+      if (this.clientId) this.sendFollow(threadId, false, hostId);
       for (const [key, approval] of this.activeRequests) {
-        if (approval.request.threadId === threadId) this.withdraw(key, approval, true);
+        if (approval.request.threadId === threadId && (approval.hostId ?? "local") === hostId) this.withdraw(key, approval, true);
       }
     }
-    for (const threadId of next) this.followThread(threadId);
+    for (const { threadId, hostId } of next.values()) this.followThread(threadId, hostId);
     // Retry a previously unroutable request after a binding/channel change.
     for (const [key, approval] of this.activeRequests) this.dispatch(key, approval);
   }
@@ -185,7 +191,7 @@ export class CodexDesktopRequestMonitor {
       if (!clientId) return;
       this.clientId = clientId;
       console.log("[codex-im-gateway] connected to Codex Desktop pending-request stream");
-      for (const threadId of this.followedThreads) this.sendFollow(threadId, true);
+      for (const { threadId, hostId } of this.followedThreads.values()) this.sendFollow(threadId, true, hostId);
       return;
     }
     if (message.type === "response" && typeof message.requestId === "string") {
@@ -207,20 +213,22 @@ export class CodexDesktopRequestMonitor {
     if (message.type !== "broadcast" || message.method !== "thread-stream-state-changed") return;
     const params = recordValue(message.params);
     const threadId = stringValue(params?.conversationId);
+    const hostId = stringValue(params?.hostId) ?? "local";
+    const scope = threadId ? followKey(threadId, hostId) : "";
     const change = recordValue(params?.change);
-    if (!threadId || !change || !this.followedThreads.has(threadId)) return;
+    if (!threadId || !change || !this.followedThreads.has(scope)) return;
     if (change.type === "snapshot") {
       const state = recordValue(change.conversationState);
       if (!state || (state.requests !== undefined && !Array.isArray(state.requests))) return;
       const snapshot = { requests: (state.requests ?? []) as unknown[], cwd: stringValue(state.cwd),
         turns: Array.isArray(state.turns) ? state.turns : [], turnHistory: state.turnHistory,
         threadRuntimeStatus: state.threadRuntimeStatus };
-      this.requestSnapshots.set(threadId, snapshot);
-      this.processSnapshot(threadId, snapshot);
+      this.requestSnapshots.set(scope, snapshot);
+      this.processSnapshot(threadId, snapshot, hostId);
       return;
     }
     if (change.type !== "patches" || !Array.isArray(change.patches)) return;
-    const snapshot = structuredClone(this.requestSnapshots.get(threadId) ?? { requests: [] });
+    const snapshot = structuredClone(this.requestSnapshots.get(scope) ?? { requests: [] });
     let changed = false;
     for (const patch of change.patches) {
       const record = recordValue(patch);
@@ -234,12 +242,12 @@ export class CodexDesktopRequestMonitor {
         changed = true;
       }
     }
-    this.requestSnapshots.set(threadId, snapshot);
-    if (changed) this.processSnapshot(threadId, snapshot);
+    this.requestSnapshots.set(scope, snapshot);
+    if (changed) this.processSnapshot(threadId, snapshot, hostId);
   }
 
-  private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }): void {
-    const receipts = desktopAsyncAnswerReceipts(threadId, snapshot as unknown as Record<string, unknown>);
+  private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }, hostId: string): void {
+    const receipts = desktopAsyncAnswerReceipts(threadId, snapshot as unknown as Record<string, unknown>, hostId);
     for (const [id, pending] of this.pendingDecisions) if (pending.answerReceipts?.length
       && pending.answerReceipts.every(expected => receipts.some(actual => actual.hostId === expected.hostId
         && actual.threadId === expected.threadId && actual.turnId === expected.turnId
@@ -249,13 +257,13 @@ export class CodexDesktopRequestMonitor {
     if (receipts.length) void Promise.resolve(this.options.onObservedUserInputAnswers?.(receipts)).catch(() => {
       console.warn("[codex-im-gateway] native question receipt reconciliation failed");
     });
-    const asyncRequests = desktopAsyncUserInputs(threadId, snapshot as unknown as Record<string, unknown>);
+    const asyncRequests = desktopAsyncUserInputs(threadId, snapshot as unknown as Record<string, unknown>, hostId);
     this.processRequests(threadId, [...(snapshot.requests ?? []), ...asyncRequests.map(request => ({
       method: "item/tool/requestUserInput", id: request.requestId, params: request, async: true
-    }))], snapshot.cwd);
+    }))], snapshot.cwd, hostId);
   }
 
-  private processRequests(threadId: string, value: unknown, cwd?: string): void {
+  private processRequests(threadId: string, value: unknown, cwd: string | undefined, hostId: string): void {
     if (!Array.isArray(value)) return;
     const present = new Set<string>();
     for (const raw of value) {
@@ -268,21 +276,21 @@ export class CodexDesktopRequestMonitor {
       const inputRequest = parsedInput ? { ...parsedInput, ...(envelope?.async === true ? { kind: "async" as const } : {}) } : undefined;
       const request = inputRequest ?? (isAppServerApprovalMethod(method) ? parseAppServerApproval(method, params) : undefined);
       if (!request || request.threadId !== threadId) continue;
-      const key = JSON.stringify([threadId, request.turnId, typeof requestId, requestId]);
+      const key = JSON.stringify([hostId, threadId, request.turnId, typeof requestId, requestId]);
       present.add(key);
-      const normalized = inputRequest ? { ...inputRequest, requestId, hostId: "local" }
+      const normalized = inputRequest ? { ...inputRequest, requestId, hostId }
         : { ...request, ...((request as CodexApprovalRequest).cwd || !cwd ? {} : { cwd }) };
       const previous = this.activeRequests.get(key);
       if (previous && previous.method === method && JSON.stringify(previous.request) === JSON.stringify(normalized)) continue;
       if (previous) this.withdraw(key, previous);
       const approval: DesktopRequest = inputRequest
-        ? { hostId: "local", requestId, method: "item/tool/requestUserInput", request: { ...inputRequest, requestId, hostId: "local" } }
-        : { hostId: "local", requestId, method: method as AppServerApprovalMethod, request: normalized as CodexApprovalRequest };
+        ? { hostId, requestId, method: "item/tool/requestUserInput", request: { ...inputRequest, requestId, hostId } }
+        : { hostId, requestId, method: method as AppServerApprovalMethod, request: normalized as CodexApprovalRequest };
       this.activeRequests.set(key, approval);
       this.dispatch(key, approval);
     }
     for (const [key, approval] of this.activeRequests) {
-      if (approval.request.threadId === threadId && !present.has(key)) this.withdraw(key, approval);
+      if (approval.request.threadId === threadId && (approval.hostId ?? "local") === hostId && !present.has(key)) this.withdraw(key, approval);
     }
   }
 
@@ -333,18 +341,18 @@ export class CodexDesktopRequestMonitor {
             // current cwd, workspace, collaboration mode and permissions.
             restoreMessage: { context: {} },
             clientUserMessageId: crypto.createHash("sha256").update(JSON.stringify([
-              approval.request.threadId, approval.request.turnId, approval.requestId
+              approval.hostId, approval.request.threadId, approval.request.turnId, approval.requestId
             ])).digest("hex")
-          }, approval.request.turnId, approval.request.questions.map(question => ({ hostId: "local",
+          }, approval.request.turnId, approval.request.questions.map(question => ({ hostId: approval.hostId,
             threadId: approval.request.threadId, turnId: approval.request.turnId, questionId: question.id,
-            digest: asyncAnswerDigest(question.id, question.question, answers[question.id]?.answers[0] ?? "") })));
+            digest: asyncAnswerDigest(question.id, question.question, answers[question.id]?.answers[0] ?? "") })), approval.hostId);
         } else await this.submitDecision("thread-follower-submit-user-input", {
             conversationId: approval.request.threadId, requestId: approval.requestId, response: { answers }
-          });
+          }, undefined, undefined, approval.hostId);
         await this.reportInput(approval, "confirmed");
       } catch (error) {
         console.warn(`[codex-im-gateway] native question RPC unconfirmed ${JSON.stringify({ timestamp: new Date().toISOString(),
-          threadId: approval.request.threadId, turnId: approval.request.turnId,
+          hostId: approval.hostId, threadId: approval.request.threadId, turnId: approval.request.turnId,
           code: /timed out/.test(error instanceof Error ? error.message : "") ? "timeout" : "invalid-or-disconnected-receipt" })}`);
         await this.reportInput(approval, "failed");
       }
@@ -373,7 +381,7 @@ export class CodexDesktopRequestMonitor {
           decision
         };
     try {
-      await this.submitDecision(method, params);
+      await this.submitDecision(method, params, undefined, undefined, approval.hostId);
       await this.report(approval, "confirmed");
     } catch {
       // Never retry a potentially accepted decision automatically.
@@ -381,7 +389,7 @@ export class CodexDesktopRequestMonitor {
     }
   }
 
-  private submitDecision(method: string, params: IpcMessage, expectedTurnId?: string, answerReceipts?: NativeAsyncAnswerReceipt[]): Promise<void> {
+  private submitDecision(method: string, params: IpcMessage, expectedTurnId?: string, answerReceipts?: NativeAsyncAnswerReceipt[], hostId = "local"): Promise<void> {
     if (!this.clientId || !this.socket?.writable) return Promise.reject(new Error("Desktop IPC disconnected"));
     const requestId = crypto.randomUUID();
     return new Promise((resolve, reject) => {
@@ -392,7 +400,10 @@ export class CodexDesktopRequestMonitor {
       this.pendingDecisions.set(requestId, { method, expectedTurnId, answerReceipts,
         resolve, reject, timer });
       try {
-        this.send({ type: "request", requestId, sourceClientId: this.clientId, version: 1, method, params });
+        // Installed Desktop uses follower v2 when execution host is explicit.
+        // The host belongs on the envelope, not inside the RPC params.
+        this.send({ type: "request", requestId, sourceClientId: this.clientId,
+          version: hostId === "local" ? 1 : 2, ...(hostId === "local" ? {} : { hostId }), method, params });
       } catch {
         clearTimeout(timer);
         this.pendingDecisions.delete(requestId);
@@ -422,12 +433,12 @@ export class CodexDesktopRequestMonitor {
     catch { console.warn("[codex-im-gateway] unable to deliver question resolution notice"); }
   }
 
-  private sendFollow(threadId: string, following: boolean): void {
+  private sendFollow(threadId: string, following: boolean, hostId: string): void {
     this.send({
       type: "broadcast",
       method: "thread-stream-following-changed",
       sourceClientId: this.clientId,
-      params: { conversationId: threadId, hostId: "local", following },
+      params: { conversationId: threadId, hostId, following },
       version: 1
     });
   }

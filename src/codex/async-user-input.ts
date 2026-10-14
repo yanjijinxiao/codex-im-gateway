@@ -5,7 +5,7 @@ const OPEN = "<send_user_message_question_reply>";
 const CLOSE = "</send_user_message_question_reply>";
 
 export type NativeAsyncAnswerReceipt = {
-  hostId: "local"; threadId: string; turnId: string; questionId: string; digest: string;
+  hostId: string; threadId: string; turnId: string; questionId: string; digest: string;
 };
 /** Durable comparison token, not the answer or an arbitrary success response. */
 export function asyncAnswerDigest(questionId: string, question: string, answer: string): string {
@@ -13,7 +13,7 @@ export function asyncAnswerDigest(questionId: string, question: string, answer: 
 }
 
 /** Only a canonical, accepted native answer to an existing widget is evidence. */
-export function desktopAsyncAnswerReceipts(threadId: string, state: Record<string, unknown>): NativeAsyncAnswerReceipt[] {
+export function desktopAsyncAnswerReceipts(threadId: string, state: Record<string, unknown>, hostId = "local"): NativeAsyncAnswerReceipt[] {
   const history = object(object(state.turnHistory)?.history);
   const entities = object(history?.entitiesByKey);
   const rawTurns = entities ? Object.values(entities) : Array.isArray(state.turns) ? state.turns : [];
@@ -39,7 +39,7 @@ export function desktopAsyncAnswerReceipts(threadId: string, state: Record<strin
       const text = object(input[0]);
       if (text?.type !== "text" || typeof text.text !== "string") continue;
       for (const row of answerRows(text.text)) if (questions.get(row.questionItemId) === row.question) {
-        receipts.push({ hostId: "local", threadId, turnId: turn.turnId, questionId: row.questionItemId,
+        receipts.push({ hostId, threadId, turnId: turn.turnId, questionId: row.questionItemId,
           digest: asyncAnswerDigest(row.questionItemId, row.question, row.answer) });
       }
     }
@@ -48,7 +48,7 @@ export function desktopAsyncAnswerReceipts(threadId: string, state: Record<strin
 }
 
 /** Desktop represents request_user_input_async questions on agentMessage items. */
-export function desktopAsyncUserInputs(threadId: string, state: Record<string, unknown>): CodexUserInputRequest[] {
+export function desktopAsyncUserInputs(threadId: string, state: Record<string, unknown>, hostId = "local"): CodexUserInputRequest[] {
   if (object(state.threadRuntimeStatus)?.type !== "active") return [];
   const history = object(object(state.turnHistory)?.history);
   const entities = object(history?.entitiesByKey);
@@ -84,7 +84,7 @@ export function desktopAsyncUserInputs(threadId: string, state: Record<string, u
     });
     // Each asynchronous widget is independently answerable in Desktop. A
     // sibling answered in the App must not invalidate/recreate another widget.
-    if (questions.length <= 3) for (const question of questions) requests.push({ kind: "async", hostId: "local",
+    if (questions.length <= 3) for (const question of questions) requests.push({ kind: "async", hostId,
       itemId: item.id, requestId: `async:${question.id}`, threadId, turnId: active.turnId as string,
       questions: [question], autoResolutionMs: null });
   }

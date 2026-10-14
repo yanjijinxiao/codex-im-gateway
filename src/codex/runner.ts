@@ -8,7 +8,7 @@ import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
 import { CodexBackendCapabilityError, CodexOwnerUnavailableError } from "./backend.js";
-import { communicationError } from "./communication-error.js";
+import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
 import type {
@@ -313,7 +313,17 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
       return this.backendForSharedOperation(hostId).readThreadSnapshot(threadId);
     }
-    const snapshot = await this.appServer.readThreadSnapshot(threadId);
+    let snapshot: CodexThreadSnapshot;
+    try { snapshot = await this.appServer.readThreadSnapshot(threadId); }
+    catch (error) {
+      if (isCodexCommunicationFailure(error)) {
+        const owner = await this.desktop.readThreadSnapshot?.(threadId).catch(() => undefined);
+        if (owner && confirmedDesktopObservation(threadId, owner.state)) {
+          this.desktopOwnedThreads.add(threadId); return owner;
+        }
+      }
+      throw error;
+    }
     if (["archived", "missing"].includes(snapshot.state.persistence)) {
       this.desktopOwnedThreads.delete(threadId);
       return snapshot;
@@ -379,7 +389,22 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       }
       this.desktopOwnedThreads.delete(threadId);
       return state;
-    } catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
+    } catch (error) {
+      // A failed private app-server read says nothing about Desktop's writer.
+      // This is observation-only recovery: never resume/start or switch writes.
+      if (!isRemoteHost(hostId) && this.selectedBackend !== "exec" && isCodexCommunicationFailure(error)) {
+        const owner = await this.desktop.inspectThread?.(threadId).catch(() => undefined);
+        if (owner && confirmedDesktopObservation(threadId, owner)) {
+          this.desktopOwnedThreads.add(threadId); return owner;
+        }
+      }
+      const failure = communicationError(error, { phase: "preflight", operation: "thread/read", threadId });
+      if (failure instanceof CodexCommunicationError) console.warn(`[codex-im-gateway] backend observation ${JSON.stringify({
+        timestamp: new Date().toISOString(), hostId: hostId ?? "local", threadId,
+        phase: failure.phase, operation: failure.operation, code: failure.code, submission: failure.submission
+      })}`);
+      throw failure;
+    }
   }
 
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]> {
@@ -483,6 +508,11 @@ function isDesktopSteerCandidateError(error: unknown): boolean {
 
 function isRemoteHost(hostId?: string): hostId is string {
   return Boolean(hostId && hostId !== "local");
+}
+
+function confirmedDesktopObservation(threadId: string, state: CodexThreadState): boolean {
+  return state.threadId === threadId && state.executionOwner === "desktop" && state.persistence === "active"
+    && (state.runtimeStatus === "idle" || state.runtimeStatus === "active" && Boolean(state.activeTurnId));
 }
 
 function canRunWithoutCapabilityLoss(backend: CodexBackendAdapter, input: CodexRunnerInput): boolean {

@@ -195,8 +195,9 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
         start() {},
         stop() {},
         followThread(threadId: string) { followedDesktopThreads.push(threadId); },
-        setFollowedThreads(threadIds: Iterable<string>) {
-          const next = new Set(threadIds);
+        setFollowedThreads(threadIds: Iterable<string | { threadId: string; hostId: string }>) {
+          const next = new Set(Array.from(threadIds, value => typeof value === "string" ? value
+            : value.hostId === "local" ? value.threadId : JSON.stringify([value.hostId, value.threadId])));
           for (const id of next) if (!currentlyFollowed.has(id)) followedDesktopThreads.push(id);
           currentlyFollowed.clear();
           for (const id of next) currentlyFollowed.add(id);
@@ -746,6 +747,22 @@ function boundQuestion(): CodexDesktopUserInput {
   } };
 }
 
+test("remote Desktop questions and approvals stay on their execution host's binding", async t => {
+  const f = setup(t);
+  seedApprovalBinding(f.paths, "account-one", "local-room");
+  seedApprovalBinding(f.paths, "account-two", "remote-room", { hostId: "remote-host" });
+  await f.manager.startAll();
+  const question = boundQuestion(); question.hostId = "remote-host"; question.request.hostId = "remote-host";
+  assert.deepEqual(await f.emitDesktopQuestion(question), { question: { answers: ["回答"] } });
+  await f.emitQuestionResult(question, "confirmed");
+  const approval = boundApproval(); approval.hostId = "remote-host";
+  assert.equal(await f.emitDesktopApproval(approval), "accept");
+  assert.deepEqual(f.channelQuestions.map(q => q.senderId), ["remote-room"]);
+  assert.deepEqual(f.channelApprovals.map(q => q.senderId), ["remote-room"]);
+  assert.deepEqual(f.questionResults, [{ senderId: "remote-room", result: "confirmed" }]);
+  await f.manager.stopAll();
+});
+
 test("multi-bound App questions and approvals use the explicit primary, not every progress follower", async t => {
   const f = setup(t);
   const one = seedApprovalBinding(f.paths, "account-one", "one-room");
@@ -876,7 +893,7 @@ test("does not confuse a remote binding with an identically named local thread",
   seedApprovalBinding(paths, "account-one", "local-room");
   seedApprovalBinding(paths, "account-two", "remote-room", { hostId: "remote-host" });
   await manager.startAll();
-  assert.deepEqual(followedDesktopThreads, ["bound-approval-thread"]);
+  assert.deepEqual(followedDesktopThreads, ["bound-approval-thread", JSON.stringify(["remote-host", "bound-approval-thread"])]);
   assert.equal(await emitDesktopApproval(boundApproval()), "accept");
   assert.equal(channelApprovals[0]?.senderId, "local-room");
   await manager.stopAll();
@@ -895,7 +912,7 @@ for (const binding of ["remote", "not-following", "ambiguous"] as const) {
     approval.request.cwd = path.join(paths.root, "approval-workspace");
     assert.equal(await emitDesktopApproval(approval), undefined);
     assert.deepEqual(channelApprovals, []);
-    if (binding !== "ambiguous") assert.equal(currentlyFollowed.size, 0);
+    if (binding !== "ambiguous") assert.equal(currentlyFollowed.size, binding === "remote" ? 1 : 0);
     await manager.stopAll();
   });
 }

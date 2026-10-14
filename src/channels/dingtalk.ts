@@ -298,7 +298,12 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
           || !["group", "user"].includes(data.type) || !data.targetId || !data.robotCode) throw new ChannelCapabilityError("dingtalk", "streamRecovery", "route mismatch");
         target = { conversationId: data.targetId, conversationType: data.type === "group" ? "2" : "1", actorId: data.targetId, robotCode: data.robotCode };
       } else target = this.cardTarget(input.toUserId);
-    } catch (error) { publish(state.stage, { operation: saved ? "deliver" : "create", code: "RouteUnconfirmed", uncertain: false }); throw error; }
+    } catch (error) {
+      const failure: ChannelStreamFailure = { operation: saved ? "deliver" : "create", code: "RouteUnconfirmed",
+        uncertain: false, requestNotSent: true };
+      publish(state.stage, failure);
+      throw new ChannelProgressError(!saved, undefined, 5_000, error, false, failure);
+    }
     state.adapterData = { accountId: this.account.accountId, clientId: this.account.clientId,
       type: target.conversationType === "2" ? "group" : "user", targetId: target.conversationType === "2" ? target.conversationId : target.actorId, robotCode: target.robotCode };
     const providerTarget: DingTalkAICardTarget = target.conversationType === "2"

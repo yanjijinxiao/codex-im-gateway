@@ -10,6 +10,29 @@ import {
 import { CodexBackendRouter } from "../src/codex/runner.js";
 import type { CodexRunnerInput, CodexThreadState } from "../src/codex/backend.js";
 
+for (const operation of ["inspect", "snapshot"] as const) {
+  test(`failed private ${operation} reads recover only through a confirmed Desktop owner`, async t => {
+    let desktopReads = 0, writes = 0;
+    const state: CodexThreadState = { threadId: "thread", persistence: "active", runtimeStatus: "active",
+      activeFlags: [], executionOwner: "desktop", activeTurnId: "native-turn" };
+    const failed = async () => { throw new Error("app-server request thread/read timed out after 15000ms"); };
+    const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: {
+      inspectThread: failed, readThreadSnapshot: failed, async run() { writes++; }, close() {}
+    } as never, desktopRunner: {
+      async inspectThread() { desktopReads++; return state; },
+      async readThreadSnapshot() { desktopReads++; return { state, turns: [] }; },
+      async run() { writes++; }, close() {}
+    } as never });
+    t.after(() => router.close());
+    const read = () => operation === "inspect" ? router.inspectThread("thread") : router.readThreadSnapshot("thread").then(s => s.state);
+    assert.equal((await read()).activeTurnId, "native-turn"); assert.equal(desktopReads, 1); assert.equal(writes, 0);
+    const failure = operation === "inspect" ? { name: "CodexCommunicationError", code: "timeout" } : /timed out/;
+    state.threadId = "different-host-thread"; await assert.rejects(read(), failure);
+    state.threadId = "thread"; state.runtimeStatus = "notLoaded"; await assert.rejects(read(), failure);
+    assert.equal(writes, 0);
+  });
+}
+
 test("message inspection reads metadata first and hydrates turns only for an active guard", async t => {
   const reads: Array<unknown> = [];
   let active = false;

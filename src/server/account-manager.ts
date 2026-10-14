@@ -1351,14 +1351,14 @@ export class AccountManager {
     for (const entry of this.entries.values()) entry.service?.reconcileUserInputs?.();
     const monitor = this.codexDesktopRequestMonitor;
     if (!monitor) return;
-    const threadIds = new Set(this.threadSubscriptions()
-      .filter((binding) => binding.enabled && binding.hostId === "local" && binding.threadId)
-      .map((binding) => binding.threadId));
+    const threadIds = this.threadSubscriptions()
+      .filter((binding) => binding.enabled && binding.threadId)
+      .map((binding) => ({ hostId: binding.hostId, threadId: binding.threadId }));
     for (const task of this.externalCodexTasks.values()) {
       // Keep the legacy project-notification route for unbound Desktop tasks.
       if (!this.hasLocalThreadBinding(task.sessionId)
         && this.projectForExternalThread(task.sessionId, task.workspace)?.notifications?.some(target => target.enabled)) {
-        threadIds.add(task.sessionId);
+        threadIds.push({ hostId: "local", threadId: task.sessionId });
       }
     }
     monitor.setFollowedThreads(threadIds);
@@ -1396,15 +1396,15 @@ export class AccountManager {
     await route.service.reportApprovalResult(route.recipientId, approval.request, result);
   }
 
-  private interactionBinding(threadId: string, turnId: string): ThreadSubscription | undefined {
-    const status = this.interactionRouting.resolve("local", threadId, this.interactionDestinations(), turnId);
+  private interactionBinding(threadId: string, turnId: string, hostId = "local"): ThreadSubscription | undefined {
+    const status = this.interactionRouting.resolve(hostId, threadId, this.interactionDestinations(), turnId);
     if (!status.destination) {
-      const key = JSON.stringify([threadId, turnId, status.status]);
+      const key = JSON.stringify([hostId, threadId, turnId, status.status]);
       if (!this.unresolvedInteractions.has(key)) {
         this.unresolvedInteractions.add(key);
         while (this.unresolvedInteractions.size > 500) this.unresolvedInteractions.delete(this.unresolvedInteractions.values().next().value!);
         console.warn(`[codex-im-gateway] interaction route unresolved ${JSON.stringify({ timestamp: new Date().toISOString(),
-          hostId: "local", threadId, turnId, code: status.status, bindingCount: status.bindingCount })}`);
+          hostId, threadId, turnId, code: status.status, bindingCount: status.bindingCount })}`);
       }
       return undefined;
     }
@@ -1421,14 +1421,14 @@ export class AccountManager {
       // The previous destination is durable even if the in-memory origin was
       // lost on restart. Never broadcast the same prompt to every binding.
       const recovered = this.threadSubscriptions().filter(candidate => {
-        if (!candidate.enabled || candidate.hostId !== "local" || candidate.threadId !== input.request.threadId) return false;
+        if (!candidate.enabled || candidate.hostId !== input.hostId || candidate.threadId !== input.request.threadId) return false;
         const [accountId] = JSON.parse(candidate.key) as [string, string];
         return this.entries.get(accountId)?.service?.hasUserInput(candidate.recipientId, input.request);
       });
       if (recovered.length === 1) binding = recovered[0];
       else if (recovered.length > 1) return undefined;
     }
-    binding ??= this.interactionBinding(input.request.threadId, input.request.turnId);
+    binding ??= this.interactionBinding(input.request.threadId, input.request.turnId, input.hostId);
     if (!binding) return undefined;
     const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
     this.interactionRouting.pinInteraction({ accountId, sessionId, recipientId: binding.recipientId,
@@ -1438,7 +1438,7 @@ export class AccountManager {
     this.userInputRoutes.set(input, { service, recipientId: binding.recipientId });
     const answers = await service.requestUserInput(binding.recipientId, input.request);
     if (!this.threadSubscriptions().some(candidate => candidate.key === binding!.key && candidate.enabled
-      && candidate.threadId === binding!.threadId && candidate.hostId === "local")) {
+      && candidate.threadId === binding!.threadId && candidate.hostId === input.hostId)) {
       await service.reportUserInputResult(binding.recipientId, input.request, "suspended");
       return undefined;
     }
@@ -1453,7 +1453,8 @@ export class AccountManager {
   }
 
   private async handleDesktopApproval(approval: CodexDesktopApproval): Promise<CodexApprovalDecision | undefined> {
-    const binding = this.interactionBinding(approval.request.threadId, approval.request.turnId);
+    const hostId = approval.hostId ?? "local";
+    const binding = this.interactionBinding(approval.request.threadId, approval.request.turnId, hostId);
     if (binding) {
       const [accountId] = JSON.parse(binding.key) as [string, string];
       const service = this.entries.get(accountId)?.service;
@@ -1461,12 +1462,14 @@ export class AccountManager {
       this.approvalRoutes.set(approval, { service, recipientId: binding.recipientId });
       const decision = await service.requestApproval(binding.recipientId, approval.request);
       if (!this.threadSubscriptions().some(candidate => candidate.key === binding.key && candidate.enabled
-        && candidate.threadId === binding.threadId && candidate.hostId === "local")) {
+        && candidate.threadId === binding.threadId && candidate.hostId === hostId)) {
         await this.reportDesktopApprovalResult(approval, "withdrawn");
         return undefined;
       }
       return decision;
     }
+    // A remote interaction never falls through to a local cwd/project route.
+    if (hostId !== "local") return undefined;
     // Never route an inactive/ambiguous explicit binding by its working directory.
     if (this.hasLocalThreadBinding(approval.request.threadId)) {
       console.warn("[codex-im-gateway] approval has no unique active session binding; left for Desktop");

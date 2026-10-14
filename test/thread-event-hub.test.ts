@@ -6,6 +6,45 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
+test("background follow recovers five locally unsent old results without force or duplicate notices", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-unsent-route-recovery-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filePath = path.join(root, "follow.json");
+  const pendingTerminals = Object.fromEntries(Array.from({ length: 5 }, (_, index) => [`old-turn-${index}`, {
+    text: `old-result-${index}`, checkpoint: {
+      streamId: `logical-${index}`, creationAttempted: true, startedAt: Date.now(),
+      progressEntries: [], thought: "", answerPreview: "", finished: false,
+      terminal: { text: `old-result-${index}`, error: false },
+      bootstrap: { version: 1, instanceId: `logical-${index}`, recipientId: "chat", stage: "create-rejected",
+        failure: { operation: "create", code: "RouteUnconfirmed", uncertain: false } }
+    }
+  }]));
+  fs.writeFileSync(filePath, JSON.stringify({ binding: {
+    eventVersion: 2, deliveryVersion: 1, hostId: "local", threadId: "thread", initialized: true,
+    sequence: 0, delivered: [], completed: [], baseline: [], pendingTerminals
+  } }));
+  const starts: string[] = [], notices: string[] = [];
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+    client: { resumableTextStream: true,
+      async sendText(input) { notices.push(input.text); return { messageId: "notice" }; },
+      async startTextStream(input) { starts.push(input.streamId!); return { messageId: input.streamId! }; },
+      async updateTextStream() {}
+    }
+  };
+  const hub = new ThreadEventHub({ filePath, subscriptions: () => [sub], backend: () => ({
+    async readThreadSnapshot() { return { state: { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [] }, turns: [] }; }
+  }) });
+  t.after(() => hub.stop());
+  await hub.refresh();
+  for (let i=0; i<20 && Object.keys(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.pendingTerminals).length; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(starts.sort(), ["logical-0", "logical-1", "logical-2", "logical-3", "logical-4"]);
+  assert.deepEqual(notices, []);
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(filePath, "utf8")).binding.pendingTerminals).length, 0);
+  await hub.refresh(); assert.equal(starts.length, 5);
+});
+
 test("an active owner conflicting with acknowledged completion is not blamed on IM permissions", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-owner-conflict-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

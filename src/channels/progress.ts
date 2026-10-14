@@ -4,7 +4,7 @@ import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
 import { summarizeProgress } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
-import { restoredBootstrap, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
+import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
 const MAX_RECOVERY_PROBES = 3;
 
@@ -218,8 +218,9 @@ export class ChannelTurnTextStream {
     this.stopTimers();
     this.persistence?.save(this.checkpoint());
     if (this.finalizing) return this.finalizing;
-    if (recovery.recoverBootstrap) this.terminalBlocked = false;
-    this.finalizing = this.finalizeNow(recovery.recoverBootstrap, recovery.confirmUncertainDelivery);
+    const recoverBootstrap = recovery.recoverBootstrap || canRetryUnsentCreation(this.bootstrap);
+    if (recoverBootstrap) this.terminalBlocked = false;
+    this.finalizing = this.finalizeNow(recoverBootstrap, recovery.confirmUncertainDelivery);
     try { return await this.finalizing; } finally { this.finalizing = undefined; }
   }
 
@@ -334,10 +335,15 @@ export class ChannelTurnTextStream {
   async reportTerminalFailure(): Promise<boolean> {
     if (!this.terminal || this.finished || this.suspended) return false;
     if (this.terminalNoticeSent) return true;
+    // A locally blocked create is still waiting for routing, not a failed
+    // update to an existing card. Background recovery will retry it safely.
+    if (canRetryUnsentCreation(this.bootstrap)) return false;
     if (this.notifying) return this.notifying;
     this.notifying = (async () => {
       await this.sendPlainText(!this.supported
         ? "最终答复有页面未确认送达，未自动重发以避免重复。可用 /history 查看完整结果。"
+        : !this.messageId
+        ? "最终答复的 AI Card 尚未确认创建或投递。可用 /status 查看送达状态，或到原 Codex 会话查看结果。"
         : this.terminal!.error
         ? "任务执行失败，原 AI Card 也未能更新。请到原 Codex 会话查看详细错误。"
         : "最终答复未能更新原 AI Card。请到原 Codex 会话查看结果。");
@@ -430,6 +436,7 @@ export class ChannelTurnTextStream {
 
   private async openNow(recover = false, confirmUncertainDelivery = false): Promise<boolean> {
     if (this.opening) return this.opening;
+    recover ||= canRetryUnsentCreation(this.bootstrap);
     const resume = this.bootstrap && ["created", "delivery-rejected", "delivery-unconfirmed"].includes(this.bootstrap.stage);
     if (this.creationAttempted && !this.messageId && !(recover && (resume && this.client.resumeTextStream
       || this.bootstrap?.stage === "create-rejected"))) return false;

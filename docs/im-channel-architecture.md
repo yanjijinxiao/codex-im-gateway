@@ -98,6 +98,8 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 
 创建尝试在发请求之前记入通用检查点。没有明确回执的创建（含长答案续页）不因终态或重启而自动重放；明确可重试的适配器错误才能释放重试标记。已知卡片的更新可按原恢复策略重试。这是防重复保护，不宣称跨进程请求具有平台端 exactly-once 保证。
 
+路由等本地校验在请求发出前拒绝时，适配器记录 `requestNotSent:true`，共享进度层可沿原逻辑实例 ID 自动恢复，而不把它当作已发出的不确定 POST。旧版仅由本地路由校验产生的 `RouteUnconfirmed` 检查点在恢复边界升级为这一语义。必须同时为 create-rejected、创建操作、无消息回执且 uncertain=false；其他创建/投递不确定态和服务端权限拒绝不自动解锁。路由等待不再逐轮发送“原卡更新失败”；确实未确认创建的提示也与已有卡更新失败区分。
+
 卡片日志区分 `api_acknowledged` 与客户端渲染验收，记录操作、卡片 ID、HTTP 状态、请求 ID、正文大小/摘要指纹，不输出正文、凭证或原始业务错误。过去宽松回执检查确实会产生“假成功”；它是已确认的 Gateway 缺陷，但不能仅凭日志断言每一次历史空卡都是同一原因。
 
 跟随状态也不能混淆后端与 IM：若 Desktop 快照称同一轮次仍 active，但该轮已有完成投递回执，则报告后端状态冲突（unconfirmed），不能提示“检查渠道权限”。不据此重开已结束的卡片、重发结果或自动操作 Codex；等待新的可信轮次状态。未加载或已归档的旧会话同样不等于 Gateway/钉钉连接断开。
@@ -183,7 +185,11 @@ Desktop 异步答复的 IPC 参数包含原生接口要求的 `restoreMessage: {
 
 飞书使用共享卡片上的原生输入框和选择/跳过按钮；钉钉、微信、企业微信沿用各自已经支持的普通交互通知，并完整展示 `/answer Q1 回答内容`、`/answer Q1 --option 1`、`/skip Q1`。这不是进度卡文本降级，不更新、覆盖或另建正在运行的进度卡。`/answer list` 显示当前绑定已恢复的待答问题。纯数字按文字答案处理，只有显式 `--option` 才选择；普通聊天消息不会被猜测成答案。命令/卡片回调共用 actor ACL 与 participant 权限，Q 编号不复用审批 A 编号，跳过不等于批准执行。
 
-当前 Desktop 请求监听只连接本机 IPC；远程 Gateway 发起的 App Server 任务和原生 queue 使用同一个回答回调。不能以本机同名 thread 接管远程 Desktop 弹窗。相关回归覆盖 `test/user-input.test.ts`、`test/bridge-user-input.test.ts`、`test/codex-desktop-request-monitor.test.ts`、AccountManager 路由及既有审批测试；模拟通过不等于所有企业账号都已做真实表单验收。
+Desktop 请求监听通过本机 IPC peer 代理已连接的本机及远程会话。订阅、快照、请求、回执及交互路由全部按 host + thread + turn 隔离；同名本机 thread 的答案不能确认或撤回远程问题。远程 follower 请求采用安装版本的 v2 协议，hostId 在请求外层，订阅广播中的 hostId 则位于 params。AccountManager 仍只选择一个有效交互目标，不广播问题到所有跟随群。未连接的远程主机不能转交本机执行，不恢复已结束的历史问题，不自动重发未知答案；远程 App Server 同步问题及原生 queue 继续使用原回答回调。
+
+本机私有 App Server 观察读取遇通信故障时，BackendRouter 可以只读核验真正的 Desktop 持有者；仅原 thread、active 持久状态、明确 Desktop owner、idle 或带原生 turn ID 的 active 状态可作为恢复证据。已知归档/不存在仍优先于 Desktop，未加载或其他 thread 不构成恢复。远程和 CLI 不借用本机持有者；所有写操作仍沿原后端路由。最终失败日志保留 host、操作、通信分类及提交阶段，不输出原始正文或凭证。
+
+相关回归覆盖 `test/user-input.test.ts`、`test/bridge-user-input.test.ts`、`test/codex-desktop-request-monitor.test.ts`、AccountManager host 路由及既有审批测试；模拟通过不等于所有企业账号都已做真实表单验收。
 
 旧 `weixin` 注入参数和 `NormalizedWeixinMessage` 类型保留为兼容入口，适配逻辑集中于 `channels/legacy.ts`；生产启动使用完整的新接口。旧的账号数据目录和轮询检查点无需迁移，历史 WeChat 提示仍可解析；新钉钉/飞书提示会标注实际来源。
 
