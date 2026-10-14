@@ -90,6 +90,7 @@ import { validateLocalAttachments } from "../channels/client.js";
 import { adaptLegacyClient } from "../channels/legacy.js";
 import { ChannelTurnTextStream } from "../channels/progress.js";
 import { formatFollowStatus, type SessionFollowPort } from "./session-follow.js";
+import { formatInteractionRoute, type SessionInteractionPort } from "./interaction-routing.js";
 export { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
 import type { ChannelMessage } from "../channels/message.js";
 import type { OutboundChannelMessage } from "../webhooks/channel-message-webhook.js";
@@ -133,6 +134,7 @@ export type BridgeServiceOptions = {
   deliverTurnResult?: (session: ManagedSession, turnId: string, text: string) => Promise<boolean>;
   onSubscriptionsChanged?: () => Promise<void>;
   sessionFollow?: SessionFollowPort;
+  sessionInteractions?: SessionInteractionPort;
   onTurnStarted?: (session: ManagedSession, turnId: string) => Promise<void> | void;
   config: CodexImGatewayConfig;
   stateStore: RuntimeStateStore;
@@ -1457,6 +1459,13 @@ export class BridgeService {
       return;
     }
     if (command.name === "follow") {
+      if (arg === "primary") {
+        if (!await this.requireRole(senderId, "controller")) return;
+        if (!this.options.sessionInteractions) { await this.reply(senderId, "当前部署未接入交互路由；未修改绑定。"); return; }
+        const route = this.options.sessionInteractions.setPrimary(session);
+        await this.reply(senderId, `${formatInteractionRoute(route)}\n\n已保存，Gateway 重启后保留。仅更改新轮次的默认提问/审批目标；原交互仍归原轮次所有，其他跟随绑定未变。`);
+        return;
+      }
       const retryDelivery = arg === "sync --retry-delivery";
       const action = retryDelivery ? "sync" : arg;
       if (retryDelivery && !/^\/follow\s+sync\s+--retry-delivery\s*$/i.test(sourceText.trim())) {
@@ -1464,7 +1473,7 @@ export class BridgeService {
         return;
       }
       if (action && !["on", "off", "sync"].includes(action)) {
-        await this.reply(senderId, "用法：/follow [on|off|sync]；未知投递由控制者明确使用 /follow sync --retry-delivery 重试原实例（可能重复通知），不创建新任务。");
+        await this.reply(senderId, "用法：/follow [on|off|sync|primary]；primary 将当前对话设为主交互目标（控制者）；未知投递使用 /follow sync --retry-delivery 重试原实例（可能重复通知），不创建新任务。");
         return;
       }
       if (retryDelivery && !await this.requireRole(senderId, "controller")) return;
@@ -1482,6 +1491,7 @@ export class BridgeService {
         : this.options.sessionFollow?.status(current);
       await this.reply(senderId, [
         `实时跟随：${enabled ? "已开启" : "已关闭"}${supported ? "" : "（当前后端不支持）"}。`,
+        ...(this.options.sessionInteractions ? [formatInteractionRoute(this.options.sessionInteractions.status(current))] : []),
         ...(!current.threadId ? ["当前绑定尚未创建 Codex thread，暂时没有可同步的任务。"]
           : supported && status ? formatFollowStatus(status) : supported ? ["同步状态：当前部署未接入跟随协调器，未确认同步成功。"] : []),
         ...(action === "on" || action === "sync" ? ["未创建新任务、未介入或停止原任务。"] : ["发送 /follow sync 立即同步当前状态；/stream on 开启过程进度。"])

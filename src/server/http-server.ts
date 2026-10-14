@@ -588,6 +588,12 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     });
     return;
   }
+  if ((method === "GET" || method === "POST") && sessionAction?.action === "interaction-primary") {
+    sendJson(response, 200, { interactionRoute: method === "POST"
+      ? context.accountManager.setSessionInteractionPrimary(sessionAction.accountId, sessionAction.sessionId)
+      : context.accountManager.getSessionInteractionRoute(sessionAction.accountId, sessionAction.sessionId) });
+    return;
+  }
   if (method === "POST" && sessionAction?.action === "reset") {
     sendJson(response, 200, { session: context.accountManager.resetSession(sessionAction.accountId, sessionAction.sessionId) });
     return;

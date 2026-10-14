@@ -21,6 +21,26 @@ test("Codex status probe reuses the runner command resolver", async () => {
   });
 });
 
+test("interaction primary API uses existing local mutation protection and the shared routing port", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-interaction-primary-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: string[] = [];
+  const status = { status: "primary", bindingCount: 2, current: true };
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {
+    getSessionInteractionRoute(account: string, session: string) { calls.push(`get:${account}:${session}`); return status; },
+    setSessionInteractionPrimary(account: string, session: string) { calls.push(`set:${account}:${session}`); return status; }
+  } as never });
+  t.after(() => server.close());
+  const endpoint = `${server.url}/api/sessions/one/session/interaction-primary`;
+  assert.equal((await fetch(endpoint, { method: "POST" })).status, 403);
+  assert.deepEqual(calls, []);
+  const read = await fetch(endpoint); assert.equal(read.status, 200);
+  assert.deepEqual((await read.json()).interactionRoute, status);
+  const selected = await fetch(endpoint, { method: "POST", headers: { Origin: server.url, "X-Codex-Im-Gateway-Token": server.requestToken } });
+  assert.equal(selected.status, 200);
+  assert.deepEqual(calls, ["get:one:session", "set:one:session"]);
+});
+
 test("account deletion passes the session-history retention choice", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-delete-api-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

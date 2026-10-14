@@ -17,6 +17,7 @@ import { BridgeService } from "../bridge/service.js";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import { SessionControlJournal } from "../bridge/session-control.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
+import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import {
   userFacingMessageHandlingError,
@@ -266,7 +267,8 @@ export type AccountManagerOptions = {
 export class AccountManager {
   private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
   private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
-  private readonly approvalOrigins = new Map<string, { accountId: string; sessionId: string; turnId: string }>();
+  private readonly interactionRouting: InteractionRoutingJournal;
+  private readonly unresolvedInteractions = new Set<string>();
   private readonly entries = new Map<string, RuntimeEntry>();
   private readonly respondingSessions = new Map<string, number>();
   private readonly configProvider: () => CodexImGatewayConfig;
@@ -295,6 +297,7 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    this.interactionRouting = new InteractionRoutingJournal(path.join(options.paths.runtimeDir, "interaction-routing.json"));
     this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
@@ -346,7 +349,7 @@ export class AccountManager {
     await this.codexSessionMonitor?.stop();
     this.codexSessionMonitor = undefined;
     this.externalCodexTasks.clear();
-    this.approvalOrigins.clear();
+    this.unresolvedInteractions.clear();
     this.managedTurnCompletions.clear();
     await this.threadEvents.stop();
     this.taskboardController?.abort();
@@ -423,13 +426,17 @@ export class AccountManager {
           return this.threadEvents.synchronize(JSON.stringify([account.accountId, session.id]), recovery);
         }
       },
+      sessionInteractions: {
+        status: session => this.getSessionInteractionRoute(account.accountId, session.id),
+        setPrimary: session => this.setSessionInteractionPrimary(account.accountId, session.id)
+      },
       onSubscriptionsChanged: () => {
         this.ensureCodexSessionMonitor();
         this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.refresh();
       },
       onTurnStarted: (session, turnId) => {
-        this.rememberApprovalOrigin(account.accountId, session, turnId);
+        this.rememberInteractionOrigin(account.accountId, session, turnId);
         this.ensureCodexSessionMonitor();
         this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.managedTurnStarted({
@@ -907,6 +914,22 @@ export class AccountManager {
     return this.sessionSummary(accountId, session, this.isActive(accountId, session.id));
   }
 
+  getSessionInteractionRoute(accountId: string, sessionId: string): InteractionRouteStatus {
+    const session = requireSession(this.storeFor(accountId), sessionId);
+    const destination = this.interactionDestination(accountId, session);
+    const status = this.interactionRouting.resolve(destination.hostId, destination.threadId, this.interactionDestinations());
+    return { ...status, current: status.destination?.accountId === accountId && status.destination.sessionId === sessionId };
+  }
+
+  setSessionInteractionPrimary(accountId: string, sessionId: string): InteractionRouteStatus {
+    const session = requireSession(this.storeFor(accountId), sessionId);
+    if (!session.threadId || !this.threadSubscriptions().some(binding => binding.enabled
+      && binding.key === JSON.stringify([accountId, sessionId]))) throw new Error("请选择当前启用跟随的会话绑定，再设置主交互对话。");
+    this.interactionRouting.setPrimary(this.interactionDestination(accountId, session));
+    this.refreshDesktopRequestSubscriptions();
+    return this.getSessionInteractionRoute(accountId, sessionId);
+  }
+
   isSessionStreamEnabled(accountId: string, sessionId: string): boolean {
     const session = requireSession(this.storeFor(accountId), sessionId);
     return session.streamReplies ?? this.configProvider().streamReplies;
@@ -1030,7 +1053,7 @@ export class AccountManager {
           this.refreshDesktopRequestSubscriptions();
         },
         onTurnStarted: ({ threadId, turnId }) => {
-          this.rememberApprovalOrigin(accountId, { ...session, threadId }, turnId);
+          this.rememberInteractionOrigin(accountId, { ...session, threadId }, turnId);
           this.refreshDesktopRequestSubscriptions();
         },
         queueKey: session.threadId ?? session.id,
@@ -1346,11 +1369,21 @@ export class AccountManager {
     });
   }
 
-  private rememberApprovalOrigin(accountId: string, session: ManagedSession, turnId: string): void {
-    const hostId = session.hostId ?? this.storeFor(accountId).getProject(session.projectId ?? "")?.hostId ?? "local";
-    if (!session.threadId) return;
-    this.approvalOrigins.set(JSON.stringify([hostId, session.threadId]), { accountId, sessionId: session.id, turnId });
-    if (this.approvalOrigins.size > 2_000) this.approvalOrigins.delete(this.approvalOrigins.keys().next().value!);
+  private interactionDestination(accountId: string, session: ManagedSession): InteractionDestination {
+    return { accountId, sessionId: session.id, recipientId: session.senderId,
+      hostId: session.hostId ?? this.storeFor(accountId).getProject(session.projectId ?? "")?.hostId ?? "local",
+      threadId: session.threadId ?? "" };
+  }
+
+  private interactionDestinations(): InteractionDestination[] {
+    return this.threadSubscriptions().filter(binding => binding.enabled).map(binding => {
+      const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
+      return { accountId, sessionId, recipientId: binding.recipientId, hostId: binding.hostId, threadId: binding.threadId };
+    });
+  }
+
+  private rememberInteractionOrigin(accountId: string, session: ManagedSession, turnId: string): void {
+    if (session.threadId) this.interactionRouting.rememberTurn(this.interactionDestination(accountId, session), turnId);
   }
 
   private async reportDesktopApprovalResult(approval: CodexDesktopApproval, result: ApprovalDeliveryResult): Promise<void> {
@@ -1361,21 +1394,27 @@ export class AccountManager {
   }
 
   private interactionBinding(threadId: string, turnId: string): ThreadSubscription | undefined {
-    const bindings = this.threadSubscriptions().filter(binding => binding.enabled
-      && binding.hostId === "local" && binding.threadId === threadId);
-    const origin = this.approvalOrigins.get(JSON.stringify(["local", threadId]));
-    const originatingBinding = origin?.turnId === turnId
-      ? bindings.find(binding => binding.key === JSON.stringify([origin.accountId, origin.sessionId])) : undefined;
-    const destinations = new Map(bindings.map(binding => {
-      const [accountId] = JSON.parse(binding.key) as [string, string];
-      return [JSON.stringify([accountId, binding.recipientId]), binding];
-    }));
-    return originatingBinding ?? (destinations.size === 1 ? [...destinations.values()][0] : undefined);
+    const status = this.interactionRouting.resolve("local", threadId, this.interactionDestinations(), turnId);
+    if (!status.destination) {
+      const key = JSON.stringify([threadId, turnId, status.status]);
+      if (!this.unresolvedInteractions.has(key)) {
+        this.unresolvedInteractions.add(key);
+        while (this.unresolvedInteractions.size > 500) this.unresolvedInteractions.delete(this.unresolvedInteractions.values().next().value!);
+        console.warn(`[codex-im-gateway] interaction route unresolved ${JSON.stringify({ timestamp: new Date().toISOString(),
+          hostId: "local", threadId, turnId, code: status.status, bindingCount: status.bindingCount })}`);
+      }
+      return undefined;
+    }
+    const destination = status.destination;
+    this.interactionRouting.pinInteraction(destination, turnId);
+    return this.threadSubscriptions().find(binding => binding.enabled
+      && binding.key === JSON.stringify([destination.accountId, destination.sessionId])
+      && binding.hostId === destination.hostId && binding.threadId === destination.threadId && binding.recipientId === destination.recipientId);
   }
 
   private async handleDesktopUserInput(input: CodexDesktopUserInput): Promise<CodexUserInputAnswer | undefined> {
-    let binding = this.interactionBinding(input.request.threadId, input.request.turnId);
-    if (!binding) {
+    let binding: ThreadSubscription | undefined;
+    {
       // The previous destination is durable even if the in-memory origin was
       // lost on restart. Never broadcast the same prompt to every binding.
       const recovered = this.threadSubscriptions().filter(candidate => {
@@ -1384,9 +1423,13 @@ export class AccountManager {
         return this.entries.get(accountId)?.service?.hasUserInput(candidate.recipientId, input.request);
       });
       if (recovered.length === 1) binding = recovered[0];
+      else if (recovered.length > 1) return undefined;
     }
+    binding ??= this.interactionBinding(input.request.threadId, input.request.turnId);
     if (!binding) return undefined;
-    const [accountId] = JSON.parse(binding.key) as [string, string];
+    const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
+    this.interactionRouting.pinInteraction({ accountId, sessionId, recipientId: binding.recipientId,
+      hostId: binding.hostId, threadId: binding.threadId }, input.request.turnId);
     const service = this.entries.get(accountId)?.service;
     if (!service) return undefined;
     this.userInputRoutes.set(input, { service, recipientId: binding.recipientId });

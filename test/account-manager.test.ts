@@ -21,8 +21,8 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
-function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
+function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object; root?: string } = {}) {
+  const root = options.root ?? fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
   for (const accountId of ["account-one", "account-two"]) {
@@ -745,6 +745,62 @@ function boundQuestion(): CodexDesktopUserInput {
     questions: [{ id: "question", header: "问题", question: "farming 在哪里？" }], autoResolutionMs: null
   } };
 }
+
+test("multi-bound App questions and approvals use the explicit primary, not every progress follower", async t => {
+  const f = setup(t);
+  const one = seedApprovalBinding(f.paths, "account-one", "one-room");
+  const two = seedApprovalBinding(f.paths, "account-two", "two-room");
+  await f.manager.startAll();
+  assert.equal(f.manager.getSessionInteractionRoute("account-one", one.id).status, "ambiguous");
+  assert.equal(f.manager.setSessionInteractionPrimary("account-two", two.id).current, true);
+  await f.emitDesktopQuestion(boundQuestion());
+  await f.emitDesktopApproval(boundApproval());
+  assert.deepEqual(f.channelQuestions.map(q => q.senderId), ["two-room"]);
+  assert.deepEqual(f.channelApprovals.map(q => q.senderId), ["two-room"]);
+  assert.equal(f.manager.listSessions().filter(s => s.active).length, 2);
+  await f.manager.stopAll();
+});
+
+test("selecting a primary cannot reactivate a switched binding or disable another follower", async t => {
+  const f = setup(t); const one = seedApprovalBinding(f.paths, "account-one", "one-room");
+  seedApprovalBinding(f.paths, "account-one", "one-room");
+  const off = seedApprovalBinding(f.paths, "account-two", "two-room", { follow: false });
+  await f.manager.startAll();
+  assert.throws(() => f.manager.setSessionInteractionPrimary("account-one", one.id), /当前启用/);
+  assert.throws(() => f.manager.setSessionInteractionPrimary("account-two", off.id), /当前启用/);
+  await f.manager.stopAll();
+});
+
+test("an already persisted question destination is not changed by a new primary", async t => {
+  const f = setup(t); seedApprovalBinding(f.paths, "account-one", "one-room");
+  const two = seedApprovalBinding(f.paths, "account-two", "two-room");
+  f.recoveredQuestions.add("account-one:one-room");
+  await f.manager.startAll(); f.manager.setSessionInteractionPrimary("account-two", two.id);
+  await f.emitDesktopQuestion(boundQuestion());
+  assert.deepEqual(f.channelQuestions.map(q => q.senderId), ["one-room"]);
+  await f.manager.stopAll();
+});
+
+test("manager restart retains exact turn origins and the separate primary for new App turns", async t => {
+  const first = setup(t); const one = seedApprovalBinding(first.paths, "account-one", "one-room");
+  const two = seedApprovalBinding(first.paths, "account-two", "two-room");
+  await first.manager.startAll(); first.manager.setSessionInteractionPrimary("account-two", two.id);
+  first.setRunHandler(async input => {
+    await (input.onTurnStarted as (r: { threadId: string; turnId: string }) => void)({ threadId: "bound-approval-thread", turnId: "approval-turn" });
+    return { raw: "", text: "done", threadId: "bound-approval-thread", turnId: "approval-turn" };
+  });
+  await first.manager.continueSession("account-one", one.id, "start");
+  await first.manager.stopAll();
+  const restored = setup(t, { root: first.root }); await restored.manager.startAll();
+  await restored.emitDesktopQuestion(boundQuestion());
+  await restored.emitDesktopApproval(boundApproval());
+  const next = boundQuestion(); next.request.turnId = "new-app-turn";
+  await restored.emitDesktopQuestion(next);
+  assert.deepEqual(restored.channelQuestions.map(q => q.senderId), ["one-room", "two-room"]);
+  assert.deepEqual(restored.channelApprovals.map(q => q.senderId), ["one-room"]);
+  assert.equal(restored.manager.getSessionInteractionRoute("account-two", two.id).current, true);
+  await restored.manager.stopAll();
+});
 
 test("routes questions and native receipts to the unique originating IM, never an unrelated project target", async t => {
   const f = setup(t); seedApprovalBinding(f.paths, "account-one", "bound-room", { project: true });

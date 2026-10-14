@@ -162,7 +162,11 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 
 ### Codex 问题交互
 
-问题、审批与进度是不同的领域事件。`CodexDesktopRequestMonitor` 复用一条本机 follower 连接收集待处理交互；旧审批监听器名称只作兼容导出。AccountManager 按 host + thread + turn 的发起绑定选择唯一目的聊天；重启后可由账号内的问题日志恢复原目的地，没有唯一绑定时留在 App，不按工作目录猜目标或广播到所有群。
+问题、审批与进度是不同的领域事件。`CodexDesktopRequestMonitor` 复用一条本机 follower 连接收集待处理交互；旧审批监听器名称只作兼容导出。共享应用层的 `InteractionRoutingJournal` 在 `runtime/interaction-routing.json` 原子保存 host + thread 的主交互目标、host + thread + turn 的原生交互归属（权限 0600，仅标识符，不存问题、答案或凭证）。进度跟随依然可多绑定；原生问题/审批只由一个对话回答。
+
+路由优先级为原轮次归属、持久化主交互目标、唯一启用绑定。成功接收的 IM 轮次保存原始来源；未显式选择主对话时也建立后续 App 轮次的默认目标。`/follow primary` 仅允许 controller 将当前启用绑定设为主对话；明确的主对话不会被其他跟随轮询或新 IM 来源覆盖。管理 API 的 `GET/POST /api/sessions/:accountId/:sessionId/interaction-primary` 使用同一个应用层端口，POST 沿用本机 Origin/token 校验。`/follow` 显示路由健康与配置指引，不启动任务、不改变其他跟随绑定。
+
+已记录的问题目的地优先恢复；第一次选出的交互目标钉住原轮次，后续主对话变更只作用于新轮次。原目的地已退出或切换到别的会话时不会重定向到其他群；没有唯一目标时留在 App并记录去重的结构化路由冲突日志，不按工作目录、最近更新或账号顺序猜目标。重启恢复使用精确的账号、会话、host、thread、turn 与接收方匹配，不重发未确认的回答、不重复广播题目。
 
 两种 native 问题分别适配：
 

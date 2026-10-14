@@ -370,6 +370,27 @@ test("a viewer can inspect follow health but cannot force delivery or change the
   assert.match(texts.at(-1)!, /权限/);
 });
 
+test("follow primary is a controller-only shared route selection without backend mutations", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-interaction-primary-command-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(root));
+  const session = store.createSession("group", root); store.setSessionThread(session.id, "thread");
+  store.setRole("group", "actor", "participant");
+  const texts: string[] = []; let selections = 0;
+  const route = { status: "primary" as const, bindingCount: 2, current: true,
+    destination: { accountId: "account", sessionId: session.id, recipientId: "group", hostId: "local", threadId: "thread" } };
+  const bridge = new BridgeService({ stateStore: store, config: { ...defaultConfig(root), allowedSenderIds: ["actor"] },
+    channel: createChannelClient("dingtalk", TEXT_CAPABILITIES, { async sendText(x) { texts.push(x.text); return { messageId: "text" }; } }),
+    sessionInteractions: { status: () => route, setPrimary: selected => { assert.equal(selected.id, session.id); selections++; return route; } },
+    runner: {} as never });
+  const send = (id: string, text: string) => bridge.handleMessage({ id, senderId: "actor", replyTargetId: "group", text, raw: {}, attachments: [] });
+  await send("1", "/follow primary"); assert.equal(selections, 0); assert.match(texts.at(-1)!, /权限/);
+  store.setRole("group", "actor", "controller");
+  await send("2", "/follow primary"); assert.equal(selections, 1); assert.match(texts.at(-1)!, /重启后保留/);
+  await send("3", "/follow"); assert.match(texts.at(-1)!, /当前对话.*持久化主交互/);
+  assert.equal(store.getActiveSession("group")?.threadId, "thread");
+});
+
 test("only explicit controller confirmation opts into unknown-instance redelivery", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "follow-redelivery-role-")); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new RuntimeStateStore(resolveStatePaths(root)); const session = store.createSession("group", root);

@@ -61,6 +61,7 @@ const SESSION_HELP_LINES = [
   "/history more - 继续查看更早的对话",
   "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/follow sync --retry-delivery - 控制者明确重试原实例的未知投递，可能重复通知，不创建新卡",
+  "/follow primary - 控制者将当前对话设为持久化主交互目标；提问/审批单处交互，进度仍可多处跟随",
   "/leave - 退出当前会话并停止跟随；不会停止任务，也不会自动接回旧会话",
   "/steer（/iv）补充要求 - 插入当前运行轮次；后端不支持时明确拒绝，不暗中排队",
   "/queue 补充要求 - 加入 Codex 原生队列，作为下一轮执行（需后端支持）",
