@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
 import { communicationError, CodexCommunicationError } from "./communication-error.js";
+import { IpcFrameDecoder, IpcFrameSizeError } from "./ipc-frames.js";
 
 import type {
   CodexRunResult,
@@ -431,7 +432,7 @@ async function sendFollowerInterrupt(input: Omit<FollowerRequest, "request"> & {
 class DesktopIpcConnection {
   private socket?: net.Socket;
   private clientId = "initializing-client";
-  private buffer = Buffer.alloc(0);
+  private readonly frames = new IpcFrameDecoder(IPC_MESSAGE_MAX_BYTES);
   private readonly snapshots = new Map<string, Record<string, unknown>>();
   private snapshotWaiter?: {
     threadId: string;
@@ -523,6 +524,7 @@ class DesktopIpcConnection {
     }
     this.pending.clear();
     this.snapshots.clear();
+    this.frames.reset();
     this.socket?.destroy();
     this.socket = undefined;
   }
@@ -558,23 +560,14 @@ class DesktopIpcConnection {
   }
 
   private receive(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    while (this.buffer.length >= 4) {
-      const length = this.buffer.readUInt32LE(0);
-      if (length > IPC_MESSAGE_MAX_BYTES) {
-        this.socket?.destroy(new Error(`Rejected oversized Codex Desktop IPC message: ${length} bytes`));
-        return;
-      }
-      if (this.buffer.length < length + 4) return;
-      const payload = this.buffer.subarray(4, length + 4);
-      this.buffer = this.buffer.subarray(length + 4);
+    try { this.frames.push(chunk, payload => {
       let message: IpcMessage;
-      try {
-        message = JSON.parse(payload.toString("utf8")) as IpcMessage;
-      } catch {
-        continue;
-      }
+      try { message = JSON.parse(payload.toString("utf8")) as IpcMessage; }
+      catch { return; }
       this.handleMessage(message);
+    }); } catch (error) {
+      if (!(error instanceof IpcFrameSizeError)) throw error;
+      this.socket?.destroy(error);
     }
   }
 

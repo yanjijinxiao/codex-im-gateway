@@ -6,6 +6,8 @@ import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import type { CodexUserInputAnswer, CodexUserInputRequest, CodexUserInputResult } from "../codex/backend.js";
 import { parseUserInputRequest } from "../codex/user-input.js";
 import { desktopAsyncUserInputs, asyncUserInputReply, asyncAnswerDigest, desktopAsyncAnswerReceipts, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
+import { IpcFrameDecoder, IpcFrameSizeError } from "../codex/ipc-frames.js";
+import { applyDesktopStatePatches } from "../codex/desktop-state-patches.js";
 
 import {
   isAppServerApprovalMethod,
@@ -67,7 +69,7 @@ export class CodexDesktopRequestMonitor {
   private socket?: net.Socket;
   private reconnectTimer?: NodeJS.Timeout;
   private clientId?: string;
-  private buffer = Buffer.alloc(0);
+  private readonly frames = new IpcFrameDecoder(IPC_MESSAGE_MAX_BYTES);
   private started = false;
 
   constructor(private readonly options: CodexDesktopRequestMonitorOptions) {
@@ -88,7 +90,7 @@ export class CodexDesktopRequestMonitor {
     this.socket?.destroy();
     this.socket = undefined;
     this.clientId = undefined;
-    this.buffer = Buffer.alloc(0);
+    this.frames.reset();
     this.failPendingDecisions();
     for (const [key, approval] of this.activeRequests) this.withdraw(key, approval, true);
     this.requestSnapshots.clear();
@@ -135,7 +137,7 @@ export class CodexDesktopRequestMonitor {
       if (this.socket !== socket && this.socket) return;
       if (this.socket === socket) this.socket = undefined;
       this.clientId = undefined;
-      this.buffer = Buffer.alloc(0);
+      this.frames.reset();
       this.failPendingDecisions();
       for (const [key, request] of this.activeRequests) this.withdraw(key, request, true);
       this.requestSnapshots.clear();
@@ -155,23 +157,17 @@ export class CodexDesktopRequestMonitor {
   }
 
   private receive(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    while (this.buffer.length >= 4) {
-      const length = this.buffer.readUInt32LE(0);
-      if (length > IPC_MESSAGE_MAX_BYTES) {
-        console.error(`[codex-im-gateway] rejected oversized Codex Desktop IPC message: ${length} bytes`);
-        this.socket?.destroy();
-        return;
-      }
-      if (this.buffer.length < length + 4) return;
-      const payload = this.buffer.subarray(4, length + 4);
-      this.buffer = this.buffer.subarray(length + 4);
+    try { this.frames.push(chunk, payload => {
       try {
         this.handleMessage(JSON.parse(payload.toString("utf8")) as IpcMessage);
       } catch {
         // Parse errors may include payload text. Do not log question/answer data.
         console.warn("[codex-im-gateway] ignored invalid Codex Desktop IPC message");
       }
+    }); } catch (error) {
+      if (!(error instanceof IpcFrameSizeError)) throw error;
+      console.error(`[codex-im-gateway] rejected oversized Codex Desktop IPC message: ${error.frameBytes} bytes`);
+      this.socket?.destroy();
     }
   }
 
@@ -228,22 +224,25 @@ export class CodexDesktopRequestMonitor {
       return;
     }
     if (change.type !== "patches" || !Array.isArray(change.patches)) return;
-    const snapshot = structuredClone(this.requestSnapshots.get(scope) ?? { requests: [] });
-    let changed = false;
-    for (const patch of change.patches) {
+    const relevant = change.patches.filter(patch => {
       const record = recordValue(patch);
       const patchPath = Array.isArray(record?.path) ? record.path : [];
-      if (patchPath.length === 1 && patchPath[0] === "cwd") snapshot.cwd = stringValue(record?.value);
-      if (["requests", "turns", "turnHistory", "threadRuntimeStatus"].includes(String(patchPath[0]))) {
-        if (!applyStatePatch(snapshot as Record<string, unknown>, patchPath, record!)) {
-          console.warn("[codex-im-gateway] ignored invalid Desktop pending-request state patch");
-          return;
-        }
-        changed = true;
-      }
+      return ["cwd", "requests", "turns", "turnHistory", "threadRuntimeStatus"].includes(String(patchPath[0]));
+    });
+    if (!relevant.length) return;
+    const snapshot = applyDesktopStatePatches(this.requestSnapshots.get(scope) ?? { requests: [] }, relevant);
+    if (!snapshot) {
+      console.warn("[codex-im-gateway] ignored invalid Desktop pending-request state patch");
+      // The base may now be out of date. Suspend pending local handlers and
+      // request a fresh read-only snapshot rather than submit from stale data.
+      this.requestSnapshots.delete(scope);
+      for (const [key, request] of this.activeRequests) if (request.request.threadId === threadId
+        && (request.hostId ?? "local") === hostId) this.withdraw(key, request, true);
+      this.sendFollow(threadId, true, hostId);
+      return;
     }
     this.requestSnapshots.set(scope, snapshot);
-    if (changed) this.processSnapshot(threadId, snapshot, hostId);
+    this.processSnapshot(threadId, snapshot, hostId);
   }
 
   private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }, hostId: string): void {
@@ -465,43 +464,6 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
-}
-
-function applyStatePatch(snapshot: Record<string, unknown>, keys: unknown[], patch: IpcMessage): boolean {
-  const op = patch.op ?? "replace";
-  if (op !== "add" && op !== "remove" && op !== "replace") return false;
-  if (!keys.length) return false;
-  // Immer-style array and nested-field patches. Clone before applying so a
-  // pending notice's command/permissions can never change beneath the user.
-  let parent: unknown = snapshot;
-  for (const key of keys.slice(0, -1)) {
-    if (!safePatchKey(key) || !parent || typeof parent !== "object" || !Object.hasOwn(parent, key)) return false;
-    parent = (parent as Record<string | number, unknown>)[key];
-  }
-  const key = keys.at(-1);
-  if (!safePatchKey(key) || !parent || typeof parent !== "object") return false;
-  if (Array.isArray(parent)) {
-    if (key === "length" && op === "replace" && Number.isSafeInteger(patch.value)
-      && Number(patch.value) >= 0 && Number(patch.value) <= parent.length) {
-      parent.length = Number(patch.value);
-      return true;
-    }
-    const index = typeof key === "number" ? key : /^\d+$/.test(key) ? Number(key) : -1;
-    if (!Number.isSafeInteger(index) || index < 0 || index > parent.length || (op !== "add" && index === parent.length)) return false;
-    if (op === "remove") parent.splice(index, 1);
-    else if (op === "add") parent.splice(index, 0, patch.value);
-    else parent[index] = patch.value;
-  } else {
-    if (op !== "add" && !Object.hasOwn(parent, key)) return false;
-    if (op === "remove") delete (parent as Record<string | number, unknown>)[key];
-    else (parent as Record<string | number, unknown>)[key] = patch.value;
-  }
-  return true;
-}
-
-function safePatchKey(key: unknown): key is string | number {
-  return (typeof key === "string" || typeof key === "number")
-    && key !== "__proto__" && key !== "constructor" && key !== "prototype";
 }
 
 function stringValue(value: unknown): string | undefined {

@@ -242,3 +242,27 @@ test("native question without an ok receipt is not marked confirmed", async t =>
   await waitFor(() => f.results.length === 1);
   assert.deepEqual(f.results, ["failed"]);
 });
+
+test("invalid patch suspends a stale question and requests a fresh snapshot without submitting an answer", async t => {
+  let answer!: (value: Record<string, { answers: string[] }>) => void;
+  const f = await fixture(t, { onUserInput: async () => new Promise(resolve => { answer = resolve; }) });
+  f.snapshot({ requests: [native] }); await waitFor(() => f.inputs.length === 1);
+  f.patches([{ op: "replace", path: ["requests", 4], value: native }]);
+  await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["suspended"]);
+  answer({ "native-question": { answers: ["late answer"] } });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(f.writes().length, 0);
+  assert.ok(f.messages.filter(message => message.method === "thread-stream-following-changed").length >= 2);
+});
+
+test("patching a question never mutates the request already presented to the human", async t => {
+  const f = await fixture(t, { onUserInput: async () => undefined });
+  f.snapshot({ requests: [native], turnHistory: { largeUntouched: "x".repeat(1024 * 1024) } });
+  await waitFor(() => f.inputs.length === 1);
+  f.patches([{ op: "replace", path: ["requests", 0, "params", "questions", 0, "question"], value: "新问题" }]);
+  await waitFor(() => f.inputs.length === 2);
+  assert.equal(f.inputs[0].request.questions[0].question, "目录在哪？");
+  assert.equal(f.inputs[1].request.questions[0].question, "新问题");
+  assert.equal(f.writes().length, 0);
+});
