@@ -328,6 +328,10 @@ export class CodexDesktopRequestMonitor {
           await this.submitDecision("thread-follower-steer-turn", {
             conversationId: approval.request.threadId,
             input: [{ type: "text", text: asyncUserInputReply(approval.request, answers), text_elements: [] }],
+            // Desktop dereferences restoreMessage.context before steering.
+            // Leave optional settings absent so the native owner retains its
+            // current cwd, workspace, collaboration mode and permissions.
+            restoreMessage: { context: {} },
             clientUserMessageId: crypto.createHash("sha256").update(JSON.stringify([
               approval.request.threadId, approval.request.turnId, approval.requestId
             ])).digest("hex")

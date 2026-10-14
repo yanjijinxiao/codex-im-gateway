@@ -81,6 +81,20 @@ for (const includeMethod of [true, false]) test(`flat async receipts require the
   assert.deepEqual(f.results, ["confirmed"]); assert.equal(f.writes().length, 1);
 });
 
+test("async answer provides Desktop restore context without overriding native settings", async t => {
+  const f = await fixture(t); f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);
+  const params = f.writes()[0].params;
+  assert.deepEqual(params.restoreMessage, { context: {} });
+  // The native owner dereferences both objects before accepting an answer.
+  // Optional values must fall back to the existing native conversation.
+  const cwd = params.restoreMessage.cwd ?? "native-cwd";
+  const mode = params.restoreMessage.context.collaborationMode ?? "native-mode";
+  assert.equal(cwd, "native-cwd"); assert.equal(mode, "native-mode");
+  assert.equal(params.toolOutput, undefined);
+  f.respond({ result: { turnId: "turn" } }); await waitFor(() => f.results.length === 1);
+  assert.deepEqual(f.results, ["confirmed"]); assert.equal(f.writes().length, 1);
+});
+
 test("matching accepted native answer settles a missing RPC receipt without resending the answer", async t => {
   const receipts: NativeAsyncAnswerReceipt[] = [];
   const f = await fixture(t, { onObservedUserInputAnswers: values => { receipts.push(...values); } });
