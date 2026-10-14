@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { DesktopCodexRunner, parseDesktopSnapshot } from "../src/codex/desktop-runner.js";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
 
 test("relays a turn to the Desktop thread owner and returns its session-log completion", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-desktop-runner-"));
@@ -273,7 +274,7 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
           writeFrame(socket, response(message, {}));
         }
         if (message.method === "thread-stream-following-changed") writeFrame(socket, ownerSnapshot("thread", snapshot()));
-        if (message.method === "thread-follower-start-turn") writeFrame(socket, response(message, accepted));
+        if (message.method === "thread-follower-start-turn" && accepted !== null) writeFrame(socket, response(message, accepted));
       }
     });
   });
@@ -303,7 +304,9 @@ test("ordinary Desktop messages wait for idle instead of invoking start while th
   }));
   const progress: string[] = [];
   await assert.rejects(runner.run({ cwd: "/tmp", threadId: "thread", prompt: "你是 GPT？",
-    onProgress: text => { progress.push(text); } }), /did not return a turn id/);
+    onProgress: text => { progress.push(text); } }),
+    error => error instanceof CodexCommunicationError
+      && error.code === "invalid-receipt" && error.submission === "unconfirmed");
   assert.equal(observations, 3);
   assert.equal(received.filter(message => message.method === "thread-follower-start-turn").length, 1);
   assert.equal(progress.filter(text => text.includes("已加入队列")).length, 1);
@@ -324,4 +327,12 @@ test("a Desktop acknowledgement of an existing turn is never retried or reported
     onTurnStarted: () => { starts++; } }), /已有轮次.*未重复提交/);
   assert.equal(starts, 0);
   assert.equal(received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+});
+
+test("a missing Desktop start receipt remains unconfirmed without replay or interruption", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }), null);
+  await assert.rejects(runner.run({ cwd: "/tmp", threadId: "thread", prompt: "original-input" }),
+    error => error instanceof CodexCommunicationError && error.phase === "submission" && error.submission === "unconfirmed");
+  assert.equal(received.filter(message => message.method === "thread-follower-start-turn").length, 1);
+  assert.equal(received.filter(message => /interrupt-turn|steer-turn/.test(String(message.method))).length, 0);
 });

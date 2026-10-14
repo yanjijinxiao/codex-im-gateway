@@ -6,6 +6,7 @@ import { parseActionBlocks } from "../bridge/actions.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus, type FollowSyncOptions } from "../bridge/session-follow.js";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { isLegacyCommunicationNotice } from "../codex/communication-error.js";
 
 export type ThreadSubscription = {
   key: string;
@@ -250,21 +251,41 @@ export class ThreadEventHub {
         // local transport error. Only a loaded writer confirming the SAME
         // still-running turn may recover an unacknowledged presentation error.
         const activeId = snapshot.state.activeTurnId;
-        if (snapshot.state.runtimeStatus === "active" && activeId && state.turnId === activeId
+        const checkpointTurn = state.checkpointTurnId ?? state.turnId;
+        const legacyCommunication = state.checkpoint?.terminal?.error
+          && isLegacyCommunicationNotice(state.checkpoint.terminal.text);
+        const matchingTurn = snapshot.turns.find(turn => turn.id === checkpointTurn);
+        const recoverLegacy = legacyCommunication && state.checkpoint?.messageId && !state.terminalPending
+          && state.turnId === checkpointTurn && !["notLoaded", "unknown", "systemError"].includes(snapshot.state.runtimeStatus)
+          && (matchingTurn?.status === "inProgress" && activeId === checkpointTurn
+            || matchingTurn?.status === "completed" && matchingTurn.messages.some(message => message.role === "assistant" && message.kind !== "progress" && message.text.trim()));
+        if (recoverLegacy || snapshot.state.runtimeStatus === "active" && activeId && state.turnId === activeId
           && snapshot.turns.some(turn => turn.id === activeId && turn.status === "inProgress")
           && state.checkpoint?.terminal?.error && !state.checkpoint.finished
           && !state.completed.includes(activeId) && !state.terminalPending) {
           await this.streams.get(sub.key)?.suspend();
           if (this.stopped || !this.isLive(sub)) return this.changedBinding();
           this.streams.delete(sub.key);
-          const { terminal: _terminal, terminalNoticeSent: _notice, ...checkpoint } = state.checkpoint;
-          state.checkpoint = checkpoint;
+          const { terminal: _terminal, terminalNoticeSent: _notice, terminalPages: _pages, ...checkpoint } = state.checkpoint!;
+          state.checkpoint = { ...checkpoint, finished: false, answerPreview: "" };
+          if (recoverLegacy) {
+            state.completed = state.completed.filter(id => id !== checkpointTurn);
+            state.baseline = state.baseline?.filter(id => id !== checkpointTurn);
+            state.retired = state.retired?.filter(id => id !== checkpointTurn);
+            state.delivered = [];
+          }
           this.save();
         }
         const restoreCard = !this.streams.has(sub.key) && Boolean(state.checkpoint?.messageId && !state.checkpoint.finished);
         await this.reconcile(sub, snapshot, force, options);
         if (this.stopped || !this.isLive(sub)) return this.changedBinding();
         const runtime = snapshot.state;
+        if (runtime.runtimeStatus === "active" && runtime.activeTurnId === state.turnId
+          && snapshot.turns.some(turn => turn.id === state.turnId && turn.status === "inProgress")
+          && state.checkpoint?.communicationNotice && sub.progressEnabled !== false) {
+          await this.stream(sub).progress("已确认原任务仍在执行，继续同步原卡片。");
+          await this.stream(sub).flush();
+        }
         if (["archived", "missing"].includes(runtime.persistence) || runtime.runtimeStatus === "systemError") {
           this.failSync(sub, { code: "unavailable", message: "会话已归档、不存在或发生系统错误；请在对应 Codex 后端检查。" });
         } else if (runtime.pendingTurnWithoutId && runtime.runtimeStatus !== "active") {

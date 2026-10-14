@@ -10,6 +10,26 @@ import {
 import { CodexBackendRouter } from "../src/codex/runner.js";
 import type { CodexRunnerInput, CodexThreadState } from "../src/codex/backend.js";
 
+test("message inspection reads metadata first and hydrates turns only for an active guard", async t => {
+  const reads: Array<unknown> = [];
+  let active = false;
+  const app = { capabilities: APP_SERVER_BACKEND_CAPABILITIES,
+    async inspectThread(_id: string, observation?: { includeTurns: false; timeoutMs: number }) {
+      reads.push(observation);
+      return { threadId: "thread", persistence: "active", runtimeStatus: active ? "active" : "idle", activeFlags: [],
+        ...(active && !observation ? { activeTurnId: "turn" } : {}) };
+    }, close() {}
+  } as never;
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: app,
+    desktopRunner: { async inspectThread() { return undefined; }, close() {} } as never });
+  t.after(() => router.close());
+  assert.equal((await router.inspectThread("thread")).runtimeStatus, "idle");
+  assert.deepEqual(reads, [{ includeTurns: false, timeoutMs: 15000 }]);
+  active = true;
+  assert.equal((await router.inspectThread("thread")).activeTurnId, "turn");
+  assert.deepEqual(reads.slice(1), [{ includeTurns: false, timeoutMs: 15000 }, undefined]);
+});
+
 test("declares the protocol capabilities of the two Codex backends explicitly", () => {
   assert.equal(EXEC_BACKEND_CAPABILITIES.streaming, false);
   assert.equal(EXEC_BACKEND_CAPABILITIES.history, true);

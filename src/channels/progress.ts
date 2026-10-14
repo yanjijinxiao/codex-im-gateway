@@ -20,6 +20,8 @@ export type ChannelStreamCheckpoint = {
   thought: string;
   answerPreview: string;
   finished: boolean;
+  /** Presentation notice, never a task-completion receipt. */
+  communicationNotice?: string;
   /** Terminal delivery may be retried, but progress must never resume. */
   terminal?: { text: string; error: boolean };
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
@@ -54,6 +56,7 @@ export class ChannelTurnTextStream {
   private latestText = "";
   private startedAt = Date.now();
   private finished = false;
+  private communicationNotice?: string;
   private opening?: Promise<boolean>;
   private readonly progressEntries: string[] = [];
   private thought = "正在理解任务并规划下一步…";
@@ -94,6 +97,7 @@ export class ChannelTurnTextStream {
       this.thought = saved.thought;
       this.answerPreview = saved.answerPreview;
       this.finished = saved.finished;
+      this.communicationNotice = saved.communicationNotice;
       this.terminal = saved.terminal;
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
       this.resultPageBytes = saved.resultPageBytes;
@@ -108,6 +112,7 @@ export class ChannelTurnTextStream {
       ...(this.presentationFailure ? { presentationFailure: this.presentationFailure } : {}),
       progressEntries: [...this.progressEntries], thought: this.thought,
       answerPreview: this.answerPreview, finished: this.finished,
+      ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
         terminalPages: this.terminalPages.map(page => ({ ...page })) } : {}),
@@ -161,6 +166,7 @@ export class ChannelTurnTextStream {
     if (this.finished || this.terminal || this.suspended) return true;
     const content = summarizeProgress(text);
     if (!content) return false;
+    this.communicationNotice = undefined;
     if (content.startsWith("🤔")) {
       this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
     } else {
@@ -182,6 +188,7 @@ export class ChannelTurnTextStream {
     if (this.finished || this.terminal || this.suspended) return true;
     const content = text.trim();
     if (!content) return false;
+    this.communicationNotice = undefined;
     this.answerPreview = boundedProgressText(content, 2_400);
     this.thought = "正在组织最终回复…";
     return this.publish(this.render());
@@ -310,6 +317,19 @@ export class ChannelTurnTextStream {
     return this.finalize(text, true);
   }
 
+  /** A lost backend receipt cannot finish a provider stream or assert task failure. */
+  async waitForBackend(text: string): Promise<boolean> {
+    if (this.finished || this.terminal || this.suspended) return false;
+    this.communicationNotice = text.trim();
+    this.persistence?.save(this.checkpoint());
+    if (!this.supported) {
+      try { await this.sendPlainText(text); return true; } catch { return false; }
+    }
+    const published = await this.publish(this.render());
+    await this.flush();
+    return published && this.deliveryState() === "active";
+  }
+
   /** Report failed terminal delivery once; never resend the answer as a new card. */
   async reportTerminalFailure(): Promise<boolean> {
     if (!this.terminal || this.finished || this.suspended) return false;
@@ -389,8 +409,8 @@ export class ChannelTurnTextStream {
 
   private render(): string {
     const sections = [
-      "🤔 **正在思考**",
-      this.thought || "正在处理当前任务…"
+      this.communicationNotice ? "⏳ **等待后端确认**" : "🤔 **正在思考**",
+      this.communicationNotice || this.thought || "正在处理当前任务…"
     ];
     if (this.progressEntries.length) {
       const entries = this.progressEntries.map((entry) => `- ${entry.replace(/\n/g, "\n  ")}`).join("\n");
@@ -399,7 +419,8 @@ export class ChannelTurnTextStream {
     if (this.answerPreview) {
       sections.push(`---\n✍️ **正在组织回复**\n\n${this.answerPreview}`);
     }
-    sections.push(`_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行，发送 /stop 可停止_`);
+    sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
+      : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行，发送 /stop 可停止_`);
     return sections.join("\n\n");
   }
 

@@ -8,6 +8,7 @@ import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
 import { CodexBackendCapabilityError, CodexOwnerUnavailableError } from "./backend.js";
+import { communicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
 import type {
@@ -364,16 +365,21 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
-    if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
-      return this.backendForSharedOperation(hostId).inspectThread(threadId);
-    }
-    const state = await this.appServer.inspectThread(threadId);
-    if (state.runtimeStatus !== "active" && state.persistence !== "missing" && state.persistence !== "archived") {
-      const owner = await this.desktop.inspectThread?.(threadId);
-      if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
-    }
-    this.desktopOwnedThreads.delete(threadId);
-    return state;
+    try {
+      if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
+        return await this.backendForSharedOperation(hostId).inspectThread(threadId);
+      }
+      // Most IM messages only need metadata. Fetch turns only if a live writer
+      // needs a concrete compare-and-steer guard that metadata cannot supply.
+      let state = await this.appServer.inspectThread(threadId, { includeTurns: false, timeoutMs: 15_000 });
+      if (state.runtimeStatus === "active" && !state.activeTurnId) state = await this.appServer.inspectThread(threadId);
+      if (state.runtimeStatus !== "active" && state.persistence !== "missing" && state.persistence !== "archived") {
+        const owner = await this.desktop.inspectThread?.(threadId);
+        if (owner) { this.desktopOwnedThreads.add(threadId); return owner; }
+      }
+      this.desktopOwnedThreads.delete(threadId);
+      return state;
+    } catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
   }
 
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]> {

@@ -1,6 +1,7 @@
 import type { CodexThreadState } from "../codex/backend.js";
 import type { ManagedSession } from "../state/runtime-state.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure } from "../channels/stream-bootstrap.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
 export type FollowSyncOptions = { confirmUncertainDelivery?: boolean };
 
 /** Application port: commands never own transport subscriptions or card handles. */
@@ -29,6 +30,9 @@ export type SessionFollowStatus = {
 };
 
 export function followSyncFailure(error: unknown): FollowSyncFailure {
+  if (error instanceof CodexCommunicationError) return error.code === "timeout"
+    ? { code: "timeout", message: "读取 Codex 当前状态超时；原任务与绑定未改变，跟随继续等待可信状态。" }
+    : { code: "connection", message: "Codex 状态读取连接中断；原任务与绑定未改变，跟随继续等待连接恢复。" };
   const message = error instanceof Error ? error.message : String(error);
   if (/timed?\s*out|timeout/i.test(message)) return { code: "timeout", message: "读取 Codex 当前状态超时；请检查对应主机或 Codex App 的连接后重试。" };
   if (/EACCES|EPERM|permission denied|forbidden|unauthorized|access denied/i.test(message)) return { code: "permission", message: "读取 Codex 状态被拒绝；请检查对应主机或后端的访问权限。" };

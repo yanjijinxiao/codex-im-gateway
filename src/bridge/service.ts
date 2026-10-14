@@ -6,6 +6,7 @@ import { AccessController, requiredCommandRole, roleAllows, type SessionRole } f
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError } from "../codex/backend.js";
+import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
 import { ChannelApprovalController, type ApprovalDeliveryResult } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
@@ -1379,7 +1380,9 @@ export class BridgeService {
       await this.reply(message.senderId, "当前后端不支持介入正在执行的轮次，消息未提交。原生队列也需要后端支持；可在 Codex 中操作。");
       return;
     }
-    const state = await this.runner.inspectThread(session.threadId, hostId);
+    let state: Awaited<ReturnType<NonNullable<CodexBridgeBackend["inspectThread"]>>>;
+    try { state = await this.runner.inspectThread(session.threadId, hostId); }
+    catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId: session.threadId }); }
     if (state.executionOwner === "desktop") {
       await this.reply(message.senderId, "当前 Desktop 转发协议不支持指定轮次的安全介入，消息未提交。请在 Codex App 中介入或排队，或改用共享 App Server 会话。");
       return;
@@ -1517,7 +1520,9 @@ export class BridgeService {
     if (!session?.threadId || session.mode === "qa") return false;
     if (typeof this.runner.inspectThread !== "function") return false;
     const hostId = this.sessionHostId(session);
-    const state = await this.runner.inspectThread(session.threadId, hostId);
+    let state: Awaited<ReturnType<NonNullable<CodexBridgeBackend["inspectThread"]>>>;
+    try { state = await this.runner.inspectThread(session.threadId, hostId); }
+    catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId: session.threadId }); }
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
       return true;
@@ -2113,7 +2118,8 @@ export class BridgeService {
     const workspace = session.workspace;
     const threadId = session.threadId || undefined;
     if (threadId && typeof this.runner.inspectThread === "function") {
-      assertCodexThreadRunnable(await this.runner.inspectThread(threadId, this.sessionHostId(session)));
+      try { assertCodexThreadRunnable(await this.runner.inspectThread(threadId, this.sessionHostId(session))); }
+      catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
     const stillBound = () => this.executionSession(message.senderId)?.id === session.id;
@@ -2129,6 +2135,8 @@ export class BridgeService {
       : undefined;
     let streamedAnswer = "";
     let acceptedQueueTurn = false;
+    let backendEntered = false;
+    let acceptedTurnId: string | undefined;
     this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
     this.runningSessions.add(session.id);
     try {
@@ -2152,6 +2160,7 @@ export class BridgeService {
             return this.options.onSubscriptionsChanged?.();
           },
           onTurnStarted: async ({ threadId: startedThreadId, turnId }: { threadId: string; turnId: string }) => {
+            acceptedTurnId = turnId;
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             session.threadId = startedThreadId;
             this.options.stateStore.setSessionThread(session.id, startedThreadId);
@@ -2189,6 +2198,7 @@ export class BridgeService {
           onUserInputResult: (request: import("../codex/backend.js").CodexUserInputRequest, result: import("../codex/backend.js").CodexUserInputResult) =>
             this.reportUserInputResult(message.senderId, request, result, this.sessionHostId(session))
         };
+        backendEntered = true;
         const result = queued
           ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,
             queuedSubmissionId: queued.receipt.queuedSubmissionId, onQueueStarting: queued.starting,
@@ -2237,6 +2247,20 @@ export class BridgeService {
       });
     } catch (error) {
       if (queued && !acceptedQueueTurn) throw error;
+      error = communicationError(error, { phase: acceptedTurnId ? "observation" : backendEntered ? "submission" : "preflight",
+        operation: acceptedTurnId ? "turn/observe" : backendEntered ? "turn/submit" : "turn/prepare", threadId: session.threadId, turnId: acceptedTurnId });
+      if (error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
+        console.warn(`[codex-im-gateway] backend communication ${JSON.stringify({ timestamp: new Date().toISOString(),
+          phase: error.phase, operation: error.operation, submission: error.submission, code: error.code,
+          threadId: error.threadId, turnId: error.turnId })}`);
+        // Preserve the same card. Following reconciles late acceptance/result
+        // receipts without resending the prompt or emitting task completion.
+        const reported = !stillBound() || (await replyStream?.waitForBackend(
+          stripBridgeErrorPrefix(userFacingMessageHandlingError(error))) ?? false);
+        if (reported) markMessageHandlingErrorReported(error);
+        await this.options.onSubscriptionsChanged?.();
+        throw error;
+      }
       let failureWasReported = !stillBound() || (await replyStream?.fail(
         stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
       ) ?? false);

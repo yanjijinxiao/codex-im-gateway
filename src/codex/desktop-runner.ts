@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { CodexInterventionError, CodexOwnerUnavailableError } from "./backend.js";
+import { CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
+import { communicationError, CodexCommunicationError } from "./communication-error.js";
 
 import type {
   CodexRunResult,
@@ -118,6 +119,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       throw new Error("Codex Desktop relay does not support dynamic bridge tools for an existing Desktop-owned thread");
     }
 
+    let acceptedTurnId: string | undefined;
     this.activeThreads.add(input.threadId);
     try {
       await this.ensureMonitorReady();
@@ -168,22 +170,27 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       }
       const turnId = followerTurnId(response);
       if (!turnId) {
-        throw new Error("Codex Desktop accepted the message but did not return a turn id");
+        throw new CodexCommunicationError("submission", "thread-follower-start-turn", input.threadId,
+          undefined, { code: "InvalidAcknowledgement" });
       }
       if (previousTurnIds.has(turnId)) {
         // A concurrent Desktop writer can race our read. The message may have
         // been consumed by that turn: fail visibly, never retry or duplicate it.
         throw new CodexInterventionError("Desktop 将这条消息接收到了已有轮次，而不是新任务。未重复提交，请查看 /history 和 /status 确认。");
       }
+      acceptedTurnId = turnId;
       await input.onTurnStarted?.({ threadId: input.threadId, turnId });
       const completion = await this.waitForCompletion(input.threadId, turnId, input.onProgress);
-      if (!completion.success) throw new Error(completion.text);
+      if (!completion.success) throw new CodexTurnExecutionError("failed", completion.text);
       return {
         threadId: input.threadId,
         turnId,
         text: completion.text,
         raw: JSON.stringify(completion)
       };
+    } catch (error) {
+      throw communicationError(error, { phase: acceptedTurnId ? "observation" : "preflight",
+        operation: acceptedTurnId ? "turn/observe" : "desktop/prepare", threadId: input.threadId, turnId: acceptedTurnId });
     } finally {
       this.activeThreads.delete(input.threadId);
     }
@@ -340,6 +347,7 @@ type FollowerRequest = {
 
 async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);
+  let phase: "preflight" | "submission" = "preflight";
   try {
     await connection.initialize();
     await connection.request("thread-owner-discovery", 1, {
@@ -355,6 +363,7 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
       throw new CodexInterventionError("无法确认 Codex Desktop 会话处于空闲状态，未发送新消息。请检查 /status 后重试。");
     }
     input.onSnapshot?.(snapshot);
+    phase = "submission";
     return await connection.request("thread-follower-start-turn", 2, {
       conversationId: input.threadId,
       turnStart: {
@@ -366,6 +375,8 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
         }
       }
     });
+  } catch (error) {
+    throw communicationError(error, { phase, operation: phase === "submission" ? "thread-follower-start-turn" : "desktop/thread-state", threadId: input.threadId });
   } finally {
     connection.close();
   }

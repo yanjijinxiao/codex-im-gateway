@@ -9,6 +9,7 @@ import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.j
 import { APP_SERVER_BACKEND_CAPABILITIES, type CodexRunnerInput, type CodexThreadState } from "../src/codex/backend.js";
 import { DesktopCodexRunner } from "../src/codex/desktop-runner.js";
 import { CodexBackendRouter } from "../src/codex/runner.js";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
 import { ThreadEventHub } from "../src/server/thread-event-hub.js";
 import { defaultConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
@@ -190,7 +191,8 @@ test("an ambiguous accepted response without a turn id must not resume or resend
   const f = await fixture(t);
   f.ownerError(undefined);
   await f.router.inspectThread("original-thread");
-  await assert.rejects(f.router.run({ threadId: "original-thread", cwd: f.root, prompt: "ordinary" }), /accepted.*did not return a turn id/);
+  await assert.rejects(f.router.run({ threadId: "original-thread", cwd: f.root, prompt: "ordinary" }),
+    error => error instanceof CodexCommunicationError && error.code === "invalid-receipt" && error.submission === "unconfirmed");
   assert.equal(f.methods.filter(method => method === "thread-follower-start-turn").length, 1);
   assert.equal(f.runs.length, 0);
 });
@@ -200,7 +202,8 @@ test("a cached owner's discovery timeout is uncertain and cannot authorize resub
   f.ownerError(undefined);
   await f.router.inspectThread("original-thread");
   f.ownerError("__timeout__");
-  await assert.rejects(f.router.run({ threadId: "original-thread", cwd: f.root, prompt: "ordinary" }), /timed out/);
+  await assert.rejects(f.router.run({ threadId: "original-thread", cwd: f.root, prompt: "ordinary" }),
+    error => error instanceof CodexCommunicationError && error.code === "timeout" && error.submission === "not-submitted");
   assert.ok(!f.methods.includes("thread-follower-start-turn"));
   assert.equal(f.runs.length, 0);
 });

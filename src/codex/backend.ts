@@ -409,6 +409,8 @@ export interface CodexBackendControls {
 }
 
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
+  /** Read metadata without loading the complete turn history for message preflight. */
+  inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState>;
   readonly id: "app-server";
 }
 

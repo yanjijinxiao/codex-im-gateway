@@ -352,6 +352,39 @@ test("DingTalk card state snapshots use the configured content key", () => {
   });
 });
 
+for (const mode of ["https", "sdk"] as const) {
+  test(`DingTalk ${mode} task-error bodies remain visible on their original instance`, async () => {
+    const states: Array<Record<string, string>> = [];
+    const streams: Array<{ isError?: boolean; isFinalize?: boolean; content?: string }> = [];
+    const ids: string[] = [];
+    const client = mode === "https" ? new DingTalkHttpsAICardClient(async (_url, init) => {
+      assert.equal(init?.method, "PUT");
+      const body = JSON.parse(String(init?.body)); ids.push(body.outTrackId);
+      if (body.cardData) states.push(body.cardData.cardParamMap); else streams.push(body);
+      return new Response(JSON.stringify({ success: true, result: true }), { status: 200 });
+    }, [0], async () => undefined) : new DingTalkSdkAICardClient({
+      async createCardWithOptions() { throw new Error("Must not create a replacement"); },
+      async deliverCardWithOptions() { throw new Error("Must not redeliver"); },
+      async updateCardWithOptions(request: { outTrackId: string; cardData: { cardParamMap: Record<string, string> } }) {
+        ids.push(request.outTrackId); states.push(request.cardData.cardParamMap);
+        return { statusCode: 200, body: { success: true, result: true } };
+      },
+      async streamingUpdateWithOptions(request: { outTrackId: string; isError?: boolean; isFinalize?: boolean; content?: string }) {
+        ids.push(request.outTrackId); streams.push(request);
+        return { statusCode: 200, body: { success: true, result: true } };
+      }
+    } as never, [0], async () => undefined);
+    await client.update({ accessToken: "fake", outTrackId: "original", contentKey: "msgContent",
+      text: "明确的失败说明，不是空白内容", finalize: true, error: true });
+    assert.ok(ids.every(id => id === "original"));
+    assert.equal(streams.at(-1)?.isError, false);
+    assert.equal(streams.at(-1)?.isFinalize, true);
+    assert.match(streams.at(-1)?.content ?? "", /处理失败.*失败说明/s);
+    assert.equal(states.at(-1)?.flowStatus, "3");
+    assert.match(states.at(-1)?.msgContent ?? "", /处理失败.*失败说明/s);
+  });
+}
+
 test("DingTalk serializes updates, uses ordered GUIDs, and retries a rejected business response", async () => {
   const calls: Array<{ text: string; finalize: boolean; guid: string }> = [];
   const states: Array<{ text: string; flowStatus: string; updateByKey: boolean }> = [];

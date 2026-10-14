@@ -11,6 +11,45 @@ import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-ev
 import { defaultConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
+import { userFacingMessageHandlingError } from "../src/bridge/errors.js";
+
+for (const completed of [false, true]) {
+  test(`exact legacy transport terminals recover their original card: backendCompleted=${completed}`, async t => {
+    const f = hubFixture(t);
+    await f.hub.refresh(); await f.hub.stop();
+    const states = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+    states.binding.checkpoint.terminal = { text: userFacingMessageHandlingError(new Error("thread-follower-start-turn-timeout")).replace(/^\[codex-im-gateway\]\s*/, ""), error: true };
+    states.binding.checkpoint.finished = true;
+    states.binding.checkpointTurnId = "turn";
+    states.binding.checkpoint.terminalPages = [{ delivered: true, messageId: "original-card" }];
+    if (completed) states.binding.completed = ["turn"];
+    fs.writeFileSync(f.filePath, JSON.stringify(states));
+    await f.restart();
+    if (completed) f.setRead(async () => ({ state: { ...snapshot().state, runtimeStatus: "idle", activeTurnId: undefined },
+      turns: [{ id: "turn", status: "completed", messages: [{ id: "final", role: "assistant", text: "模型的实际最终回复" }] }] }));
+    const status = await f.hub.synchronize("binding");
+    assert.equal(status.status, "synced");
+    assert.equal(f.starts, 1);
+    assert.equal(f.writes.at(-1)?.messageId, "original-card");
+    const saved = JSON.parse(fs.readFileSync(f.filePath, "utf8")).binding;
+    assert.equal(saved.checkpoint.finished, completed);
+    if (completed) assert.equal(f.writes.at(-1)?.text, "模型的实际最终回复");
+    else assert.equal(saved.checkpoint.terminal, undefined);
+  });
+}
+
+test("a genuinely failed task with a finished card is never reopened as progress", async t => {
+  const f = hubFixture(t);
+  await f.hub.refresh(); await f.hub.stop();
+  const states = JSON.parse(fs.readFileSync(f.filePath, "utf8"));
+  states.binding.checkpoint.terminal = { text: "模型任务确实执行失败", error: true };
+  states.binding.checkpoint.finished = true; states.binding.checkpointTurnId = "turn";
+  fs.writeFileSync(f.filePath, JSON.stringify(states));
+  await f.restart();
+  assert.equal((await f.hub.synchronize("binding")).status, "unconfirmed");
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).binding.checkpoint.finished, true);
+  assert.equal(f.starts, 1);
+});
 
 function snapshot(threadId = "thread", text = "当前公开进展"): CodexThreadSnapshot {
   return { state: { threadId, persistence: "active", runtimeStatus: "active", activeFlags: [], activeTurnId: "turn" },

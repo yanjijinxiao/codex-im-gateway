@@ -1,4 +1,5 @@
 import { CodexInterventionError, CodexThreadStateError, CodexBackendCapabilityError } from "../codex/backend.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
 
 const channelReportedErrors = new WeakSet<object>();
 
@@ -13,6 +14,11 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 }
 
 export function userFacingMessageHandlingError(error: unknown): string {
+  if (error instanceof CodexCommunicationError) {
+    if (error.submission === "not-submitted") return "[codex-im-gateway] 提交前的状态读取或准备通信失败，这条消息未提交；原任务与绑定未改变。请稍后查看 /status。";
+    if (error.submission === "accepted") return "[codex-im-gateway] 原任务已接收，但进展连接中断；这不代表任务失败。Gateway 保留原卡片并继续跟随，不重发消息、不停止原任务。";
+    return "[codex-im-gateway] 提交结果尚未确认；原任务可能已接收。这不代表任务失败，Gateway 保留原卡片并只读核对，不重发消息、不停止原任务。";
+  }
   if (error instanceof CodexInterventionError) return error.message;
   if (error instanceof CodexBackendCapabilityError) return `当前后端不支持 ${error.capability}。${error.capability === "turnSteering" ? "可以使用 /queue 排队。" : ""}此操作未转交其他后端；需要时请显式切换后端配置。`;
   if (error instanceof CodexThreadStateError) {

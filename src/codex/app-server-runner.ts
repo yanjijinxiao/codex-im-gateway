@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
+import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { parseUserInputRequest } from "./user-input.js";
 import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
@@ -168,6 +169,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly nativeQueueOrigins = new Map<string, CodexQueueAddInput>();
   private readonly nativeTurnClients = new Map<string, string>();
   private readonly subscribedThreads = new Set<string>();
+  private readonly unconfirmedStarts = new Set<string>();
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
 
@@ -203,11 +205,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       : undefined;
     let threadResponse: Record<string, unknown>;
     try {
-      const alreadySubscribedQueue = Boolean(input.queuedSubmissionId && input.threadId && this.subscribedThreads.has(input.threadId));
+      // A missing start receipt can leave this client's subscription alive.
+      // Read our subscription instead of acquiring the same writer twice.
+      const alreadySubscribed = Boolean(input.threadId && this.subscribedThreads.has(input.threadId));
       threadResponse = await this.request(
-        alreadySubscribedQueue ? "thread/read" : input.threadId ? "thread/resume" : "thread/start",
+        alreadySubscribed ? "thread/read" : input.threadId ? "thread/resume" : "thread/start",
         compactObject({
-          ...(alreadySubscribedQueue ? { includeTurns: false } : {}),
+          ...(alreadySubscribed ? { includeTurns: false } : {}),
           ...(input.threadId ? { threadId: input.threadId } : {}),
           ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
           cwd: input.cwd,
@@ -324,10 +328,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }
     } catch (error) {
       if (input.queuedSubmissionId || !input.threadId || !isThreadBusyError(error)) {
-        this.approvalHandlersByThread.delete(threadId);
-        this.dynamicToolHandlersByThread.delete(threadId);
-        this.userInputHandlersByThread.delete(threadId);
-        this.userInputResultHandlersByThread.delete(threadId);
+        if (isCodexCommunicationFailure(error)) this.unconfirmedStarts.add(threadId);
+        else {
+          this.approvalHandlersByThread.delete(threadId);
+          this.dynamicToolHandlersByThread.delete(threadId);
+          this.userInputHandlersByThread.delete(threadId);
+          this.userInputResultHandlersByThread.delete(threadId);
+        }
         throw error;
       }
       await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
@@ -345,14 +352,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const turn = turnResponse.turn as Record<string, unknown> | undefined;
     const turnId = typeof turn?.id === "string" ? turn.id : undefined;
     if (!turnId) {
-      this.approvalHandlersByThread.delete(threadId);
-      this.dynamicToolHandlersByThread.delete(threadId);
-      this.userInputHandlersByThread.delete(threadId);
-      this.userInputResultHandlersByThread.delete(threadId);
-      throw new Error("Codex app-server did not return a turn id");
+      this.unconfirmedStarts.add(threadId);
+      throw new CodexCommunicationError("submission", "turn/start", threadId, undefined, { code: "InvalidAcknowledgement" });
     }
 
     this.activeTurns.set(threadId, turnId);
+    this.unconfirmedStarts.delete(threadId);
     const previousState = this.threadStates.get(threadId);
     this.threadStates.set(threadId, {
       threadId,
@@ -378,12 +383,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       this.queuedTurnEvents.delete(key);
     }
     await input.onTurnStarted?.({ threadId, turnId });
-    return await this.waitForTurn(threadId, turnId);
+    try { return await this.waitForTurn(threadId, turnId); }
+    catch (error) { throw communicationError(error, { phase: "observation", operation: "turn/observe", threadId, turnId }); }
     } finally {
       // A native queued turn may start before this turn's delivery finishes.
       // Keep its subscription (and approval requests) on the same connection.
       if (![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)
-        && !this.activeTurns.has(threadId)) await this.unsubscribeThread(threadId);
+        && !this.activeTurns.has(threadId) && !this.unconfirmedStarts.has(threadId)) await this.unsubscribeThread(threadId);
       await this.recyclePrivateTransportIfIdle();
     }
   }
@@ -415,7 +421,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
    * be stopped by an individual Bridge client.
    */
   private async recyclePrivateTransportIfIdle(): Promise<void> {
-    if (this.options.transport || this.operationLeases || this.activeTurns.size || this.pending.size || this.nativeQueueOrigins.size) return;
+    if (this.options.transport || this.operationLeases || this.activeTurns.size || this.pending.size || this.nativeQueueOrigins.size || this.unconfirmedStarts.size) return;
     const child = this.child;
     if (!child || child.exitCode !== null) return;
 
@@ -462,6 +468,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       this.threadStates.set(threadId, state);
       return state;
     } catch (error) {
+      if (isCodexCommunicationFailure(error)) throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId });
       const archived = await this.findListedThread(threadId, true);
       if (archived) {
         const state = membership(parseThreadState(archived, "archived"));
@@ -1199,8 +1206,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const timer = setTimeout(() => {
         const error = new Error(`app-server request ${method} timed out after ${timeoutMs}ms`);
         this.pending.delete(id);
-        reject(error);
-        this.failTransport(error, true);
+        const submitting = ["turn/start", "turn/steer", "thread/queue/start", "thread/queue/add"].includes(method);
+        const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
+        if (["turn/start", "thread/queue/start"].includes(method) && threadId) this.unconfirmedStarts.add(threadId);
+        reject(communicationError(error, { phase: submitting ? "submission" : "preflight", operation: method, threadId }));
+        // One missing RPC receipt is not a broken transport or a failed task.
+        // Keep the connection alive for late execution/approval notifications.
       }, timeoutMs);
       this.pending.set(id, { method, resolve, reject, timer });
       try {
@@ -1209,7 +1220,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         const normalizedError = error instanceof Error ? error : new Error(String(error));
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(normalizedError);
+        reject(communicationError(normalizedError, { phase: "preflight", operation: method,
+          threadId: typeof params.threadId === "string" ? params.threadId : undefined }));
       }
     });
   }
@@ -1272,6 +1284,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (threadId && turn?.id) {
         for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId && pending.request.turnId !== turn.id) this.resolveUserInput(key, "withdrawn");
         this.activeTurns.set(threadId, turn.id);
+        this.unconfirmedStarts.delete(threadId);
       }
     }
     if (method === "thread/status/changed") {
@@ -1413,6 +1426,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!threadId || !turnId) {
       return;
     }
+    this.unconfirmedStarts.delete(threadId);
     for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId
       && pending.request.turnId === turnId) this.resolveUserInput(key, pending.submitted ? "failed" : "withdrawn");
     const key = turnKey(threadId, turnId);
@@ -1702,6 +1716,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       waiter.reject(error);
     }
     this.activeTurns.clear();
+    this.unconfirmedStarts.clear();
     this.nativeQueueOrigins.clear();
     this.nativeTurnClients.clear();
     this.subscribedThreads.clear();

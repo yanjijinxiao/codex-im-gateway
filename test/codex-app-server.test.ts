@@ -6,6 +6,33 @@ import { fileURLToPath } from "node:url";
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
 import { CodexThreadStateError } from "../src/codex/backend.js";
 import { HybridCodexRunner } from "../src/codex/runner.js";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
+
+test("a read-only RPC timeout preserves the live transport and does not run a prompt", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 1000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  await runner.getRuntimeInfo("/tmp/project");
+  const processIdentity = (runner as unknown as { child: { pid: number } }).child.pid;
+  await assert.rejects(runner.inspectThread("thread-read-unresponsive", { includeTurns: false, timeoutMs: 25 }),
+    e => e instanceof CodexCommunicationError && e.submission === "not-submitted" && e.operation === "thread/read");
+  await runner.getRuntimeInfo("/tmp/project");
+  assert.equal((runner as unknown as { child: { pid: number } }).child.pid, processIdentity);
+});
+
+test("an unconfirmed turn/start receipt neither closes the transport nor repeats turn/start", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 50, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  await assert.rejects(runner.run({ cwd: "/tmp/project", threadId: "thread-existing", prompt: "delayed-turn-receipt" }),
+    e => e instanceof CodexCommunicationError && e.submission === "unconfirmed" && e.operation === "turn/start");
+  const processIdentity = (runner as unknown as { child: { pid: number } }).child.pid;
+  const result = await runner.run({ cwd: "/tmp/project", threadId: "thread-existing", prompt: "next-prompt" });
+  assert.equal(result.turnId, "turn-2");
+  assert.equal((runner as unknown as { child: { pid: number } }).child.pid, processIdentity);
+});
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 

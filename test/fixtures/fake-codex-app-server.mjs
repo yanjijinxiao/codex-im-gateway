@@ -449,6 +449,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/read") {
+    if (message.params.threadId === "thread-read-unresponsive") return;
     if (archivedThreads.has(message.params.threadId)) {
       fail(message.id, `thread ${message.params.threadId} is archived; unarchive it first`);
       return;
@@ -547,7 +548,9 @@ rl.on("line", (line) => {
       }
     }
     activeTurns.set(message.params.threadId, turnId);
-    respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+    if (prompt === "delayed-turn-receipt") {
+      setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 150);
+    } else respond(message.id, { turn: completedTurn(turnId, "inProgress") });
     if (["command", "file", "permissions"].includes(approvalKind)) {
       const approvalId = `approval-${turnId}`;
       pendingApprovals.set(approvalId, {

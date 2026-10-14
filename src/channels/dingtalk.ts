@@ -758,7 +758,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     finalize: boolean;
     error: boolean;
   }, lifecycleId: string): Promise<void> {
-    const content = normalizeDingTalkCardContent(input.text);
+    const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
     if (firstUpdate) {
@@ -770,7 +770,9 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       contentKey: input.contentKey,
       text: input.finalize ? content : content.replace(/\n+$/, ""),
       finalize: input.finalize,
-      error: input.error,
+      // Successful content generation is distinct from a failed Codex task.
+      // The template's native failed-stream branch hides its supplied body.
+      error: false,
       guid: this.streamGuids.next()
     });
     await this.mutateWithRetry(lifecycleId, "stream", "/v1.0/card/streaming", input.accessToken, streamBody);
@@ -779,7 +781,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       + `error=${input.error} outTrackId=${input.outTrackId} ${cardContentDiagnostic(content)}`
     );
     if (input.finalize) {
-      await this.updateCardState(lifecycleId, input, content, input.error ? "5" : "3", true);
+      await this.updateCardState(lifecycleId, input, content, "3", true);
       this.inputingCards.delete(input.outTrackId);
     } else if (!firstUpdate) {
       // Some DingTalk tenants acknowledge /card/streaming without pushing the
@@ -993,7 +995,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     finalize: boolean;
     error: boolean;
   }): Promise<void> {
-    const content = normalizeDingTalkCardContent(input.text);
+    const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
     if (firstUpdate) {
@@ -1009,7 +1011,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         contentKey: input.contentKey,
         text: content,
         finalize: input.finalize,
-        error: input.error,
+        error: false,
         guid
       }));
       const headers = new DingTalk.card_1_0.StreamingUpdateHeaders({
@@ -1024,7 +1026,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
           + cardContentDiagnostic(content)
         );
         if (input.finalize) {
-          await this.updateCardStateWithRetry(input, content, input.error ? "5" : "3", true);
+          await this.updateCardStateWithRetry(input, content, "3", true);
           this.inputingCards.delete(input.outTrackId);
         } else if (!firstUpdate) {
           await this.updateCardStateWithRetry(input, content, "2", true);
@@ -1113,6 +1115,11 @@ class DingTalkStreamSequence {
     }
     return `${timestamp}_${this.streamGuidSequence.toString(36).padStart(10, "0")}`;
   }
+}
+
+function visibleDingTalkTerminalContent(input: { text: string; finalize: boolean; error: boolean }): string {
+  const text = input.finalize && input.error ? `❌ **处理失败**\n\n${input.text}` : input.text;
+  return normalizeDingTalkCardContent(text);
 }
 
 function initialDingTalkCardData(input: { contentKey: string; text: string }): Record<string, string> {
