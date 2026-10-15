@@ -70,7 +70,9 @@ export function desktopAsyncUserInputs(threadId: string, state: Record<string, u
       const question = object(value);
       const id = JSON.stringify(["request_user_input_async", item.id, index]);
       if (answered.has(id) || typeof question?.title !== "string" || !question.title.trim() || question.title.length > 12_000) return [];
-      if (question.options !== undefined && (!Array.isArray(question.options) || question.options.length > 32
+      // Desktop serializes a free-input widget as options:null. Normalize only
+      // the absent/null/empty forms here, before the channel-neutral contract.
+      if (question.options !== undefined && question.options !== null && (!Array.isArray(question.options) || question.options.length > 32
         || question.options.some(label => typeof label !== "string" || !label.trim() || label.length > 2_000))) return [];
       const options = (question.options ?? []) as string[];
       return [{ header: "问题", id, question: question.title,

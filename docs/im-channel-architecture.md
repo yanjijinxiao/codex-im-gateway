@@ -177,6 +177,8 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 - App Server / Desktop `item/tool/requestUserInput` 保留原 `requestId`、`itemId` 和 question ID，返回 `{answers:{questionId:{answers:[text]}}}`。Desktop 使用 `thread-follower-submit-user-input`，App Server 直接回复原 JSON-RPC request；不通过普通消息、queue 或新任务替代。
 - 截图中的异步问题来自 Desktop 的 `agentMessage.questions`。每道题的 `questionItemId` 是 `JSON.stringify(["request_user_input_async", item.id, index])`，分别跟踪；答复使用 App 原生的 `send_user_message_question_reply` 结构化信封。当前 Desktop IPC v1 通过专用的提问回复处理路径调用 follower steer 投递这个信封，不能启动新任务。v1 **不提供**服务端原子的 expected-turn 校验：Gateway 发送前核对仍然活跃的原题，回执必须返回同一个 turn ID；轮次不符、断连和超时均记为未确认，不自动重发。这个兼容路径不解除普通 `/steer` 的后端限制，也不宣称能消除 App 端的竞态。
 
+Desktop 自由输入题的原生 `options:null`、字段缺省及空数组均在原生适配层归一为无选项题；非空选项仍校验类型、数量和长度，不让渠道自行猜测协议格式。回归覆盖本机/远程 canonical 快照、IM 多行文本答案、同题回执、重启去重和原任务卡续写；已获原生回答证据的题不因这次兼容修复重新投递，仍在原活跃轮次等待回答的题才走正常发现路径。
+
 `ChannelUserInputController` 是渠道中立的应用层控制器，持久化账号内 Q 编号、原生身份、目的聊天、过期条件、部分答复和投递状态，不包含 RPC 或 SDK。日志原子写入、权限 0600；回答成功或请求失效时移除答案正文。重启时重新看到同一个原生问题才恢复等待，沿用原 Q 编号、不重复发卡；可能已经投递但缺少回执的答案不重放。问题被 App 回答、取消、轮次结束或绑定切换后，迟到的 IM 回答不能提交；原生 `autoResolutionMs:null` 不会被 Gateway 自行替换为五分钟后跳过。敏感输入只提示回到 App，不向 IM 展示问题内容或收取答案。
 
 异步答案确认有两种可信证据：关联原请求并返回同一轮次的 RPC 回执，或原生 canonical turn 中已接收的结构化答案。Desktop 适配器只向共享控制器输出 host/thread/turn/question ID 与答案摘要，不转交原始快照或答案正文。提交前持久保存精确问题及答案的比较摘要；原题、原轮次、正文摘要和当前有效绑定全部匹配后，才可只读恢复 `unconfirmed → confirmed`，包括重启后的恢复。待接受 steer、其他题目/轮次、引用文本、不同答案或未提交的答案都不能作为成功证据。已确认状态不会被迟到的超时或撤回覆盖，未知提交仍不重发；确认通知按结果去重。

@@ -26,11 +26,18 @@ function send(socket: net.Socket, value: unknown) {
   header.writeUInt32LE(payload.length); socket.write(Buffer.concat([header, payload]));
 }
 
-for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const kind of ["async", "sync"] as const) {
-  test(`${channel}/${kind}: native question → IM command → native receipt → same progress/final card, with restart deduplication`, async t => {
+const scenarios = [
+  { kind: "sync", style: "choice" }, { kind: "async", style: "choice" },
+  { kind: "async", style: "null" }, { kind: "async", style: "absent" }, { kind: "async", style: "empty" }
+] as const;
+for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const hostId of ["local", "remote-ssh-discovered:test"]) for (const { kind, style } of scenarios) {
+  test(`${channel}/${hostId}/${kind}/${style}: native question → IM command → native receipt → same progress/final card, with restart deduplication`, async t => {
+    const freeInput = style !== "choice";
+    const questionText = freeInput ? "端到端测试使用哪个版本和环境？" : "继续执行吗？";
+    const answerText = freeInput ? "version-2026.10\n测试环境：上海" : "继续";
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-question-roundtrip-"));
     const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "runtime")));
-    const session = store.createSession("room", root, "original task", undefined, "session", undefined, { standalone: true });
+    const session = store.createSession("room", root, "original task", undefined, "session", undefined, { standalone: true, hostId });
     store.setSessionThread(session.id, "thread");
     const texts: string[] = [], progress: Array<{ messageId?: string; text: string; finalize?: boolean }> = [];
     const questions: string[] = [], questionUpdates: string[] = [], generalWrites: string[] = [], nativeWrites: Array<Record<string, any>> = [];
@@ -55,19 +62,24 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const kind
       activeTurnId: "turn", activeFlags: [] }, turns: [{ id: "turn", status: "inProgress",
       messages: [{ id: "before", role: "assistant", kind: "progress", text: "等待前的公开进展" }] }] };
     const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [{
-      key: "binding", hostId: "local", threadId: "thread", recipientId: "room", managed: false, client }],
+      key: "binding", hostId, threadId: "thread", recipientId: "room", managed: false, client }],
       backend: () => ({ async readThreadSnapshot() { return snapshot; } }) });
     let peer!: net.Socket;
     const sockets = new Set<net.Socket>();
-    const wireState = () => ({ requests: kind === "sync" && !answered ? [{ id: 42, method: "item/tool/requestUserInput",
+    const wireState = () => {
+      const turn = { turnId: "turn", status: "inProgress", items: kind === "async" ? [
+        { type: "agentMessage", id: "native-question", questions: [{ title: questionText,
+          ...(style === "absent" ? {} : { options: style === "null" ? null : style === "empty" ? [] : ["继续"] }) }] },
+        ...(answered ? [{ type: "steeringUserMessage", status: "accepted", input: nativeWrites[0].params.input }] : [])
+      ] : [] };
+      return { requests: kind === "sync" && !answered ? [{ id: 42, method: "item/tool/requestUserInput",
       params: { threadId: "thread", turnId: "turn", itemId: "native-question", autoResolutionMs: null,
         questions: [{ id: "sync-question", header: "问题", question: "继续执行吗？", options: [{ label: "继续", description: "继续原任务" }] }] } }] : [],
-      threadRuntimeStatus: { type: "active" }, turns: [{ turnId: "turn", status: "inProgress", items: kind === "async" ? [
-        { type: "agentMessage", id: "native-question", questions: [{ title: "继续执行吗？", options: ["继续"] }] },
-        ...(answered ? [{ type: "steeringUserMessage", status: "accepted", input: nativeWrites[0].params.input }] : [])
-      ] : [] }] });
+      threadRuntimeStatus: { type: "active" }, ...(hostId === "local" ? { turns: [turn] }
+        : { turns: [], turnHistory: { history: { entitiesByKey: { turn } } } }) };
+    };
     const broadcast = () => send(peer, { type: "broadcast", method: "thread-stream-state-changed", version: 11,
-      params: { conversationId: "thread", hostId: "local", change: { type: "snapshot", conversationState: wireState() } } });
+      params: { conversationId: "thread", hostId, change: { type: "snapshot", conversationState: wireState() } } });
     const server = net.createServer(socket => {
       peer = socket; sockets.add(socket); socket.on("close", () => sockets.delete(socket));
       const frames = new IpcFrameDecoder(1024 * 1024);
@@ -78,12 +90,14 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const kind
         } else if (message.method === "thread-stream-following-changed" && message.params.following) broadcast();
         else if (message.type === "request") {
           assert.equal(message.method, kind === "async" ? "thread-follower-steer-turn" : "thread-follower-submit-user-input");
+          assert.equal(message.version, hostId === "local" ? 1 : 2);
+          assert.equal(message.hostId, hostId === "local" ? undefined : hostId);
           nativeWrites.push(message); answered = true;
           if (kind === "async") {
             const text = message.params.input[0].text;
             assert.match(text, /^<send_user_message_question_reply>/);
             assert.deepEqual(JSON.parse(text.split("\n")[1]), [{ questionItemId: '["request_user_input_async","native-question",0]',
-              question: "继续执行吗？", answer: "继续" }]);
+              question: questionText, answer: answerText }]);
           } else assert.deepEqual(message.params.response, { answers: { "sync-question": { answers: ["继续"] } } });
           send(socket, { type: "response", requestId: message.requestId, method: message.method, resultType: "success",
             result: kind === "async" ? { result: { turnId: "turn" } } : { ok: true } });
@@ -105,10 +119,11 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const kind
       await new Promise<void>(resolve => server.close(() => resolve()));
       fs.rmSync(root, { recursive: true, force: true });
     });
-    await hub.refresh(); monitor.followThread("thread"); monitor.start();
+    await hub.refresh(); monitor.followThread("thread", hostId); monitor.start();
     await until(() => texts.some(text => text.includes("/answer Q1")) || questions.length === 1);
     snapshot.state.activeFlags = ["waitingOnUserInput"]; await hub.refresh();
-    await service.handleMessage({ id: "im-answer", senderId: "actor", replyTargetId: "room", text: "/answer Q1 --option 1", raw: {} });
+    await service.handleMessage({ id: "im-answer", senderId: "actor", replyTargetId: "room",
+      text: freeInput ? `/answer Q1 ${answerText}` : "/answer Q1 --option 1", raw: {} });
     await until(() => texts.some(text => text.includes("Codex 已确认")) || questionUpdates.length === 1);
     assert.equal(nativeWrites.length, 1); assert.deepEqual(generalWrites, []);
     snapshot = { state: { ...snapshot.state, activeFlags: [] }, turns: [{ id: "turn", status: "inProgress",
@@ -118,7 +133,7 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const kind
     assert.equal(starts, 1); assert.notEqual(progress.at(-1)?.finalize, true);
     monitor.stop(); service.suspendUserInputs(); service = createService(); monitor = createMonitor();
     const noticeCount = texts.length + questions.length + questionUpdates.length;
-    monitor.followThread("thread"); monitor.start(); await until(() => connections === 2);
+    monitor.followThread("thread", hostId); monitor.start(); await until(() => connections === 2);
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(nativeWrites.length, 1); assert.equal(texts.length + questions.length + questionUpdates.length, noticeCount);
     snapshot = { state: { ...snapshot.state, runtimeStatus: "idle", activeTurnId: undefined }, turns: [{
