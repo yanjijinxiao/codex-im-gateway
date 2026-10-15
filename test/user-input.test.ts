@@ -400,6 +400,46 @@ test("a stale failed-state update cannot supersede the newer native confirmation
   assert.equal(row.status, "confirmed"); assert.equal(row.noticeOutcome, "confirmed"); assert.equal(row.noticeDelivery, "delivered");
 });
 
+test("question presentation facts exist only after native confirmation and survive restart without answer bodies", async t => {
+  const f = fixture(t);
+  const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 PRIVATE_ANSWER_BODY"); await pending;
+  assert.deepEqual(f.controller.acceptedPresentationInputs(), []);
+  await f.controller.reportResult("room", request, "failed");
+  assert.deepEqual(f.controller.acceptedPresentationInputs(), []);
+  await f.controller.reportResult("room", request, "confirmed");
+  const [fact] = f.controller.acceptedPresentationInputs(); assert.ok(fact);
+  assert.equal(fact.kind, "answer"); assert.equal(fact.hostId, "local"); assert.equal(fact.turnId, request.turnId);
+  assert.doesNotMatch(JSON.stringify(fact), /PRIVATE_ANSWER_BODY|farming/);
+  f.controller.close(); const restored = f.create();
+  assert.deepEqual(restored.acceptedPresentationInputs(), [fact]);
+  await restored.reportResult("room", request, "failed");
+  assert.deepEqual(restored.acceptedPresentationInputs(), [fact]);
+});
+
+test("legacy confirmed answers do not manufacture historical card boundaries on upgrade", async t => {
+  const f = fixture(t); const pending = f.controller.request("room", request);
+  f.controller.answer("room", "Q1 旧回答"); await pending;
+  await f.controller.reportResult("room", request, "confirmed"); f.controller.close();
+  const journal = JSON.parse(fs.readFileSync(f.filePath, "utf8")); delete journal.records[0].presentation;
+  fs.writeFileSync(f.filePath, JSON.stringify(journal));
+  const restored = f.create(); await restored.reportResult("room", request, "confirmed");
+  assert.deepEqual(restored.acceptedPresentationInputs(), []);
+});
+
+test("a delayed presentation callback cannot overwrite a replacement question controller's journal", async t => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = fixture(t, { onAcceptedInput: async () => { await gate; } });
+  const pending = f.controller.request("room", request); f.controller.answer("room", "Q1 回答"); await pending;
+  const reporting = f.controller.reportResult("room", request, "confirmed"); await tick();
+  f.controller.close(); const restored = f.create();
+  const second = restored.request("room", { ...request, requestId: "second" });
+  release(); await reporting;
+  assert.equal(JSON.parse(fs.readFileSync(f.filePath, "utf8")).records.length, 2);
+  restored.close(); await second;
+});
+
 test("Desktop async widgets have independent stable identities and the exact native answer envelope", () => {
   const state = asyncState();
   const requests = desktopAsyncUserInputs("thread", state);

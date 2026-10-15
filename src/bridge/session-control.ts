@@ -3,6 +3,7 @@ import { readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { CodexInputReceipt } from "../codex/backend.js";
 import { CodexInterventionError } from "../codex/backend.js";
 import type { PromptBufferItem } from "./prompt-buffer.js";
+import type { AcceptedPresentationInput } from "./input-presentation.js";
 
 /** Serializes controls for one host/thread, without blocking controls on a running turn. */
 export class SessionControlQueue {
@@ -29,7 +30,8 @@ export type PendingIntervention = {
   expiresAt: number;
   status: "pending" | "submitted" | "cancelled";
 };
-type Receipt = { status: "sending" | "accepted" | "uncertain"; result?: CodexInputReceipt };
+type Receipt = { status: "sending" | "accepted" | "uncertain"; result?: CodexInputReceipt;
+  presentation?: AcceptedPresentationInput };
 
 /** Write-ahead receipts: an unknown transport outcome is never automatically resubmitted. */
 export class SessionControlJournal {
@@ -40,11 +42,17 @@ export class SessionControlJournal {
   }
   private save(): void { writeJsonFile(this.filePath, this.state); }
 
-  steer(key: string, messageId: string, action: () => Promise<CodexInputReceipt>): Promise<CodexInputReceipt> {
-    return this.submit(key, messageId, action);
+  steer(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, hostId?: string): Promise<CodexInputReceipt> {
+    return this.submit(key, messageId, action, hostId);
   }
 
-  async submit(key: string, messageId: string, action: () => Promise<CodexInputReceipt>): Promise<CodexInputReceipt> {
+  acceptedPresentationInputs(): AcceptedPresentationInput[] {
+    return Object.values(this.state.receipts).flatMap(receipt => receipt.status === "accepted" && receipt.presentation
+      && receipt.result?.threadId === receipt.presentation.threadId && receipt.result.turnId === receipt.presentation.turnId
+      ? [receipt.presentation] : []);
+  }
+
+  async submit(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, presentationHostId?: string): Promise<CodexInputReceipt> {
     const receiptId = crypto.createHash("sha256").update(JSON.stringify([key, messageId])).digest("hex");
     return this.queue.run(key, async () => {
       const receipt = this.state.receipts[receiptId];
@@ -54,7 +62,12 @@ export class SessionControlJournal {
       this.save();
       try {
         const result = await action();
-        this.state.receipts[receiptId] = { status: "accepted", result };
+        this.state.receipts[receiptId] = { status: "accepted", result,
+          ...(presentationHostId && key === JSON.stringify([presentationHostId, result.threadId])
+            && result.status === "accepted" && result.turnId && result.threadId ? { presentation: {
+            id: `steer:${receiptId}`, kind: "steer" as const, hostId: presentationHostId,
+            threadId: result.threadId, turnId: result.turnId, acceptedAt: Date.now()
+          } } : {}) };
         this.save();
         return result;
       } catch (error) {

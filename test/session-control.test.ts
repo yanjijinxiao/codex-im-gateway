@@ -47,3 +47,24 @@ test("pending input is scoped to its actor and conversation and survives restart
   assert.equal(restarted.claimChoice(choice.id, "alice", "group", false).turnId, "run");
   assert.throws(() => restarted.claimChoice(choice.id, "alice", "group", false), /已处理/);
 });
+
+test("presentation recovery projects only exact confirmed receipts, not legacy/uncertain/cross-thread submissions", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-presentation-controls-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "controls.json"); const controls = new SessionControlJournal(file);
+  const key = JSON.stringify(["remote", "thread"]);
+  const receipt = { status: "accepted" as const, threadId: "thread", turnId: "turn" };
+  let nativeWrites = 0;
+  await controls.submit(key, "confirmed", async () => { nativeWrites++; return receipt; }, "remote");
+  await controls.submit(key, "legacy", async () => receipt);
+  await controls.submit(key, "wrong-scope", async () => ({ ...receipt, threadId: "another-thread" }), "remote");
+  await assert.rejects(controls.submit(key, "unknown", async () => { throw new Error("receipt lost"); }, "remote"));
+  const restored = new SessionControlJournal(file);
+  await restored.submit(key, "confirmed", async () => { nativeWrites++; return receipt; }, "remote");
+  assert.equal(nativeWrites, 1);
+  assert.equal(restored.acceptedPresentationInputs().length, 1);
+  const [input] = restored.acceptedPresentationInputs();
+  assert.equal(input.hostId, "remote"); assert.equal(input.threadId, "thread"); assert.equal(input.turnId, "turn");
+  assert.equal(input.kind, "steer"); assert.equal(typeof input.acceptedAt, "number");
+  assert.deepEqual(input, controls.acceptedPresentationInputs()[0]);
+});

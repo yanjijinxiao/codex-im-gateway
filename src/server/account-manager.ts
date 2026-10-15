@@ -304,7 +304,9 @@ export class AccountManager {
     this.threadEvents = new ThreadEventHub({
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       subscriptions: () => this.threadSubscriptions(),
-      backend: () => this.runnerFor(this.configProvider())
+      backend: () => this.runnerFor(this.configProvider()),
+      acceptedInputs: () => [ ...this.sessionControls.acceptedPresentationInputs(),
+        ...[...this.entries.values()].flatMap(entry => entry.service?.acceptedPresentationInputs?.() ?? []) ]
     });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
     this.adapterFactory = options.adapterFactory ?? channelFactoryWithLegacyOverrides(options);
@@ -415,6 +417,7 @@ export class AccountManager {
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       sessionControls: this.sessionControls,
+      onAcceptedInput: input => this.threadEvents.acceptedInput(input),
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
         synchronize: async (session, recovery) => {
@@ -445,14 +448,14 @@ export class AccountManager {
           threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true
         }, turnId);
       },
-      createTextStream: (session) => this.threadEvents.prepareManagedStream({
+      createTextStream: (session, acceptedTurnId) => this.threadEvents.prepareManagedStream({
         key: JSON.stringify([account.accountId, session.id]),
         hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",
         threadId: session.threadId ?? "", recipientId: session.senderId, client, managed: true,
         contextToken: store.getContextToken(session.senderId),
         onTextDelivered: (part) => webhook.publish({ direction: "outbound", id: part.messageId,
           recipientId: session.senderId, text: part.text, attachments: [] })
-      }),
+      }, acceptedTurnId),
       deliverTurnResult: (session, turnId, text) => this.threadEvents.managedCompletion({
         key: JSON.stringify([account.accountId, session.id]),
         hostId: session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local",

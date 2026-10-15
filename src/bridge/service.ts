@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
+import type { AcceptedPresentationInput } from "./input-presentation.js";
+import { ChannelTurnPresentation, type TurnReplyStream } from "../channels/turn-presentation.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
@@ -88,7 +90,6 @@ import {
 import { ChannelContextExpiredError, ChannelPartialDeliveryError, InboundMediaTooLargeError } from "../channels/errors.js";
 import { validateLocalAttachments } from "../channels/client.js";
 import { adaptLegacyClient } from "../channels/legacy.js";
-import { ChannelTurnTextStream } from "../channels/progress.js";
 import { formatFollowStatus, type SessionFollowPort } from "./session-follow.js";
 import { formatInteractionRoute, type SessionInteractionPort } from "./interaction-routing.js";
 export { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
@@ -130,7 +131,8 @@ export type BridgeServiceOptions = {
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
-  createTextStream?: (session: ManagedSession) => ChannelTurnTextStream | Promise<ChannelTurnTextStream>;
+  createTextStream?: (session: ManagedSession, acceptedTurnId?: string) => TurnReplyStream | Promise<TurnReplyStream>;
+  onAcceptedInput?: (input: AcceptedPresentationInput) => Promise<void>;
   deliverTurnResult?: (session: ManagedSession, turnId: string, text: string) => Promise<boolean>;
   onSubscriptionsChanged?: () => Promise<void>;
   sessionFollow?: SessionFollowPort;
@@ -179,6 +181,7 @@ export class BridgeService {
   private recoveringQueue = false;
   private lastQueueWarningAt = 0;
   private readonly runningSessions = new Set<string>();
+  private readonly activePresentations = new Map<string, { hostId: string; threadId?: string; turnId?: string; stream: TurnReplyStream }>();
   private readonly catalogControls = new SessionControlQueue();
   private readonly turnDeliveries = new SessionControlQueue();
   private readonly historyPages = new Map<string, {
@@ -241,7 +244,8 @@ export class BridgeService {
         ...(this.channel.capabilities.cardUpdates === "available" ? {
           updateCard: (messageId: string, card: ChannelActionCard) => this.channel.updateActionCard({ messageId, card })
         } : {}),
-        sendNotice: (senderId, text) => this.reply(senderId, text)
+        sendNotice: (senderId, text) => this.reply(senderId, text),
+        onAcceptedInput: input => this.presentAcceptedInput(input)
       }
     );
     this.taskboardController = new TaskboardChannelController({
@@ -1421,7 +1425,8 @@ export class BridgeService {
       prompt,
       cwd: session.workspace,
       clientUserMessageId: message.id
-    }, hostId));
+    }, hostId), hostId ?? "local");
+    await this.presentControlReceipt(session, result.turnId);
     this.options.stateStore.setSessionPromptPreview(session.id, prompt);
     await this.reply(message.senderId, [
       "已介入当前正在执行的 Codex 任务。",
@@ -1613,7 +1618,8 @@ export class BridgeService {
             { code: "InvalidAcknowledgement" });
         }
         return receipt;
-      });
+      }, hostId ?? "local");
+    await this.presentControlReceipt(session, result.turnId);
     this.options.stateStore.setSessionPromptPreview(session.id, prompt);
     await this.reply(message.senderId, `消息已由原 Codex 会话接收。\nTurn：${result.turnId}\n继续跟随原会话；未新建任务或自动排队。`);
   }
@@ -2171,19 +2177,29 @@ export class BridgeService {
     const wantsProgress = () => stillBound()
       && (this.options.stateStore.getSession(session.id)?.streamReplies ?? this.options.config.streamReplies);
     const sentProgress = new Set<string>();
-    const replyStream = progressEnabled
-      ? await this.options.createTextStream?.(session) ?? new ChannelTurnTextStream(this.channel, message.senderId, {
+    let replyStream: TurnReplyStream | undefined;
+    const prepareReplyStream = async (acceptedTurnId?: string) => {
+      if (!progressEnabled || replyStream) return;
+      replyStream = await this.options.createTextStream?.(session, acceptedTurnId) ?? new ChannelTurnPresentation(this.channel, message.senderId, {
         save: () => undefined, contextToken: this.options.stateStore.getContextToken(message.senderId),
         onTextDelivered: (part) => this.options.onOutboundMessage?.({ direction: "outbound", id: part.messageId,
           recipientId: message.senderId, text: part.text, attachments: [] })
-      })
-      : undefined;
+      });
+      this.activePresentations.set(session.id, { hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, stream: replyStream });
+    };
+    if (!queued) await prepareReplyStream();
     let streamedAnswer = "";
     let acceptedQueueTurn = false;
     let backendEntered = false;
     let acceptedTurnId: string | undefined;
-    this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
-    this.runningSessions.add(session.id);
+    let activeMarked = false;
+    const markActive = () => {
+      if (activeMarked) return;
+      activeMarked = true;
+      this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
+      this.runningSessions.add(session.id);
+    };
+    if (!queued) markActive();
     try {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-im-gateway] starting Codex turn for ${message.senderId} in ${workspace}`);
@@ -2209,6 +2225,9 @@ export class BridgeService {
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             session.threadId = startedThreadId;
             this.options.stateStore.setSessionThread(session.id, startedThreadId);
+            if (queued) { await prepareReplyStream(turnId); markActive(); }
+            const presentation = this.activePresentations.get(session.id);
+            if (presentation) { presentation.threadId = startedThreadId; presentation.turnId = turnId; }
             await this.options.onTurnStarted?.(session, turnId);
             if (queued && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
           },
@@ -2221,16 +2240,16 @@ export class BridgeService {
             onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
           } : {}),
           ...(progressEnabled ? {
-            ...(replyStream?.supported ? {
+            ...(replyStream?.supported || queued ? {
               onDelta: async (delta: string) => {
-                if (!wantsProgress()) return;
+                if (!wantsProgress() || queued && !acceptedQueueTurn || !replyStream?.supported) return;
                 streamedAnswer += delta;
                 const visible = visibleStreamingAnswer(streamedAnswer);
                 if (visible) await replyStream.answer(visible);
               }
             } : {}),
             onProgress: async (progress: string) => {
-              if (!wantsProgress()) return;
+              if (!wantsProgress() || queued && !acceptedQueueTurn) return;
               const progressText = progress.trim();
               if (!progressText || sentProgress.has(progressText)) return;
               sentProgress.add(progressText);
@@ -2323,8 +2342,11 @@ export class BridgeService {
       if (queued && error instanceof CodexTurnExecutionError) return;
       throw error;
     } finally {
-      this.runningSessions.delete(session.id);
-      this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
+      if (this.activePresentations.get(session.id)?.stream === replyStream) this.activePresentations.delete(session.id);
+      if (activeMarked) {
+        this.runningSessions.delete(session.id);
+        this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
+      }
     }
     });
   }
@@ -2714,6 +2736,26 @@ export class BridgeService {
     const session = this.executionSession(senderId);
     if (session?.threadId !== native.threadId || (this.sessionHostId(session) ?? "local") !== native.hostId) return Promise.resolve(undefined);
     return this.userInputs.request(senderId, native);
+  }
+
+  acceptedPresentationInputs(): AcceptedPresentationInput[] {
+    return this.userInputs.acceptedPresentationInputs();
+  }
+  private async presentControlReceipt(session: ManagedSession, turnId: string): Promise<void> {
+    const inputs = this.controls.acceptedPresentationInputs().filter(input => input.hostId === (this.sessionHostId(session) ?? "local")
+      && input.threadId === session.threadId && input.turnId === turnId);
+    for (const input of inputs) await this.presentAcceptedInput(input);
+  }
+  private async presentAcceptedInput(input: AcceptedPresentationInput): Promise<void> {
+    // Presentation failure cannot turn a successful native submission into an
+    // execution failure. Polling recovers this exact fact from its own receipt.
+    try {
+      if (this.options.onAcceptedInput) await this.options.onAcceptedInput(input);
+      else for (const active of this.activePresentations.values()) if (active.hostId === input.hostId
+        && active.threadId === input.threadId && active.turnId === input.turnId && active.stream instanceof ChannelTurnPresentation) {
+        await active.stream.startSegment(input);
+      }
+    } catch { console.warn("[codex-im-gateway] accepted input presentation pending"); }
   }
 
   hasUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest): boolean {

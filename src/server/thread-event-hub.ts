@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "../codex/backend.js";
 import type { ChannelTextClient } from "../channels/types.js";
-import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
+import type { ChannelStreamCheckpoint } from "../channels/progress.js";
+import { ChannelTurnPresentation, nextTurnCheckpoint } from "../channels/turn-presentation.js";
+import type { AcceptedPresentationInput } from "../bridge/input-presentation.js";
 import { parseActionBlocks } from "../bridge/actions.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus, type FollowSyncOptions } from "../bridge/session-follow.js";
@@ -49,11 +51,14 @@ type FollowState = {
   /** Legacy observation notices are not model answers or completion receipts. */
   observationNotices?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
   repairTurnId?: string;
+  presentationInputBaseline?: string[];
 };
 type Options = {
   filePath: string;
   subscriptions: () => ThreadSubscription[];
   backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot">;
+  /** Recovery projection of existing native receipts, not an execution queue. */
+  acceptedInputs?: () => readonly AcceptedPresentationInput[];
   intervalMs?: number;
   readTimeoutMs?: number;
 };
@@ -66,7 +71,7 @@ type Options = {
  */
 export class ThreadEventHub {
   private readonly states: Record<string, FollowState>;
-  private readonly streams = new Map<string, ChannelTurnTextStream>();
+  private readonly streams = new Map<string, ChannelTurnPresentation>();
   private readonly queue = new SessionControlQueue();
   private timer?: NodeJS.Timeout;
   private scan?: Promise<void>;
@@ -418,6 +423,9 @@ export class ThreadEventHub {
       if (text?.trim()) state.terminalPending = { turnId: state.turnId, text: visibleText(text).trim(), fallbackSent: false };
     }
     if (!sub.managed && currentTurn && state.turnId !== currentTurn.id) await this.selectTurn(sub, currentTurn.id, true);
+    if (currentTurn?.id === state.turnId) {
+      for (const input of this.presentationInputs(sub, state.turnId)) await this.segmentInput(sub, input);
+    }
     const nativeText = sub.client.capabilities
       ? sub.client.capabilities.progress === "unsupported"
       : !sub.client.startTextStream && !sub.client.updateTextStream;
@@ -527,6 +535,23 @@ export class ThreadEventHub {
       && this.states[sub.key]?.turnId === turnId)
       .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text))));
   }
+  /** A confirmed native input splits presentation only. Never completes a turn. */
+  async acceptedInput(input: AcceptedPresentationInput): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
+      && sub.hostId === input.hostId && sub.threadId === input.threadId)
+      .map(sub => this.queue.run(sub.key, () => this.segmentInput(sub, input))));
+  }
+  private presentationInputs(sub: ThreadSubscription, turnId?: string): AcceptedPresentationInput[] {
+    return (this.options.acceptedInputs?.() ?? []).filter(input => input.hostId === sub.hostId
+      && input.threadId === sub.threadId && input.turnId === turnId).slice().sort((a, b) => a.acceptedAt - b.acceptedAt || a.id.localeCompare(b.id));
+  }
+  private async segmentInput(sub: ThreadSubscription, input: AcceptedPresentationInput): Promise<void> {
+    if (this.stopped || !this.isLive(sub) || sub.progressEnabled === false) return;
+    const state = this.state(sub);
+    if (state.hostId !== input.hostId || state.threadId !== input.threadId || state.turnId !== input.turnId
+      || state.completed.includes(input.turnId) || state.terminalPending || state.presentationInputBaseline?.includes(input.id)) return;
+    if (await this.stream(sub).startSegment(input)) { state.sequence++; this.save(); }
+  }
   /** Reuse the same persistent record for turns initiated from the IM channel. */
   async managedTurnStarted(sub: ThreadSubscription, turnId: string): Promise<void> {
     await this.queue.run(sub.key, async () => this.managedStarted(sub, turnId));
@@ -536,6 +561,7 @@ export class ThreadEventHub {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);
     if (state.turnId !== turnId && !this.preparedStreams.has(sub.key)) this.rotateStream(sub);
+    if (state.turnId !== turnId) state.presentationInputBaseline = this.presentationInputs(sub, turnId).map(input => input.id);
     state.turnId = turnId;
     state.checkpointTurnId = turnId;
     this.preparedStreams.delete(sub.key);
@@ -543,7 +569,7 @@ export class ThreadEventHub {
     this.save();
   }
 
-  managedStream(sub: ThreadSubscription): ChannelTurnTextStream {
+  managedStream(sub: ThreadSubscription): ChannelTurnPresentation {
     const state = this.state(sub);
     this.rotateStream(sub);
     state.turnId = undefined;
@@ -553,8 +579,14 @@ export class ThreadEventHub {
     return this.stream(sub);
   }
   /** Serialize presentation rotation with in-flight completion acknowledgements. */
-  async prepareManagedStream(sub: ThreadSubscription): Promise<ChannelTurnTextStream> {
-    return this.queue.run(sub.key, async () => this.managedStream(sub));
+  async prepareManagedStream(sub: ThreadSubscription, acceptedTurnId?: string): Promise<ChannelTurnPresentation> {
+    return this.queue.run(sub.key, async () => {
+      if (acceptedTurnId) {
+        if (!await this.selectTurn(sub, acceptedTurnId, true)) throw new Error("Accepted queue binding changed");
+        return this.stream(sub);
+      }
+      return this.managedStream(sub);
+    });
   }
   /** Execution and following use the same acknowledged delivery journal. */
   async managedCompletion(sub: ThreadSubscription, turnId: string, text: string): Promise<boolean> {
@@ -587,8 +619,9 @@ export class ThreadEventHub {
     const old = this.streams.get(sub.key);
     this.streams.delete(sub.key);
     if (old) void old.suspend().catch(report);
-    state.checkpoint = undefined;
+    state.checkpoint = nextTurnCheckpoint(state.checkpoint);
     state.checkpointTurnId = undefined;
+    state.presentationInputBaseline = undefined;
     state.delivered = [];
     this.save();
   }
@@ -606,7 +639,7 @@ export class ThreadEventHub {
       if (this.previousRecoveries.has(recoveryKey) || !force && Date.now() < (this.previousRetryAt.get(recoveryKey) ?? 0)) continue;
       if (pending.checkpoint?.messageId && !sub.client.resumableTextStream) continue;
       const work = (async () => {
-      const stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
+      const stream = new ChannelTurnPresentation(sub.client, sub.recipientId, {
         restore: pending.checkpoint, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
         save: checkpoint => {
           if (this.stopped || !this.isLive(sub) || state.pendingTerminals?.[turnId] !== pending) throw new Error("Old result binding changed");
@@ -628,7 +661,7 @@ export class ThreadEventHub {
       this.previousRecoveries.set(recoveryKey, work);
     }
   }
-  private stream(sub: ThreadSubscription): ChannelTurnTextStream {
+  private stream(sub: ThreadSubscription): ChannelTurnPresentation {
     let stream = this.streams.get(sub.key);
     if (stream) return stream;
     const state = this.state(sub);
@@ -636,7 +669,7 @@ export class ThreadEventHub {
     // Only transports explicitly supporting persisted handles may resume.
     const restore = saved && (sub.client.resumableTextStream || !saved.messageId)
       ? saved : undefined;
-    stream = new ChannelTurnTextStream(sub.client, sub.recipientId, {
+    stream = new ChannelTurnPresentation(sub.client, sub.recipientId, {
       restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
       save: (checkpoint) => {
         // A retired stream's late HTTP acknowledgement cannot poison the new
@@ -656,6 +689,7 @@ export class ThreadEventHub {
     const state = this.state(sub);
     if (state.retired?.includes(turnId)) return undefined;
     if (!state.turnId && this.preparedStreams.has(sub.key)) {
+      state.presentationInputBaseline = this.presentationInputs(sub, turnId).map(input => input.id);
       state.turnId = turnId;
       state.checkpointTurnId = turnId;
       this.preparedStreams.delete(sub.key);
@@ -665,19 +699,20 @@ export class ThreadEventHub {
     if (state.turnId !== turnId) {
       if (state.turnId && !allowSwitch) return undefined;
       const old = this.streams.get(sub.key)
-        ?? (state.checkpoint?.messageId && !state.checkpoint.finished ? this.stream(sub) : undefined);
+        ?? (state.checkpoint && !state.checkpoint.finished && (state.checkpoint.messageId || state.checkpoint.creationAttempted || state.checkpoint.bootstrap)
+          ? this.stream(sub) : undefined);
       const hadResult = Boolean(state.terminalPending || state.checkpoint?.terminal);
-      if (old) {
-        if (state.terminalPending || old.checkpoint().terminal) void old.suspend().catch(report);
-        else { await old.finalize("已切换到新的任务轮次；上一轮结果可用 /history 查看。"); await old.suspend(); }
-      }
-      this.streams.delete(sub.key);
-      // A synthetic "switched turns" closure is not a model's final result.
       this.archiveTerminal(state, hadResult);
+      if (old) {
+        if (hadResult) { void old.suspend().catch(report); this.streams.delete(sub.key); }
+        else await old.nextTurn(turnId);
+      }
+      // A synthetic "switched turns" closure is not a model's final result.
       if (state.turnId) state.retired = [...(state.retired ?? []), state.turnId].slice(-200);
       state.turnId = turnId;
       state.checkpointTurnId = turnId;
-      state.checkpoint = undefined;
+      if (!old || hadResult) state.checkpoint = nextTurnCheckpoint(state.checkpoint);
+      state.presentationInputBaseline = this.presentationInputs(sub, turnId).map(input => input.id);
       state.delivered = [];
       this.save();
     }

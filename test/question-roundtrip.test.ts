@@ -31,7 +31,7 @@ const scenarios = [
   { kind: "async", style: "null" }, { kind: "async", style: "absent" }, { kind: "async", style: "empty" }
 ] as const;
 for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const hostId of ["local", "remote-ssh-discovered:test"]) for (const { kind, style } of scenarios) {
-  test(`${channel}/${hostId}/${kind}/${style}: native question → IM command → native receipt → same progress/final card, with restart deduplication`, async t => {
+  test(`${channel}/${hostId}/${kind}/${style}: native answer → summarized old card + new progress/final segment, with restart deduplication`, async t => {
     const freeInput = style !== "choice";
     const questionText = freeInput ? "端到端测试使用哪个版本和环境？" : "继续执行吗？";
     const answerText = freeInput ? "version-2026.10\n测试环境：上海" : "继续";
@@ -47,11 +47,11 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const host
       async sendText(input) { texts.push(input.text); return { messageId: `notice-${texts.length}` }; },
       async sendActionCard(input) { questions.push(input.card.title); return { messageId: "question-card" }; },
       async updateActionCard(input) { assert.equal(input.messageId, "question-card"); questionUpdates.push(input.card.title); },
-      async startTextStream(input) { starts++; progress.push(input); return { messageId: "original-task-card" }; },
-      async updateTextStream(input) { assert.equal(input.messageId, "original-task-card"); progress.push(input); }
+      async startTextStream(input) { starts++; progress.push(input); return { messageId: `task-card-${starts}` }; },
+      async updateTextStream(input) { assert.match(input.messageId, /^task-card-[12]$/); progress.push(input); }
     });
     const createService = () => new BridgeService({ config: { ...defaultConfig(root), allowedSenderIds: ["actor"] },
-      stateStore: store, channel: client, runner: {
+      stateStore: store, channel: client, onAcceptedInput: input => hub.acceptedInput(input), runner: {
         async run() { generalWrites.push("run"); throw new Error("must not start"); },
         async steer() { generalWrites.push("steer"); throw new Error("must not use ordinary input"); },
         async addQueuedSubmission() { generalWrites.push("queue"); throw new Error("must not enqueue"); },
@@ -129,8 +129,9 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const host
     snapshot = { state: { ...snapshot.state, activeFlags: [] }, turns: [{ id: "turn", status: "inProgress",
       messages: [{ id: "after", role: "assistant", kind: "progress", text: "回答后继续执行原任务" }] }] };
     await hub.refresh();
-    await until(() => progress.some(write => write.messageId === "original-task-card" && write.text.includes("回答后继续执行原任务")));
-    assert.equal(starts, 1); assert.notEqual(progress.at(-1)?.finalize, true);
+    await until(() => progress.some(write => write.messageId === "task-card-2" && write.text.includes("回答后继续执行原任务")));
+    assert.equal(starts, 2); assert.notEqual(progress.at(-1)?.finalize, true);
+    assert.ok(progress.some(write => write.messageId === "task-card-1" && write.finalize && write.text.includes("阶段小结")));
     monitor.stop(); service.suspendUserInputs(); service = createService(); monitor = createMonitor();
     const noticeCount = texts.length + questions.length + questionUpdates.length;
     monitor.followThread("thread", hostId); monitor.start(); await until(() => connections === 2);
@@ -138,7 +139,7 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) for (const host
     assert.equal(nativeWrites.length, 1); assert.equal(texts.length + questions.length + questionUpdates.length, noticeCount);
     snapshot = { state: { ...snapshot.state, runtimeStatus: "idle", activeTurnId: undefined }, turns: [{
       id: "turn", status: "completed", messages: [{ id: "final", role: "assistant", text: "原任务最终答复" }] }] };
-    await hub.refresh(); assert.equal(starts, 1); assert.equal(progress.at(-1)?.messageId, "original-task-card");
+    await hub.refresh(); assert.equal(starts, 2); assert.equal(progress.at(-1)?.messageId, "task-card-2");
     assert.equal(progress.at(-1)?.finalize, true); assert.equal(progress.at(-1)?.text, "原任务最终答复");
     assert.deepEqual(generalWrites, []);
   });

@@ -6,6 +6,7 @@ import { createChoiceCard, type ChannelActionCard } from "../channels/action-car
 import type { ChannelReceipt } from "../channels/types.js";
 import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
 import { channelProgressError } from "../channels/errors.js";
+import type { AcceptedPresentationInput } from "./input-presentation.js";
 
 type QuestionStatus = "pending" | "answered" | "submitting" | "confirmed" | "withdrawn" | "unconfirmed" | "expired";
 type QuestionRecord = {
@@ -16,6 +17,7 @@ type QuestionRecord = {
   /** Native acceptance and delivery of its IM acknowledgement are separate facts. */
   noticeDelivery?: "pending" | "delivered" | "unconfirmed";
   noticeAttempts?: number; noticeRetryAt?: number;
+  presentation?: AcceptedPresentationInput;
 };
 type Waiter = { resolve: (answer: string | undefined) => void; timer?: NodeJS.Timeout };
 const MAX_RESOLUTION_CARD_ATTEMPTS = 3;
@@ -25,6 +27,7 @@ type Options = {
   sendNotice?: (senderId: string, text: string) => Promise<void>;
   validate?: (senderId: string, request: Pick<QuestionRecord, "hostId" | "threadId" | "turnId">) => boolean;
   noticeRetryDelayMs?: number;
+  onAcceptedInput?: (input: AcceptedPresentationInput) => Promise<void>;
 };
 
 /** Account-scoped application controller. No Codex RPC or provider payloads. */
@@ -169,6 +172,7 @@ export class ChannelUserInputController {
     if (this.closed) return;
     const key = requestKey(senderId, request);
     for (const record of this.state.records.filter(record => record.requestKey === key)) {
+      if (this.closed) return;
       if (record.status === "confirmed") {
         // A late transport failure cannot undo native evidence. Retry only the
         // same acknowledgement card, never the answer or a new notification.
@@ -176,13 +180,27 @@ export class ChannelUserInputController {
         continue;
       }
       if (result === "suspended") { this.release(record.id); continue; }
+      if (result === "confirmed") record.presentation ??= {
+        id: `answer:${crypto.createHash("sha256").update(record.requestKey).digest("hex")}`,
+        kind: "answer", hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, acceptedAt: Date.now()
+      };
       record.status = result === "failed" ? "unconfirmed" : result;
       delete record.answer; this.release(record.id); this.save();
+      if (record.presentation && result === "confirmed") {
+        try { await this.options.onAcceptedInput?.(record.presentation); }
+        catch { console.warn("[codex-im-gateway] question presentation boundary pending"); }
+        if (this.closed) return;
+      }
       if ((record.noticeAttempted && !(result === "confirmed" && record.noticeOutcome !== "confirmed")) || !record.deliveryAttempted) continue;
       record.noticeAttempted = true; record.noticeOutcome = result;
       record.noticeDelivery = "pending"; record.noticeAttempts = 0; delete record.noticeRetryAt; this.save();
       await this.deliverResolution(record);
     }
+  }
+
+  acceptedPresentationInputs(): AcceptedPresentationInput[] {
+    return this.closed ? [] : this.state.records.flatMap(record => record.status === "confirmed" && record.presentation
+      ? [record.presentation] : []);
   }
 
   private async deliverResolution(record: QuestionRecord): Promise<void> {
@@ -196,7 +214,7 @@ export class ChannelUserInputController {
     const action = (async () => {
       record.noticeDelivery = "pending"; record.noticeAttempts = (record.noticeAttempts ?? 0) + 1;
       delete record.noticeRetryAt; this.save();
-      const text = outcome === "confirmed" ? `Codex 已确认接收问题 ${record.id} 的回答。后续进展继续使用原任务卡；这不代表任务已完成。`
+      const text = outcome === "confirmed" ? `Codex 已确认接收问题 ${record.id} 的回答。任务继续，后续进展按展示阶段同步；这不代表任务已完成。`
         : outcome === "withdrawn" ? `问题 ${record.id} 已失效或已在 Codex 中处理。`
         : `问题 ${record.id} 的回答尚未获 Codex 确认，未自动重发；请在 Codex App 核对。`;
       try {

@@ -30,6 +30,12 @@ export type ChannelStreamCheckpoint = {
   resultPageBytes?: number;
   resultPresentation?: "card" | "native-text";
   terminalPages?: Array<{ messageId?: string; delivered: boolean; attempted?: boolean; bootstrap?: ChannelStreamBootstrap }>;
+  /** Independent presentation segments within the SAME native turn. */
+  segments?: {
+    acceptedInputs: string[];
+    previous: Array<{ inputId: string; checkpoint: ChannelStreamCheckpoint; attempts: number; retryAt?: number }>;
+    answerPrefix?: { length: number; digest: string };
+  };
 };
 
 export class ChannelTurnTextStream {
