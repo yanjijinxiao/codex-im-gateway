@@ -212,7 +212,7 @@ test("/leave remains detached after restart; /new explicitly rebinds and refresh
   f.restart();
   await f.send("你是 GPT？");
   assert.equal(f.runs.length, 0);
-  assert.match(f.texts.at(-1)!, /已退出会话.*未发送/);
+  assert.match(f.texts.at(-1)!, /未绑定任何 session.*未提交/);
   await f.send("/new");
   const restored = new RuntimeStateStore(f.paths);
   assert.equal(restored.isSessionDetached("chat"), false);

@@ -191,6 +191,7 @@ test("Gateway commands and execution work identically with every IM client, with
   for (const { client } of fakeAdapters().adapters) {
     const store = new RuntimeStateStore(resolveStatePaths(path.join(root, client.channel)));
     store.createProject("same project", root);
+    store.createSession("user", root);
     let prompt = "";
     const service = new BridgeService({ channel: client, stateStore: store,
       config: { ...defaultConfig(root), allowedSenderIds: ["user"], streamReplies: false },

@@ -1,10 +1,10 @@
 # 渠道命令审计
 
-内置命令现在有 29 个顶级入口，统一登记在 `CHANNEL_COMMAND_REGISTRY`。解析别名、保留关键字和 `/help` 后端限制使用同一登记表；渠道扩展不能覆盖这些入口。微信、钉钉、飞书共享业务命令，仅呈现方式不同。
+内置命令统一登记在 `CHANNEL_COMMAND_REGISTRY`。解析别名、保留关键字和 `/help` 后端限制使用同一登记表；渠道扩展不能覆盖这些入口。微信、钉钉、飞书和企业微信共享业务命令，仅呈现方式不同。
 
 | 处理结论 | 命令 | 本次处理 |
 | --- | --- | --- |
-| 保留，修复会话生命周期 | `/session`、`/sessions`、`/new`、`/history`、`/follow`、`/leave` | 切换时刷新跟随；退出后不自动重连；任务与绑定分离 |
+| 保留，修复会话生命周期 | `/session`、`/sessions`、`/new`、`/history`、`/follow`、`/unbind`、`/leave` | 未绑定时普通消息只提示绑定；`/unbind` 明确解绑，`/leave` 为兼容入口；不删 session、不停止任务、不自动接回旧会话 |
 | 保留，修复状态及策略 | `/status`、`/policy`、`/steer`、`/queue`、`/intervene`、`/stop` | 普通消息默认安全 steer；显式 queue 使用 Codex 原生队列；list/cancel 核对和取消本聊天回执；按实际持有者校验能力，不支持时明确拒绝；重启不重发未确认消息 |
 | 保留，补齐帮助和保留字 | `/help`、`/answer` | 帮助显示后端限制；补充 `/answer`，避免与扩展冲突 |
 | 保留，受后端或部署能力限制 | `/approve`、`/reject`、`/plan`、`/goal`、`/balance`、`/task` | CLI 不支持的操作在帮助标注；Taskboard 未启用时标注前置条件 |

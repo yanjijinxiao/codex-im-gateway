@@ -20,6 +20,7 @@ import { handleTaskboardHttp } from "./taskboard-http.js";
 import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
 import { selectLocalDirectory } from "./directory-picker.js";
+import { SessionBindingConflictError } from "../state/runtime-state.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
@@ -138,6 +139,11 @@ const sessionPatchSchema = z.object({
   effort: z.string().max(40).nullable().optional(),
   streamReplies: z.boolean().nullable().optional()
 }).refine((value) => Object.keys(value).length > 0, "Session update is empty");
+const sessionUnbindSchema = z.object({
+  conversationId: z.string().min(1).max(500),
+  hostId: z.string().min(1).max(500),
+  threadId: z.string().min(1).max(500).nullable()
+}).strict();
 const configSchema = z.object({
   activeMessagePolicy: z.enum(["ask", "steer", "queue"]).optional(),
   defaultCwd: z.string().min(1),
@@ -540,6 +546,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   const sessionAction = matchPath(url.pathname, "/api/sessions/:accountId/:sessionId/:action");
+  if (method === "POST" && sessionAction?.action === "unbind") {
+    const expected = sessionUnbindSchema.parse(await readJsonBody(request));
+    sendJson(response, 200, await context.accountManager.unbindSession(sessionAction.accountId, sessionAction.sessionId, expected));
+    return;
+  }
   if (method === "GET" && sessionAction?.action === "messages") {
     const messages = await context.accountManager.getSessionMessages(sessionAction.accountId, sessionAction.sessionId);
     sendJson(response, 200, {
@@ -828,6 +839,7 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function errorStatus(error: unknown, message: string): number {
+  if (error instanceof SessionBindingConflictError) return 409;
   if (error instanceof z.ZodError) return 400;
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;

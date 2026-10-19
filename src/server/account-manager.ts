@@ -64,6 +64,7 @@ import {
   type ManagedProject,
   type ManagedKnowledgeBase,
   type ManagedSession,
+  type SessionBindingTarget,
   type ProjectNotificationTarget,
   type SessionRuntimeOverrides
 } from "../state/runtime-state.js";
@@ -136,6 +137,7 @@ export type AccountSession = ManagedSession & {
   accountId: string;
   active: boolean;
   responding: boolean;
+  binding: SessionBindingTarget & { bound: boolean };
 };
 
 export type AccountProject = ManagedProject & {
@@ -421,7 +423,7 @@ export class AccountManager {
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
         synchronize: async (session, recovery) => {
-          if (store.getActiveSession(session.senderId)?.id !== session.id) return {
+          if (store.getBoundSession(session.senderId)?.id !== session.id) return {
             status: "failed" as const, failure: { code: "binding-changed" as const, message: "当前对话已切换绑定，未同步旧会话。" }
           };
           this.ensureCodexSessionMonitor();
@@ -694,13 +696,8 @@ export class AccountManager {
   listSessions(): AccountSession[] {
     return listAccounts(this.options.paths).flatMap((account) => {
       const store = this.storeFor(account.accountId);
-      const activeIds = new Set(Object.values(store.snapshot.activeSessionIds));
-      return store.listSessions().map((session) => ({
-        ...session,
-        accountId: account.accountId,
-        active: activeIds.has(session.id),
-        responding: this.isSessionResponding(account.accountId, session.id)
-      }));
+      return store.listSessions().map(session => this.sessionSummary(account.accountId, session,
+        store.getBoundSession(session.senderId)?.id === session.id));
     }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
@@ -903,6 +900,7 @@ export class AccountManager {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
     const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title, project?.id);
+    this.storeFor(accountId).setInteractionMode(senderId, "session");
     this.refreshDesktopRequestSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
@@ -946,6 +944,7 @@ export class AccountManager {
       assertCodexThreadRunnable(await this.runnerFor().inspectThread(pending.threadId, pending.hostId ?? project?.hostId));
     }
     const session = store.activateSession(sessionId);
+    store.setInteractionMode(session.senderId, session.mode === "qa" ? "qa" : "session");
     this.refreshDesktopRequestSubscriptions();
     return this.sessionSummary(accountId, session, true);
   }
@@ -960,6 +959,16 @@ export class AccountManager {
     this.storeFor(accountId).deleteSession(sessionId);
     this.respondingSessions.delete(sessionRuntimeKey(accountId, sessionId));
     this.refreshDesktopRequestSubscriptions();
+  }
+
+  async unbindSession(accountId: string, sessionId: string, expected: SessionBindingTarget): Promise<{ session: AccountSession; changed: boolean }> {
+    const store = this.storeFor(accountId);
+    const result = store.unbindSession(sessionId, expected);
+    if (result.changed) this.entries.get(accountId)?.service?.clearConversationBindingState?.(result.session.senderId);
+    this.ensureCodexSessionMonitor();
+    this.refreshDesktopRequestSubscriptions();
+    await this.threadEvents.refresh();
+    return { session: this.sessionSummary(accountId, result.session, false), changed: result.changed };
   }
 
   async getSessionMessages(accountId: string, sessionId: string): Promise<SessionHistoryMessage[]> {
@@ -1184,7 +1193,9 @@ export class AccountManager {
   }
 
   private isActive(accountId: string, sessionId: string): boolean {
-    return Object.values(this.storeFor(accountId).snapshot.activeSessionIds).includes(sessionId);
+    const store = this.storeFor(accountId);
+    const session = store.getSession(sessionId);
+    return Boolean(session && store.getBoundSession(session.senderId)?.id === session.id);
   }
 
   private sessionSummary(accountId: string, session: ManagedSession, active: boolean): AccountSession {
@@ -1192,7 +1203,8 @@ export class AccountManager {
       ...session,
       accountId,
       active,
-      responding: this.isSessionResponding(accountId, session.id)
+      responding: this.isSessionResponding(accountId, session.id),
+      binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active }
     };
   }
 
@@ -1323,7 +1335,7 @@ export class AccountManager {
           hostId,
           recipientId: session.senderId, client: entry.client,
           managed,
-          enabled: store.getActiveSession(session.senderId)?.id === session.id && (managed || session.follow !== false),
+          enabled: store.getBoundSession(session.senderId)?.id === session.id && (managed || session.follow !== false),
           progressEnabled: session.streamReplies ?? this.configProvider().streamReplies,
           contextToken: store.getContextToken(session.senderId),
           onTextDelivered: (part) => entry.webhook?.publish({ direction: "outbound", id: part.messageId,
@@ -1540,11 +1552,10 @@ export class AccountManager {
     store = this.storeFor(accountId)
   ): AccountProject {
     const sessions = store.listSessions().filter((session) => session.projectId === project.id);
-    const activeSessionIds = new Set(Object.values(store.snapshot.activeSessionIds));
     const boundSessions: AccountProjectSession[] = sessions.slice(0, 10).map((session) => ({
       id: session.id,
       title: session.title,
-      active: activeSessionIds.has(session.id),
+      active: store.getBoundSession(session.senderId)?.id === session.id,
       hasThread: Boolean(session.threadId),
       updatedAt: session.updatedAt
     }));

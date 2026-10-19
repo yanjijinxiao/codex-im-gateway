@@ -654,13 +654,18 @@ function renderSessions() {
     const selected = sessionKey(session) === state.selectedSessionKey;
     return `<article class="session-card${selected ? " is-selected" : ""}">
       <button class="session-open" type="button" data-session-action="open" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" aria-pressed="${selected}">
-        <span class="session-card-top"><strong>${session.active ? `<span class="active-mark" title="微信当前会话"></span>` : ""}${escapeHtml(session.title)}</strong><time datetime="${escapeAttr(session.updatedAt)}">${escapeHtml(relativeTime(session.updatedAt))}</time></span>
+        <span class="session-card-top"><strong>${session.active ? `<span class="active-mark" title="IM 当前绑定"></span>` : ""}${escapeHtml(session.title)}</strong><time datetime="${escapeAttr(session.updatedAt)}">${escapeHtml(relativeTime(session.updatedAt))}</time></span>
         <span class="session-owner"><strong>${escapeHtml(accountDisplayName(session.accountId))}</strong></span>
+        <span class="session-binding-state${session.binding?.bound ? " is-bound" : ""}">${session.binding?.bound ? "当前 IM 绑定" : "未绑定到当前 IM 对话"}</span>
+        <span class="session-binding-id">对话：${escapeHtml(session.senderId)}</span>
+        <span class="session-binding-id">主机：${escapeHtml(session.binding?.hostId || session.hostId || "local")}</span>
+        <span class="session-binding-id">Session：${escapeHtml(session.threadId || "尚未创建 Codex session")}</span>
         <span class="session-workspace" title="${escapeAttr(session.workspace)}">${escapeHtml(session.workspace)}</span>
         <span class="session-thread${session.responding ? " is-responding" : ""}">${session.responding ? "对方正在输入…" : session.threadId ? "已连接 Codex" : "等待首条消息"}</span>
       </button>
       <div class="session-actions">
-        <button class="icon-button" type="button" data-session-action="activate" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.active ? "disabled" : ""} title="切换为微信当前会话" aria-label="切换为微信当前会话"><i data-lucide="circle-play"></i></button>
+        <button class="icon-button" type="button" data-session-action="activate" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.active ? "disabled" : ""} title="绑定到此记录的 IM 对话" aria-label="绑定到此记录的 IM 对话"><i data-lucide="circle-play"></i></button>
+        <button class="button button-secondary session-unbind" type="button" data-session-action="unbind" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding?.bound ? "" : "disabled"} title="仅解除此 IM 对话的绑定，不删除或停止 Codex session"><i data-lucide="unlink"></i><span>解绑</span></button>
         <button class="icon-button" type="button" data-session-action="rename" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" title="重命名会话" aria-label="重命名会话"><i data-lucide="pencil"></i></button>
         <button class="icon-button" type="button" data-session-action="reset" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.threadId ? "" : "disabled"} title="重置 Codex 上下文" aria-label="重置 Codex 上下文"><i data-lucide="rotate-ccw"></i></button>
         <button class="icon-button is-danger" type="button" data-session-action="delete" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" title="删除受管会话" aria-label="删除受管会话"><i data-lucide="trash-2"></i></button>
@@ -1218,8 +1223,17 @@ async function handleSessionAction(event) {
   if (action === "rename") return openRenameSessionDialog(session);
   try {
     button.disabled = true;
+    if (action === "unbind") {
+      const binding = session.binding;
+      if (!binding?.bound) return;
+      if (!window.confirm(`仅解绑以下关系？\n\n账号：${accountDisplayName(accountId)}\nIM 对话：${binding.conversationId}\n主机：${binding.hostId}\nCodex session：${binding.threadId || "尚未创建"}\nGateway 记录：${sessionId}\n\n不删除 session、不停止任务、不取消原生队列、不影响其他对话。解绑后普通 IM 消息仅显示绑定提示。`)) return;
+      await api(`/api/sessions/${encodeURIComponent(accountId)}/${encodeURIComponent(sessionId)}/unbind`, {
+        method: "POST", body: { conversationId: binding.conversationId, hostId: binding.hostId, threadId: binding.threadId }
+      });
+      toast("已解除此 IM 绑定，原 session 和任务保留。");
+    }
     if (action === "activate" || action === "reset") {
-      if (action === "reset" && !window.confirm("重置此会话的 Codex 上下文？下一条微信或 Web 消息会创建新的 thread。")) return;
+      if (action === "reset" && !window.confirm("重置此会话的 Codex 上下文？下一条 IM 或 Web 消息会创建新的 thread。")) return;
       await api(`/api/sessions/${encodeURIComponent(accountId)}/${encodeURIComponent(sessionId)}/${action}`, { method: "POST" });
     }
     if (action === "delete") {

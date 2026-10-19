@@ -273,7 +273,7 @@ export class BridgeService {
   async handleMessage(message: ChannelMessage): Promise<void> {
     const conversationId = message.replyTargetId ?? message.senderId;
     const binding = () => {
-      const session = this.options.stateStore.getActiveSession(conversationId);
+      const session = this.executionSession(conversationId);
       const project = this.options.stateStore.getActiveProject(conversationId);
       return JSON.stringify([session?.id, session?.threadId, session?.follow, session?.streamReplies,
         project?.id, this.options.stateStore.getInteractionMode(conversationId)]);
@@ -353,8 +353,12 @@ export class BridgeService {
           return;
         }
         const contextRequirement = commandProjectRequirement(command);
+        if (contextRequirement === "session-or-project" && !this.executionSession(replyTargetId)) {
+          await this.replySessionRequired(replyTargetId);
+          return;
+        }
         if (
-          (contextRequirement === "required" || (contextRequirement === "session-or-project" && !this.executionSession(replyTargetId)))
+          contextRequirement === "required"
           && !this.ensureBoundProjectContext(replyTargetId)
         ) {
           await this.replyProjectRequired(replyTargetId);
@@ -373,12 +377,8 @@ export class BridgeService {
       if (!continueAsConversation) return;
     }
 
-    if (this.options.stateStore.isSessionDetached(replyTargetId)) {
-      await this.reply(replyTargetId, "已退出会话，未发送这条消息。请用 /sessions 重新绑定，或 /new 新建会话。");
-      return;
-    }
-    if (!this.executionSession(replyTargetId) && !this.ensureBoundProjectContext(replyTargetId)) {
-      await this.replyProjectRequired(replyTargetId);
+    if (!this.executionSession(replyTargetId)) {
+      await this.replySessionRequired(replyTargetId);
       return;
     }
 
@@ -542,6 +542,7 @@ export class BridgeService {
       case "follow":
       case "policy":
       case "leave":
+      case "unbind":
       case "role":
         await this.handleInterventionSetting(message.senderId, command, message.text);
         return;
@@ -608,6 +609,16 @@ export class BridgeService {
       fallbackText,
       choices: [{ label: "选择历史项目", command: "project", arg: "add", style: "primary" }]
     }));
+  }
+
+  private async replySessionRequired(senderId: string): Promise<void> {
+    await this.reply(senderId, "当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。");
+  }
+
+  /** Local conversation state only; never resolve native approvals/questions. */
+  clearConversationBindingState(senderId: string): void {
+    this.historyPages.delete(senderId);
+    this.buffers.cancel(senderId);
   }
 
   private ensureBoundProjectContext(senderId: string): boolean {
@@ -1099,12 +1110,10 @@ export class BridgeService {
 
   private executionSession(senderId: string): ManagedSession | undefined {
     const project = this.options.stateStore.getActiveProject(senderId);
-    const standalone = this.options.stateStore.getActiveSession(senderId);
+    const standalone = this.options.stateStore.getBoundSession(senderId);
     if (!project) return standalone?.projectBinding === "none" ? standalone : undefined;
     const mode = this.options.stateStore.getInteractionMode(senderId);
-    const session = mode === "qa"
-      ? this.options.stateStore.getActiveQaSession(senderId)
-      : this.options.stateStore.getActiveSession(senderId);
+    const session = standalone;
     if (session?.projectId !== project.id) return undefined;
     if (mode === "qa" && session.knowledgeBaseId !== this.resolveQaContext(project)?.id) return undefined;
     return session;
@@ -1437,6 +1446,15 @@ export class BridgeService {
 
   private async handleInterventionSetting(senderId: string, command: ChannelCommand, sourceText = ""): Promise<void> {
     const arg = command.arg.trim();
+    if (command.name === "unbind" || command.name === "leave") {
+      if (arg) { await this.reply(senderId, "用法：/unbind（兼容 /leave）；仅解绑当前 IM 对话。"); return; }
+      const session = this.executionSession(senderId);
+      if (session) this.options.stateStore.unbindSession(session.id, this.options.stateStore.sessionBindingTarget(session));
+      else this.options.stateStore.leaveSession(senderId);
+      this.clearConversationBindingState(senderId);
+      await this.reply(senderId, "当前 IM 对话已解绑，停止本对话跟随；不会删除 session、停止原任务或取消原生队列，其他对话绑定不变。\n\n请用 /sessions 查看，再 /session R编号或会话ID 绑定；或 /new 新建。解绑状态会在重启后保留。");
+      return;
+    }
     if (command.name === "role") {
       if (!arg) {
         await this.reply(senderId, [
@@ -1455,14 +1473,8 @@ export class BridgeService {
       await this.reply(senderId, "已设置 " + target + " 的权限为 " + role + "。");
       return;
     }
-    const session = this.options.stateStore.getActiveSession(senderId);
+    const session = this.executionSession(senderId);
     if (!session) { await this.reply(senderId, "请先使用 /sessions 选择会话。"); return; }
-    if (command.name === "leave") {
-      this.options.stateStore.leaveSession(senderId);
-      this.historyPages.delete(senderId);
-      await this.reply(senderId, "已退出会话并停止跟随；任务继续运行。");
-      return;
-    }
     if (command.name === "follow") {
       if (arg === "primary") {
         if (!await this.requireRole(senderId, "controller")) return;
@@ -2139,13 +2151,14 @@ export class BridgeService {
   private async runCodexTurn(message: ChannelMessage, text: string, attachments: PromptBufferItem[] = [], queued?: {
     receipt: QueueReceipt; starting: () => void; started: (turnId: string) => void;
   }): Promise<void> {
-    if (!queued && this.options.stateStore.isSessionDetached(message.senderId)) {
-      await this.reply(message.senderId, "已退出会话，消息未提交。请用 /sessions 重新绑定，或 /new 新建会话。");
+    const currentSession = this.executionSession(message.senderId);
+    if (!queued && !currentSession) {
+      await this.replySessionRequired(message.senderId);
       return;
     }
     const pinned = queued ? this.options.stateStore.getSession(queued.receipt.sessionId) : undefined;
     const activeProject = queued ? this.options.stateStore.getProject(pinned?.projectId ?? "") : this.options.stateStore.getActiveProject(message.senderId);
-    const activeSession = pinned ?? this.options.stateStore.getActiveSession(message.senderId);
+    const activeSession = pinned ?? currentSession;
     const standalone = !activeProject && activeSession?.projectBinding === "none" ? activeSession : undefined;
     if (!activeProject && !standalone) throw new Error("请先发送 /sessions 选择会话，或 /project 选择项目。");
     // Turn execution must not wait for a fresh catalog request. Account start
@@ -2154,9 +2167,7 @@ export class BridgeService {
     const mode = queued ? "session" : this.options.stateStore.getInteractionMode(message.senderId);
     const qaContext = mode === "qa" && project ? this.resolveQaContext(project) : undefined;
     if (mode === "qa" && !qaContext) throw new Error("Current project has no available llm-wiki knowledge base");
-    const session = pinned ?? standalone ?? (mode === "qa"
-      ? this.ensureQaSession(message.senderId, project!, qaContext as ManagedKnowledgeBase)
-      : this.ensureConversationSession(message.senderId, project!));
+    const session = pinned ?? currentSession!;
     return this.turnDeliveries.run(JSON.stringify([this.sessionHostId(session), session.id]), async () => {
     // The preceding queued turn may have created this session's first thread.
     const fresh = this.options.stateStore.listSessions().find((item) => item.id === session.id);
@@ -2179,7 +2190,7 @@ export class BridgeService {
     const sentProgress = new Set<string>();
     let replyStream: TurnReplyStream | undefined;
     const prepareReplyStream = async (acceptedTurnId?: string) => {
-      if (!progressEnabled || replyStream) return;
+      if (!progressEnabled || replyStream || !stillBound()) return;
       replyStream = await this.options.createTextStream?.(session, acceptedTurnId) ?? new ChannelTurnPresentation(this.channel, message.senderId, {
         save: () => undefined, contextToken: this.options.stateStore.getContextToken(message.senderId),
         onTextDelivered: (part) => this.options.onOutboundMessage?.({ direction: "outbound", id: part.messageId,
@@ -2262,6 +2273,9 @@ export class BridgeService {
           onUserInputResult: (request: import("../codex/backend.js").CodexUserInputRequest, result: import("../codex/backend.js").CodexUserInputResult) =>
             this.reportUserInputResult(message.senderId, request, result, this.sessionHostId(session))
         };
+        // A web/IM detach during preparation must not submit a new native input.
+        // Already accepted native queue items remain owned by Codex.
+        if (!queued && !stillBound()) { await replyStream?.suspend(); return; }
         backendEntered = true;
         const result = queued
           ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,
@@ -2553,7 +2567,8 @@ export class BridgeService {
       `模式：${formatInteractionMode(mode)}`,
       `问答知识库：${knowledgeBase?.name ?? "未绑定"}`,
       `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
-      `会话：${session?.title ?? "新会话"}`,
+      `会话：${session?.title ?? "未绑定任何 session"}`,
+      ...(!session ? ["普通消息不会提交；使用 /sessions 查看，/session 绑定或 /new 新建。"] : []),
       `对话状态：${session?.collaborationMode === "plan" ? "计划协作" : "普通对话（未附加模式）"}`,
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,

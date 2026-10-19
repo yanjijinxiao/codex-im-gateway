@@ -473,6 +473,7 @@ for (const cardTemplateId of [undefined, "test-template.schema"]) {
     const fx = adapterFixture(transport, cardTemplateId);
     const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
     store.createProject("Files", root);
+    store.createSession("cid-group", root);
     const outbound: Array<{ id: string; attachments?: unknown[] }> = [];
     const service = new BridgeService({
       channel: fx.adapter.client, stateStore: store,
@@ -502,6 +503,7 @@ test("Gateway reports failed DingTalk file delivery without logging an outbound 
   const fx = adapterFixture(transport);
   const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
   store.createProject("Files", root);
+  store.createSession("cid-private-test", root);
   const attachments: unknown[] = [];
   const service = new BridgeService({
     channel: fx.adapter.client, stateStore: store,

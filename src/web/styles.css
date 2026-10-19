@@ -267,6 +267,12 @@ h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 .session-actions { padding: 0 12px 12px 17px; display: flex; gap: 5px; }
 .session-actions .icon-button { width: 29px; height: 29px; background: transparent; }
 .session-actions .icon-button svg { width: 15px; height: 15px; }
+.session-binding-state { color: var(--ink-soft); font-size: 10px; }
+.session-binding-state.is-bound { color: var(--ink); font-weight: 600; }
+.session-binding-id { color: var(--ink-soft); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+.session-actions { flex-wrap: wrap; }
+.session-actions .session-unbind { min-height: 29px; padding: 3px 8px; font-size: 10px; }
+.session-actions .session-unbind svg { width: 13px; height: 13px; }
 
 .chat-panel { min-width: 0; min-height: 650px; background: linear-gradient(180deg, #fff 0, #fbfcfb 100%); display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
 .chat-header { min-height: 82px; padding: 17px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 18px; }

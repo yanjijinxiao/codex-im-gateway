@@ -10,6 +10,7 @@ import { checkCodex, startLocalHttpServer } from "../src/server/http-server.js";
 import { defaultConfig, loadConfig, saveConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
+import { SessionBindingConflictError } from "../src/state/runtime-state.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 
 test("Codex status probe reuses the runner command resolver", async () => {
@@ -39,6 +40,38 @@ test("interaction primary API uses existing local mutation protection and the sh
   const selected = await fetch(endpoint, { method: "POST", headers: { Origin: server.url, "X-Codex-Im-Gateway-Token": server.requestToken } });
   assert.equal(selected.status, 200);
   assert.deepEqual(calls, ["get:one:session", "set:one:session"]);
+});
+
+test("exact unbind API protects mutations, requires the full edge and returns conflicts", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-unbind-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: unknown[] = [];
+  const target = { conversationId: "group/with+symbols=", hostId: "remote-host", threadId: "thread-id" };
+  let conflict = false;
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {
+    async unbindSession(accountId: string, sessionId: string, expected: unknown) {
+      calls.push({ accountId, sessionId, expected });
+      if (conflict) throw new SessionBindingConflictError();
+      return { changed: true, session: { id: sessionId, binding: { ...target, bound: false } } };
+    }
+  } as never });
+  t.after(() => server.close());
+  const endpoint = `${server.url}/api/sessions/account/managed-record/unbind`;
+  const headers = { "Content-Type": "application/json", Origin: server.url, "X-Codex-Im-Gateway-Token": server.requestToken };
+  assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify(target) })).status, 403);
+  assert.equal((await fetch(endpoint, { method: "POST", headers: { ...headers, Origin: "https://evil.invalid" }, body: JSON.stringify(target) })).status, 403);
+  for (const invalid of [{}, { conversationId: "group" }, { ...target, accountId: "other" }, { ...target, hostId: "" }]) {
+    assert.equal((await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(invalid) })).status, 400);
+  }
+  assert.equal(calls.length, 0);
+  const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(target) });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).session.binding.bound, false);
+  assert.deepEqual(calls, [{ accountId: "account", sessionId: "managed-record", expected: target }]);
+  conflict = true;
+  const rejected = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(target) });
+  assert.equal(rejected.status, 409);
+  assert.match((await rejected.json()).error, /刷新/);
 });
 
 test("account deletion passes the session-history retention choice", async (t) => {

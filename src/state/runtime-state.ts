@@ -74,6 +74,12 @@ export type SessionRuntimeOverrides = {
   streamReplies?: boolean | null;
 };
 
+/** Compare the exact edge shown by a client, not just a thread or directory. */
+export type SessionBindingTarget = { conversationId: string; hostId: string; threadId: string | null };
+export class SessionBindingConflictError extends Error {
+  constructor() { super("绑定已改变，请刷新后确认要解绑的 IM 对话与 session。"); }
+}
+
 export type RuntimeState = {
   approvalSequence: number;
   sessionPageSizes: Record<string, number>;
@@ -93,7 +99,7 @@ export type RuntimeState = {
   activeSessionIds: Record<string, string>;
   activeQaSessionIds: Record<string, string>;
   activeProjectIds: Record<string, string>;
-  /** An explicit /leave must survive restarts and implicit project selection. */
+  /** An explicit /unbind or /leave survives restarts and project selection. */
   detachedSessionSenders: string[];
   interactionModes: Record<string, ProjectInteractionMode>;
   pendingDeliveries: Array<{
@@ -190,15 +196,47 @@ export class RuntimeStateStore {
   }
 
   leaveSession(senderId: string): void {
-    const session = this.mutableActiveSession(senderId);
-    if (session) session.follow = false;
+    for (const session of [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]) {
+      if (session) session.follow = false;
+    }
     delete this.state.activeSessionIds[senderId];
+    delete this.state.activeQaSessionIds[senderId];
     this.state.detachedSessionSenders = [...new Set([...this.state.detachedSessionSenders, senderId])];
     this.save();
   }
 
   isSessionDetached(senderId: string): boolean {
     return this.state.detachedSessionSenders.includes(senderId);
+  }
+
+  getBoundSession(senderId: string): ManagedSession | undefined {
+    if (this.isSessionDetached(senderId)) return undefined;
+    const session = this.getInteractionMode(senderId) === "qa"
+      ? this.getActiveQaSession(senderId) : this.getActiveSession(senderId);
+    const project = this.getActiveProject(senderId);
+    return session && (project ? session.projectId === project.id : session.projectBinding === "none") ? session : undefined;
+  }
+
+  sessionBindingTarget(session: ManagedSession): SessionBindingTarget {
+    return { conversationId: session.senderId,
+      hostId: session.hostId ?? this.getProject(session.projectId ?? "")?.hostId ?? "local",
+      threadId: session.threadId ?? null };
+  }
+
+  unbindSession(sessionId: string, expected: SessionBindingTarget): { session: ManagedSession; changed: boolean } {
+    const session = this.mutableSession(sessionId);
+    const target = this.sessionBindingTarget(session);
+    if (target.conversationId !== expected.conversationId || target.hostId !== expected.hostId || target.threadId !== expected.threadId) {
+      throw new SessionBindingConflictError();
+    }
+    const bound = this.getBoundSession(session.senderId);
+    if (bound && bound.id !== session.id) throw new SessionBindingConflictError();
+    // An already detached edge is idempotent. Never detach a replacement.
+    const selected = this.state.activeSessionIds[session.senderId] === session.id
+      || this.state.activeQaSessionIds[session.senderId] === session.id;
+    if (!selected) return { session: structuredClone(session), changed: false };
+    this.leaveSession(session.senderId);
+    return { session: structuredClone(session), changed: true };
   }
 
   save(): void {
@@ -584,7 +622,6 @@ export class RuntimeStateStore {
   activateProject(senderId: string, projectId: string): ManagedProject {
     const project = this.mutableProject(projectId);
     this.state.activeProjectIds[senderId] = project.id;
-    this.state.detachedSessionSenders = this.state.detachedSessionSenders.filter(id => id !== senderId);
     this.save();
     return structuredClone(project);
   }
@@ -795,24 +832,14 @@ export class RuntimeStateStore {
 
   deleteSession(sessionId: string): void {
     const session = this.mutableSession(sessionId);
+    if (this.getBoundSession(session.senderId)?.id === sessionId) {
+      this.leaveSession(session.senderId);
+    } else {
+      // Removing an inactive mode's history must not detach the active mode.
+      if (this.state.activeSessionIds[session.senderId] === sessionId) delete this.state.activeSessionIds[session.senderId];
+      if (this.state.activeQaSessionIds[session.senderId] === sessionId) delete this.state.activeQaSessionIds[session.senderId];
+    }
     this.state.sessions = this.state.sessions.filter((candidate) => candidate.id !== sessionId);
-    if (this.state.activeSessionIds[session.senderId] === sessionId) {
-      const fallback = this.state.sessions
-        .filter((candidate) => candidate.senderId === session.senderId)
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
-      if (fallback) {
-        this.state.activeSessionIds[session.senderId] = fallback.id;
-      } else {
-        delete this.state.activeSessionIds[session.senderId];
-      }
-    }
-    if (this.state.activeQaSessionIds[session.senderId] === sessionId) {
-      const fallback = this.state.sessions
-        .filter((candidate) => candidate.senderId === session.senderId && candidate.mode === "qa")
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
-      if (fallback) this.state.activeQaSessionIds[session.senderId] = fallback.id;
-      else delete this.state.activeQaSessionIds[session.senderId];
-    }
     this.save();
   }
 

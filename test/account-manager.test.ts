@@ -263,6 +263,40 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   };
 }
 
+test("web unbind removes only the selected account/chat edge and immediately refreshes native subscriptions", async t => {
+  const f = setup(t);
+  Object.assign(f.runner, { async readThreadSnapshot(threadId: string) {
+    return { state: { threadId, persistence: "active", runtimeStatus: "idle", activeFlags: [] }, turns: [] };
+  } });
+  await f.manager.startAccount("account-one", false);
+  await f.manager.startAccount("account-two", false);
+  t.after(() => f.manager.stopAll());
+  const store = f.bridges.get("account-one")!.stateStore;
+  const secondStore = f.bridges.get("account-two")!.stateStore;
+  const first = store.createSession("chat-one", f.root, "first"); store.setSessionThread(first.id, "shared-thread");
+  const other = store.createSession("chat-two", f.root, "other"); store.setSessionThread(other.id, "shared-thread");
+  const otherAccount = secondStore.createSession("chat-one", f.root, "other-account"); secondStore.setSessionThread(otherAccount.id, "shared-thread");
+  const before = f.manager.listSessions();
+  const selected = before.find(s => s.accountId === "account-one" && s.id === first.id)!;
+  assert.equal(selected.binding.bound, true);
+  const { bound: _bound, ...expected } = selected.binding;
+  const result = await f.manager.unbindSession("account-one", first.id, expected);
+  assert.equal(result.changed, true); assert.equal(result.session.active, false); assert.equal(result.session.binding.bound, false);
+  assert.equal(f.currentlyFollowed.has("shared-thread"), true, "other chat/account follows the same thread");
+  const after = f.manager.listSessions();
+  assert.equal(after.length, before.length);
+  assert.equal(after.find(s => s.id === other.id)?.binding.bound, true);
+  assert.equal(after.find(s => s.id === otherAccount.id)?.binding.bound, true);
+  assert.equal(store.getSession(first.id)?.threadId, "shared-thread");
+  assert.equal(store.isSessionDetached("chat-one"), true);
+  assert.equal(f.runs.length, 0);
+  assert.equal((await f.manager.unbindSession("account-one", first.id, expected)).changed, false);
+  const stale = store.createSession("chat-one", f.root, "replacement");
+  await assert.rejects(f.manager.unbindSession("account-one", first.id, expected), /绑定已改变/);
+  assert.equal(store.getBoundSession("chat-one")?.id, stale.id);
+  assert.equal(f.currentlyFollowed.has("shared-thread"), true);
+});
+
 test("account manager routes follow sync through the shared hub and rejects an old binding", async t => {
   const f = setup(t);
   const reads: Array<{ threadId: string; hostId?: string }> = [];

@@ -106,6 +106,32 @@ test("first follow baselines historical accepted inputs rather than creating a b
   await f.send("/steer 新补充", "new-input"); assert.equal(f.starts.length, 2);
 });
 
+test("detaching while a native queue item waits does not cancel or replay it and cannot create another IM card", async t => {
+  const f = fixture(t); await f.hub.refresh();
+  let entered!: () => void, start!: () => void;
+  const preparing = new Promise<void>(resolve => { entered = resolve; });
+  const canStart = new Promise<void>(resolve => { start = resolve; });
+  let consumptions = 0;
+  f.setQueuedRun(async input => {
+    entered(); input.onQueueStarting?.(); await canStart;
+    f.items.shift(); consumptions++;
+    await input.onTurnStarted?.({ threadId: "thread", turnId: "queue-turn" });
+    await input.onProgress?.("不向已解绑聊天投递");
+    await input.onDelta?.("不向已解绑聊天投递");
+    return { threadId: "thread", turnId: "queue-turn", text: "原生任务完成", raw: "" };
+  });
+  await f.send("/queue 已提交的下一轮", "queue-before-detach");
+  f.setSnapshot({ state: { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [] }, turns: [] });
+  const running = f.service.recoverNativeQueue(); await preparing;
+  await f.send("/unbind");
+  start(); await running; await until(() => f.statuses.at(-1) === false);
+  assert.equal(consumptions, 1); assert.equal(f.items.length, 0);
+  assert.equal(f.prepared.length, 0); assert.equal(f.starts.length, 1);
+  assert.equal(f.updates.some(update => update.text.includes("不向已解绑聊天投递") || update.text === "原生任务完成"), false);
+  assert.equal(f.store.getBoundSession("room"), undefined);
+  assert.equal(f.store.getSession(f.session.id)?.threadId, "thread");
+});
+
 test("a queued input does not prepare/close a card or claim a running task until its actual native start", async t => {
   const f = fixture(t); await f.hub.refresh();
   let entered!: () => void, start!: () => void, finish!: () => void;

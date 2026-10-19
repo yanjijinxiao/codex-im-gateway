@@ -122,7 +122,8 @@ test("supports create, rename, switch, reset, and delete", (t) => {
   assert.equal(store.getThread("alice@im.wechat"), undefined);
 
   store.deleteSession(first.id);
-  assert.equal(store.getActiveSession("alice@im.wechat")?.id, second.id);
+  assert.equal(store.getActiveSession("alice@im.wechat"), undefined);
+  assert.equal(store.isSessionDetached("alice@im.wechat"), true);
   assert.equal(store.listSessions().length, 1);
 });
 

@@ -167,6 +167,7 @@ test("Bridge sends an explicit image action through a channel image capability",
   fs.writeFileSync(imagePath, Buffer.from("image bytes"));
   const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
   store.createProject("Test", root);
+  store.createSession("oc_test", root);
   const images: Array<{ toUserId: string; path: string }> = [];
   const replies: string[] = [];
   const service = new BridgeService({
@@ -284,6 +285,7 @@ test("Bridge includes a downloaded channel image in the Codex prompt", async (t)
   fs.writeFileSync(imagePath, Buffer.from("image bytes"));
   const store = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
   store.createProject("Test", root);
+  store.createSession("oc_test", root);
   const prompts: string[] = [];
   const service = new BridgeService({
     config: { ...defaultConfig(root), allowedSenderIds: ["oc_test"] },

@@ -13,6 +13,14 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 
 命令侧默认使用 `BridgeService({ channel: adapter.client, ... })`。新增 IM 时不应在 BridgeService 或 Codex runner 中增加渠道分支。
 
+## IM 会话绑定与未绑定状态
+
+`RuntimeStateStore.getBoundSession` 是当前对话执行与订阅共用的绑定查询；账号、真实 IM 对话 ID、Gateway 记录 ID 和 host + Codex thread 共同确定一条关系，不能用标题或目录猜测。普通会话与 QA 模式沿用现有状态文件，不新增平行绑定库。没有绑定时，普通消息只回复 `/sessions`、`/session`、`/new` 与 `/help session` 指引，不自动选项目、创建任务或接回历史会话；模型/进度等依赖 session 的命令也不能隐式绑定。项目选择不等于 Codex session 绑定。
+
+`/unbind` 明确解绑当前 IM 对话；`/leave` 保留为兼容入口，均需 participant 权限，不依赖 session 模式是否开启。共享状态操作清除本对话普通/QA 活动指针、关闭跟随并持久保存未绑定状态。保留 session 历史、模型配置、原生任务与原生队列，不停止任务、不撤销原生交互、不影响同一 thread 在其他账号或聊天中的绑定。清除本地消息合并区与历史分页，随后通过原有订阅刷新入口停止本聊天的进展与问答投递；已在途的渠道请求不能撤回。再次 `/session` 或 `/new` 才显式建立绑定。删除当前 Gateway 记录也不会自动回退到另一个历史 session。
+
+网页会话列表展示精确对话 ID、主机、Codex thread ID 与绑定状态，将“解绑”与“删除记录”分开。`POST /api/sessions/:accountId/:sessionId/unbind` 必须携带所见关系的 `conversationId`、`hostId`、`threadId`（尚未创建为 null），复用本机 Origin/token 保护。服务端在同步状态变更前比较关系快照；记录已切换或 thread/host/对话不匹配时返回 409，不解绑新关系。重复解绑原已解绑关系无副作用，刷新跟随/交互订阅不调用原生 stop、steer 或 queue。读取接口返回 `session.binding`，IM 和网页使用同一状态操作，不分别维护绑定。
+
 ## 显式能力
 
 每项功能分别声明 `available`（适配器已实现且具备必要配置）、`not-configured`（缺配置）、`not-implemented`（该实现尚未提供）或 `unsupported`（明确不支持）。`available` 不代表凭证/权限已经在线验证成功。

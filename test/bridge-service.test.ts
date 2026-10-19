@@ -21,6 +21,7 @@ test("reports WeChat Codex turn status and resolves runtime details for status",
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   const statuses: Array<{ senderId: string; sessionId: string; active: boolean }> = [];
   const service = new BridgeService({
@@ -113,7 +114,7 @@ test("does not send an experimental collaboration mode for an ordinary bound ses
   assert.equal(sentCollaborationMode, undefined);
 });
 
-test("uses the channel default mode and lets a project binding override the channel Q&A knowledge base", async (t) => {
+test("executes an explicitly bound Q&A session with the project knowledge-base override", async (t) => {
   // Given
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-channel-mode-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -122,6 +123,8 @@ test("uses the channel default mode and lets a project binding override the chan
   const channelKnowledgeBase = stateStore.createKnowledgeBase("渠道 Wiki", path.join(root, "channel-wiki"));
   const projectKnowledgeBase = stateStore.createKnowledgeBase("项目 Wiki", path.join(root, "project-wiki"));
   stateStore.bindProjectKnowledgeBase(project.id, projectKnowledgeBase.id);
+  stateStore.createSession("alice@im.wechat", root, undefined, project.id, "qa", projectKnowledgeBase.id);
+  stateStore.setInteractionMode("alice@im.wechat", "qa");
   const runs: Array<{
     cwd: string;
     dynamicTools?: readonly { name: string; tools?: readonly { name: string }[] }[];
@@ -947,6 +950,7 @@ test("sends explicit image actions as native WeChat image messages", async (t) =
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -1039,6 +1043,7 @@ test("sends explicit video actions as native WeChat video messages", async (t) =
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -1125,6 +1130,7 @@ test("buffers inbound image attachments and includes local paths in prompt done"
 
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const config = {
     ...defaultConfig(tmpDir),
     allowedSenderIds: ["alice@im.wechat"],
@@ -1218,6 +1224,7 @@ test("replies directly when a WeChat attachment exceeds 100 MiB", async (t) => {
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   let runnerCalled = false;
   const service = new BridgeService({
@@ -1272,6 +1279,7 @@ test("replies directly when an image cannot be downloaded and does not start an 
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   let runnerCalled = false;
   const service = new BridgeService({
@@ -1464,9 +1472,9 @@ test("switching projects does not expose or control the previous project's sessi
   assert.equal(stateStore.getActiveProject("alice@im.wechat")?.id, secondProject.id);
   assert.equal(stateStore.getInteractionMode("alice@im.wechat"), "session");
   assert.doesNotMatch(replies.at(-2) ?? "", /First session|thread-first/);
-  assert.match(replies.at(-2) ?? "", /会话：新会话/);
+  assert.match(replies.at(-2) ?? "", /会话：未绑定任何 session/);
   assert.equal(goalReads, 0);
-  assert.match(replies.at(-1) ?? "", /尚未创建 Codex thread/);
+  assert.match(replies.at(-1) ?? "", /未绑定任何 session/);
 });
 
 test("lists and switches model and reasoning effort for the active WeChat session", async (t) => {
@@ -1475,6 +1483,7 @@ test("lists and switches model and reasoning effort for the active WeChat sessio
   const paths = resolveStatePaths(path.join(tmpDir, "state"));
   const stateStore = new RuntimeStateStore(paths);
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   const runs: Array<{ model?: string; effort?: string }> = [];
   const models = [{
@@ -1578,6 +1587,7 @@ test("streams process progress but sends the final WeChat answer as one message"
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   const service = new BridgeService({
     config: {
@@ -1651,6 +1661,7 @@ test("streams progress and answer deltas into one channel AI Card and finalizes 
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Card project", tmpDir);
+  stateStore.createSession("ding-user", tmpDir);
   const starts: string[] = [];
   const updates: Array<{ text: string; finalize?: boolean; error?: boolean }> = [];
   const ordinaryReplies: string[] = [];
@@ -1730,6 +1741,7 @@ test("retries the terminal card update after a progress update disables streamin
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Card terminal retry project", tmpDir);
+  stateStore.createSession("ding-user", tmpDir);
   const attempts: Array<{ text: string; finalize?: boolean }> = [];
   const ordinaryReplies: string[] = [];
   let failNextProgressUpdate = true;
@@ -1786,6 +1798,7 @@ test("reports terminal card delivery failure once without sending a replacement 
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Card delivery failure project", tmpDir);
+  stateStore.createSession("ding-user", tmpDir);
   const notices: string[] = [];
   const attempts: Array<{ messageId: string; text: string; finalize?: boolean }> = [];
   let starts = 0;
@@ -1848,6 +1861,7 @@ test("finalizes a failed channel turn as a visible card instead of an empty erro
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Card failure project", tmpDir);
+  stateStore.createSession("ding-user", tmpDir);
   const updates: Array<{ text: string; finalize?: boolean; error?: boolean }> = [];
   const failure = new Error("test runner failure");
   const service = new BridgeService({
@@ -1892,6 +1906,7 @@ test("preserves the tail of a long final answer with bounded WeChat chunks", asy
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
   stateStore.createProject("Test project", tmpDir);
+  stateStore.createSession("alice@im.wechat", tmpDir);
   const replies: string[] = [];
   const finalText = `${"长回答".repeat(700)}\n\n来源：arXiv 官方作者检索。`;
   const service = new BridgeService({
