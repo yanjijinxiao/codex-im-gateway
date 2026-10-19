@@ -211,6 +211,10 @@ Desktop 请求监听通过本机 IPC peer 代理已连接的本机及远程会�
 
 本机私有 App Server 观察读取遇通信故障时，BackendRouter 可以只读核验真正的 Desktop 持有者；仅原 thread、active 持久状态、明确 Desktop owner、idle 或带原生 turn ID 的 active 状态可作为恢复证据。已知归档/不存在仍优先于 Desktop，未加载或其他 thread 不构成恢复。远程和 CLI 不借用本机持有者；所有写操作仍沿原后端路由。最终失败日志保留 host、操作、通信分类及提交阶段，不输出原始正文或凭证。
 
+Desktop 的快照读取、普通输入预检和空闲轮次启动预检共用适配器内的只读观察器。连接/握手/持有者发现/快照的暂时通信失败，最多换一条连接重试一次：默认首次 10 秒、第二次最多 20 秒，退避最多 250ms；整个观察预算不超过 `min(requestTimeoutMs, 30.25 秒)`，不是每个 RPC 各等一整轮。上层 Router 不再把已经耗尽的 Desktop 观察重新包装为另一条恢复链。并发跟随读取共享同一条在途恢复，但不缓存旧快照用于后续发送；输入在恢复后仍核对当前绑定，原生写入与回执等待完全在重试边界之外。
+
+明确的 `no-client-found` 与权限/协议拒绝不重试；发现超时不再被当作“没有持有者”或空闲。耗尽仍是明确未提交，已调用写接口而回执未知仍保持未确认，不自动重发、排队、切换写后端、改绑定或停止任务。Gateway 关闭会取消观察退避、连接计时器和在途读取，不重连，也不杀死原任务持有者。恢复/失败诊断只记录一次逻辑观察 ID、thread/host、尝试次数、阶段耗时、预算和错误分类，不记录消息、快照、原始错误或凭证；健康轮询不逐次打印诊断。`test/desktop-owner-observation.test.ts` 用真实本地 Unix IPC 故障注入核验这些边界；这不代表 Codex App 持续不可响应时仍能提交消息。
+
 相关回归覆盖 `test/user-input.test.ts`、`test/bridge-user-input.test.ts`、`test/codex-desktop-request-monitor.test.ts`、AccountManager host 路由及既有审批测试；模拟通过不等于所有企业账号都已做真实表单验收。
 
 旧 `weixin` 注入参数和 `NormalizedWeixinMessage` 类型保留为兼容入口，适配逻辑集中于 `channels/legacy.ts`；生产启动使用完整的新接口。旧的账号数据目录和轮询检查点无需迁移，历史 WeChat 提示仍可解析；新钉钉/飞书提示会标注实际来源。

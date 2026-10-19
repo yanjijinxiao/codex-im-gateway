@@ -414,6 +414,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   private async inspectThreadOnce(threadId: string, hostId?: string): Promise<CodexThreadState> {
+    let desktopObserved = false;
     try {
       if (isRemoteHost(hostId) || this.selectedBackend === "exec") {
         return await this.backendForSharedOperation(hostId).inspectThread(threadId);
@@ -423,6 +424,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       let state = await this.readMetadata(threadId);
       if (state.runtimeStatus === "active" && !state.activeTurnId) state = await this.appServer.inspectThread(threadId);
       if (state.runtimeStatus !== "active" && state.persistence !== "missing" && state.persistence !== "archived") {
+        desktopObserved = true;
         const owner = await this.desktop.inspectThread?.(threadId);
         if (owner && confirmedDesktopObservation(threadId, owner)) { this.desktopOwnedThreads.add(threadId); return owner; }
       }
@@ -431,7 +433,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     } catch (error) {
       // A failed private app-server read says nothing about Desktop's writer.
       // This is observation-only recovery: never resume/start or switch writes.
-      if (!isRemoteHost(hostId) && this.selectedBackend !== "exec" && isCodexCommunicationFailure(error)) {
+      if (!desktopObserved && !isRemoteHost(hostId) && this.selectedBackend !== "exec" && isCodexCommunicationFailure(error)) {
         const owner = await this.desktop.inspectThread?.(threadId).catch(() => undefined);
         if (owner && confirmedDesktopObservation(threadId, owner)) {
           this.desktopOwnedThreads.add(threadId); return owner;

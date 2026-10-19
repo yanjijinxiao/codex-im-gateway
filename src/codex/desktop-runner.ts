@@ -2,8 +2,9 @@ import crypto from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
-import { communicationError, CodexCommunicationError } from "./communication-error.js";
+import { communicationError, CodexCommunicationError, isCodexCommunicationFailure } from "./communication-error.js";
 import { IpcFrameDecoder, IpcFrameSizeError } from "./ipc-frames.js";
 
 import type {
@@ -31,6 +32,27 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 type IpcMessage = Record<string, unknown>;
 
+type ObservationStage = "connect" | "initialize" | "discovery" | "snapshot" | "decode";
+export type DesktopOwnerObservationDiagnostic = {
+  timestamp: string;
+  backend: "desktop";
+  hostId: "local";
+  threadId: string;
+  observationId: string;
+  phase: "preflight";
+  operation: "thread/owner-snapshot";
+  attempt: number;
+  maxAttempts: 2;
+  stage: ObservationStage;
+  stageDurationsMs: Partial<Record<ObservationStage, number>>;
+  elapsedMs: number;
+  attemptBudgetMs: number;
+  totalBudgetMs: number;
+  outcome: "retrying" | "recovered" | "failed" | "closed";
+  code?: "timeout" | "disconnected" | "rejected";
+  messageSubmitted: false;
+};
+
 export type DesktopCodexRunnerOptions = {
   socketPath?: string;
   codexHome?: string;
@@ -38,7 +60,10 @@ export type DesktopCodexRunnerOptions = {
   completionPollIntervalMs?: number;
   busyRetryDelayMs?: number;
   observationTimeoutMs?: number;
+  onObservationDiagnostic?: (event: DesktopOwnerObservationDiagnostic) => void;
 };
+
+type OwnerObservation = { connection: DesktopIpcConnection; snapshot: CodexThreadSnapshot; release: () => void };
 
 type CompletionWaiter = {
   resolve: (completion: CodexSessionCompletion) => void;
@@ -72,6 +97,8 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private readonly observationTimeoutMs: number;
   private readonly snapshotReads = new Map<string, Promise<CodexThreadSnapshot | undefined>>();
   private readonly observationConnections = new Set<DesktopIpcConnection>();
+  private readonly observationShutdown = new AbortController();
+  private readonly onObservationDiagnostic: (event: DesktopOwnerObservationDiagnostic) => void;
 
   /** Read the actual Desktop writer, not an unrelated private app-server. */
   readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot | undefined> {
@@ -86,12 +113,11 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   }
 
   private async readThreadSnapshotOnce(threadId: string): Promise<CodexThreadSnapshot | undefined> {
-    const connection = new DesktopIpcConnection(this.socketPath, this.observationTimeoutMs);
-    this.observationConnections.add(connection);
+    let observation: OwnerObservation | undefined;
     try {
-      const snapshot = await observeDesktopOwner(connection, threadId, this.observationTimeoutMs);
+      observation = await this.observeOwner(threadId);
       this.unavailableOwnerLogTimes.delete(threadId);
-      return snapshot;
+      return observation.snapshot;
     } catch (error) {
       // Discovery is read-only. An unanswered discovery is not proof of an
       // idle Desktop task; the caller may only fall back to the app-server's
@@ -106,11 +132,10 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
         }
         return undefined;
       }
-      if (isDesktopOwnerUnavailable(error) || /thread-owner-discovery timed out/.test(String(error))) return undefined;
+      if (isDesktopOwnerUnavailable(error)) return undefined;
       throw error;
     } finally {
-      connection.close();
-      this.observationConnections.delete(connection);
+      observation?.release();
     }
   }
 
@@ -123,12 +148,64 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     this.requestTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.busyRetryDelayMs = options.busyRetryDelayMs ?? 1_000;
     this.observationTimeoutMs = Math.min(this.requestTimeoutMs, options.observationTimeoutMs ?? 10_000);
+    this.onObservationDiagnostic = options.onObservationDiagnostic ?? (event => {
+      console.info(`[codex-im-gateway] owner observation ${JSON.stringify(event)}`);
+    });
     this.monitor = new CodexSessionCompletionMonitor({
       codexHome: options.codexHome,
       pollIntervalMs: options.completionPollIntervalMs ?? 1_000,
       onCompletion: (completion) => this.handleCompletion(completion),
       onActivity: (activity) => this.handleActivity(activity)
     });
+  }
+
+  /** Only this read-only boundary retries. The returned connection is leased to
+   * the caller; any subsequent write and its acknowledgement are outside it. */
+  private async observeOwner(threadId: string): Promise<OwnerObservation> {
+    const observationId = crypto.randomUUID();
+    const started = performance.now();
+    const backoffMs = Math.min(250, Math.max(1, Math.floor(this.observationTimeoutMs / 10)));
+    const totalBudgetMs = Math.min(this.requestTimeoutMs, this.observationTimeoutMs * 3 + backoffMs);
+    const deadline = started + totalBudgetMs;
+    for (let attempt = 1; ; attempt++) {
+      if (this.closed) throw new Error("Codex Desktop runner is closed");
+      if (performance.now() >= deadline) {
+        throw new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
+          new Error("Desktop owner observation timed out"));
+      }
+      const attemptBudgetMs = Math.max(1, Math.min(this.observationTimeoutMs * attempt, deadline - performance.now()));
+      const connection = new DesktopIpcConnection(this.socketPath, this.requestTimeoutMs);
+      this.observationConnections.add(connection);
+      const release = () => { connection.close(); this.observationConnections.delete(connection); };
+      const stages = new ObservationStages();
+      const report = (outcome: DesktopOwnerObservationDiagnostic["outcome"], error?: unknown) => {
+        // Whitelist identifiers and timing only: never log IPC payloads or raw errors.
+        const event: DesktopOwnerObservationDiagnostic = {
+          timestamp: new Date().toISOString(), backend: "desktop", hostId: "local", threadId,
+          observationId, phase: "preflight", operation: "thread/owner-snapshot", attempt, maxAttempts: 2,
+          stage: stages.stage, stageDurationsMs: stages.durations(),
+          elapsedMs: Math.round(performance.now() - started), attemptBudgetMs: Math.round(attemptBudgetMs), totalBudgetMs,
+          outcome, ...(error ? { code: observationFailureCode(error) } : {}),
+          messageSubmitted: false
+        };
+        try { this.onObservationDiagnostic(event); } catch { /* Diagnostics cannot change delivery semantics. */ }
+      };
+      try {
+        const snapshot = await observeDesktopOwner(connection, threadId, attemptBudgetMs, stages);
+        if (this.closed) throw new Error("Codex Desktop runner is closed");
+        if (attempt > 1) report("recovered");
+        return { connection, snapshot, release };
+      } catch (error) {
+        release();
+        const retryable = !(error instanceof CodexOwnerUnavailableError || error instanceof DesktopIpcRejectionError) &&
+          (isCodexCommunicationFailure(error) || error instanceof DesktopIpcConnectError && error.transient);
+        const retry = !this.closed && attempt < 2 && retryable && deadline - performance.now() > backoffMs;
+        if (!(error instanceof CodexOwnerUnavailableError)) report(this.closed ? "closed" : retry ? "retrying" : "failed", error);
+        if (!retry) throw error;
+        try { await sleep(backoffMs, undefined, { signal: this.observationShutdown.signal }); }
+        catch { throw new Error("Codex Desktop runner is closed"); }
+      }
+    }
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
@@ -170,8 +247,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
         if (this.closed) throw new Error("Codex Desktop runner is closed");
         try {
           response = await sendFollowerStartTurn({
-            socketPath: this.socketPath,
-            timeoutMs: this.requestTimeoutMs,
+            observe: () => this.observeOwner(input.threadId!),
             threadId: input.threadId,
             request,
             onSnapshot: (snapshot) => {
@@ -239,10 +315,11 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
 
   async submitThreadMessage(input: CodexThreadMessageInput): Promise<CodexInputReceipt> {
     if (this.closed) throw new Error("Codex Desktop runner is closed");
-    const connection = new DesktopIpcConnection(this.socketPath, this.requestTimeoutMs);
+    let observation: OwnerObservation | undefined;
     let phase: "preflight" | "submission" = "preflight";
     try {
-      const snapshot = await observeDesktopOwner(connection, input.threadId, this.observationTimeoutMs);
+      observation = await this.observeOwner(input.threadId);
+      const { snapshot, connection } = observation;
       if (snapshot.state.runtimeStatus !== "active" || !snapshot.state.activeTurnId) {
         throw new CodexInterventionError("当前会话已经没有可确认的活动轮次，消息未提交。未新建任务或自动排队，请查看 /status 后重新发送。");
       }
@@ -264,7 +341,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     } catch (error) {
       throw communicationError(error, { phase, operation: phase === "submission" ? "thread-follower-steer-turn" : "desktop/thread-state", threadId: input.threadId });
     } finally {
-      connection.close();
+      observation?.release();
     }
   }
 
@@ -299,6 +376,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
 
   close(): void {
     this.closed = true;
+    this.observationShutdown.abort();
     for (const connection of this.observationConnections) connection.close();
     this.observationConnections.clear();
     for (const waiter of this.waiters.values()) {
@@ -390,25 +468,48 @@ function oneLineProgress(value: string, max: number): string {
 }
 
 type FollowerRequest = {
-  socketPath: string;
-  timeoutMs: number;
+  observe: () => Promise<OwnerObservation>;
   threadId: string;
   request: Record<string, unknown>;
   onSnapshot?: (snapshot: CodexThreadSnapshot) => void;
 };
 
-/** One read-only preflight deadline shared by observation and ordinary input. */
-async function observeDesktopOwner(connection: DesktopIpcConnection, threadId: string, timeoutMs: number): Promise<CodexThreadSnapshot> {
+class ObservationStages {
+  stage: ObservationStage = "connect";
+  private since = performance.now();
+  private readonly completed: Partial<Record<ObservationStage, number>> = {};
+  next(stage: ObservationStage): void {
+    this.completed[this.stage] = Math.round(performance.now() - this.since);
+    this.stage = stage;
+    this.since = performance.now();
+  }
+  durations(): Partial<Record<ObservationStage, number>> {
+    return { ...this.completed, [this.stage]: Math.round(performance.now() - this.since) };
+  }
+}
+
+/** Every attempt has one deadline, not a new timeout for each RPC/stage. */
+async function observeDesktopOwner(connection: DesktopIpcConnection, threadId: string, timeoutMs: number,
+  stages: ObservationStages): Promise<CodexThreadSnapshot> {
   let timer: NodeJS.Timeout | undefined;
+  const deadline = performance.now() + timeoutMs;
+  const timeout = () => new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
+    new Error("Desktop owner observation timed out"));
   try {
     return await Promise.race([(async () => {
-      await connection.initialize();
+      await connection.initialize(() => stages.next("initialize"));
+      stages.next("discovery");
       await connection.request("thread-owner-discovery", 1, { conversationId: threadId, hostId: "local" });
-      return parseDesktopSnapshot(threadId, await connection.followSnapshot(threadId));
+      stages.next("snapshot");
+      const owner = await connection.followSnapshot(threadId);
+      stages.next("decode");
+      const snapshot = parseDesktopSnapshot(threadId, owner);
+      // Synchronous decoding may cross the deadline before the timer can fire.
+      if (performance.now() >= deadline) throw timeout();
+      return snapshot;
     })(), new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new CodexCommunicationError("preflight", "thread/owner-snapshot", threadId, undefined,
-          new Error("Desktop owner observation timed out")));
+        reject(timeout());
         connection.close();
       }, timeoutMs);
     })]);
@@ -418,15 +519,11 @@ async function observeDesktopOwner(connection: DesktopIpcConnection, threadId: s
 }
 
 async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
-  const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);
+  let observation: OwnerObservation | undefined;
   let phase: "preflight" | "submission" = "preflight";
   try {
-    await connection.initialize();
-    await connection.request("thread-owner-discovery", 1, {
-      conversationId: input.threadId,
-      hostId: "local"
-    });
-    const snapshot = parseDesktopSnapshot(input.threadId, await connection.followSnapshot(input.threadId));
+    observation = await input.observe();
+    const { connection, snapshot } = observation;
     if (snapshot.state.pendingTurnWithoutId && snapshot.state.runtimeStatus !== "active") {
       throw new CodexInterventionError("Codex App 残留了没有轮次 ID 的运行中消息，但后端没有执行任务。为避免重复提交，未发送新消息；请先重新加载 Codex App 并检查 /history。");
     }
@@ -450,11 +547,11 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   } catch (error) {
     throw communicationError(error, { phase, operation: phase === "submission" ? "thread-follower-start-turn" : "desktop/thread-state", threadId: input.threadId });
   } finally {
-    connection.close();
+    observation?.release();
   }
 }
 
-async function sendFollowerInterrupt(input: Omit<FollowerRequest, "request"> & { expectedTurnId?: string }): Promise<void> {
+async function sendFollowerInterrupt(input: { socketPath: string; timeoutMs: number; threadId: string; expectedTurnId?: string }): Promise<void> {
   const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);
   try {
     await connection.initialize();
@@ -474,6 +571,7 @@ class DesktopIpcConnection {
   private clientId = "initializing-client";
   private readonly frames = new IpcFrameDecoder(IPC_MESSAGE_MAX_BYTES);
   private readonly snapshots = new Map<string, Record<string, unknown>>();
+  private cancelConnect?: () => void;
   private snapshotWaiter?: {
     threadId: string;
     resolve: (state: Record<string, unknown>) => void;
@@ -492,8 +590,9 @@ class DesktopIpcConnection {
     private readonly timeoutMs: number
   ) {}
 
-  async initialize(): Promise<void> {
+  async initialize(onConnected?: () => void): Promise<void> {
     await this.connect();
+    onConnected?.();
     const result = recordValue(await this.request("initialize", 0, {
       clientType: "codex-im-gateway"
     }));
@@ -557,6 +656,7 @@ class DesktopIpcConnection {
 
   close(): void {
     const error = new Error("Codex Desktop IPC connection closed");
+    this.cancelConnect?.();
     this.failSnapshot(error);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
@@ -573,20 +673,25 @@ class DesktopIpcConnection {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
       this.socket = socket;
+      const settle = (error?: Error) => {
+        clearTimeout(timer);
+        this.cancelConnect = undefined;
+        if (error) reject(error); else resolve();
+      };
       const timer = setTimeout(() => {
         socket.destroy();
-        reject(new Error(`Codex Desktop IPC connection timed out after ${this.timeoutMs}ms`));
+        settle(new Error(`Codex Desktop IPC connection timed out after ${this.timeoutMs}ms`));
       }, Math.min(this.timeoutMs, 30_000));
+      this.cancelConnect = () => settle(new Error("Codex Desktop IPC connection closed while connecting"));
       socket.once("connect", () => {
-        clearTimeout(timer);
-        resolve();
+        settle();
       });
       socket.once("error", (error) => {
-        clearTimeout(timer);
-        reject(new Error(`Unable to connect to Codex Desktop IPC: ${error.message}`));
+        settle(new DesktopIpcConnectError(error));
       });
       socket.on("data", (chunk) => this.receive(chunk));
       socket.on("close", () => {
+        this.cancelConnect?.();
         this.failSnapshot(new Error("Codex Desktop IPC closed before the owner snapshot arrived"));
         if (!this.pending.size) return;
         const error = new Error("Codex Desktop IPC connection closed before the response arrived");
@@ -651,7 +756,7 @@ class DesktopIpcConnection {
       // from start-turn must remain an uncertain failure and cannot be replayed.
       pending.reject(pending.method === "thread-owner-discovery" && (detail === "no-client-found" || errorCode === "no-client-found")
         ? new CodexOwnerUnavailableError()
-        : new Error(`Codex Desktop IPC ${pending.method} failed: ${detail}`));
+        : new DesktopIpcRejectionError(`Codex Desktop IPC ${pending.method} failed: ${detail}`));
       return;
     }
     pending.resolve(message.result);
@@ -679,6 +784,26 @@ class DesktopIpcConnection {
       });
     });
   }
+}
+
+class DesktopIpcConnectError extends Error {
+  readonly transient: boolean;
+  readonly unavailable: boolean;
+  constructor(error: NodeJS.ErrnoException) {
+    super(`Unable to connect to Codex Desktop IPC: ${error.message}`, { cause: error });
+    this.transient = ["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE"].includes(error.code ?? "");
+    this.unavailable = error.code === "ENOENT" || error.code === "ECONNREFUSED";
+  }
+}
+
+class DesktopIpcRejectionError extends Error {}
+
+function observationFailureCode(error: unknown): DesktopOwnerObservationDiagnostic["code"] {
+  if (error instanceof DesktopIpcRejectionError) return "rejected";
+  if (error instanceof CodexCommunicationError) return error.code === "timeout" ? "timeout" : "disconnected";
+  if (error instanceof DesktopIpcConnectError) return "disconnected";
+  if (isCodexCommunicationFailure(error)) return /timed out|timeout/i.test(String(error)) ? "timeout" : "disconnected";
+  return "rejected";
 }
 
 export function parseDesktopSnapshot(threadId: string, owner: Record<string, unknown>): CodexThreadSnapshot {
@@ -721,8 +846,7 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
 }
 
 function isDesktopOwnerUnavailable(error: unknown): boolean {
-  const detail = error instanceof Error ? error.message : String(error);
-  return /ENOENT|ECONNREFUSED|no (?:thread )?owner|owner.*not found|no client.*handle/i.test(detail);
+  return error instanceof DesktopIpcConnectError && error.unavailable;
 }
 
 function followerTurnId(value: unknown): string | undefined {
