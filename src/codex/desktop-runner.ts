@@ -29,6 +29,12 @@ import {
 
 const IPC_MESSAGE_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+// The installed Desktop IPC router waits up to 10s for client discovery.
+// Do not race that negative acknowledgement with our own 10s deadline.
+const DEFAULT_OBSERVATION_TIMEOUT_MS = 12_000;
+// A follow read has 25s, including a 5s private metadata read. Leave headroom
+// instead of letting a nested recovery outlive the caller and accumulate work.
+const MAX_OBSERVATION_BUDGET_MS = 19_000;
 
 type IpcMessage = Record<string, unknown>;
 
@@ -48,7 +54,7 @@ export type DesktopOwnerObservationDiagnostic = {
   elapsedMs: number;
   attemptBudgetMs: number;
   totalBudgetMs: number;
-  outcome: "retrying" | "recovered" | "failed" | "closed";
+  outcome: "retrying" | "recovered" | "no-live-owner" | "failed" | "closed";
   code?: "timeout" | "disconnected" | "rejected";
   messageSubmitted: false;
 };
@@ -147,7 +153,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     this.socketPath = options.socketPath ?? path.join(os.homedir(), ".codex", "ipc", "ipc.sock");
     this.requestTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.busyRetryDelayMs = options.busyRetryDelayMs ?? 1_000;
-    this.observationTimeoutMs = Math.min(this.requestTimeoutMs, options.observationTimeoutMs ?? 10_000);
+    this.observationTimeoutMs = Math.min(this.requestTimeoutMs, options.observationTimeoutMs ?? DEFAULT_OBSERVATION_TIMEOUT_MS);
     this.onObservationDiagnostic = options.onObservationDiagnostic ?? (event => {
       console.info(`[codex-im-gateway] owner observation ${JSON.stringify(event)}`);
     });
@@ -165,7 +171,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     const observationId = crypto.randomUUID();
     const started = performance.now();
     const backoffMs = Math.min(250, Math.max(1, Math.floor(this.observationTimeoutMs / 10)));
-    const totalBudgetMs = Math.min(this.requestTimeoutMs, this.observationTimeoutMs * 3 + backoffMs);
+    const totalBudgetMs = Math.min(this.requestTimeoutMs, this.observationTimeoutMs * 3 + backoffMs, MAX_OBSERVATION_BUDGET_MS);
     const deadline = started + totalBudgetMs;
     for (let attempt = 1; ; attempt++) {
       if (this.closed) throw new Error("Codex Desktop runner is closed");
@@ -200,7 +206,9 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
         const retryable = !(error instanceof CodexOwnerUnavailableError || error instanceof DesktopIpcRejectionError) &&
           (isCodexCommunicationFailure(error) || error instanceof DesktopIpcConnectError && error.transient);
         const retry = !this.closed && attempt < 2 && retryable && deadline - performance.now() > backoffMs;
-        if (!(error instanceof CodexOwnerUnavailableError)) report(this.closed ? "closed" : retry ? "retrying" : "failed", error);
+        if (error instanceof CodexOwnerUnavailableError) {
+          if (attempt > 1) report("no-live-owner");
+        } else report(this.closed ? "closed" : retry ? "retrying" : "failed", error);
         if (!retry) throw error;
         try { await sleep(backoffMs, undefined, { signal: this.observationShutdown.signal }); }
         catch { throw new Error("Codex Desktop runner is closed"); }

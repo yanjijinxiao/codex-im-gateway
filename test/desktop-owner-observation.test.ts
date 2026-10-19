@@ -12,11 +12,13 @@ import { CodexBackendRouter } from "../src/codex/runner.js";
 type Stage = "connect" | "initialize" | "discovery" | "snapshot";
 type Options = {
   stage?: Stage;
-  failure?: "timeout" | "disconnect" | "reject" | "no-owner" | "invalid-initialize";
+  failure?: "timeout" | "disconnect" | "reject" | "no-owner" | "late-no-owner" | "invalid-initialize";
   alwaysFail?: boolean;
   healthyDelayMs?: number;
   observationTimeoutMs?: number;
   timeoutMs?: number;
+  defaultBudget?: boolean;
+  ownerAbsent?: boolean;
   runtime?: "active" | "idle";
   writeTimeout?: boolean;
   onDiagnostic?: (event: DesktopOwnerObservationDiagnostic, runner: DesktopCodexRunner) => void;
@@ -67,13 +69,14 @@ async function fixture(t: test.TestContext, options: Options = {}) {
           if (options.failure === "disconnect") socket.destroy();
           else if (options.failure === "reject") reply({}, "permission denied: timeout secret-provider-body");
           else if (options.failure === "no-owner") reply({}, "no-client-found");
+          else if (options.failure === "late-no-owner") reply({}, "no-client-found", 80);
           else if (options.failure === "invalid-initialize") reply({});
           // No response simulates the historical owner-snapshot timeout.
           continue;
         }
         const delay = options.healthyDelayMs ?? 0;
         if (m.method === "initialize") reply({ clientId: "reader" }, undefined, delay);
-        if (m.method === "thread-owner-discovery") reply({}, undefined, delay);
+        if (m.method === "thread-owner-discovery") reply({}, options.ownerAbsent ? "no-client-found" : undefined, delay);
         if (m.method === "thread-stream-following-changed") send({ type: "broadcast", method: "thread-stream-state-changed",
           params: { conversationId: "thread", hostId: "local", change: { type: "snapshot", conversationState: {
             title: `fresh-${attempt}`, threadRuntimeStatus: { type: options.runtime ?? "active" },
@@ -88,7 +91,7 @@ async function fixture(t: test.TestContext, options: Options = {}) {
   if (options.stage !== "connect") await listen();
   let listening: Promise<void> | undefined;
   const runner = new DesktopCodexRunner({ socketPath, codexHome: root, timeoutMs: options.timeoutMs ?? 1_000,
-    observationTimeoutMs: options.observationTimeoutMs ?? 100,
+    observationTimeoutMs: options.defaultBudget ? undefined : options.observationTimeoutMs ?? 100,
     onObservationDiagnostic(event) {
       diagnostics.push(event);
       if (options.stage === "connect" && event.outcome === "retrying" && !options.alwaysFail) listening = listen();
@@ -139,6 +142,28 @@ test("recovery has a larger second-attempt budget, but only one bounded total de
   assert.ok(f.diagnostics[1].attemptBudgetMs > 150);
   assert.equal(f.diagnostics[1].totalBudgetMs, 310);
   assert.equal(f.writes().length, 0);
+});
+
+test("default preflight outlasts Desktop's 10s negative discovery window, with headroom under the follow deadline", async t => {
+  const f = await fixture(t, { stage: "connect", defaultBudget: true, timeoutMs: 60_000 });
+  assert.equal((await f.runner.readThreadSnapshot("thread"))?.state.title, "fresh-1");
+  assert.equal(f.diagnostics[0].attemptBudgetMs, 12_000);
+  assert.equal(f.diagnostics[0].totalBudgetMs, 19_000);
+  assert.equal(f.writes().length, 0);
+});
+
+test("a delayed negative discovery receipt within the budget is absence, not a transport failure", async t => {
+  const f = await fixture(t, { stage: "discovery", failure: "late-no-owner", observationTimeoutMs: 120 });
+  assert.equal(await f.runner.readThreadSnapshot("thread"), undefined);
+  assert.equal(f.connections(), 1); assert.equal(f.diagnostics.length, 0); assert.equal(f.writes().length, 0);
+});
+
+test("recovery ending in explicit owner absence closes the diagnostic chain without treating it as idle", async t => {
+  const f = await fixture(t, { stage: "initialize", ownerAbsent: true });
+  assert.equal(await f.runner.readThreadSnapshot("thread"), undefined);
+  assert.deepEqual(f.diagnostics.map(e => e.outcome), ["retrying", "no-live-owner"]);
+  assert.equal(f.diagnostics[1].code, undefined);
+  assert.equal(f.connections(), 2); assert.equal(f.writes().length, 0);
 });
 
 test("concurrent readers share the entire recovery; subsequent reads do not reuse a stale snapshot", async t => {
