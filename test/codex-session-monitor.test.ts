@@ -98,6 +98,29 @@ test("offers persisted terminal evidence only to the recovery callback", async (
   assert.equal(recovered[0].text, "已在停机期间完成");
 });
 
+test("live and restart-recovered failed turns use the same safe reason without replaying completion notices", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-failure-recovery-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "sessions"));
+  const file = path.join(root, "sessions", "failure.jsonl");
+  writeLines(file, [sessionMeta("session", root)]);
+  const failed = { timestamp: "2026-08-01T08:00:03.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "failed", error: {
+    message: "This request was blocked by our safety systems. Reason: Potentially unintended activity.", additionalDetails: "PRIVATE_TOKEN" } } };
+  const live: CodexSessionCompletion[] = [], recovered: CodexSessionCompletion[] = [];
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"), onCompletion: e => { live.push(e); } });
+  monitor.start(); t.after(() => monitor.stop()); await monitor.ready();
+  appendLines(file, [taskStarted("failed"), failed]); await monitor.scanNow();
+  assert.equal(live.length, 1); assert.equal(live[0].success, false); assert.equal(live[0].failureCode, "unintended-activity");
+  assert.match(live[0].text, /Potentially unintended activity/); assert.doesNotMatch(live[0].text, /PRIVATE_TOKEN/);
+  await monitor.stop();
+  const restarted = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60_000,
+    now: () => Date.parse("2026-08-01T09:00:00.000Z"), onCompletion() { throw new Error("do not replay historical notifications"); },
+    onRecoveredCompletion: e => { recovered.push(e); } });
+  restarted.start(); t.after(() => restarted.stop()); await restarted.ready();
+  assert.equal(recovered.length, 1); assert.equal(recovered[0].text, live[0].text); assert.equal(recovered[0].failureCode, live[0].failureCode);
+});
+
 test("reports only new Codex task completions from existing and new sessions", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-monitor-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

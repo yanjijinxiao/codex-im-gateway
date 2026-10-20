@@ -7,7 +7,7 @@ import {
 import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
-import { CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError } from "./backend.js";
+import { assertCodexThreadRunnable, CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError } from "./backend.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
@@ -150,6 +150,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
     if (this.selectedBackend === "exec") return this.exec.steer(input);
     const state = await this.inspectThread(input.threadId);
+    assertCodexThreadRunnable(state);
     if (state.executionOwner === "desktop") return this.desktop.steer(input);
     try {
       return await this.appServer.steer(input);
@@ -162,6 +163,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   async submitThreadMessage(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt> {
     if (this.selectedBackend === "exec") throw new CodexBackendCapabilityError("turnSteering", "exec");
     const state = await this.inspectThread(input.threadId, hostId);
+    assertCodexThreadRunnable(state);
     if (state.threadId !== input.threadId || state.persistence !== "active" || state.runtimeStatus !== "active" || !state.activeTurnId) {
       throw new CodexInterventionError("目标会话没有可确认的活动任务，消息未提交；未启动或排队新任务。");
     }
@@ -198,6 +200,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     // writer operation and must never steal a Desktop owner's execution.
     const backend = this.nativeQueue(input.hostId);
     const state = await this.inspectThread(input.threadId, input.hostId);
+    if (!input.observeOnly) assertCodexThreadRunnable(state);
     if (state.executionOwner === "desktop" && !input.observeOnly) throw new Error("Desktop 正在持有此会话，原生队列等待实际持有者消费；Gateway 不接管任务。");
     return backend.runQueuedSubmission(input);
   }
@@ -569,7 +572,7 @@ function isRemoteHost(hostId?: string): hostId is string {
 
 function confirmedDesktopObservation(threadId: string, state: CodexThreadState): boolean {
   return state.threadId === threadId && state.executionOwner === "desktop" && state.persistence === "active"
-    && (state.runtimeStatus === "idle" || state.runtimeStatus === "active" && Boolean(state.activeTurnId));
+    && (state.runtimeStatus === "idle" || state.runtimeStatus === "systemError" || state.runtimeStatus === "active" && Boolean(state.activeTurnId));
 }
 
 function canRunWithoutCapabilityLoss(backend: CodexBackendAdapter, input: CodexRunnerInput): boolean {

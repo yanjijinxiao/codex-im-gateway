@@ -7,6 +7,9 @@ import test from "node:test";
 
 import { DesktopCodexRunner, parseDesktopSnapshot } from "../src/codex/desktop-runner.js";
 import { CodexCommunicationError } from "../src/codex/communication-error.js";
+import { CodexThreadStateError, CodexTurnExecutionError } from "../src/codex/backend.js";
+import { userFacingMessageHandlingError } from "../src/bridge/errors.js";
+import { CodexBackendRouter } from "../src/codex/runner.js";
 
 test("relays a turn to the Desktop thread owner and returns its session-log completion", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-desktop-runner-"));
@@ -299,8 +302,65 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
     await new Promise<void>(resolve => server.close(() => resolve()));
     fs.rmSync(root, { recursive: true, force: true });
   });
-  return { runner, received };
+  return { runner, received, root };
 }
+
+test("Desktop systemError is authoritative, and no ordinary input or idle start is sent", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "systemError" },
+    turns: [{ turnId: "failed-turn", status: "failed", items: [], error: { message:
+      "This request was blocked by our safety systems. Reason: Potentially unintended activity.", additionalDetails: "PRIVATE_TOKEN" } }] }));
+  const state = await runner.inspectThread("thread");
+  assert.equal(state?.runtimeStatus, "systemError");
+  assert.deepEqual(state?.lastTurnFailure, { turnId: "failed-turn", code: "unintended-activity" });
+  assert.ok(!JSON.stringify(state).includes("PRIVATE_TOKEN"));
+  const input = { threadId: "thread", prompt: "new input", cwd: "/tmp", clientUserMessageId: "im-id" };
+  for (const run of [() => runner.run(input), () => runner.submitThreadMessage(input)]) {
+    await assert.rejects(run(), error => {
+      assert.ok(error instanceof CodexThreadStateError && error.code === "system-error");
+      assert.match(userFacingMessageHandlingError(error), /systemError.*新消息未提交/);
+      assert.match(userFacingMessageHandlingError(error), /Potentially unintended activity/);
+      return true;
+    });
+  }
+  assert.equal(received.filter(m => /start-turn|steer-turn|interrupt-turn/.test(String(m.method))).length, 0);
+});
+
+test("Desktop catches a systemError transition after Router preflight without changing writer or replaying", async t => {
+  let broken = false, otherWrites = 0;
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: broken ? "systemError" : "idle" },
+    turns: [] }));
+  const router = new CodexBackendRouter({ backend: "app-server", desktopRunner: runner,
+    appServerBackend: { async inspectThread() { return { threadId: "thread", persistence: "active", runtimeStatus: "notLoaded", activeFlags: [] }; },
+      async run() { otherWrites++; throw new Error("must not transfer writer"); }, close() {} } as never });
+  t.after(() => router.close());
+  assert.equal((await router.inspectThread("thread")).runtimeStatus, "idle");
+  broken = true;
+  await assert.rejects(router.run({ threadId: "thread", prompt: "new", cwd: "/tmp" }), e => e instanceof CodexThreadStateError && e.code === "system-error");
+  assert.equal(otherWrites, 0);
+  assert.equal(received.filter(m => /start-turn|steer-turn|interrupt-turn/.test(String(m.method))).length, 0);
+});
+
+test("a confirmed failed Desktop turn retains its public failure code without replay", async t => {
+  const { runner, root, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }),
+    { result: { turnId: "new-turn" } });
+  await assert.rejects(runner.run({ threadId: "thread", prompt: "new", cwd: root, onTurnStarted() {
+    const timestamp = new Date().toISOString();
+    fs.writeFileSync(path.join(root, "sessions", "failure.jsonl"), [
+      { timestamp, type: "session_meta", payload: { id: "thread", cwd: root } },
+      { timestamp, type: "event_msg", payload: { type: "task_started", turn_id: "new-turn" } },
+      { timestamp, type: "event_msg", payload: { type: "task_complete", turn_id: "new-turn", error: {
+        message: "This request was blocked by our safety systems. Reason: Potentially unintended activity.", additionalDetails: "SECRET_BODY" } } }
+    ].map(e => JSON.stringify(e)).join("\n") + "\n");
+  } }), error => {
+    assert.ok(error instanceof CodexTurnExecutionError);
+    assert.equal(error.failureCode, "unintended-activity");
+    assert.match(userFacingMessageHandlingError(error), /Potentially unintended activity/);
+    assert.doesNotMatch(userFacingMessageHandlingError(error), /SECRET_BODY|本轮消息处理失败/);
+    return true;
+  });
+  assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 1);
+  assert.equal(received.filter(m => /steer-turn|interrupt-turn/.test(String(m.method))).length, 0);
+});
 
 test("ordinary Desktop input uses one native thread-scoped write, without changing guarded steering", async t => {
   const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "active" },

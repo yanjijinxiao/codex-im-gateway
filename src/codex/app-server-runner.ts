@@ -7,6 +7,7 @@ import { communicationError, isCodexCommunicationFailure, CodexCommunicationErro
 import { parseUserInputRequest } from "./user-input.js";
 import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
+import { codexFailureCode, lastCodexTurnFailure, type CodexFailureCode } from "./turn-failure.js";
 import { readDesktopSessionCatalog, isDesktopCatalogThread } from "./desktop-session-catalog.js";
 
 import { resolveCodexCommand } from "./exec-runner.js";
@@ -99,6 +100,7 @@ type TurnCompletion = {
   text: string;
   raw: string;
   error?: string;
+  failureCode?: CodexFailureCode;
 };
 
 type TurnWaiter = {
@@ -781,7 +783,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const response = await this.request("thread/turns/list", {
         threadId, limit: 20, sortDirection: "desc", itemsView: "full"
       }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus }> };
-      return { state, turns: (response.data ?? []).slice().reverse().map((turn) => ({
+      const turns = (response.data ?? []).slice().reverse();
+      const failure = lastCodexTurnFailure(turns.at(-1));
+      return { state: { ...state, lastTurnFailure: failure }, turns: turns.map((turn) => ({
         id: turn.id, status: turn.status, messages: parseThreadHistory({ turns: [turn] })
       })) };
     } finally {
@@ -992,6 +996,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (input.clientUserMessageId) this.nativeQueueOrigins.delete(input.clientUserMessageId);
       return await new Promise<CodexRunResult>((resolve, reject) => {
         void this.finishTurn(input.threadId, key, { status: String(turn.status), text: extractAgentMessageFromTurn(turn),
+          failureCode: turn.status === "failed" ? codexFailureCode(turn.error) : undefined,
           raw: JSON.stringify(turn), error: typeof (turn.error as { message?: string })?.message === "string"
             ? (turn.error as { message: string }).message : undefined }, resolve, reject);
       });
@@ -1437,6 +1442,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       status,
       text: this.turnTexts.get(key) ?? extractAgentMessageFromTurn(turn),
       raw: (this.turnEvents.get(key) ?? []).join("\n"),
+      failureCode: status === "failed" ? codexFailureCode(errorValue) : undefined,
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
     if (this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
@@ -1446,9 +1452,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.threadStates.set(threadId, {
       threadId,
       persistence: previousState?.persistence ?? "active",
-      runtimeStatus: "idle",
+      runtimeStatus: status === "failed" && previousState?.runtimeStatus === "systemError" ? "systemError" : "idle",
       activeFlags: [],
       ...(normalizeTurnStatus(status) ? { latestTurnStatus: normalizeTurnStatus(status) } : {}),
+      ...(status === "failed" ? { lastTurnFailure: { turnId, code: completion.failureCode! } } : {}),
       ...(previousState?.cwd ? { cwd: previousState.cwd } : {}),
       ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
       ...(previousState?.title ? { title: previousState.title } : {}),
@@ -1538,7 +1545,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       reject(new CodexTurnExecutionError("interrupted", "Codex app-server turn was interrupted"));
       return;
     }
-    reject(new CodexTurnExecutionError("failed", completion.error ?? `Codex app-server turn ended with status ${completion.status}`));
+    reject(new CodexTurnExecutionError("failed", completion.error ?? `Codex app-server turn ended with status ${completion.status}`, completion.failureCode));
   }
 
   private appendTurnEvent(key: string, raw: string): void {
@@ -2095,6 +2102,7 @@ function parseThreadState(
     ...(rolloutIdentity({ source: thread.source, thread_source: thread.threadSource ?? thread.thread_source }).internal ? { internal: true } : {}),
     activeFlags: parsedRuntime.activeFlags,
     ...(latestTurnStatus ? { latestTurnStatus } : {}),
+    ...(lastCodexTurnFailure(latestTurn) ? { lastTurnFailure: lastCodexTurnFailure(latestTurn) } : {}),
     ...(latestTurnStatus === "inProgress" && typeof latestTurn?.id === "string"
       ? { activeTurnId: latestTurn.id }
       : {}),

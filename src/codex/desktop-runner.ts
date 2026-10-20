@@ -3,7 +3,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
+import { assertCodexThreadRunnable, CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
+import { lastCodexTurnFailure } from "./turn-failure.js";
 import { communicationError, CodexCommunicationError, isCodexCommunicationFailure } from "./communication-error.js";
 import { IpcFrameDecoder, IpcFrameSizeError } from "./ipc-frames.js";
 
@@ -284,7 +285,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       acceptedTurnId = turnId;
       await input.onTurnStarted?.({ threadId: input.threadId, turnId });
       const completion = await this.waitForCompletion(input.threadId, turnId, input.onProgress);
-      if (!completion.success) throw new CodexTurnExecutionError("failed", completion.text);
+      if (!completion.success) throw new CodexTurnExecutionError("failed", completion.text, completion.failureCode);
       return {
         threadId: input.threadId,
         turnId,
@@ -328,6 +329,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     try {
       observation = await this.observeOwner(input.threadId);
       const { snapshot, connection } = observation;
+      assertCodexThreadRunnable(snapshot.state);
       if (snapshot.state.runtimeStatus !== "active" || !snapshot.state.activeTurnId) {
         throw new CodexInterventionError("当前会话已经没有可确认的活动轮次，消息未提交。未新建任务或自动排队，请查看 /status 后重新发送。");
       }
@@ -532,6 +534,7 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   try {
     observation = await input.observe();
     const { connection, snapshot } = observation;
+    assertCodexThreadRunnable(snapshot.state);
     if (snapshot.state.pendingTurnWithoutId && snapshot.state.runtimeStatus !== "active") {
       throw new CodexInterventionError("Codex App 残留了没有轮次 ID 的运行中消息，但后端没有执行任务。为避免重复提交，未发送新消息；请先重新加载 Codex App 并检查 /history。");
     }
@@ -840,6 +843,9 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     ? runtime as CodexThreadState["runtimeStatus"] : "unknown";
   const activeTurn = runtimeStatus === "active" ? turns.filter((turn) => turn.status === "inProgress").at(-1) : undefined;
   const flags = recordValue(owner.threadRuntimeStatus)?.activeFlags;
+  const latestRaw = rawTurns.at(-1);
+  const latestTurn = turns.at(-1);
+  const failure = (latestRaw?.turnId ?? latestRaw?.id) === latestTurn?.id ? lastCodexTurnFailure(latestRaw) : undefined;
   return { state: {
     threadId, persistence: "active", runtimeStatus, executionOwner: "desktop",
     activeFlags: Array.isArray(flags) ? flags.filter((flag): flag is "waitingOnApproval" | "waitingOnUserInput" =>
@@ -847,6 +853,7 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     ...(activeTurn ? { activeTurnId: activeTurn.id } : {}),
     ...(pendingTurnWithoutId ? { pendingTurnWithoutId: true } : {}),
     ...(turns.at(-1) ? { latestTurnStatus: turns.at(-1)!.status } : {}),
+    ...(failure ? { lastTurnFailure: failure } : {}),
     ...(stringValue(owner.cwd) ? { cwd: stringValue(owner.cwd) } : {}),
     ...(stringValue(owner.title) ? { title: stringValue(owner.title) } : {}),
     ...(stringValue(owner.projectId) ? { projectId: stringValue(owner.projectId) } : {})

@@ -1554,6 +1554,7 @@ export class BridgeService {
       await this.reply(message.senderId, "绑定的会话当前不可接收消息，未提交；绑定未删除，请查看 /status。");
       return true;
     }
+    assertCodexThreadRunnable(state);
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
       return true;
@@ -2350,7 +2351,7 @@ export class BridgeService {
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
         sessionId: session.id,
-        text: error instanceof Error ? error.message : String(error),
+        text: stripBridgeErrorPrefix(userFacingMessageHandlingError(error)),
         success: false
       });
       if (queued && error instanceof CodexTurnExecutionError) return;

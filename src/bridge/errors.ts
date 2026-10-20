@@ -1,5 +1,6 @@
-import { CodexInterventionError, CodexThreadStateError, CodexBackendCapabilityError } from "../codex/backend.js";
+import { CodexInterventionError, CodexThreadStateError, CodexBackendCapabilityError, CodexTurnExecutionError } from "../codex/backend.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
+import { codexFailureSummary } from "../codex/turn-failure.js";
 
 const channelReportedErrors = new WeakSet<object>();
 
@@ -14,6 +15,10 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 }
 
 export function userFacingMessageHandlingError(error: unknown): string {
+  if (error instanceof CodexTurnExecutionError) {
+    return error.status === "interrupted" ? "[codex-im-gateway] Codex 本轮任务已中断；未自动重启或重发消息。"
+      : `[codex-im-gateway] ${codexFailureSummary(error.failureCode)}\n这是已确认的任务失败，不是钉钉投递失败；Gateway 未自动重试或换后端重发。`;
+  }
   if (error instanceof CodexCommunicationError) {
     if (error.submission === "not-submitted") return "[codex-im-gateway] 提交前的状态读取或准备通信失败，这条消息未提交；原任务与绑定未改变。请稍后查看 /status。";
     if (error.submission === "accepted") return "[codex-im-gateway] 原任务已接收，但进展连接中断；这不代表任务失败。Gateway 保留原卡片并继续跟随，不重发消息、不停止原任务。";
@@ -28,7 +33,9 @@ export function userFacingMessageHandlingError(error: unknown): string {
       case "missing":
         return "[codex-im-gateway] 当前 Codex session 已不存在或被删除。请发送 /sessions 重新选择，或发送 /new 新建 session。";
       case "system-error":
-        return "[codex-im-gateway] 当前 Codex session 处于系统错误状态。请先在 Codex App 中打开并处理错误。";
+        return ["[codex-im-gateway] 当前 Codex session 处于系统错误状态（systemError），这条新消息未提交；绑定已保留。",
+          ...(error.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(error.lastTurnFailure.code)}`] : []),
+          "请先在 Codex App 原会话中查看并处理错误，恢复可用后再发送新消息。Gateway 未自动恢复任务、重试或换后端重发。"].join("\n");
     }
   }
   const message = error instanceof Error ? error.message : String(error);

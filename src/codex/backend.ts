@@ -1,6 +1,7 @@
 import type { CodexAccountBalance } from "./account-balance.js";
 import type { CodexApprovalHandler } from "./approval.js";
 import type { CodexExecSandbox } from "./sandbox.js";
+import { codexFailureCode, type CodexFailureCode } from "./turn-failure.js";
 
 /** The two logical Codex execution engines exposed by Bridge. */
 export type CodexBackendId = "exec" | "app-server";
@@ -48,6 +49,8 @@ export type CodexThreadState = {
   runtimeStatus: CodexThreadRuntimeStatus;
   activeFlags: CodexThreadActiveFlag[];
   latestTurnStatus?: CodexTurnStatus;
+  /** Only the current failed tail, normalized at the native boundary; no raw provider body. */
+  lastTurnFailure?: { turnId: string; code: CodexFailureCode };
   activeTurnId?: string;
   /** The owner has an unacknowledged UI turn, but no actual active execution. */
   pendingTurnWithoutId?: boolean;
@@ -167,8 +170,10 @@ export class CodexInterventionError extends Error {
   constructor(message: string) { super(message); this.name = "CodexInterventionError"; }
 }
 export class CodexTurnExecutionError extends Error {
-  constructor(readonly status: "interrupted" | "failed", message: string) {
+  readonly failureCode: CodexFailureCode;
+  constructor(readonly status: "interrupted" | "failed", message: string, failureCode?: CodexFailureCode) {
     super(message); this.name = "CodexTurnExecutionError";
+    this.failureCode = failureCode ?? codexFailureCode(message);
   }
 }
 /** Explicit negative discovery BEFORE submission; never a transport timeout or an uncertain acknowledgement. */
@@ -186,7 +191,8 @@ export class CodexThreadStateError extends Error {
   constructor(
     readonly code: CodexThreadStateErrorCode,
     readonly threadId: string,
-    message: string
+    message: string,
+    readonly lastTurnFailure?: CodexThreadState["lastTurnFailure"]
   ) {
     super(message);
     this.name = "CodexThreadStateError";
@@ -212,7 +218,8 @@ export function assertCodexThreadRunnable(state: CodexThreadState): void {
     throw new CodexThreadStateError(
       "system-error",
       state.threadId,
-      `Codex session ${state.threadId} 当前处于系统错误状态，请先在 Codex App 中打开并修复。`
+      `Codex session ${state.threadId} 当前处于系统错误状态，请先在 Codex App 中打开并修复。`,
+      state.lastTurnFailure
     );
   }
 }

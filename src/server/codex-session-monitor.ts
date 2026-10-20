@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { rolloutIdentity } from "../codex/rollout-identity.js";
+import { codexFailureCode, codexFailureSummary, type CodexFailureCode } from "../codex/turn-failure.js";
 
 const RESTORED_TASK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const SESSION_CONTEXT_TAIL_BYTES = 8 * 1024 * 1024;
@@ -14,6 +15,7 @@ export type CodexSessionCompletion = {
   taskTitle: string;
   text: string;
   success: boolean;
+  failureCode?: CodexFailureCode;
   completedAt: string;
 };
 
@@ -324,10 +326,11 @@ export class CodexSessionCompletionMonitor {
     }
     await this.emitTask(cursor, status, timestamp);
     const success = status === "completed";
+    const failureCode = status === "failed" ? codexFailureCode(error) : undefined;
     const text = success && typeof payload.last_agent_message === "string"
       ? payload.last_agent_message
       : status === "failed"
-        ? `Codex 任务执行失败${typeof error?.message === "string" ? `：${error.message}` : ""}`
+        ? codexFailureSummary(failureCode!)
         : `Codex 任务已中断${typeof payload.reason === "string" ? `：${payload.reason}` : ""}`;
     await this.options.onCompletion({
       sessionId: cursor.sessionId,
@@ -336,6 +339,7 @@ export class CodexSessionCompletionMonitor {
       taskTitle: cursor.taskTitle || "Codex 客户端会话",
       text,
       success,
+      ...(failureCode ? { failureCode } : {}),
       completedAt: timestamp
     });
     cursor.activeTurnId = undefined;
@@ -551,11 +555,13 @@ async function readInitialSessionContext(
         }
         if (context.sessionId && context.workspace) {
           const success = tailPayload.type === "task_complete" && !tailPayload.error;
+          const failureCode = tailPayload.type === "task_complete" && tailPayload.error ? codexFailureCode(tailPayload.error) : undefined;
           context.recoveredCompletion = {
             sessionId: context.sessionId, workspace: context.workspace,
             turnId: tailPayload.turn_id, taskTitle: context.taskTitle ?? "Codex 客户端会话",
             text: success && typeof tailPayload.last_agent_message === "string"
-              ? tailPayload.last_agent_message : "Codex 任务已停止或执行失败。",
+              ? tailPayload.last_agent_message : failureCode ? codexFailureSummary(failureCode) : "Codex 任务已停止或执行失败。",
+            ...(failureCode ? { failureCode } : {}),
             success, completedAt: eventTimestamp(tailEvent!)
           };
         }

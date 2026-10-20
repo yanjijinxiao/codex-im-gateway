@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "../codex/backend.js";
+import { codexFailureSummary } from "../codex/turn-failure.js";
 import type { ChannelTextClient } from "../channels/types.js";
 import type { ChannelStreamCheckpoint } from "../channels/progress.js";
 import { ChannelTurnPresentation, nextTurnCheckpoint } from "../channels/turn-presentation.js";
@@ -314,7 +315,11 @@ export class ThreadEventHub {
           await this.stream(sub).progress("已确认原任务仍在执行，继续同步原卡片。");
           await this.stream(sub).flush();
         }
-        if (["archived", "missing"].includes(runtime.persistence) || runtime.runtimeStatus === "systemError") {
+        if (runtime.runtimeStatus === "systemError" && runtime.persistence === "active") {
+          this.failSync(sub, { code: "unavailable", message: ["会话处于系统错误状态（systemError）；绑定已保留，未自动恢复或重发任务。",
+            ...(runtime.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(runtime.lastTurnFailure.code)}`] : []),
+            "请在对应 Codex 后端原会话中查看并处理错误。"].join("\n") });
+        } else if (["archived", "missing"].includes(runtime.persistence) || runtime.runtimeStatus === "systemError") {
           this.failSync(sub, { code: "unavailable", message: "会话已归档、不存在或发生系统错误；请在对应 Codex 后端检查。" });
         } else if (runtime.pendingTurnWithoutId && runtime.runtimeStatus !== "active") {
           this.failSync(sub, { code: "orphan-turn", message: "Codex App 有未确认的界面轮次，不能当成正在执行的任务；请重新加载 App。" }, "unconfirmed");

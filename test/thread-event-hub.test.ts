@@ -6,6 +6,23 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
+test("systemError follow reports the real normalized reason without synthesizing a task completion or new card", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-follow-system-error-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let writes = 0;
+  const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "chat", managed: false,
+    client: { async sendText() { writes++; return { messageId: "notice" }; } } };
+  const hub = new ThreadEventHub({ filePath: path.join(root, "follow.json"), subscriptions: () => [sub], backend: () => ({
+    async readThreadSnapshot(): Promise<CodexThreadSnapshot> { return { state: { threadId: "thread", persistence: "active", runtimeStatus: "systemError",
+      activeFlags: [], lastTurnFailure: { turnId: "failed", code: "unintended-activity" } }, turns: [] }; }
+  }) });
+  t.after(() => hub.stop());
+  const status = await hub.synchronize("binding");
+  assert.equal(status.failure?.code, "unavailable"); assert.match(status.failure?.message ?? "", /systemError/);
+  assert.match(status.failure?.message ?? "", /Potentially unintended activity/);
+  assert.equal(writes, 0); assert.equal(status.resultDelivery?.pending, 0);
+});
+
 test("background and forced follow retain five unsent historical results without creating a notification burst", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-unsent-route-recovery-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

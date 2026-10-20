@@ -4,7 +4,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
-import { CodexThreadStateError } from "../src/codex/backend.js";
+import { CodexThreadStateError, CodexTurnExecutionError } from "../src/codex/backend.js";
+import { userFacingMessageHandlingError } from "../src/bridge/errors.js";
 import { HybridCodexRunner } from "../src/codex/runner.js";
 import { CodexCommunicationError } from "../src/codex/communication-error.js";
 
@@ -35,6 +36,26 @@ test("an unconfirmed turn/start receipt neither closes the transport nor repeats
 });
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+
+for (const [prompt, code] of [["fixture-safety-block", "unintended-activity"], ["fixture-coded-failure", "context-window"]] as const) {
+  test(`native App Server failures retain normalized reasons and explicit systemError: ${code}`, async t => {
+    const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
+      command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"
+    } });
+    t.after(() => runner.close());
+    let accepted = 0;
+    await assert.rejects(runner.run({ cwd: "/tmp/project", threadId: "thread-existing", prompt, onTurnStarted() { accepted++; } }), error => {
+      assert.ok(error instanceof CodexTurnExecutionError);
+      assert.equal(error.failureCode, code);
+      assert.doesNotMatch(userFacingMessageHandlingError(error), /PRIVATE_TOKEN|本轮消息处理失败/);
+      return true;
+    });
+    assert.equal(accepted, 1);
+    const states = (runner as unknown as { threadStates: Map<string, import("../src/codex/backend.js").CodexThreadState> }).threadStates;
+    assert.equal(states.get("thread-existing")?.runtimeStatus, "systemError");
+    assert.deepEqual(states.get("thread-existing")?.lastTurnFailure, { turnId: "turn-1", code });
+  });
+}
 
 test("native queue add/list/delete/start consumes the stored item and retains approval callbacks", async t => {
   const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {

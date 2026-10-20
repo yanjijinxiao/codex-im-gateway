@@ -583,6 +583,15 @@ rl.on("line", (line) => {
     if (prompt === "hold") {
       return;
     }
+    if (prompt === "fixture-safety-block" || prompt === "fixture-coded-failure") {
+      const error = prompt === "fixture-safety-block"
+        ? { message: "This request was blocked by our safety systems. Reason: Potentially unintended activity.", additionalDetails: "PRIVATE_TOKEN" }
+        : { message: "provider rejected", codexErrorInfo: "ContextWindowExceeded", additionalDetails: "PRIVATE_TOKEN" };
+      send({ method: "thread/status/changed", params: { threadId: message.params.threadId, status: { type: "systemError" } } });
+      send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: completedTurn(turnId, "failed", error) } });
+      activeTurns.delete(message.params.threadId);
+      return;
+    }
     if (prompt === "dynamic-tool") {
       if (!dynamicToolsEnabled) {
         fail(message.id, "thread/start must register knowledge dynamic tools");
