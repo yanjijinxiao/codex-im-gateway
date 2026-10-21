@@ -30,6 +30,7 @@ export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
+import { dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
 import {
   PinnedNetworkLifecycleTransport,
   type NetworkFamilyPolicy
@@ -1362,7 +1363,7 @@ async function sendDingTalkEmotionRequest(
 }
 
 export function normalizeDingTalkCardContent(text: string): string {
-  const lines = ensureDingTalkTableSpacing(text).split("\n");
+  const lines = ensureDingTalkTableSpacing(dingTalkVisibleOrdinals(text.replace(/\r\n?/g, "\n"))).split("\n");
   const markdownBlockStart = /^(\s{0,3}(?:[-*+]|\d+[.)])[ ])|(\s{0,3}\|)|(\s{0,3}#{1,6}\s)|(\s{0,3}(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))/;
   const fence = /^\s{0,3}```/;
   const quote = /^\s{0,3}>\s?/;
