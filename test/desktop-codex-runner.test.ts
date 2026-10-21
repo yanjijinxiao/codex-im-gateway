@@ -250,6 +250,7 @@ test("Desktop paginated owner history is ordered by turn time, and orphan UI tai
   assert.equal(result.state.activeTurnId, undefined);
   assert.equal(result.state.latestTurnStatus, "interrupted");
   assert.deepEqual(result.turns.map(turn => turn.id), ["old", "new"]);
+  assert.deepEqual(result.turns.map(turn => turn.startedAt), ["1970-01-01T00:00:01.000Z", "1970-01-01T00:00:02.000Z"]);
   assert.equal(result.turns[0].messages[0].createdAt, "1970-01-01T00:00:01.000Z");
 });
 

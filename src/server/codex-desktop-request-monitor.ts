@@ -40,6 +40,8 @@ export type CodexDesktopRequestMonitorOptions = {
   socketPath?: string;
   reconnectDelayMs?: number;
   decisionTimeoutMs?: number;
+  /** Read-only fresh-snapshot probes for interactions not yet routed to IM. */
+  deferredRetryDelayMs?: number;
   onApproval: (approval: CodexDesktopApproval) => Promise<CodexApprovalDecision | undefined>;
   onResult?: (approval: CodexDesktopApproval, result: ApprovalDeliveryResult) => Promise<void> | void;
   onUserInput?: (input: CodexDesktopUserInput) => Promise<CodexUserInputAnswer | undefined>;
@@ -62,6 +64,10 @@ export class CodexDesktopRequestMonitor {
     turnHistory?: unknown; threadRuntimeStatus?: unknown }>();
   private readonly processingRequests = new Set<string>();
   private readonly rerouteRequests = new Set<string>();
+  private readonly deferredRequests = new Map<string, number>();
+  private readonly retryReady = new Set<string>();
+  private readonly retryProbes = new Map<string, number>();
+  private deferredTimer?: NodeJS.Timeout;
   private readonly pendingDecisions = new Map<string, {
     method: string; expectedTurnId?: string; resolve: () => void; reject: (error: Error) => void; timer: NodeJS.Timeout;
     answerReceipts?: NativeAsyncAnswerReceipt[];
@@ -87,6 +93,7 @@ export class CodexDesktopRequestMonitor {
     this.started = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    this.clearDeferred();
     this.socket?.destroy();
     this.socket = undefined;
     this.clientId = undefined;
@@ -112,14 +119,18 @@ export class CodexDesktopRequestMonitor {
       if (next.has(scope)) continue;
       this.followedThreads.delete(scope);
       this.requestSnapshots.delete(scope);
+      this.retryProbes.delete(scope);
       if (this.clientId) this.sendFollow(threadId, false, hostId);
       for (const [key, approval] of this.activeRequests) {
         if (approval.request.threadId === threadId && (approval.hostId ?? "local") === hostId) this.withdraw(key, approval, true);
       }
     }
     for (const { threadId, hostId } of next.values()) this.followThread(threadId, hostId);
-    // Retry a previously unroutable request after a binding/channel change.
-    for (const [key, approval] of this.activeRequests) this.dispatch(key, approval);
+    // Route changes require a fresh native snapshot, not a send from cached UI.
+    for (const [key, approval] of this.activeRequests) {
+      if (this.processingRequests.has(key)) this.rerouteRequests.add(key);
+      else if (!this.handledRequests.has(key)) this.defer(key, 0);
+    }
   }
 
   private connect(): void {
@@ -138,6 +149,7 @@ export class CodexDesktopRequestMonitor {
       if (this.socket === socket) this.socket = undefined;
       this.clientId = undefined;
       this.frames.reset();
+      this.clearDeferred();
       this.failPendingDecisions();
       for (const [key, request] of this.activeRequests) this.withdraw(key, request, true);
       this.requestSnapshots.clear();
@@ -220,7 +232,8 @@ export class CodexDesktopRequestMonitor {
         turns: Array.isArray(state.turns) ? state.turns : [], turnHistory: state.turnHistory,
         threadRuntimeStatus: state.threadRuntimeStatus };
       this.requestSnapshots.set(scope, snapshot);
-      this.processSnapshot(threadId, snapshot, hostId);
+      this.retryProbes.delete(scope);
+      this.processSnapshot(threadId, snapshot, hostId, true);
       return;
     }
     if (change.type !== "patches" || !Array.isArray(change.patches)) return;
@@ -245,7 +258,7 @@ export class CodexDesktopRequestMonitor {
     this.processSnapshot(threadId, snapshot, hostId);
   }
 
-  private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }, hostId: string): void {
+  private processSnapshot(threadId: string, snapshot: { requests: unknown[]; cwd?: string }, hostId: string, fresh = false): void {
     const receipts = desktopAsyncAnswerReceipts(threadId, snapshot as unknown as Record<string, unknown>, hostId);
     for (const [id, pending] of this.pendingDecisions) if (pending.answerReceipts?.length
       && pending.answerReceipts.every(expected => receipts.some(actual => actual.hostId === expected.hostId
@@ -259,10 +272,10 @@ export class CodexDesktopRequestMonitor {
     const asyncRequests = desktopAsyncUserInputs(threadId, snapshot as unknown as Record<string, unknown>, hostId);
     this.processRequests(threadId, [...(snapshot.requests ?? []), ...asyncRequests.map(request => ({
       method: "item/tool/requestUserInput", id: request.requestId, params: request, async: true
-    }))], snapshot.cwd, hostId);
+    }))], snapshot.cwd, hostId, fresh);
   }
 
-  private processRequests(threadId: string, value: unknown, cwd: string | undefined, hostId: string): void {
+  private processRequests(threadId: string, value: unknown, cwd: string | undefined, hostId: string, fresh: boolean): void {
     if (!Array.isArray(value)) return;
     const present = new Set<string>();
     for (const raw of value) {
@@ -280,7 +293,10 @@ export class CodexDesktopRequestMonitor {
       const normalized = inputRequest ? { ...inputRequest, requestId, hostId }
         : { ...request, ...((request as CodexApprovalRequest).cwd || !cwd ? {} : { cwd }) };
       const previous = this.activeRequests.get(key);
-      if (previous && previous.method === method && JSON.stringify(previous.request) === JSON.stringify(normalized)) continue;
+      if (previous && previous.method === method && JSON.stringify(previous.request) === JSON.stringify(normalized)) {
+        if (fresh && this.retryReady.has(key)) this.dispatch(key, previous);
+        continue;
+      }
       if (previous) this.withdraw(key, previous);
       const approval: DesktopRequest = inputRequest
         ? { hostId, requestId, method: "item/tool/requestUserInput", request: { ...inputRequest, requestId, hostId } }
@@ -299,19 +315,22 @@ export class CodexDesktopRequestMonitor {
       this.rerouteRequests.add(key);
       return;
     }
+    this.deferredRequests.delete(key); this.retryReady.delete(key);
     this.processingRequests.add(key);
     void this.forwardApproval(key, approval).catch(() => {
       console.error("[codex-im-gateway] unable to forward Codex Desktop interaction");
+      if (this.activeRequests.get(key) === approval && !this.handledRequests.has(key)) this.defer(key);
     }).finally(() => {
       this.processingRequests.delete(key);
       const retry = this.rerouteRequests.delete(key);
       const active = this.activeRequests.get(key);
-      if (retry && active) this.dispatch(key, active);
+      if (retry && active && !this.handledRequests.has(key)) this.defer(key, 0);
     });
   }
 
   private withdraw(key: string, approval: DesktopRequest, suspended = false): void {
     this.activeRequests.delete(key);
+    this.deferredRequests.delete(key); this.retryReady.delete(key); this.rerouteRequests.delete(key);
     // A requests-list removal is normal after our own decision; the RPC result
     // is the authoritative receipt in that case.
     if (!this.handledRequests.delete(key)) {
@@ -323,7 +342,10 @@ export class CodexDesktopRequestMonitor {
   private async forwardApproval(key: string, approval: DesktopRequest): Promise<void> {
     if (approval.method === "item/tool/requestUserInput") {
       const answers = await this.options.onUserInput?.(approval);
-      if (!answers || this.activeRequests.get(key) !== approval) return;
+      if (!answers || this.activeRequests.get(key) !== approval) {
+        if (!answers && this.activeRequests.get(key) === approval) this.defer(key);
+        return;
+      }
       this.handledRequests.add(key);
       try {
         if (approval.request.kind === "async") {
@@ -358,7 +380,10 @@ export class CodexDesktopRequestMonitor {
       return;
     }
     const decision = await this.options.onApproval(approval);
-    if (!decision || this.activeRequests.get(key) !== approval) return;
+    if (!decision || this.activeRequests.get(key) !== approval) {
+      if (!decision && this.activeRequests.get(key) === approval) this.defer(key);
+      return;
+    }
     this.handledRequests.add(key);
     const method = approval.method === "item/commandExecution/requestApproval"
       ? "thread-follower-command-approval-decision"
@@ -417,6 +442,46 @@ export class CodexDesktopRequestMonitor {
       pending.reject(new Error("Desktop IPC disconnected before receipt"));
     }
     this.pendingDecisions.clear();
+  }
+
+  private defer(key: string, delayMs = this.options.deferredRetryDelayMs ?? 30_000): void {
+    if (!this.started || !this.activeRequests.has(key) || this.handledRequests.has(key)) return;
+    this.deferredRequests.set(key, Math.min(this.deferredRequests.get(key) ?? Infinity, Date.now() + delayMs));
+    this.scheduleDeferred();
+  }
+
+  private scheduleDeferred(): void {
+    if (this.deferredTimer) clearTimeout(this.deferredTimer);
+    this.deferredTimer = undefined;
+    if (!this.started || !this.deferredRequests.size) return;
+    this.deferredTimer = setTimeout(() => {
+      this.deferredTimer = undefined;
+      const now = Date.now(), delay = Math.max(1, this.options.deferredRetryDelayMs ?? 30_000);
+      for (const [key, retryAt] of this.deferredRequests) {
+        const request = this.activeRequests.get(key);
+        if (!request || this.handledRequests.has(key)) { this.deferredRequests.delete(key); continue; }
+        if (retryAt > now) continue;
+        this.deferredRequests.set(key, now + delay);
+        if (!this.clientId || this.processingRequests.has(key)) continue;
+        const hostId = request.hostId ?? "local", threadId = request.request.threadId;
+        const scope = followKey(threadId, hostId);
+        if (!this.followedThreads.has(scope)) continue;
+        this.retryReady.add(key);
+        if ((this.retryProbes.get(scope) ?? 0) > now) continue;
+        this.retryProbes.set(scope, now + delay);
+        // A read-only subscription refresh. Only its fresh snapshot may retry
+        // delivery; a removed question or changed host must never be replayed.
+        this.sendFollow(threadId, true, hostId);
+      }
+      this.scheduleDeferred();
+    }, Math.max(0, Math.min(...this.deferredRequests.values()) - Date.now()));
+    this.deferredTimer.unref();
+  }
+
+  private clearDeferred(): void {
+    if (this.deferredTimer) clearTimeout(this.deferredTimer);
+    this.deferredTimer = undefined;
+    this.deferredRequests.clear(); this.retryReady.clear(); this.retryProbes.clear();
   }
 
   private async report(approval: CodexDesktopApproval, result: ApprovalDeliveryResult): Promise<void> {

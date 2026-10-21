@@ -10,6 +10,7 @@ import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus, type FollowSyncOptions } from "../bridge/session-follow.js";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
 import { isLegacyCommunicationNotice } from "../codex/communication-error.js";
+import { afterFollowBoundary, followBoundary, type FollowHistoryBoundary } from "./follow-history-boundary.js";
 
 export type ThreadSubscription = {
   key: string;
@@ -34,6 +35,7 @@ type FollowState = {
   delivered: string[];
   completed: string[];
   baseline?: string[];
+  historyBoundary?: FollowHistoryBoundary;
   retired?: string[];
   startedAt?: string;
   checkpoint?: ChannelStreamCheckpoint;
@@ -420,6 +422,23 @@ export class ThreadEventHub {
     // Runtime availability is an observation, never evidence that a particular
     // turn completed. Keep its binding, card and real result journal untouched.
     if (["archived", "missing"].includes(snapshot.state.persistence) || snapshot.state.runtimeStatus === "systemError") return;
+    if (!state.historyBoundary && ["active", "idle"].includes(snapshot.state.runtimeStatus)) {
+      // Migration must not trust an old cursor already moved backwards by the
+      // replay bug. Freeze the newly visible history at its native tail. The
+      // exact tracked result/pending receipts remain independently recoverable.
+      const tail = snapshot.turns.at(-1);
+      state.historyBoundary = tail ? followBoundary(tail)
+        : followBoundary(state.turnId ? { id: state.turnId, startedAt: state.startedAt } : undefined);
+      if (!sub.managed && snapshot.state.runtimeStatus === "idle" && tail && state.turnId && tail.id !== state.turnId
+        && (state.terminalPending || state.checkpoint?.terminal && !state.checkpoint.finished)) {
+        const retired = state.turnId;
+        this.rotateStream(sub); // Keep this old result, but only recover an already delivered card.
+        state.retired = [...(state.retired ?? []), retired].slice(-200);
+        state.turnId = undefined;
+      }
+      this.save();
+    }
+    const boundary = state.historyBoundary ? { ...state.historyBoundary } : followBoundary();
     const currentTurn = snapshot.state.runtimeStatus === "active" ? snapshot.turns.filter(turn => turn.status === "inProgress"
       && (!snapshot.state.activeTurnId || turn.id === snapshot.state.activeTurnId)).at(-1) : undefined;
     if (!sub.managed && currentTurn && state.turnId && state.turnId !== currentTurn.id && !state.terminalPending) {
@@ -460,7 +479,7 @@ export class ThreadEventHub {
         { recoverBootstrap: force, confirmUncertainDelivery: options.confirmUncertainDelivery });
     }
     const { turns } = snapshot;
-    if (!state.initialized) {
+    if (!state.initialized && ["active", "idle"].includes(snapshot.state.runtimeStatus)) {
       // History replay handles past turns; only current and subsequent turns
       // are forwarded. This boundary is retained across service restarts.
       state.baseline = turns.filter((turn) => turn.status !== "inProgress" && turn.id !== state.turnId).map((turn) => turn.id);
@@ -490,11 +509,21 @@ export class ThreadEventHub {
         // completed/interrupted even while Desktop is still executing them.
         // Only a loaded runtime or an explicit lifecycle event can end a card.
         if (snapshot.state.runtimeStatus === "notLoaded" || snapshot.state.runtimeStatus === "unknown") continue;
+        if (turn.id !== state.turnId && !afterFollowBoundary(turn, turns, boundary)) continue;
         const final = turn.messages.filter((message) => message.role === "assistant" && message.kind !== "progress")
           .map((message) => message.text).join("\n\n");
         await this.finish(sub, turn.id, final || (turn.status === "completed" ? "任务已完成。" : "任务已停止或执行失败。"),
           Boolean(state.turnId && state.completed.includes(state.turnId)));
       }
+    }
+    // Advance only from the native ordered/timestamped window, not from an
+    // arbitrary unseen ID. Preserve the cursor even when old pages appear later.
+    const newest = turns.at(-1);
+    if (["active", "idle"].includes(snapshot.state.runtimeStatus) && newest
+      && (newest.id === state.turnId || afterFollowBoundary(newest, turns, boundary))) {
+      state.historyBoundary = followBoundary({ ...newest,
+        startedAt: newest.startedAt ?? (newest.id === boundary.turnId ? boundary.startedAt : undefined) });
+      this.save();
     }
   }
   /** Only an actual start event (or a loaded backend snapshot) may switch turns. */
@@ -509,6 +538,7 @@ export class ThreadEventHub {
         if (sub.managed) this.managedStarted(sub, turnId);
         else if (!await this.selectTurn(sub, turnId, true)) return;
         state.startedAt = startedAt;
+        state.historyBoundary = followBoundary({ id: turnId, startedAt });
         state.sequence++;
         this.save();
       })));

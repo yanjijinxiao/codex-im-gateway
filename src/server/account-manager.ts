@@ -1430,6 +1430,36 @@ export class AccountManager {
       && binding.hostId === destination.hostId && binding.threadId === destination.threadId && binding.recipientId === destination.recipientId);
   }
 
+  private async notifyInteractionRouteConflict(hostId: string, threadId: string, turnId: string): Promise<void> {
+    const candidates = this.threadSubscriptions().filter(binding => binding.enabled
+      && binding.hostId === hostId && binding.threadId === threadId);
+    const status = this.interactionRouting.resolve(hostId, threadId, this.interactionDestinations(), turnId);
+    if (status.destination || !["ambiguous", "unavailable"].includes(status.status)) return;
+    const unique = new Map(candidates.map(binding => {
+      const [accountId] = JSON.parse(binding.key) as [string, string];
+      return [JSON.stringify([accountId, binding.recipientId]), binding] as const;
+    }));
+    await Promise.all([...unique.values()].map(async binding => {
+      const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
+      const destination = { accountId, sessionId, recipientId: binding.recipientId, hostId, threadId };
+      if (!this.interactionRouting.claimRouteNotice(destination, status.status as "ambiguous" | "unavailable")) return;
+      if (!this.threadSubscriptions().some(current => current.enabled && current.key === binding.key
+        && current.hostId === hostId && current.threadId === threadId && current.recipientId === binding.recipientId)) return;
+      const text = status.status === "ambiguous"
+        ? "当前绑定的 Codex 会话有待处理交互，但多个对话跟随且未确定主交互对话，题目未投递。请控制者在希望接收题目的对话发送 /follow primary；仍待回答的问题会重新核对后投递。未代答、未启动或停止任务。"
+        : "当前绑定的 Codex 会话有待处理交互，但原交互目标不可用，未转发题目或改投其他对话。请在 Codex App 处理原问题；控制者可用 /follow primary 设置后续轮次的主交互对话。";
+      try {
+        // This is a neutral configuration notice, never a broadcast of the
+        // native question/choices. Prefer plain text, not another progress card.
+        const send = binding.client.sendProgressText
+          ?? (binding.client.capabilities?.progress !== "available" ? binding.client.sendText : undefined);
+        if (!send) throw new Error("Plain interaction notice is unavailable");
+        const sent = await send.call(binding.client, { toUserId: binding.recipientId, text, contextToken: binding.contextToken });
+        binding.onTextDelivered?.({ messageId: sent.messageId, text });
+      } catch { console.warn("[codex-im-gateway] interaction route notice unconfirmed; not automatically resent"); }
+    }));
+  }
+
   private async handleDesktopUserInput(input: CodexDesktopUserInput): Promise<CodexUserInputAnswer | undefined> {
     let binding: ThreadSubscription | undefined;
     {
@@ -1444,7 +1474,10 @@ export class AccountManager {
       else if (recovered.length > 1) return undefined;
     }
     binding ??= this.interactionBinding(input.request.threadId, input.request.turnId, input.hostId);
-    if (!binding) return undefined;
+    if (!binding) {
+      await this.notifyInteractionRouteConflict(input.hostId, input.request.threadId, input.request.turnId);
+      return undefined;
+    }
     const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
     this.interactionRouting.pinInteraction({ accountId, sessionId, recipientId: binding.recipientId,
       hostId: binding.hostId, threadId: binding.threadId }, input.request.turnId);
@@ -1483,6 +1516,7 @@ export class AccountManager {
       }
       return decision;
     }
+    await this.notifyInteractionRouteConflict(hostId, approval.request.threadId, approval.request.turnId);
     // A remote interaction never falls through to a local cwd/project route.
     if (hostId !== "local") return undefined;
     // Never route an inactive/ambiguous explicit binding by its working directory.

@@ -75,6 +75,57 @@ function asyncState(canonical = false) {
     ? { turnHistory: { history: { entitiesByKey: { turn: asyncTurn } } } } : { turns: [asyncTurn] }) };
 }
 
+test("an unrouted question is retried only after a fresh native snapshot and then submitted once", async t => {
+  let routable = false;
+  const f = await fixture(t, { deferredRetryDelayMs: 10, onUserInput: async input => routable
+    ? { [input.request.questions[0].id]: { answers: ["明确回答"] } } : undefined });
+  f.snapshot(asyncState()); await waitFor(() => f.inputs.length === 1);
+  await waitFor(() => f.messages.filter(m => m.method === "thread-stream-following-changed").length >= 2);
+  routable = true;
+  f.patches([{ op: "add", path: ["cwd"], value: "/tmp/project" }]);
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(f.inputs.length, 1, "cached patches cannot authorize a deferred delivery");
+  assert.equal(f.writes().length, 0);
+  f.snapshot(asyncState()); await waitFor(() => f.writes().length === 1);
+  f.respond({ turnId: "turn" }); await waitFor(() => f.results.includes("confirmed"));
+  f.snapshot(asyncState()); await new Promise(resolve => setTimeout(resolve, 35));
+  assert.equal(f.inputs.length, 2); assert.equal(f.writes().length, 1);
+});
+
+test("primary/binding refresh rechecks native state and never forwards a question already removed in the App", async t => {
+  const f = await fixture(t, { onUserInput: async () => undefined });
+  f.snapshot(asyncState()); await waitFor(() => f.inputs.length === 1);
+  const count = f.messages.filter(m => m.method === "thread-stream-following-changed").length;
+  f.monitor.setFollowedThreads(["thread"]);
+  await waitFor(() => f.messages.filter(m => m.method === "thread-stream-following-changed").length > count);
+  assert.equal(f.inputs.length, 1);
+  f.snapshot({ requests: [], threadRuntimeStatus: { type: "idle" }, turns: [] });
+  await waitFor(() => f.results.includes("withdrawn"));
+  assert.equal(f.inputs.length, 1); assert.equal(f.writes().length, 0);
+});
+
+test("a stopped monitor cancels deferred rerouting probes without sending an answer", async t => {
+  const f = await fixture(t, { deferredRetryDelayMs: 15, onUserInput: async () => undefined });
+  f.snapshot(asyncState()); await waitFor(() => f.inputs.length === 1);
+  f.monitor.stop();
+  const count = f.messages.length;
+  await new Promise(resolve => setTimeout(resolve, 35));
+  assert.equal(f.messages.length, count); assert.equal(f.writes().length, 0);
+});
+
+test("deferred routing never retries an answer whose native submission receipt became unknown", async t => {
+  let routable = false;
+  const f = await fixture(t, { deferredRetryDelayMs: 5, decisionTimeoutMs: 20,
+    onUserInput: async input => routable ? { [input.request.questions[0].id]: { answers: ["回答"] } } : undefined });
+  f.snapshot(asyncState()); await waitFor(() => f.inputs.length === 1);
+  await waitFor(() => f.messages.filter(m => m.method === "thread-stream-following-changed").length >= 2);
+  routable = true; f.snapshot(asyncState()); await waitFor(() => f.results.includes("failed"));
+  assert.equal(f.writes().length, 1);
+  f.monitor.setFollowedThreads(["thread"]); f.snapshot(asyncState());
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(f.inputs.length, 2); assert.equal(f.writes().length, 1);
+});
+
 test("remote async answers use host-scoped follower v2 and cannot be confirmed by a local twin", async t => {
   const remote = "remote-ssh-discovered:test";
   const f = await fixture(t);

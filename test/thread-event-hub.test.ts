@@ -282,7 +282,8 @@ test("a loaded snapshot can deliver a short next turn completed between polling 
   await hub.refresh();
   await hub.started("local", "main", "first", "2026-09-10T00:00:00Z");
   await hub.completion("local", "main", "first", "第一轮完成");
-  turns = [{ id: "second", status: "completed", messages: [{ id: "answer", role: "assistant", text: "快速第二轮完成" }] }];
+  turns = [{ id: "second", status: "completed", startedAt: "2026-09-10T00:01:00Z",
+    messages: [{ id: "answer", role: "assistant", text: "快速第二轮完成" }] }];
   await hub.refresh();
   await hub.refresh();
   assert.deepEqual(writes, ["第一轮完成", "快速第二轮完成"]);

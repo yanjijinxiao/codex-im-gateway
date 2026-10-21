@@ -53,3 +53,14 @@ test("a late interaction from an older turn cannot replace the latest accepted d
   assert.deepEqual(f.restart().resolve("local", "thread", [first, second]).destination, second);
   assert.deepEqual(f.restart().resolve("local", "thread", [first, second], "old").destination, first);
 });
+
+test("neutral route-conflict notices are claimed once per exact binding across restarts", t => {
+  const f = fixture(t);
+  assert.equal(f.journal.claimRouteNotice(first, "ambiguous"), true);
+  assert.equal(f.restart().claimRouteNotice(first, "ambiguous"), false);
+  assert.equal(f.restart().claimRouteNotice(second, "ambiguous"), true);
+  assert.equal(f.restart().claimRouteNotice({ ...first, hostId: "remote" }, "ambiguous"), true);
+  assert.equal(f.restart().claimRouteNotice(first, "unavailable"), true);
+  const saved = fs.readFileSync(f.filePath, "utf8");
+  assert.doesNotMatch(saved, /question|answer|token/i);
+});

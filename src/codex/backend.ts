@@ -326,9 +326,12 @@ export type CodexHistoryMessage = {
 
 export type CodexThreadSnapshot = {
   state: CodexThreadState;
+  /** Native oldest-to-newest order; a bounded window may later expand backwards. */
   turns: Array<{
     id: string;
     status: CodexTurnStatus;
+    /** Native start time, when available; never inferred from the turn ID. */
+    startedAt?: string;
     messages: CodexHistoryMessage[];
   }>;
 };

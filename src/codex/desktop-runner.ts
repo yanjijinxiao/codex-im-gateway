@@ -834,7 +834,10 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     const status = turn.status as CodexTurnStatus;
     if (!["inProgress", "completed", "interrupted", "failed"].includes(status)) continue;
     if (!id) { pendingTurnWithoutId ||= status === "inProgress"; continue; }
-    turns.push({ id, status, messages: parseThreadHistory({ turns: [{ ...turn, id,
+    const startedAtMs = typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs
+      : typeof turn.startedAt === "number" ? turn.startedAt * 1_000 : NaN;
+    turns.push({ id, status, ...(Number.isFinite(new Date(startedAtMs).getTime()) && startedAtMs > 0
+      ? { startedAt: new Date(startedAtMs).toISOString() } : {}), messages: parseThreadHistory({ turns: [{ ...turn, id,
       startedAt: typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs / 1_000 : turn.startedAt
     }] }) });
   }

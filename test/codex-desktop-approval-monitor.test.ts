@@ -317,7 +317,11 @@ test("a previously unroutable approval is retried when bindings become available
   await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(f.decisionMessages().length, 0);
   routable = true;
+  const follows = f.messages.filter(message => message.method === "thread-stream-following-changed").length;
   f.monitor.setFollowedThreads(["thread-one"]);
+  await waitFor(() => f.messages.filter(message => message.method === "thread-stream-following-changed").length > follows);
+  assert.equal(attempts, 1, "routing changes cannot resubmit a cached request");
+  f.snapshot();
   await waitFor(() => f.decisionMessages().length === 1);
   f.respond("success");
   await waitFor(() => f.results.length > 0);
@@ -334,8 +338,11 @@ test("does not lose a binding change while an initial routing attempt is still p
   } });
   f.snapshot();
   await waitFor(() => attempts === 1);
+  const follows = f.messages.filter(message => message.method === "thread-stream-following-changed").length;
   f.monitor.setFollowedThreads(["thread-one"]);
   release(undefined);
+  await waitFor(() => f.messages.filter(message => message.method === "thread-stream-following-changed").length > follows);
+  f.snapshot();
   await waitFor(() => f.decisionMessages().length === 1);
   f.respond("success");
   await waitFor(() => f.results.length > 0);
@@ -385,7 +392,10 @@ test("a changed command withdraws the old notice without mutating its displayed 
   f.patches([{ op: "replace", path: ["requests", 0, "params", "command"], value: "echo changed" }]);
   await waitFor(() => f.results.includes("withdrawn"));
   assert.equal(seen[0]?.command, "echo mock");
+  const follows = f.messages.filter(message => message.method === "thread-stream-following-changed").length;
   decisions[0]!("accept");
+  await waitFor(() => f.messages.filter(message => message.method === "thread-stream-following-changed").length > follows);
+  f.snapshot([{ ...f.nativeRequest, params: { ...f.nativeRequest.params, command: "echo changed" } }]);
   await waitFor(() => seen.length === 2);
   assert.equal(seen[1]?.command, "echo changed");
   assert.equal(f.decisionMessages().length, 0);

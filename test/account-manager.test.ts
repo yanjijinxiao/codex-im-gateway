@@ -812,6 +812,34 @@ test("multi-bound App questions and approvals use the explicit primary, not ever
   await f.manager.stopAll();
 });
 
+test("unrouted interactions produce deduplicated neutral guidance, not leaked questions or repeated cards", async t => {
+  const f = setup(t);
+  seedApprovalBinding(f.paths, "account-one", "one-room");
+  const two = seedApprovalBinding(f.paths, "account-two", "two-room");
+  await f.manager.startAll();
+  for (let i = 0; i < 4; i++) assert.equal(await f.emitDesktopQuestion(boundQuestion()), undefined);
+  await f.emitDesktopApproval(boundApproval());
+  const notices = f.sent.filter(message => message.text.includes("主交互对话"));
+  assert.equal(notices.length, 2);
+  assert.deepEqual(notices.map(message => message.toUserId).sort(), ["one-room", "two-room"]);
+  assert.ok(notices.every(message => message.text.includes("/follow primary") && !message.text.includes("farming")));
+  assert.equal(f.channelQuestions.length, 0); assert.equal(f.streamStarts.length, 0);
+  await f.manager.stopAll();
+  const unresolvedRestart = setup(t, { root: f.root }); await unresolvedRestart.manager.startAll();
+  await unresolvedRestart.emitDesktopQuestion(boundQuestion());
+  assert.equal(unresolvedRestart.sent.filter(message => message.text.includes("主交互对话")).length, 0);
+  await unresolvedRestart.manager.stopAll();
+  await f.manager.startAll();
+  f.manager.setSessionInteractionPrimary("account-two", two.id);
+  await f.emitDesktopQuestion(boundQuestion());
+  assert.deepEqual(f.channelQuestions.map(question => question.senderId), ["two-room"]);
+  await f.manager.stopAll();
+  const restarted = setup(t, { root: f.root }); await restarted.manager.startAll();
+  await restarted.emitDesktopQuestion(boundQuestion());
+  assert.equal(restarted.sent.filter(message => message.text.includes("主交互对话")).length, 0);
+  await restarted.manager.stopAll();
+});
+
 test("selecting a primary cannot reactivate a switched binding or disable another follower", async t => {
   const f = setup(t); const one = seedApprovalBinding(f.paths, "account-one", "one-room");
   seedApprovalBinding(f.paths, "account-one", "one-room");

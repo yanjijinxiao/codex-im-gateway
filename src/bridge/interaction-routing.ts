@@ -16,7 +16,7 @@ export type SessionInteractionPort = {
   setPrimary(session: ManagedSession): InteractionRouteStatus;
 };
 type Journal = { version: 1; primary: Record<string, { destination: InteractionDestination; explicit: boolean }>;
-  origins: Record<string, InteractionDestination> };
+  origins: Record<string, InteractionDestination>; routeNotices?: Record<string, number> };
 const scope = (hostId: string, threadId: string) => JSON.stringify([hostId, threadId]);
 const turnScope = (hostId: string, threadId: string, turnId: string) => JSON.stringify([hostId, threadId, turnId]);
 const same = (a: InteractionDestination, b: InteractionDestination) =>
@@ -68,6 +68,17 @@ export class InteractionRoutingJournal {
     }
     return count === 1 ? { status: "unique", bindingCount: count, current: false, destination: { ...candidates[0] } }
       : { status: count ? "ambiguous" : "unavailable", bindingCount: count, current: false };
+  }
+  /** Claim before sending: an unknown notification receipt must not cause spam. */
+  claimRouteNotice(destination: InteractionDestination, status: "ambiguous" | "unavailable"): boolean {
+    const key = JSON.stringify([destination.accountId, destination.sessionId, destination.recipientId,
+      destination.hostId, destination.threadId, status]);
+    const notices = this.state.routeNotices ??= {};
+    if (Object.hasOwn(notices, key)) return false;
+    notices[key] = Date.now();
+    while (Object.keys(notices).length > 1_000) delete notices[Object.keys(notices)[0]];
+    this.save();
+    return true;
   }
   private save(): void {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });

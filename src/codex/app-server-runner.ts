@@ -782,11 +782,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       await this.ensureConnected();
       const response = await this.request("thread/turns/list", {
         threadId, limit: 20, sortDirection: "desc", itemsView: "full"
-      }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus }> };
+      }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus; startedAt?: number }> };
       const turns = (response.data ?? []).slice().reverse();
       const failure = lastCodexTurnFailure(turns.at(-1));
       return { state: { ...state, lastTurnFailure: failure }, turns: turns.map((turn) => ({
-        id: turn.id, status: turn.status, messages: parseThreadHistory({ turns: [turn] })
+        id: turn.id, status: turn.status, ...(unixTimestampToIso(turn.startedAt) ? { startedAt: unixTimestampToIso(turn.startedAt) } : {}),
+        messages: parseThreadHistory({ turns: [turn] })
       })) };
     } finally {
       this.operationLeases--;
