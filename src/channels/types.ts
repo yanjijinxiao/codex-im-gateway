@@ -7,6 +7,8 @@ import type { ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream
 export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
 export type ChannelTextInput = { toUserId: string; text: string; contextToken?: string };
+export type ChannelMention = { userId: string; name?: string };
+export type ChannelMentionInput = ChannelTextInput & { mentions: readonly ChannelMention[] };
 
 export type ChannelTextClient = {
   /** Legacy transport boundary. Production consumers receive a ChannelClient. */
@@ -14,6 +16,8 @@ export type ChannelTextClient = {
   /** Can update an existing stream using only its persisted message ID. */
   resumableTextStream?: boolean;
   sendText(input: ChannelTextInput): Promise<{ messageId: string }>;
+  /** Completion-only, native directed mention. Never parsed from model text. */
+  sendMentionNotification?(input: ChannelMentionInput): Promise<ChannelReceipt>;
   /** Plain delivery for native text progress or a terminal error notice; never create an AI Card. */
   sendProgressText?(input: ChannelTextInput): Promise<{ messageId: string }>;
   /** Repeated starts with the same streamId must target the same logical card. */
@@ -41,6 +45,8 @@ export type ChannelTextClient = {
 
 export type Capability = "available" | "not-configured" | "not-implemented" | "unsupported";
 export type ChannelCapabilities = {
+  readonly mentions?: Capability;
+  readonly mentionBatchSize?: number;
   /** Conservative UTF-8 budget for each complete-result page. */
   readonly resultPageBytes?: number;
   /** Presentation supported by this adapter, independent of actionable buttons. */

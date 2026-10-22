@@ -16,6 +16,7 @@ import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import { SessionControlJournal } from "../bridge/session-control.js";
+import { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
 import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
@@ -283,6 +284,7 @@ export class AccountManager {
   private readonly managedTurnCompletions = new Set<string>();
   private readonly threadEvents: ThreadEventHub;
   private readonly sessionControls: SessionControlJournal;
+  private readonly turnAudience: TurnAudienceJournal;
   private readonly nativeQueue: NativeQueueCoordinator;
   private nativeQueueTimer?: NodeJS.Timeout;
   private readonly nativeQueueWarningAt = new Map<string, number>();
@@ -301,10 +303,12 @@ export class AccountManager {
   constructor(private readonly options: AccountManagerOptions) {
     this.interactionRouting = new InteractionRoutingJournal(path.join(options.paths.runtimeDir, "interaction-routing.json"));
     this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
+    this.turnAudience = new TurnAudienceJournal(path.join(options.paths.runtimeDir, "turn-audience.json"));
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
+      turnAudience: this.turnAudience,
       subscriptions: () => this.threadSubscriptions(),
       backend: () => this.runnerFor(this.configProvider()),
       acceptedInputs: () => [ ...this.sessionControls.acceptedPresentationInputs(),
@@ -419,6 +423,7 @@ export class AccountManager {
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       sessionControls: this.sessionControls,
+      turnAudience: this.turnAudience,
       onAcceptedInput: input => this.threadEvents.acceptedInput(input),
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),

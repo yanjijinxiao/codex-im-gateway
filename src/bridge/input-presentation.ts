@@ -7,4 +7,5 @@ export type AcceptedPresentationInput = {
   turnId: string;
   kind: "answer" | "steer";
   acceptedAt: number;
+  origin?: import("./turn-audience.js").TurnParticipantOrigin;
 };

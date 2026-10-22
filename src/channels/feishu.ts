@@ -59,7 +59,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     this.inboundDir = options.inboundDir;
     this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.client = createChannelClient("feishu", {
-      ...TEXT_CAPABILITIES,
+      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50,
       tableLayout: "native",
       inbound: { ...NO_MEDIA, image: options.inboundDir ? "available" : "not-configured", file: options.inboundDir ? "available" : "not-configured" },
       outbound: { ...NO_MEDIA, image: "available" },
@@ -69,6 +69,11 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
   }
 
   async sendText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
+    // Ordinary/model-authored text cannot grant native mention authority.
+    return this.sendTextPayload({ ...input, text: input.text.replace(/<(\/?at)(?=[\s>])/gi, "&lt;$1") });
+  }
+
+  private async sendTextPayload(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
     const result = await this.apiClient.im.v1.message.create({
       params: { receive_id_type: recipientType(input.toUserId) },
       data: {
@@ -78,6 +83,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
       }
     });
     return feishuMessageReceipt(result, "sendText");
+  }
+
+  async sendMentionNotification(input: import("./types.js").ChannelMentionInput): Promise<{ messageId: string }> {
+    if (recipientType(input.toUserId) !== "chat_id") throw new Error("Directed mentions require a group chat");
+    // Only structured, validated recipient ids become tags. Model text is escaped.
+    const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    const tags = input.mentions.map(item => `<at user_id="${escape(item.userId)}"></at>`).join(" ");
+    return this.sendTextPayload({ toUserId: input.toUserId, text: `${tags}\n${escape(input.text)}` });
   }
 
   async sendImage(input: { toUserId: string; path: string }): Promise<{ messageId: string }> {
@@ -144,6 +157,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         const pendingMessage: ChannelMessage = {
           id: event.message.message_id,
           senderId: actorId,
+          ...(event.message.chat_type === "group" ? { mention: { userId: actorId } } : {}),
           replyTargetId: event.message.chat_id,
           text: "",
           attachments: [],

@@ -85,6 +85,38 @@ test("generic client rejects missing acknowledgements instead of inventing messa
   await assert.rejects(client.sendText({ toUserId: "chat", text: "hello" }), ChannelDeliveryError);
 });
 
+test("Feishu completion mentions use native user ids and escape all non-recipient markup", async () => {
+  const sent: any[] = [];
+  const adapter = new FeishuChannelAdapter(accounts[2] as never, { apiClient: { im: { v1: { message: {
+    async create(input: unknown) { sent.push(input); return { code: 0, data: { message_id: "mention" } }; }
+  } } } } as never, wsClient: { async start() {}, close() {} } });
+  await adapter.client.sendMentionNotification({ toUserId: "oc_group", text: '<at user_id="all">untrusted</at> & result',
+    mentions: [{ userId: "ou_alice", name: "ignored <at id=all>" }, { userId: "ou_bob" }] });
+  assert.equal(sent.length, 1); assert.equal(sent[0].data.msg_type, "text");
+  assert.equal(JSON.parse(sent[0].data.content).text,
+    '<at user_id="ou_alice"></at> <at user_id="ou_bob"></at>\n&lt;at user_id=&quot;all&quot;&gt;untrusted&lt;/at&gt; &amp; result');
+  await adapter.client.sendText({ toUserId: "oc_group", text: '<at user_id="all">model output</at>' });
+  assert.equal(JSON.parse(sent[1].data.content).text, '&lt;at user_id="all">model output&lt;/at>');
+  await assert.rejects(adapter.client.sendMentionNotification({ toUserId: "ou_dm", text: "x", mentions: [{ userId: "ou_alice" }] }));
+  assert.equal(sent.length, 2);
+});
+
+test("Feishu only group inbound messages carry mention authority, not a DM or its quoted author", async () => {
+  let dispatcher: any;
+  const received: ChannelMessage[] = [], abort = new AbortController();
+  const adapter = new FeishuChannelAdapter(accounts[2] as never, { apiClient: { im: { v1: { message: {} } } } as never,
+    wsClient: { async start(input) { dispatcher = input.eventDispatcher; }, close() {} } });
+  const monitor = adapter.monitor({ signal: abort.signal, async onMessage(message) { received.push(message); } });
+  await tick();
+  try {
+    for (const chat_type of ["group", "p2p"]) await dispatcher.handles.get("im.message.receive_v1")({
+      sender: { sender_id: { open_id: "ou_human" } },
+      message: { message_id: chat_type, chat_id: "oc_chat", chat_type, message_type: "text", content: '{"text":"hello"}', parent_id: "quoted" }
+    });
+    assert.deepEqual(received[0].mention, { userId: "ou_human" }); assert.equal(received[1].mention, undefined);
+  } finally { abort.abort(); await monitor; }
+});
+
 test("multi-part fallback exposes actual receipts and preserves acknowledged parts on failure", async () => {
   const sent: Array<{ text: string; contextToken?: string }> = [];
   let fail = false;

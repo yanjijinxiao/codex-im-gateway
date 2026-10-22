@@ -2,12 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { chunkText } from "../bridge/format.js";
 import { resultPages } from "./result-pages.js";
+import { isDirectedMentionId } from "./mentions.js";
 import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, InboundMediaTooLargeError, channelProgressError } from "./errors.js";
 import type { ChannelAttachment } from "./message.js";
 import type { Capability, ChannelCapabilities, ChannelClient, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
 
 export const NO_MEDIA = Object.freeze({ image: "not-implemented", file: "not-implemented", video: "not-implemented", audio: "not-implemented" } as const);
 export const TEXT_CAPABILITIES: ChannelCapabilities = Object.freeze({
+  mentions: "unsupported",
   tableLayout: "list",
   inbound: NO_MEDIA, outbound: NO_MEDIA, progress: "not-implemented", resumableProgress: false, streamBootstrapRecovery: "not-implemented",
   actions: "not-implemented", tasks: "not-implemented", cardUpdates: "not-implemented", typing: "not-implemented"
@@ -52,6 +54,12 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
   };
   return {
     channel, capabilities: caps, resumableTextStream: caps.resumableProgress, sendText,
+    async sendMentionNotification(input) {
+      requireFeature("mentions", caps.mentions ?? "unsupported");
+      if (!input.mentions.length || input.mentions.length > (caps.mentionBatchSize ?? 50)
+        || input.mentions.some(item => !isDirectedMentionId(item.userId))) throw new Error("Invalid directed mention recipients");
+      return acknowledged("sendMentionNotification", required(driver.sendMentionNotification, "mentions").call(driver, input));
+    },
     async sendProgressText(input) {
       // Text-only drivers already send plain messages. Card-capable drivers
       // must implement this operation explicitly rather than create a new card.

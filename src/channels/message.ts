@@ -2,6 +2,8 @@
 export type ChannelMessage = {
   id: string;
   senderId: string;
+  /** Only a provider-confirmed group-member identity; absent in DMs/unsupported transports. */
+  mention?: import("./types.js").ChannelMention;
   /** Conversation used for replies and session bindings; defaults to senderId in a DM. */
   replyTargetId?: string;
   source?: "native-menu";

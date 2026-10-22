@@ -4,6 +4,7 @@ import { SessionControlQueue } from "./session-control.js";
 import { CodexBackendCapabilityError, type CodexBridgeBackend, type CodexQueuedSubmission, type CodexQueueAddInput } from "../codex/backend.js";
 
 export type QueueOrigin = {
+  mention?: import("../channels/types.js").ChannelMention;
   accountId: string; conversationId: string; actorId: string; messageId: string;
   sessionId: string; hostId: string; backend: string; threadId: string;
 };

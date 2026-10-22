@@ -5,6 +5,7 @@ import path from "node:path";
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
+import { TurnAudienceJournal, type TurnParticipantOrigin } from "./turn-audience.js";
 import { ChannelTurnPresentation, type TurnReplyStream } from "../channels/turn-presentation.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
@@ -59,6 +60,7 @@ import type {
   CodexHistoryMessage,
   CodexModelOption,
   CodexRuntimeInfo,
+  CodexInputReceipt,
   CodexThreadState,
   CodexThreadGoal,
   CodexThreadGoalStatus
@@ -131,6 +133,7 @@ export type BridgeServiceOptions = {
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
+  turnAudience?: TurnAudienceJournal;
   createTextStream?: (session: ManagedSession, acceptedTurnId?: string) => TurnReplyStream | Promise<TurnReplyStream>;
   onAcceptedInput?: (input: AcceptedPresentationInput) => Promise<void>;
   deliverTurnResult?: (session: ManagedSession, turnId: string, text: string) => Promise<boolean>;
@@ -176,6 +179,9 @@ export class BridgeService {
     page: number; pageSize: number; createdAt: number; label: string; warnings: string[];
   }>();
   private readonly actor = new AsyncLocalStorage<string>();
+  private readonly participant = new AsyncLocalStorage<Pick<TurnParticipantOrigin, "actorId" | "conversationId" | "mention">>();
+  private readonly turnAudience: TurnAudienceJournal;
+  private audienceSuspended = false;
   private readonly controls: SessionControlJournal;
   private readonly nativeQueue: NativeQueueCoordinator;
   private recoveringQueue = false;
@@ -204,6 +210,8 @@ export class BridgeService {
       maxInboundBytes: options.config.maxInboundBytes, cdnBaseUrl: options.cdnBaseUrl, mediaFetch: options.mediaFetch
     });
     this.controls = options.sessionControls ?? new SessionControlJournal(options.stateStore.controlJournalPath);
+    this.turnAudience = options.turnAudience ?? new TurnAudienceJournal(
+      path.join(path.dirname(options.stateStore.controlJournalPath), "turn-audience.json"));
     this.nativeQueue = options.nativeQueue ?? new NativeQueueCoordinator(
       path.join(path.dirname(options.stateStore.controlJournalPath), "native-submissions.json"));
     this.access = new AccessController({
@@ -245,6 +253,8 @@ export class BridgeService {
           updateCard: (messageId: string, card: ChannelActionCard) => this.channel.updateActionCard({ messageId, card })
         } : {}),
         sendNotice: (senderId, text) => this.reply(senderId, text),
+        holdAudience: (origin, request) => this.turnAudience.hold({ bindingKey: origin.bindingKey,
+          conversationId: origin.conversationId, hostId: request.hostId, threadId: request.threadId, turnId: request.turnId }),
         onAcceptedInput: input => this.presentAcceptedInput(input)
       }
     );
@@ -280,8 +290,9 @@ export class BridgeService {
     };
     const before = binding();
     try {
-      await this.actor.run(message.senderId, () =>
-        this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message)));
+      await this.participant.run({ actorId: message.senderId, conversationId,
+        ...(message.mention ? { mention: message.mention } : {}) }, () => this.actor.run(message.senderId, () =>
+        this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message))));
     } finally {
       // All binding entry points (new, project, Taskboard, catalog and leave)
       // use the same subscription invalidation boundary.
@@ -524,10 +535,12 @@ export class BridgeService {
         await this.handleGoalCommand(message, command.arg);
         return;
       case "answer":
-        await this.reply(message.senderId, this.userInputs.answer(message.senderId, command.arg));
+        await this.reply(message.senderId, this.userInputs.answer(message.senderId, command.arg,
+          this.participantOrigin(this.executionSession(message.senderId))));
         return;
       case "skip":
-        await this.reply(message.senderId, this.userInputs.skip(message.senderId, command.arg));
+        await this.reply(message.senderId, this.userInputs.skip(message.senderId, command.arg,
+          this.participantOrigin(this.executionSession(message.senderId))));
         return;
       case "new":
         await this.handleNewSessionCommand(message.senderId, command.arg);
@@ -1425,7 +1438,7 @@ export class BridgeService {
       await this.reply(message.senderId, "目标任务已结束或发生切换，未发送这条介入。请查看 /history 后重新发送。");
       return;
     }
-    const result = await this.controls.steer(
+    const result = await this.observeControlAudience(session, state.activeTurnId, () => this.controls.steer(
       JSON.stringify([hostId ?? "local", session.threadId]),
       JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
       () => this.runner.steer({
@@ -1434,8 +1447,7 @@ export class BridgeService {
       prompt,
       cwd: session.workspace,
       clientUserMessageId: message.id
-    }, hostId), hostId ?? "local");
-    await this.presentControlReceipt(session, result.turnId);
+    }, hostId), hostId ?? "local", this.participantOrigin(session)));
     this.options.stateStore.setSessionPromptPreview(session.id, prompt);
     await this.reply(message.senderId, [
       "已介入当前正在执行的 Codex 任务。",
@@ -1579,7 +1591,7 @@ export class BridgeService {
     const prompt = buildPromptParts("", await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), []).prompt;
     if (policy === "steer") {
       if (state.executionOwner === "desktop" && this.runner.submitThreadMessage) {
-        await this.submitActiveThreadMessage(message, session, prompt);
+        await this.submitActiveThreadMessage(message, session, prompt, state.activeTurnId);
         return true;
       }
       await this.handleSteerCommand(message, prompt, state.activeTurnId);
@@ -1609,7 +1621,7 @@ export class BridgeService {
     return true;
   }
 
-  private async submitActiveThreadMessage(message: ChannelMessage, session: ManagedSession, prompt: string): Promise<void> {
+  private async submitActiveThreadMessage(message: ChannelMessage, session: ManagedSession, prompt: string, expectedTurnId?: string): Promise<void> {
     const hostId = this.sessionHostId(session);
     const assertCurrent = () => {
       const current = this.executionSession(message.senderId);
@@ -1619,7 +1631,7 @@ export class BridgeService {
       }
     };
     assertCurrent();
-    const result = await this.controls.submit(
+    const result = await this.observeControlAudience(session, expectedTurnId, () => this.controls.submit(
       JSON.stringify([hostId ?? "local", session.threadId]),
       JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
       async () => {
@@ -1631,8 +1643,7 @@ export class BridgeService {
             { code: "InvalidAcknowledgement" });
         }
         return receipt;
-      }, hostId ?? "local");
-    await this.presentControlReceipt(session, result.turnId);
+      }, hostId ?? "local", this.participantOrigin(session)));
     this.options.stateStore.setSessionPromptPreview(session.id, prompt);
     await this.reply(message.senderId, `消息已由原 Codex 会话接收。\nTurn：${result.turnId}\n继续跟随原会话；未新建任务或自动排队。`);
   }
@@ -1704,7 +1715,8 @@ export class BridgeService {
     const receipt = await this.nativeQueue.enqueue({
       accountId: this.options.accountId ?? "standalone", conversationId: message.senderId,
       actorId: this.actor.getStore() ?? message.senderId, messageId: message.id,
-      sessionId: session.id, hostId, backend: this.runner.backendInfo(hostId).id, threadId: session.threadId
+      sessionId: session.id, hostId, backend: this.runner.backendInfo(hostId).id, threadId: session.threadId,
+      ...(this.participant.getStore()?.mention ? { mention: this.participant.getStore()!.mention } : {})
     }, prompt, this.runner, {
       onApproval: request => this.approvals.request(message.senderId, request),
       onUserInput: request => this.requestUserInput(message.senderId, request, hostId),
@@ -2169,6 +2181,16 @@ export class BridgeService {
     const qaContext = mode === "qa" && project ? this.resolveQaContext(project) : undefined;
     if (mode === "qa" && !qaContext) throw new Error("Current project has no available llm-wiki knowledge base");
     const session = pinned ?? currentSession!;
+    const origin = queued ? {
+      bindingKey: JSON.stringify([queued.receipt.accountId, session.id]), conversationId: queued.receipt.conversationId,
+      actorId: queued.receipt.actorId, ...(queued.receipt.mention ? { mention: queued.receipt.mention } : {})
+    } : this.participantOrigin(session);
+    const recordParticipant = (nativeThreadId: string, turnId: string) => {
+      try {
+        if (origin) this.turnAudience.record({ bindingKey: origin.bindingKey, conversationId: origin.conversationId,
+          hostId: this.sessionHostId(session) ?? "local", threadId: nativeThreadId, turnId }, origin);
+      } catch { console.warn("[codex-im-gateway] accepted turn audience journal unavailable"); }
+    };
     return this.turnDeliveries.run(JSON.stringify([this.sessionHostId(session), session.id]), async () => {
     // The preceding queued turn may have created this session's first thread.
     const fresh = this.options.stateStore.listSessions().find((item) => item.id === session.id);
@@ -2237,6 +2259,7 @@ export class BridgeService {
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             session.threadId = startedThreadId;
             this.options.stateStore.setSessionThread(session.id, startedThreadId);
+            recordParticipant(startedThreadId, turnId);
             if (queued) { await prepareReplyStream(turnId); markActive(); }
             const presentation = this.activePresentations.get(session.id);
             if (presentation) { presentation.threadId = startedThreadId; presentation.turnId = turnId; }
@@ -2292,6 +2315,7 @@ export class BridgeService {
         if (result.threadId) {
           this.options.stateStore.setSessionThread(session.id, result.threadId);
         }
+        if (result.threadId && result.turnId) recordParticipant(result.threadId, result.turnId);
         const parsed = parseActionBlocks(result.text);
         for (const memory of parsed.actions.remember) {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
@@ -2301,6 +2325,7 @@ export class BridgeService {
         const streamed = journaled
           ? await this.options.deliverTurnResult!(session, result.turnId!, parsed.visibleText.trim() || "处理完成。")
           : bound && replyStream ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。") : false;
+        let resultDelivered = Boolean(streamed);
         if (!bound) {
           await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。");
           await replyStream?.suspend();
@@ -2311,6 +2336,10 @@ export class BridgeService {
           await replyStream.reportTerminalFailure();
         } else if (parsed.visibleText.trim() && !streamed) {
           await this.reply(message.senderId, parsed.visibleText);
+          resultDelivered = true;
+        }
+        if (!journaled && bound && result.turnId && resultDelivered) {
+          void this.notifyTurnParticipants(session, result.turnId, stillBound);
         }
         for (const action of parsed.actions.send) {
           if (!stillBound()) break;
@@ -2348,6 +2377,9 @@ export class BridgeService {
         catch { console.warn("[codex-im-gateway] terminal delivery-error notice failed"); }
       }
       if (failureWasReported) markMessageHandlingErrorReported(error);
+      if (failureWasReported && error instanceof CodexTurnExecutionError && acceptedTurnId && stillBound()) {
+        void this.notifyTurnParticipants(session, acceptedTurnId, stillBound);
+      }
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
         sessionId: session.id,
@@ -2757,6 +2789,28 @@ export class BridgeService {
   acceptedPresentationInputs(): AcceptedPresentationInput[] {
     return this.userInputs.acceptedPresentationInputs();
   }
+  private participantOrigin(session?: ManagedSession): TurnParticipantOrigin | undefined {
+    const source = this.participant.getStore();
+    if (!source || !session || source.conversationId !== session.senderId) return undefined;
+    return { ...source, bindingKey: JSON.stringify([this.options.accountId ?? "standalone", session.id]) };
+  }
+  private async observeControlAudience(session: ManagedSession, turnId: string | undefined, submit: () => Promise<CodexInputReceipt>): Promise<CodexInputReceipt> {
+    const origin = this.participantOrigin(session);
+    const release = origin && turnId && session.threadId ? this.turnAudience.hold({ bindingKey: origin.bindingKey,
+      conversationId: origin.conversationId, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, turnId }) : () => {};
+    try {
+      const receipt = await submit();
+      await this.presentControlReceipt(session, receipt.turnId);
+      return receipt;
+    } finally { release(); }
+  }
+  private async notifyTurnParticipants(session: ManagedSession, turnId: string, isCurrent: () => boolean): Promise<void> {
+    if (!session.threadId) return;
+    try { await this.turnAudience.notify({ bindingKey: JSON.stringify([this.options.accountId ?? "standalone", session.id]),
+      conversationId: session.senderId, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, turnId }, this.channel,
+    { isCurrent: () => !this.audienceSuspended && isCurrent(), contextToken: this.options.stateStore.getContextToken(session.senderId) }); }
+    catch { console.warn("[codex-im-gateway] turn mention journal unavailable; result delivery preserved"); }
+  }
   private async presentControlReceipt(session: ManagedSession, turnId: string): Promise<void> {
     const inputs = this.controls.acceptedPresentationInputs().filter(input => input.hostId === (this.sessionHostId(session) ?? "local")
       && input.threadId === session.threadId && input.turnId === turnId);
@@ -2766,6 +2820,8 @@ export class BridgeService {
     // Presentation failure cannot turn a successful native submission into an
     // execution failure. Polling recovers this exact fact from its own receipt.
     try {
+      if (input.origin) this.turnAudience.record({ bindingKey: input.origin.bindingKey,
+        conversationId: input.origin.conversationId, hostId: input.hostId, threadId: input.threadId, turnId: input.turnId }, input.origin, input.acceptedAt);
       if (this.options.onAcceptedInput) await this.options.onAcceptedInput(input);
       else for (const active of this.activePresentations.values()) if (active.hostId === input.hostId
         && active.threadId === input.threadId && active.turnId === input.turnId && active.stream instanceof ChannelTurnPresentation) {
@@ -2778,7 +2834,7 @@ export class BridgeService {
     return this.userInputs.hasRequest(senderId, request);
   }
 
-  suspendUserInputs(): void { this.userInputs.close(); }
+  suspendUserInputs(): void { this.audienceSuspended = true; this.userInputs.close(); }
 
   reconcileUserInputs(): void { this.userInputs.suspendInvalidBindings(); }
 

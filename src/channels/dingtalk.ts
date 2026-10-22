@@ -15,7 +15,7 @@ import {
 import type { DingTalkAccount } from "../weixin/accounts.js";
 import { sanitizeFileName } from "../weixin/media.js";
 import type { ChannelMessage } from "./message.js";
-import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput } from "./types.js";
+import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput, ChannelMentionInput } from "./types.js";
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
 import { chunkText } from "../bridge/format.js";
@@ -52,6 +52,7 @@ type DingTalkWebhookSender = (input: {
   text: string;
   accessToken: string;
   lifecycleId: string;
+  atUserIds?: readonly string[];
 }) => Promise<{ messageId?: string } | void>;
 
 export type DingTalkAICardTarget =
@@ -66,12 +67,13 @@ export type DingTalkAICardClient = {
     outTrackId: string;
     robotCode: string;
     target: DingTalkAICardTarget;
+    atUserIds?: Record<string, string>;
     text: string;
     lifecycleId?: string;
     onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void>;
   /** Reuses a created outTrackId; never calls createCard. */
-  deliver?(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void>;
+  deliver?(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void>;
   update(input: {
     accessToken: string;
     contentKey: string;
@@ -179,7 +181,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.now = options.now ?? Date.now;
     this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
     this.client = createChannelClient("dingtalk", {
-      ...TEXT_CAPABILITIES, inbound: { ...NO_MEDIA, image: "available", file: "available" },
+      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50, inbound: { ...NO_MEDIA, image: "available", file: "available" },
       outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
@@ -229,6 +231,21 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
   }
 
+  async sendMentionNotification(input: ChannelMentionInput): Promise<{ messageId: string }> {
+    const target = this.cardTarget(input.toUserId);
+    if (target.conversationType !== "2") throw new ChannelCapabilityError("dingtalk", "mentions", "群聊定向提醒仅适用于已确认群聊");
+    const reply = this.replyTargets.get(input.toUserId);
+    // Select before any external write. Never switch transports after an ambiguous send.
+    if (reply && (reply.expiresAt === undefined || reply.expiresAt > this.now())) {
+      return this.sendWebhookText({ ...input, text: `${input.mentions.map(item => `@${item.userId}`).join(" ")}\n${input.text}`,
+        atUserIds: input.mentions.map(item => item.userId) });
+    }
+    // Persisted group routing permits a small completion notice after restart,
+    // even when the ephemeral session webhook is gone. Do not duplicate the answer.
+    return this.createTextCard(target, input.text, true, undefined,
+      Object.fromEntries(input.mentions.map(item => [item.userId, item.name || "参与者"])));
+  }
+
   /** Read-only table in the existing AI template; selection remains a slash command. */
   async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<ChannelReceipt> {
     const { card } = input;
@@ -251,7 +268,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     return { messageId: parts.at(-1)!.messageId, parts };
   }
 
-  private async sendWebhookText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {
+  private async sendWebhookText(input: { toUserId: string; text: string; atUserIds?: readonly string[] }): Promise<{ messageId: string }> {
     const target = this.requireReplyTarget(input.toUserId);
     const accessToken = await this.accessToken();
     const lifecycleId = target.messageId || `dingtalk-webhook-${crypto.randomUUID()}`;
@@ -261,7 +278,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         url: target.webhookUrl,
         text: input.text,
         accessToken,
-        lifecycleId
+        lifecycleId,
+        ...(input.atUserIds ? { atUserIds: input.atUserIds } : {})
       });
       if (typeof result?.messageId !== "string" || !result.messageId.trim()) throw new ChannelDeliveryError("dingtalk", "sendText");
       return { messageId: result.messageId };
@@ -400,6 +418,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       const message: ChannelMessage = {
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,
+        ...(body.conversationType === "2" && body.senderStaffId?.trim()
+          ? { mention: { userId: body.senderStaffId.trim(), ...(typeof body.senderNick === "string" && body.senderNick.trim()
+            ? { name: body.senderNick.trim().slice(0, 100) } : {}) } } : {}),
         replyTargetId: conversationId,
         text: dingTalkCommandText(body, decoded.text),
         ...(!decoded.supported ? { unsupportedMessageType: body.msgtype } : {}),
@@ -555,7 +576,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     target: CardTargetContext,
     text: string,
     finalize: boolean,
-    streamId?: string
+    streamId?: string,
+    atUserIds?: Record<string, string>
   ): Promise<{ messageId: string }> {
     const cardTemplateId = this.account.cardTemplateId?.trim();
     if (!cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
@@ -568,6 +590,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       contentKey,
       outTrackId,
       robotCode: target.robotCode,
+      ...(atUserIds ? { atUserIds } : {}),
       text,
       target: target.conversationType === "2"
         ? { type: "group", conversationId: target.conversationId }
@@ -685,6 +708,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     outTrackId: string;
     robotCode: string;
     target: DingTalkAICardTarget;
+    atUserIds?: Record<string, string>;
     text: string;
     lifecycleId?: string;
     onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
@@ -718,13 +742,13 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     }
   }
 
-  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void> {
+  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void> {
     const lifecycle = this.cardLifecycles.get(input.outTrackId) ?? { id: input.outTrackId, owned: true };
     this.cardLifecycles.set(input.outTrackId, lifecycle);
     await this.mutate(lifecycle.id, "deliver", "/v1.0/card/instances/deliver", "POST", input.accessToken, {
       outTrackId: input.outTrackId, userIdType: 1,
       ...(input.target.type === "group" ? { openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
-        imGroupOpenDeliverModel: { robotCode: input.robotCode } } : {
+        imGroupOpenDeliverModel: { robotCode: input.robotCode, ...(input.atUserIds ? { atUserIds: input.atUserIds } : {}) } } : {
         openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
         imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode: input.robotCode, extension: { dynamicSummary: "true" } }
       })
@@ -911,6 +935,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     outTrackId: string;
     robotCode: string;
     target: DingTalkAICardTarget;
+    atUserIds?: Record<string, string>;
     text: string;
     onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void> {
@@ -948,14 +973,14 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     }
   }
 
-  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget }): Promise<void> {
+  async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void> {
       const deliverRequest = new DingTalk.card_1_0.DeliverCardRequest({
         outTrackId: input.outTrackId,
         userIdType: 1,
         ...(input.target.type === "group" ? {
           openSpaceId: `dtv1.card//IM_GROUP.${input.target.conversationId}`,
           imGroupOpenDeliverModel: new DingTalk.card_1_0.DeliverCardRequestImGroupOpenDeliverModel({
-            robotCode: input.robotCode
+            robotCode: input.robotCode, ...(input.atUserIds ? { atUserIds: input.atUserIds } : {})
           })
         } : {
           openSpaceId: `dtv1.card//IM_ROBOT.${input.target.staffId}`,
@@ -1450,6 +1475,7 @@ async function sendSessionWebhook(transport: PinnedNetworkLifecycleTransport, in
   text: string;
   accessToken: string;
   lifecycleId: string;
+  atUserIds?: readonly string[];
 }): Promise<{ messageId?: string }> {
   const url = new URL(input.url);
   if (url.protocol !== "https:" || !url.hostname.toLowerCase().endsWith(".dingtalk.com")) {
@@ -1461,7 +1487,8 @@ async function sendSessionWebhook(transport: PinnedNetworkLifecycleTransport, in
       "Content-Type": "application/json",
       "x-acs-dingtalk-access-token": input.accessToken
     },
-    body: JSON.stringify({ msgtype: "text", text: { content: input.text } })
+    body: JSON.stringify({ msgtype: "text", text: { content: input.text },
+      ...(input.atUserIds ? { at: { atUserIds: input.atUserIds, isAtAll: false } } : {}) })
   });
   const result = await response.json().catch(() => undefined) as {
     errcode?: unknown;

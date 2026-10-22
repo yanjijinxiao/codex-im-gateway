@@ -7,6 +7,7 @@ import type { ChannelReceipt } from "../channels/types.js";
 import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
 import { channelProgressError } from "../channels/errors.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
+import type { TurnParticipantOrigin } from "./turn-audience.js";
 
 type QuestionStatus = "pending" | "answered" | "submitting" | "confirmed" | "withdrawn" | "unconfirmed" | "expired";
 type QuestionRecord = {
@@ -18,6 +19,7 @@ type QuestionRecord = {
   noticeDelivery?: "pending" | "delivered" | "unconfirmed";
   noticeAttempts?: number; noticeRetryAt?: number;
   presentation?: AcceptedPresentationInput;
+  origin?: TurnParticipantOrigin;
 };
 type Waiter = { resolve: (answer: string | undefined) => void; timer?: NodeJS.Timeout };
 const MAX_RESOLUTION_CARD_ATTEMPTS = 3;
@@ -28,6 +30,7 @@ type Options = {
   validate?: (senderId: string, request: Pick<QuestionRecord, "hostId" | "threadId" | "turnId">) => boolean;
   noticeRetryDelayMs?: number;
   onAcceptedInput?: (input: AcceptedPresentationInput) => Promise<void>;
+  holdAudience?: (origin: TurnParticipantOrigin, request: Pick<QuestionRecord, "hostId" | "threadId" | "turnId">) => () => void;
 };
 
 /** Account-scoped application controller. No Codex RPC or provider payloads. */
@@ -36,6 +39,7 @@ export class ChannelUserInputController {
   private readonly waiters = new Map<string, Waiter>();
   private readonly liveRequests = new Map<string, Promise<CodexUserInputAnswer | undefined>>();
   private readonly resolutionUpdates = new Map<string, Promise<void>>();
+  private readonly audienceHolds = new Map<string, () => void>();
   private resolutionRetryTimer?: NodeJS.Timeout;
   private closed = false;
 
@@ -92,7 +96,7 @@ export class ChannelUserInputController {
     return answers;
   }
 
-  answer(senderId: string, arg: string): string {
+  answer(senderId: string, arg: string, origin?: TurnParticipantOrigin): string {
     if (!arg.trim() || arg.trim() === "list") {
       const records = this.state.records.filter(record => this.pending(senderId, record.id));
       const status = this.state.records.filter(record => this.matchesBinding(senderId, record)
@@ -111,14 +115,14 @@ export class ChannelUserInputController {
     const selected = /^--option\s+(\d+)$/i.exec(raw);
     const answer = selected ? record.question.options?.[Number(selected[1]) - 1]?.label : raw;
     if (!answer || answer.length > 2_000) return selected ? "选项不存在，请使用问题中的选项编号。" : "回答不能为空，且不能超过 2000 字符。";
-    this.settle(record, answer);
+    this.settle(record, answer, origin);
     return `已记录问题 ${record.id} 的回答；是否生效以 Codex 接收回执为准。`;
   }
 
-  skip(senderId: string, arg: string): string {
+  skip(senderId: string, arg: string, origin?: TurnParticipantOrigin): string {
     const record = this.pending(senderId, arg.trim());
     if (!record) return this.unavailableAnswer(senderId, arg.trim());
-    this.settle(record, undefined);
+    this.settle(record, undefined, origin);
     return `已记录跳过问题 ${record.id}；是否生效以 Codex 接收回执为准，不等于批准任何操作。`;
   }
 
@@ -140,7 +144,12 @@ export class ChannelUserInputController {
     return this.options.validate && !this.options.validate(senderId, record) ? undefined : record;
   }
 
-  private settle(record: QuestionRecord, answer: string | undefined): void {
+  private settle(record: QuestionRecord, answer: string | undefined, origin?: TurnParticipantOrigin): void {
+    if (origin?.conversationId === record.senderId) {
+      record.origin = origin;
+      const release = this.options.holdAudience?.(origin, record);
+      if (release) this.audienceHolds.set(record.id, release);
+    }
     record.status = "answered"; record.skipped = answer === undefined; record.answer = answer;
     if (record.kind === "async" && !record.question.isSecret) record.answerDigest = asyncAnswerDigest(record.question.id, record.question.question, answer ?? "");
     this.save(); this.release(record.id, answer);
@@ -179,10 +188,11 @@ export class ChannelUserInputController {
         if (result === "confirmed") await this.deliverResolution(record);
         continue;
       }
-      if (result === "suspended") { this.release(record.id); continue; }
+      if (result === "suspended") { this.release(record.id); this.releaseAudience(record.id); continue; }
       if (result === "confirmed") record.presentation ??= {
         id: `answer:${crypto.createHash("sha256").update(record.requestKey).digest("hex")}`,
-        kind: "answer", hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, acceptedAt: Date.now()
+        kind: "answer", hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, acceptedAt: Date.now(),
+        ...(record.origin ? { origin: record.origin } : {})
       };
       record.status = result === "failed" ? "unconfirmed" : result;
       delete record.answer; this.release(record.id); this.save();
@@ -191,6 +201,7 @@ export class ChannelUserInputController {
         catch { console.warn("[codex-im-gateway] question presentation boundary pending"); }
         if (this.closed) return;
       }
+      this.releaseAudience(record.id);
       if ((record.noticeAttempted && !(result === "confirmed" && record.noticeOutcome !== "confirmed")) || !record.deliveryAttempted) continue;
       record.noticeAttempted = true; record.noticeOutcome = result;
       record.noticeDelivery = "pending"; record.noticeAttempts = 0; delete record.noticeRetryAt; this.save();
@@ -280,6 +291,7 @@ export class ChannelUserInputController {
   }
 
   cancelSender(senderId: string): void {
+    for (const record of this.state.records) if (record.senderId === senderId) this.releaseAudience(record.id);
     for (const record of this.state.records) if (record.senderId === senderId && this.waiters.has(record.id)) {
       record.status = "withdrawn"; delete record.answer; this.release(record.id);
     }
@@ -293,6 +305,7 @@ export class ChannelUserInputController {
     if (!this.options.validate) return;
     for (const record of this.state.records) if (this.waiters.has(record.id)
       && !this.options.validate(record.senderId, record)) this.release(record.id);
+    for (const record of this.state.records) if (!this.options.validate(record.senderId, record)) this.releaseAudience(record.id);
     this.scheduleResolutionRetry();
   }
   close(): void {
@@ -300,9 +313,13 @@ export class ChannelUserInputController {
     this.closed = true;
     if (this.resolutionRetryTimer) clearTimeout(this.resolutionRetryTimer);
     this.resolutionRetryTimer = undefined;
+    for (const id of this.audienceHolds.keys()) this.releaseAudience(id);
     for (const id of this.waiters.keys()) this.release(id); this.liveRequests.clear(); this.save();
   }
   private expire(record: QuestionRecord): void { record.status = "expired"; this.save(); this.release(record.id); }
+  private releaseAudience(id: string): void {
+    const release = this.audienceHolds.get(id); this.audienceHolds.delete(id); release?.();
+  }
   private release(id: string, answer?: string): void {
     const waiter = this.waiters.get(id); if (!waiter) return;
     if (waiter.timer) clearTimeout(waiter.timer);

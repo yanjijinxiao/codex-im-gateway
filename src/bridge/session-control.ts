@@ -4,6 +4,7 @@ import type { CodexInputReceipt } from "../codex/backend.js";
 import { CodexInterventionError } from "../codex/backend.js";
 import type { PromptBufferItem } from "./prompt-buffer.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
+import type { TurnParticipantOrigin } from "./turn-audience.js";
 
 /** Serializes controls for one host/thread, without blocking controls on a running turn. */
 export class SessionControlQueue {
@@ -31,6 +32,7 @@ export type PendingIntervention = {
   status: "pending" | "submitted" | "cancelled";
 };
 type Receipt = { status: "sending" | "accepted" | "uncertain"; result?: CodexInputReceipt;
+  origin?: TurnParticipantOrigin;
   presentation?: AcceptedPresentationInput };
 
 /** Write-ahead receipts: an unknown transport outcome is never automatically resubmitted. */
@@ -42,8 +44,8 @@ export class SessionControlJournal {
   }
   private save(): void { writeJsonFile(this.filePath, this.state); }
 
-  steer(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, hostId?: string): Promise<CodexInputReceipt> {
-    return this.submit(key, messageId, action, hostId);
+  steer(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, hostId?: string, origin?: TurnParticipantOrigin): Promise<CodexInputReceipt> {
+    return this.submit(key, messageId, action, hostId, origin);
   }
 
   acceptedPresentationInputs(): AcceptedPresentationInput[] {
@@ -52,13 +54,13 @@ export class SessionControlJournal {
       ? [receipt.presentation] : []);
   }
 
-  async submit(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, presentationHostId?: string): Promise<CodexInputReceipt> {
+  async submit(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, presentationHostId?: string, origin?: TurnParticipantOrigin): Promise<CodexInputReceipt> {
     const receiptId = crypto.createHash("sha256").update(JSON.stringify([key, messageId])).digest("hex");
     return this.queue.run(key, async () => {
       const receipt = this.state.receipts[receiptId];
       if (receipt?.status === "accepted" && receipt.result) return receipt.result;
       if (receipt) throw new CodexInterventionError("该条消息已尝试提交，但结果尚未确认；请查看 /history，避免重复执行。");
-      this.state.receipts[receiptId] = { status: "sending" };
+      this.state.receipts[receiptId] = { status: "sending", ...(origin ? { origin } : {}) };
       this.save();
       try {
         const result = await action();
@@ -66,7 +68,7 @@ export class SessionControlJournal {
           ...(presentationHostId && key === JSON.stringify([presentationHostId, result.threadId])
             && result.status === "accepted" && result.turnId && result.threadId ? { presentation: {
             id: `steer:${receiptId}`, kind: "steer" as const, hostId: presentationHostId,
-            threadId: result.threadId, turnId: result.turnId, acceptedAt: Date.now()
+            threadId: result.threadId, turnId: result.turnId, acceptedAt: Date.now(), ...(origin ? { origin } : {})
           } } : {}) };
         this.save();
         return result;

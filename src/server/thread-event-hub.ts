@@ -5,6 +5,7 @@ import type { ChannelTextClient } from "../channels/types.js";
 import type { ChannelStreamCheckpoint } from "../channels/progress.js";
 import { ChannelTurnPresentation, nextTurnCheckpoint } from "../channels/turn-presentation.js";
 import type { AcceptedPresentationInput } from "../bridge/input-presentation.js";
+import type { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { parseActionBlocks } from "../bridge/actions.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus, type FollowSyncOptions } from "../bridge/session-follow.js";
@@ -57,6 +58,7 @@ type FollowState = {
   presentationInputBaseline?: string[];
 };
 type Options = {
+  turnAudience?: TurnAudienceJournal;
   filePath: string;
   subscriptions: () => ThreadSubscription[];
   backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot">;
@@ -374,6 +376,7 @@ export class ThreadEventHub {
             this.save();
           }
         }
+        if (state.turnId && state.completed.includes(state.turnId)) void this.notifyParticipants(sub, state.turnId);
         return this.status(sub.key);
       });
     } catch (error) {
@@ -572,9 +575,28 @@ export class ThreadEventHub {
   }
   /** A confirmed native input splits presentation only. Never completes a turn. */
   async acceptedInput(input: AcceptedPresentationInput): Promise<void> {
+    this.recordParticipant(input);
     await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
       && sub.hostId === input.hostId && sub.threadId === input.threadId)
       .map(sub => this.queue.run(sub.key, () => this.segmentInput(sub, input))));
+  }
+  private recordParticipant(input: AcceptedPresentationInput): void {
+    if (!input.origin) return;
+    this.options.turnAudience?.record({ bindingKey: input.origin.bindingKey, conversationId: input.origin.conversationId,
+      hostId: input.hostId, threadId: input.threadId, turnId: input.turnId }, input.origin, input.acceptedAt);
+  }
+  private async notifyParticipants(sub: ThreadSubscription, turnId: string): Promise<void> {
+    try {
+      const isCurrent = () => {
+        const current = this.currentSubscription(sub);
+        return !this.stopped && current?.recipientId === sub.recipientId && current.client === sub.client;
+      };
+      if (!this.options.turnAudience || !isCurrent() || this.state(sub).turnId !== turnId) return;
+      for (const input of this.presentationInputs(sub, turnId)) this.recordParticipant(input);
+      await this.options.turnAudience.notify({ bindingKey: sub.key, conversationId: sub.recipientId,
+        hostId: sub.hostId, threadId: sub.threadId, turnId }, sub.client,
+      { isCurrent, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered });
+    } catch { console.warn("[codex-im-gateway] turn mention journal unavailable; result delivery preserved"); }
   }
   private presentationInputs(sub: ThreadSubscription, turnId?: string): AcceptedPresentationInput[] {
     return (this.options.acceptedInputs?.() ?? []).filter(input => input.hostId === sub.hostId
@@ -777,7 +799,7 @@ export class ThreadEventHub {
     if (!current) return;
     sub = current;
     const state = this.state(sub);
-    if (state.completed.includes(turnId)) return;
+    if (state.completed.includes(turnId)) { void this.notifyParticipants(sub, turnId); return; }
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
     const clean = visibleText(text).trim() || "任务已结束。";
     state.terminalPending ??= { turnId, text: clean, fallbackSent: false };
@@ -804,6 +826,8 @@ export class ThreadEventHub {
     state.sequence++;
     this.logDelivery(sub, turnId, "delivered");
     this.save();
+    // An ancillary reminder must not hold the progress/control serial queue.
+    void this.notifyParticipants(sub, turnId);
   }
 
   private logDelivery(sub: ThreadSubscription, turnId: string, status: "pending" | "delivered"): void {

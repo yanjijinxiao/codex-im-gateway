@@ -12,7 +12,7 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
 
   constructor(account: WeComAccount, options: { wsClient?: InstanceType<typeof AiBot.WSClient> } = {}) {
     this.wsClient = options.wsClient ?? new AiBot.WSClient({ botId: account.botId, secret: account.secret });
-    this.client = createChannelClient("wecom", TEXT_CAPABILITIES, this);
+    this.client = createChannelClient("wecom", { ...TEXT_CAPABILITIES, mentions: "not-implemented" }, this);
   }
 
   async sendText(input: { toUserId: string; text: string }): Promise<{ messageId: string }> {

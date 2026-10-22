@@ -1264,3 +1264,46 @@ function noEmotionClient(): DingTalkEmotionClient {
     async recall() {}
   };
 }
+
+test("DingTalk completion @ uses native webhook recipients, with no AI Card recreation", async () => {
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  const sent: any[] = [], received: any[] = [];
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
+    clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
+    apiTransport: new PinnedNetworkLifecycleTransport("ipv4", async (_family, _url, init) => {
+      sent.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ errcode: 0, processQueryKey: "mention" }), { status: 200 });
+    }), cardClient: { async create() { throw new Error("must not create card"); }, async update() {} },
+    emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }), now: () => 1_800_000_000_000
+  });
+  const abort = new AbortController(), ready = Promise.withResolvers<void>();
+  const monitor = adapter.monitor({ signal: abort.signal, async onMessage(message) { received.push(message); ready.resolve(); } });
+  try {
+    listener!(frame(robotMessage())); await ready.promise;
+    assert.deepEqual(received[0].mention, { userId: "staff-123", name: "Tester" });
+    await adapter.client.sendMentionNotification({ toUserId: "conversation-123", text: "完成", mentions: [{ userId: "staff-123" }, { userId: "staff-456" }] });
+    assert.deepEqual(sent, [{ msgtype: "text", text: { content: "@staff-123 @staff-456\n完成" }, at: { atUserIds: ["staff-123", "staff-456"], isAtAll: false } }]);
+  } finally { abort.abort(); await monitor; }
+});
+
+for (const transport of ["https", "sdk"] as const) {
+  test(`DingTalk ${transport} completion card @ survives ephemeral webhook loss using the persisted group route`, async () => {
+    const deliveries: any[] = [];
+    const client = transport === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
+      if (String(url).endsWith("/deliver")) deliveries.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ success: true, result: init?.method === "PUT" ? true
+        : String(url).endsWith("/deliver") ? [{ success: true }] : "instance" }), { status: 200 });
+    }, [0], async () => {}) : new DingTalkSdkAICardClient({
+      async createCardWithOptions() { return { statusCode: 200, body: { success: true, result: "instance" } }; },
+      async deliverCardWithOptions(request: unknown) { deliveries.push(request); return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
+      async updateCardWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; },
+      async streamingUpdateWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; }
+    } as never, [0], async () => {});
+    const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+      cardTemplateId: "template", savedAt: "", enabled: true }, { cardRouting: cardRouting(), cardClient: client,
+      streamClient: { async getAccessToken() { return "fake"; } } as never,
+      async webhookSender() { throw new Error("no ephemeral route after restart"); } });
+    await adapter.client.sendMentionNotification({ toUserId: "cid-test", text: "完成", mentions: [{ userId: "staff-123", name: "Tester" }] });
+    assert.equal(deliveries.length, 1); assert.equal(deliveries[0].openSpaceId, "dtv1.card//IM_GROUP.cid-test");
+    assert.deepEqual(deliveries[0].imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester" });
+  });
+}
