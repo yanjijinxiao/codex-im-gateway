@@ -3,6 +3,7 @@ import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "
 import { codexFailureSummary } from "../codex/turn-failure.js";
 import type { ChannelTextClient } from "../channels/types.js";
 import type { ChannelStreamCheckpoint } from "../channels/progress.js";
+import { completedCardForMentions } from "../channels/completion-mentions.js";
 import { ChannelTurnPresentation, nextTurnCheckpoint } from "../channels/turn-presentation.js";
 import type { AcceptedPresentationInput } from "../bridge/input-presentation.js";
 import type { TurnAudienceJournal } from "../bridge/turn-audience.js";
@@ -589,13 +590,15 @@ export class ThreadEventHub {
     try {
       const isCurrent = () => {
         const current = this.currentSubscription(sub);
-        return !this.stopped && current?.recipientId === sub.recipientId && current.client === sub.client;
+        return !this.stopped && current?.recipientId === sub.recipientId && current.client === sub.client
+          && this.state(sub).turnId === turnId;
       };
       if (!this.options.turnAudience || !isCurrent() || this.state(sub).turnId !== turnId) return;
       for (const input of this.presentationInputs(sub, turnId)) this.recordParticipant(input);
       await this.options.turnAudience.notify({ bindingKey: sub.key, conversationId: sub.recipientId,
         hostId: sub.hostId, threadId: sub.threadId, turnId }, sub.client,
-      { isCurrent, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered });
+      { isCurrent, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered,
+        completedCard: completedCardForMentions(this.state(sub).checkpoint) });
     } catch { console.warn("[codex-im-gateway] turn mention journal unavailable; result delivery preserved"); }
   }
   private presentationInputs(sub: ThreadSubscription, turnId?: string): AcceptedPresentationInput[] {

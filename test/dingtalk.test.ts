@@ -1307,3 +1307,76 @@ for (const transport of ["https", "sdk"] as const) {
     assert.deepEqual(deliveries[0].imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester" });
   });
 }
+
+for (const transport of ["https", "sdk"] as const) {
+  test(`DingTalk ${transport} merges full result and native @, then summarizes only the original segment`, async () => {
+    const calls: Array<{ operation: string; body: any }> = [];
+    const client = transport === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
+      const operation = String(url).endsWith("/deliver") ? "deliver" : init?.method === "POST" ? "create"
+        : String(url).endsWith("/streaming") ? "stream" : "state";
+      calls.push({ operation, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ success: true, result: operation === "create" ? "instance"
+        : operation === "deliver" ? [{ success: true }] : true }), { status: 200 });
+    }, [0], async () => {}) : new DingTalkSdkAICardClient({
+      async createCardWithOptions(body: unknown) { calls.push({ operation: "create", body }); return { statusCode: 200, body: { success: true, result: "instance" } }; },
+      async deliverCardWithOptions(body: unknown) { calls.push({ operation: "deliver", body }); return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
+      async updateCardWithOptions(body: unknown) { calls.push({ operation: "state", body }); return { statusCode: 200, body: { success: true, result: true } }; },
+      async streamingUpdateWithOptions(body: unknown) { calls.push({ operation: "stream", body }); return { statusCode: 200, body: { success: true, result: true } }; }
+    } as never, [0], async () => {});
+    let listener: ((message: DWClientDownStream) => void) | undefined;
+    const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+      cardTemplateId: "template", savedAt: "", enabled: true }, { cardClient: client,
+      streamClient: streamClientThatCaptures(callback => { listener = callback; }), emotionClient: noEmotionClient(),
+      async webhookSender() { throw new Error("a combined result must not use the otherwise available webhook"); }, now: () => 1_800_000_000_000 });
+    const abort = new AbortController(), ready = Promise.withResolvers<void>();
+    const monitor = adapter.monitor({ signal: abort.signal, async onMessage() { ready.resolve(); } });
+    try {
+      listener!(frame(robotMessage())); await ready.promise;
+      const receipt = await adapter.client.sendMentionNotification({ toUserId: "conversation-123", text: "full result",
+        mentions: [{ userId: "staff-123", name: "Tester" }, { userId: "staff-456", name: "Other" }],
+        completedCard: { messageId: "original-segment", text: "full result", summary: "phase summary" } });
+      assert.notEqual(receipt.messageId, "original-segment");
+      assert.equal(calls.filter(item => item.operation === "create").length, 1);
+      const delivery = calls.find(item => item.operation === "deliver")!.body;
+      assert.equal(delivery.outTrackId, receipt.messageId); assert.equal(delivery.openSpaceId, "dtv1.card//IM_GROUP.conversation-123");
+      assert.deepEqual(delivery.imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester", "staff-456": "Other" });
+      assert.deepEqual(calls.filter(item => item.operation === "stream").map(item => [item.body.outTrackId, item.body.content]),
+        [[receipt.messageId, "full result"], ["original-segment", "phase summary"]]);
+      const newFinal = calls.findIndex(item => item.operation === "state" && item.body.outTrackId === receipt.messageId && item.body.cardData.cardParamMap.flowStatus === "3");
+      const oldFirst = calls.findIndex(item => item.body.outTrackId === "original-segment");
+      assert.ok(newFinal > 0 && oldFirst > newFinal, "never remove the old answer before the new final content is acknowledged");
+      assert.equal(calls.filter(item => item.operation === "deliver").length, 1, "no re-delivery of the source card and no extra reminder");
+      assert.equal(calls.at(-1)!.body.outTrackId, "original-segment");
+    } finally { abort.abort(); await monitor; }
+  });
+}
+
+for (const failure of ["create", "deliver", "final", "summary"] as const) {
+  test(`DingTalk merged result ${failure} failure never causes a second delivery or prematurely removes the original answer`, async () => {
+    const calls: Array<{ operation: string; outTrackId: string; text?: string }> = [];
+    const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+      cardTemplateId: "template", savedAt: "", enabled: true }, { cardRouting: cardRouting(), emotionClient: noEmotionClient(),
+      streamClient: { async getAccessToken() { return "fake"; } } as never,
+      async webhookSender() { throw new Error("no fallback"); },
+      cardClient: {
+        async create(input) {
+          calls.push({ operation: "create", outTrackId: input.outTrackId, text: input.text });
+          if (failure === "create") throw new Error("unknown create receipt");
+          calls.push({ operation: "deliver", outTrackId: input.outTrackId });
+          if (failure === "deliver") throw new Error("unknown delivery receipt");
+        },
+        async update(input) {
+          const summary = input.outTrackId === "original-segment";
+          calls.push({ operation: summary ? "summary" : "final", outTrackId: input.outTrackId, text: input.text });
+          if (failure === (summary ? "summary" : "final")) throw new Error("unknown update receipt");
+        }
+      } });
+    const operation = adapter.client.sendMentionNotification({ toUserId: "cid-test", text: "result", mentions: [{ userId: "staff-123" }],
+      completedCard: { messageId: "original-segment", text: "result", summary: "summary" } });
+    if (failure === "summary") assert.ok((await operation).messageId);
+    else await assert.rejects(operation);
+    assert.equal(calls.filter(item => item.operation === "create").length, 1);
+    assert.equal(calls.some(item => item.operation === "summary"), failure === "summary");
+    assert.equal(calls.some(item => item.operation === "deliver" && item.outTrackId === "original-segment"), false);
+  });
+}

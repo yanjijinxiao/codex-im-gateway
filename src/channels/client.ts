@@ -58,6 +58,13 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
       requireFeature("mentions", caps.mentions ?? "unsupported");
       if (!input.mentions.length || input.mentions.length > (caps.mentionBatchSize ?? 50)
         || input.mentions.some(item => !isDirectedMentionId(item.userId))) throw new Error("Invalid directed mention recipients");
+      if (input.completedCard) {
+        requireFeature("completionMentionCard", caps.completionMentionCard ?? "not-implemented");
+        if (!input.completedCard.messageId.trim() || !input.completedCard.summary.trim()
+          || !input.completedCard.text.trim() || resultPages(input.completedCard.text, caps.resultPageBytes).length !== 1) {
+          throw new Error("Invalid completed card context");
+        }
+      }
       return acknowledged("sendMentionNotification", required(driver.sendMentionNotification, "mentions").call(driver, input));
     },
     async sendProgressText(input) {

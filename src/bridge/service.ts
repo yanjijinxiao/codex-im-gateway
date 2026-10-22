@@ -7,6 +7,7 @@ import { SessionControlJournal, SessionControlQueue } from "./session-control.js
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import { TurnAudienceJournal, type TurnParticipantOrigin } from "./turn-audience.js";
 import { ChannelTurnPresentation, type TurnReplyStream } from "../channels/turn-presentation.js";
+import { completedCardForMentions } from "../channels/completion-mentions.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
@@ -2339,7 +2340,7 @@ export class BridgeService {
           resultDelivered = true;
         }
         if (!journaled && bound && result.turnId && resultDelivered) {
-          void this.notifyTurnParticipants(session, result.turnId, stillBound);
+          void this.notifyTurnParticipants(session, result.turnId, stillBound, replyStream?.checkpoint());
         }
         for (const action of parsed.actions.send) {
           if (!stillBound()) break;
@@ -2378,7 +2379,7 @@ export class BridgeService {
       }
       if (failureWasReported) markMessageHandlingErrorReported(error);
       if (failureWasReported && error instanceof CodexTurnExecutionError && acceptedTurnId && stillBound()) {
-        void this.notifyTurnParticipants(session, acceptedTurnId, stillBound);
+        void this.notifyTurnParticipants(session, acceptedTurnId, stillBound, replyStream?.checkpoint());
       }
       await this.options.onTurnCompleted?.({
         senderId: message.senderId,
@@ -2804,11 +2805,13 @@ export class BridgeService {
       return receipt;
     } finally { release(); }
   }
-  private async notifyTurnParticipants(session: ManagedSession, turnId: string, isCurrent: () => boolean): Promise<void> {
+  private async notifyTurnParticipants(session: ManagedSession, turnId: string, isCurrent: () => boolean,
+    checkpoint?: ReturnType<TurnReplyStream["checkpoint"]>): Promise<void> {
     if (!session.threadId) return;
     try { await this.turnAudience.notify({ bindingKey: JSON.stringify([this.options.accountId ?? "standalone", session.id]),
       conversationId: session.senderId, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, turnId }, this.channel,
-    { isCurrent: () => !this.audienceSuspended && isCurrent(), contextToken: this.options.stateStore.getContextToken(session.senderId) }); }
+    { isCurrent: () => !this.audienceSuspended && isCurrent(), contextToken: this.options.stateStore.getContextToken(session.senderId),
+      completedCard: completedCardForMentions(checkpoint) }); }
     catch { console.warn("[codex-im-gateway] turn mention journal unavailable; result delivery preserved"); }
   }
   private async presentControlReceipt(session: ManagedSession, turnId: string): Promise<void> {

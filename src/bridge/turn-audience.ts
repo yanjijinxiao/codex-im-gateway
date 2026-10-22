@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
-import type { ChannelMention, ChannelTextClient } from "../channels/types.js";
+import type { ChannelCompletedCard, ChannelMention, ChannelTextClient } from "../channels/types.js";
 import { isDirectedMentionId } from "../channels/mentions.js";
 
 /** Transport-confirmed identity, scoped to the binding that received the input.
@@ -19,7 +19,9 @@ export type TurnAudienceScope = {
   turnId: string;
 };
 type Participant = { actorId: string; mention?: ChannelMention; acceptedAt: number };
-type Notice = { status: "pending" | "attempted" | "delivered" | "unconfirmed"; mentions: ChannelMention[]; messageId?: string };
+type Notice = { status: "pending" | "attempted" | "delivered" | "unconfirmed"; mentions: ChannelMention[]; messageId?: string;
+  /** Freeze the presentation choice and source identity, but not the answer body. */
+  completedCardId?: string };
 type Audience = TurnAudienceScope & {
   participants: Participant[];
   /** Frozen at completion; every batch is attempted at most once, including after a crash. */
@@ -78,6 +80,7 @@ export class TurnAudienceJournal {
   async notify(scope: TurnAudienceScope, client: ChannelTextClient, options: {
     isCurrent: () => boolean;
     contextToken?: string;
+    completedCard?: ChannelCompletedCard;
     onTextDelivered?: (part: { messageId: string; text: string }) => void;
   }): Promise<void> {
     const key = keyOf(scope), record = this.records[key];
@@ -96,19 +99,26 @@ export class TurnAudienceJournal {
       if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid mention batch size");
       record.notices = [];
       for (let index = 0; index < mentions.length; index += limit) {
-        record.notices.push({ status: "pending", mentions: mentions.slice(index, index + limit) });
+        record.notices.push({ status: "pending", mentions: mentions.slice(index, index + limit),
+          ...(mentions.length <= limit && client.capabilities.completionMentionCard === "available" && options.completedCard
+            ? { completedCardId: options.completedCard.messageId } : {}) });
       }
       this.save();
     }
     for (const notice of record.notices) {
       if (!options.isCurrent()) break;
       if (notice.status !== "pending") continue;
+      // A restart must not substitute another segment or silently downgrade a
+      // planned result card to the former extra reminder. Wait for exact context.
+      if (notice.completedCardId && (options.completedCard?.messageId !== notice.completedCardId
+        || client.capabilities?.completionMentionCard !== "available")) continue;
       // Write ahead of the external send. A crash here is unknown, never a retry.
       notice.status = "attempted"; this.save();
-      const text = "本轮最终答复已更新，请查看上方完整结果。";
+      const text = notice.completedCardId ? options.completedCard!.text : "本轮最终答复已更新，请查看上方完整结果。";
       try {
         const receipt = await client.sendMentionNotification!({ toUserId: scope.conversationId, text,
-          mentions: notice.mentions, contextToken: options.contextToken });
+          mentions: notice.mentions, contextToken: options.contextToken,
+          ...(notice.completedCardId ? { completedCard: options.completedCard } : {}) });
         if (!receipt?.messageId?.trim()) throw new Error("Missing mention receipt");
         notice.status = "delivered"; notice.messageId = receipt.messageId; this.save();
       } catch {

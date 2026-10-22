@@ -181,7 +181,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.now = options.now ?? Date.now;
     this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
     this.client = createChannelClient("dingtalk", {
-      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50, inbound: { ...NO_MEDIA, image: "available", file: "available" },
+      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50,
+      completionMentionCard: account.cardTemplateId?.trim() ? "available" : "not-configured",
+      inbound: { ...NO_MEDIA, image: "available", file: "available" },
       outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
@@ -234,6 +236,22 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   async sendMentionNotification(input: ChannelMentionInput): Promise<{ messageId: string }> {
     const target = this.cardTarget(input.toUserId);
     if (target.conversationType !== "2") throw new ChannelCapabilityError("dingtalk", "mentions", "群聊定向提醒仅适用于已确认群聊");
+    if (input.completedCard) {
+      // Native @ belongs to delivery, not /instances or /streaming updates.
+      // Deliver the whole answer WITH its recipients first; only then retire
+      // the acknowledged source card. Never re-deliver that original instance.
+      const receipt = await this.createTextCard(target, input.completedCard.text, true, undefined,
+        Object.fromEntries(input.mentions.map(item => [item.userId, item.name || "参与者"])));
+      try {
+        await this.updateTextStream({ toUserId: input.toUserId, messageId: input.completedCard.messageId,
+          text: input.completedCard.summary, finalize: true });
+      } catch {
+        // The result/@ is acknowledged. A summary failure must neither resend
+        // it nor invalidate the result. Leaving the original answer is safe.
+        console.warn("[codex-im-gateway] completion mention card delivered; original summary update unavailable");
+      }
+      return receipt;
+    }
     const reply = this.replyTargets.get(input.toUserId);
     // Select before any external write. Never switch transports after an ambiguous send.
     if (reply && (reply.expiresAt === undefined || reply.expiresAt > this.now())) {

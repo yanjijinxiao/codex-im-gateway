@@ -8,7 +8,13 @@ export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
 export type ChannelTextInput = { toUserId: string; text: string; contextToken?: string };
 export type ChannelMention = { userId: string; name?: string };
-export type ChannelMentionInput = ChannelTextInput & { mentions: readonly ChannelMention[] };
+/** Trusted delivery context, never parsed from model text. The source card is
+ * already fully acknowledged; retain it if the combined result is uncertain. */
+export type ChannelCompletedCard = { messageId: string; text: string; summary: string };
+export type ChannelMentionInput = ChannelTextInput & {
+  mentions: readonly ChannelMention[];
+  completedCard?: ChannelCompletedCard;
+};
 
 export type ChannelTextClient = {
   /** Legacy transport boundary. Production consumers receive a ChannelClient. */
@@ -47,6 +53,8 @@ export type Capability = "available" | "not-configured" | "not-implemented" | "u
 export type ChannelCapabilities = {
   readonly mentions?: Capability;
   readonly mentionBatchSize?: number;
+  /** Can deliver the result and native mentions together, then summarize the source card. */
+  readonly completionMentionCard?: Capability;
   /** Conservative UTF-8 budget for each complete-result page. */
   readonly resultPageBytes?: number;
   /** Presentation supported by this adapter, independent of actionable buttons. */
