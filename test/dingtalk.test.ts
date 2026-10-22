@@ -1287,16 +1287,19 @@ test("DingTalk completion @ uses native webhook recipients, with no AI Card recr
 
 for (const transport of ["https", "sdk"] as const) {
   test(`DingTalk ${transport} completion card @ survives ephemeral webhook loss using the persisted group route`, async () => {
-    const deliveries: any[] = [];
+    const deliveries: any[] = [], creations: any[] = [], frames: string[] = [];
     const client = transport === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
-      if (String(url).endsWith("/deliver")) deliveries.push(JSON.parse(String(init?.body)));
+      const body = JSON.parse(String(init?.body));
+      if (String(url).endsWith("/deliver")) deliveries.push(body);
+      else if (init?.method === "POST") creations.push(body);
+      else frames.push(body.content ?? body.cardData.cardParamMap.content);
       return new Response(JSON.stringify({ success: true, result: init?.method === "PUT" ? true
         : String(url).endsWith("/deliver") ? [{ success: true }] : "instance" }), { status: 200 });
     }, [0], async () => {}) : new DingTalkSdkAICardClient({
-      async createCardWithOptions() { return { statusCode: 200, body: { success: true, result: "instance" } }; },
+      async createCardWithOptions(request: unknown) { creations.push(request); return { statusCode: 200, body: { success: true, result: "instance" } }; },
       async deliverCardWithOptions(request: unknown) { deliveries.push(request); return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
-      async updateCardWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; },
-      async streamingUpdateWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; }
+      async updateCardWithOptions(request: any) { frames.push(request.cardData.cardParamMap.content); return { statusCode: 200, body: { success: true, result: true } }; },
+      async streamingUpdateWithOptions(request: any) { frames.push(request.content); return { statusCode: 200, body: { success: true, result: true } }; }
     } as never, [0], async () => {});
     const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
       cardTemplateId: "template", savedAt: "", enabled: true }, { cardRouting: cardRouting(), cardClient: client,
@@ -1305,6 +1308,11 @@ for (const transport of ["https", "sdk"] as const) {
     await adapter.client.sendMentionNotification({ toUserId: "cid-test", text: "完成", mentions: [{ userId: "staff-123", name: "Tester" }] });
     assert.equal(deliveries.length, 1); assert.equal(deliveries[0].openSpaceId, "dtv1.card//IM_GROUP.cid-test");
     assert.deepEqual(deliveries[0].imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester" });
+    assert.deepEqual(creations[0].cardAtUserIds, ["staff-123"]);
+    assert.equal(creations[0].userIdType, 1);
+    const expected = "<a atId=staff-123>Tester</a>\n\n完成";
+    assert.equal(creations[0].cardData.cardParamMap.content, expected);
+    assert.deepEqual(frames, [expected, expected, expected], "initial state, full streaming frame and completed state retain the same native anchor and body");
   });
 }
 
@@ -1337,17 +1345,43 @@ for (const transport of ["https", "sdk"] as const) {
         completedCard: { messageId: "original-segment", text: "full result", summary: "phase summary" } });
       assert.notEqual(receipt.messageId, "original-segment");
       assert.equal(calls.filter(item => item.operation === "create").length, 1);
+      const created = calls.find(item => item.operation === "create")!.body;
+      const expected = "<a atId=staff-123>Tester</a> <a atId=staff-456>Other</a>\n\nfull result";
+      assert.deepEqual(created.cardAtUserIds, ["staff-123", "staff-456"]);
+      assert.equal(created.userIdType, 1);
+      assert.equal(created.cardData.cardParamMap.content, expected);
       const delivery = calls.find(item => item.operation === "deliver")!.body;
       assert.equal(delivery.outTrackId, receipt.messageId); assert.equal(delivery.openSpaceId, "dtv1.card//IM_GROUP.conversation-123");
       assert.deepEqual(delivery.imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester", "staff-456": "Other" });
       assert.deepEqual(calls.filter(item => item.operation === "stream").map(item => [item.body.outTrackId, item.body.content]),
-        [[receipt.messageId, "full result"], ["original-segment", "phase summary"]]);
+        [[receipt.messageId, expected], ["original-segment", "phase summary"]]);
+      assert.deepEqual(calls.filter(item => item.operation === "state" && item.body.outTrackId === receipt.messageId)
+        .map(item => item.body.cardData.cardParamMap.content), [expected, expected]);
+      assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "stream", "state", "state", "stream", "state"]);
       const newFinal = calls.findIndex(item => item.operation === "state" && item.body.outTrackId === receipt.messageId && item.body.cardData.cardParamMap.flowStatus === "3");
       const oldFirst = calls.findIndex(item => item.body.outTrackId === "original-segment");
       assert.ok(newFinal > 0 && oldFirst > newFinal, "never remove the old answer before the new final content is acknowledged");
       assert.equal(calls.filter(item => item.operation === "deliver").length, 1, "no re-delivery of the source card and no extra reminder");
       assert.equal(calls.at(-1)!.body.outTrackId, "original-segment");
     } finally { abort.abort(); await monitor; }
+  });
+}
+
+for (const transport of ["https", "sdk"] as const) {
+  test(`DingTalk ${transport} rejects invalid @ metadata before creating or delivering anything`, async () => {
+    const unexpected = async (): Promise<never> => { throw new Error("unexpected external write"); };
+    const client = transport === "https" ? new DingTalkHttpsAICardClient(unexpected, [0]) : new DingTalkSdkAICardClient({
+      createCardWithOptions: unexpected, deliverCardWithOptions: unexpected,
+      updateCardWithOptions: unexpected, streamingUpdateWithOptions: unexpected
+    } as never, [0]);
+    for (const atUserIds of [{}, { "@ALL": "@ALL" }, { "bad id": "name" }, { alice: "" },
+      Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`u${i}`, "name"]))]) {
+      const input = { accessToken: "fake", outTrackId: "invalid", robotCode: "fake", target: { type: "group" as const, conversationId: "group" }, atUserIds };
+      await assert.rejects(client.create({ ...input, cardTemplateId: "template", contentKey: "content", text: "body" }), /Invalid DingTalk/);
+      await assert.rejects(client.deliver!(input), /Invalid DingTalk/);
+    }
+    await assert.rejects(client.create({ accessToken: "fake", outTrackId: "dm", robotCode: "fake", cardTemplateId: "template",
+      contentKey: "content", text: "body", target: { type: "user", staffId: "alice" }, atUserIds: { alice: "Alice" } }), /Invalid DingTalk/);
   });
 }
 

@@ -24,6 +24,9 @@ export type ChannelTextClient = {
   sendText(input: ChannelTextInput): Promise<{ messageId: string }>;
   /** Completion-only, native directed mention. Never parsed from model text. */
   sendMentionNotification?(input: ChannelMentionInput): Promise<ChannelReceipt>;
+  /** Pure preflight, before freezing a delivery plan. Includes provider markup
+   * overhead; false preserves the acknowledged result and uses a short notice. */
+  canCombineCompletionMentionCard?(input: { completedCard: ChannelCompletedCard; mentions: readonly ChannelMention[] }): boolean;
   /** Plain delivery for native text progress or a terminal error notice; never create an AI Card. */
   sendProgressText?(input: ChannelTextInput): Promise<{ messageId: string }>;
   /** Repeated starts with the same streamId must target the same logical card. */

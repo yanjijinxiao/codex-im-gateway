@@ -118,6 +118,21 @@ test("multi-batch audiences keep one short notification per batch instead of cop
   assert.ok(writes.every(item => !item.completedCard && !item.text.includes("complete answer")));
 });
 
+test("provider overhead is preflighted before freezing a merge; restart cannot promote the short plan", async t => {
+  const { audience, file } = journal(t), writes: ChannelMentionInput[] = [];
+  record(audience);
+  const client = channel(writes);
+  client.canCombineCompletionMentionCard = () => false;
+  let current = 0;
+  await audience.notify(scope, client, { isCurrent: () => ++current === 1, completedCard: completedCardForMentions(checkpoint()) });
+  const saved = fs.readFileSync(file, "utf8");
+  assert.doesNotMatch(saved, /completedCardId/);
+  await new TurnAudienceJournal(file).notify(scope, channel(writes), { isCurrent: () => true, completedCard: completedCardForMentions(checkpoint()) });
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].completedCard, undefined);
+  assert.equal(writes[0].text, "本轮最终答复已更新，请查看上方完整结果。");
+});
+
 test("in-flight accepted input joins the merge, but detaching before receipt release stays quiet", async t => {
   const { audience } = journal(t), writes: ChannelMentionInput[] = [];
   const release = audience.hold(scope); record(audience);

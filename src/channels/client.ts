@@ -52,8 +52,12 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
     } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
     return { messageId: parts.at(-1)!.messageId, parts };
   };
+  const canCombineCompletionMentionCard: NonNullable<ChannelTextClient["canCombineCompletionMentionCard"]> = input =>
+    caps.completionMentionCard === "available"
+    && resultPages(input.completedCard.text, caps.resultPageBytes).length === 1
+    && (driver.canCombineCompletionMentionCard?.(input) ?? true);
   return {
-    channel, capabilities: caps, resumableTextStream: caps.resumableProgress, sendText,
+    channel, capabilities: caps, resumableTextStream: caps.resumableProgress, sendText, canCombineCompletionMentionCard,
     async sendMentionNotification(input) {
       requireFeature("mentions", caps.mentions ?? "unsupported");
       if (!input.mentions.length || input.mentions.length > (caps.mentionBatchSize ?? 50)
@@ -61,7 +65,7 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
       if (input.completedCard) {
         requireFeature("completionMentionCard", caps.completionMentionCard ?? "not-implemented");
         if (!input.completedCard.messageId.trim() || !input.completedCard.summary.trim()
-          || !input.completedCard.text.trim() || resultPages(input.completedCard.text, caps.resultPageBytes).length !== 1) {
+          || !input.completedCard.text.trim() || !canCombineCompletionMentionCard({ ...input, completedCard: input.completedCard })) {
           throw new Error("Invalid completed card context");
         }
       }

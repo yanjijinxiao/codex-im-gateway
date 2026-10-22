@@ -31,6 +31,8 @@ import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
 import { dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
+import { dingTalkMentionCard, dingTalkCardAtParameters } from "./dingtalk-mentions.js";
+import { DEFAULT_RESULT_PAGE_BYTES } from "./result-pages.js";
 import {
   PinnedNetworkLifecycleTransport,
   type NetworkFamilyPolicy
@@ -233,15 +235,20 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
   }
 
+  canCombineCompletionMentionCard(input: Parameters<NonNullable<ChannelTextClient["canCombineCompletionMentionCard"]>>[0]): boolean {
+    const card = dingTalkMentionCard(input.completedCard.text, input.mentions);
+    return Buffer.byteLength(normalizeDingTalkCardContent(card.text)) <= DEFAULT_RESULT_PAGE_BYTES;
+  }
+
   async sendMentionNotification(input: ChannelMentionInput): Promise<{ messageId: string }> {
     const target = this.cardTarget(input.toUserId);
     if (target.conversationType !== "2") throw new ChannelCapabilityError("dingtalk", "mentions", "群聊定向提醒仅适用于已确认群聊");
     if (input.completedCard) {
-      // Native @ belongs to delivery, not /instances or /streaming updates.
+      // Native @ needs creation whitelist + body anchors + delivery recipients.
       // Deliver the whole answer WITH its recipients first; only then retire
       // the acknowledged source card. Never re-deliver that original instance.
-      const receipt = await this.createTextCard(target, input.completedCard.text, true, undefined,
-        Object.fromEntries(input.mentions.map(item => [item.userId, item.name || "参与者"])));
+      const card = dingTalkMentionCard(input.completedCard.text, input.mentions);
+      const receipt = await this.createTextCard(target, card.text, true, undefined, card.atUserIds);
       try {
         await this.updateTextStream({ toUserId: input.toUserId, messageId: input.completedCard.messageId,
           text: input.completedCard.summary, finalize: true });
@@ -260,8 +267,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
     // Persisted group routing permits a small completion notice after restart,
     // even when the ephemeral session webhook is gone. Do not duplicate the answer.
-    return this.createTextCard(target, input.text, true, undefined,
-      Object.fromEntries(input.mentions.map(item => [item.userId, item.name || "参与者"])));
+    const card = dingTalkMentionCard(input.text, input.mentions);
+    return this.createTextCard(target, card.text, true, undefined, card.atUserIds);
   }
 
   /** Read-only table in the existing AI template; selection remains a slash command. */
@@ -731,6 +738,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     lifecycleId?: string;
     onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void> {
+    const mentionParameters = dingTalkCardAtParameters(input.target, input.atUserIds);
     const suppliedLifecycleId = input.lifecycleId?.trim();
     const lifecycle = { id: suppliedLifecycleId || input.outTrackId, owned: !suppliedLifecycleId };
     this.cardLifecycles.set(input.outTrackId, lifecycle);
@@ -739,6 +747,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       await this.mutate(lifecycle.id, "create", "/v1.0/card/instances", "POST", input.accessToken, {
         cardTemplateId: input.cardTemplateId,
         outTrackId: input.outTrackId,
+        ...mentionParameters,
         cardData: { cardParamMap: initialDingTalkCardData(input) },
         callbackType: "STREAM",
         imGroupOpenSpaceModel: { supportForward: true },
@@ -761,6 +770,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
   }
 
   async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void> {
+    dingTalkCardAtParameters(input.target, input.atUserIds);
     const lifecycle = this.cardLifecycles.get(input.outTrackId) ?? { id: input.outTrackId, owned: true };
     this.cardLifecycles.set(input.outTrackId, lifecycle);
     await this.mutate(lifecycle.id, "deliver", "/v1.0/card/instances/deliver", "POST", input.accessToken, {
@@ -957,11 +967,13 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     text: string;
     onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
   }): Promise<void> {
+    const mentionParameters = dingTalkCardAtParameters(input.target, input.atUserIds);
     let operation: "create" | "deliver" = "create";
     try {
       const createRequest = new DingTalk.card_1_0.CreateCardRequest({
         cardTemplateId: input.cardTemplateId,
         outTrackId: input.outTrackId,
+        ...mentionParameters,
         cardData: new DingTalk.card_1_0.CreateCardRequestCardData({
           cardParamMap: initialDingTalkCardData(input)
         }),
@@ -992,6 +1004,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
   }
 
   async deliver(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void> {
+      dingTalkCardAtParameters(input.target, input.atUserIds);
       const deliverRequest = new DingTalk.card_1_0.DeliverCardRequest({
         outTrackId: input.outTrackId,
         userIdType: 1,

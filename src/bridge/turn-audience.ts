@@ -97,10 +97,12 @@ export class TurnAudienceJournal {
       }
       const limit = client.capabilities.mentionBatchSize ?? 50;
       if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid mention batch size");
+      const combine = mentions.length <= limit && client.capabilities.completionMentionCard === "available" && options.completedCard
+        && (client.canCombineCompletionMentionCard?.({ completedCard: options.completedCard, mentions }) ?? true);
       record.notices = [];
       for (let index = 0; index < mentions.length; index += limit) {
         record.notices.push({ status: "pending", mentions: mentions.slice(index, index + limit),
-          ...(mentions.length <= limit && client.capabilities.completionMentionCard === "available" && options.completedCard
+          ...(combine && options.completedCard
             ? { completedCardId: options.completedCard.messageId } : {}) });
       }
       this.save();

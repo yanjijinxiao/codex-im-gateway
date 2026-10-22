@@ -54,7 +54,9 @@ Gateway 有两个相互独立的适配维度：IM 渠道负责输入和呈现，
 
 渠道契约包含 `mentions`、`mentionBatchSize`、`completionMentionCard` 和 `sendMentionNotification`，与普通 `sendText`/AI Card 正文更新分开。`completedCardForMentions` 仅从当前已完成段的单页卡片确认检查点提取正文、原卡 ID 和进度小结，不接受旧段或未确认页。通知日志只保存合并计划的原卡 ID，不复制保存正文；计划被冻结后不改用其他卡片或补发旧式提醒。只使用适配器确认的群成员标识；钉钉只认 `senderStaffId`，不把加密 `senderId` 当员工 ID；飞书文字事件只在明确群聊时提供原生用户 ID。DM、未知身份或未实现渠道照常投递最终结果，不伪造 `@名字`，不自动私聊或跨群寻找身份。禁止 `@all` 和模型文本标签注入。
 
-钉钉官方[投放卡片](https://open.dingtalk.com/document/development/delivery-card-interface)支持 `imGroupOpenDeliverModel.atUserIds`，[更新卡片](https://open.dingtalk.com/document/development/interactive-card-update-interface)不提供该字段；场域通知属性也不等于定向 @。因此配置 AI 模板、有单页确认结果且名单在一个批次内时，新投放一张“完整结果 + 原生 @”卡，然后才将原进度卡更新为最近进展小结，不再另发“请看上方结果”。不重新投放原实例，不伪造正文 @。新卡的创建、投递、最终内容任一步未确认，原完整正文保持不变，也不换 webhook 或再建替代卡；新卡已确认但小结更新失败时保留两份正文，不撤销成功回执或再次提醒。仅使用精确当前段的原卡 ID，答题/steer 先前阶段卡及新 turn 卡不会被改写。
+钉钉原生 @ 有三个独立部分：官方[创建卡片](https://open.dingtalk.com/document/development/interface-for-creating-a-card-instance)要求 `cardAtUserIds` 白名单及正文 `<a atId=员工ID>昵称</a>` 标签（`userIdType:1`）；[投放卡片](https://open.dingtalk.com/document/development/delivery-card-interface)使用 `imGroupOpenDeliverModel.atUserIds` 定向通知；[更新卡片](https://open.dingtalk.com/document/development/interactive-card-update-interface)不提供投放通知字段。投放名单不等于卡内高亮，场域通知属性也不等于定向 @。`dingtalk-mentions.ts` 仅由可信来源名单生成标签，转义显示名及模型正文中的 HTML 锚点，禁止从文本推导身份。HTTPS/SDK 共用创建参数校验；初始非空正文、流式完整终帧、普通完成态快照均使用同一份标签和完整正文，不以仅更新普通状态替代生产流式收尾。
+
+配置 AI 模板、有单页确认结果、名单在一个批次内，且适配器纯预检 `canCombineCompletionMentionCard` 确认规范化正文加原生标签仍在 UTF-8 展示预算内时，新投放一张“完整结果 + 原生 @”卡，然后才将原进度卡更新为最近进展小结，不再另发“请看上方结果”。计划在任何外部写入前冻结；标签开销超预算时保留完整原卡，只发送短通知，不截断正文或丢弃参与者。不重新投放原实例，不伪造正文 @。新卡的创建、投递、最终内容任一步未确认，原完整正文保持不变，也不换 webhook 或再建替代卡；新卡已确认但小结更新失败时保留两份正文，不撤销成功回执或再次提醒。仅使用精确当前段的原卡 ID，答题/steer 先前阶段卡及新 turn 卡不会被改写。
 
 超长分页结果、超过单批名单、未配置模板、纯文本进度沿用原策略，避免截断结果或给每个批次复制完整答案：有有效 session webhook 时用 `at.atUserIds` 与 `isAtAll:false`；没有有效 webhook 时按已持久化确认的群路由投放简短通知卡。HTTPS/SDK 使用相同字段，接口调用后不自动换渠道补发。飞书仍使用文本消息原生 `<at user_id="...">` 标签，其余通知文字转义。普通消息不解析人名生成 @。真实客户端提醒效果仍须上线验收，模拟 API 回执不等于手机已经收到提醒。
 
