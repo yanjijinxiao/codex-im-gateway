@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { codexTurnRecovery } from "./turn-recovery.js";
 import { setTimeout as sleep } from "node:timers/promises";
 import { assertCodexThreadRunnable, CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
 import { lastCodexTurnFailure } from "./turn-failure.js";
@@ -854,6 +855,8 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     activeFlags: Array.isArray(flags) ? flags.filter((flag): flag is "waitingOnApproval" | "waitingOnUserInput" =>
       flag === "waitingOnApproval" || flag === "waitingOnUserInput") : [],
     ...(activeTurn ? { activeTurnId: activeTurn.id } : {}),
+    ...(activeTurn && latestRaw && (latestRaw.turnId ?? latestRaw.id) === activeTurn.id
+      && codexTurnRecovery(threadId, latestRaw) ? { recovery: codexTurnRecovery(threadId, latestRaw) } : {}),
     ...(pendingTurnWithoutId ? { pendingTurnWithoutId: true } : {}),
     ...(turns.at(-1) ? { latestTurnStatus: turns.at(-1)!.status } : {}),
     ...(failure ? { lastTurnFailure: failure } : {}),

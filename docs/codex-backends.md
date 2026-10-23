@@ -17,6 +17,18 @@ CodexExecRunner      AppServerCodexRunner
           Desktop relay only for an owned writer
 ```
 
+## Native execution recovery is not delivery retry
+
+The backend normalizes native errors into a closed vocabulary (`CodexFailureCode`), including current camelCase and legacy PascalCase codes. Model capacity (`serverOverloaded` / "model is at capacity") is distinct from rate limits, exhausted usage, authentication and safety refusal. Provider `additionalDetails`, stack traces and arbitrary error bodies are never copied into IM notices.
+
+App Server `error` notifications carry an exact thread/turn identity and `willRetry`. They are **nonterminal observations**: `willRetry=true` means Codex itself is retrying; `false` waits for the final turn receipt, rather than inventing one. `CodexRunnerInput.onRecovery` projects that state into the existing presentation handle. Progress or answer activity clears the notice; only native completion ends the card. Duplicate errors do not produce more notifications, foreign/late errors cannot reopen a completed turn, and errors arriving before the start receipt are drained only after binding the accepted identity.
+
+Read-only follow uses the same normalized recovery metadata, scoped to the active native turn and its loaded runtime. An active Desktop snapshot with an error but no explicit retry signal is shown as waiting for further status, **not** as a promise of automatic retry. Its notice and original card handle survive Gateway restart. Neither the follow hub nor channel transports acquire execution authority or start another turn to recover a model error.
+
+The installed native protocol has no safe `turn/retry` operation. A confirmed failed turn is therefore reported precisely, with manual retry/model-selection guidance where appropriate; Gateway does not silently issue another `turn/start`, repeat tools, switch models or replay an unconfirmed submission. Native retry policy/backoff belongs to Codex; card delivery retry remains a separate transport concern.
+
+Protocol references: [official App Server lifecycle](https://learn.chatgpt.com/docs/app-server) and installed `codex-cli 0.154.0` generated `ErrorNotification` / `TurnError` / `CodexErrorInfo` types. OpenAI API retry guidance is not treated as a capability to replay a partially executed Codex turn.
+
 ## Contracts
 
 - `CodexBackendAdapter` includes execution plus `CodexBackendControls`: project/session catalogs, inspection, history/paging/snapshots, runtime information, models, rate limits, goals, and lifecycle controls. Both implementations implement every method; unsupported operations return `CodexBackendCapabilityError`.

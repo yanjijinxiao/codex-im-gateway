@@ -11,6 +11,7 @@ import { completedCardForMentions } from "../channels/completion-mentions.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
+import { codexRecoverySummary } from "../codex/turn-recovery.js";
 import { ChannelApprovalController, type ApprovalDeliveryResult } from "./approval.js";
 import { parseActionBlocks } from "./actions.js";
 import {
@@ -2243,6 +2244,10 @@ export class BridgeService {
         const promptParts = buildPromptParts(text, await this.stagePromptItems(attachments, session, message), channelPromptSource(this.channel.channel), knowledge);
         const runInput: CodexRunnerInput = {
           prompt: qaContext ? buildQaPrompt(promptParts.prompt, project!, qaContext) : promptParts.prompt,
+          onRecovery: async recovery => {
+            if (!stillBound() || recovery.threadId !== session.threadId || recovery.turnId !== acceptedTurnId) return;
+            if (wantsProgress()) await replyStream?.waitForRecovery(codexRecoverySummary(recovery));
+          },
           developerInstructions: promptParts.developerInstructions,
           cwd: workspace,
           hostId: this.sessionHostId(session),
@@ -2287,7 +2292,7 @@ export class BridgeService {
             onProgress: async (progress: string) => {
               if (!wantsProgress() || queued && !acceptedQueueTurn) return;
               const progressText = progress.trim();
-              if (!progressText || sentProgress.has(progressText)) return;
+              if (!progressText || sentProgress.has(progressText) && !replyStream?.checkpoint().recoveryNotice) return;
               sentProgress.add(progressText);
               if (sentProgress.size > 200) sentProgress.clear();
               await replyStream?.progress(progressText);

@@ -2,6 +2,7 @@ import type { CodexAccountBalance } from "./account-balance.js";
 import type { CodexApprovalHandler } from "./approval.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { codexFailureCode, type CodexFailureCode } from "./turn-failure.js";
+import type { CodexTurnRecovery } from "./turn-recovery.js";
 
 /** The two logical Codex execution engines exposed by Bridge. */
 export type CodexBackendId = "exec" | "app-server";
@@ -51,6 +52,8 @@ export type CodexThreadState = {
   latestTurnStatus?: CodexTurnStatus;
   /** Only the current failed tail, normalized at the native boundary; no raw provider body. */
   lastTurnFailure?: { turnId: string; code: CodexFailureCode };
+  /** Nonterminal native error observation, scoped to the exact active turn. */
+  recovery?: CodexTurnRecovery;
   activeTurnId?: string;
   /** The owner has an unacknowledged UI turn, but no actual active execution. */
   pendingTurnWithoutId?: boolean;
@@ -287,6 +290,7 @@ export type CodexRunnerInput = {
   effort?: string;
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
+  onRecovery?: (recovery: CodexTurnRecovery) => Promise<void> | void;
   onApproval?: CodexApprovalHandler;
   onDynamicToolCall?: CodexDynamicToolHandler;
   onUserInput?: CodexUserInputHandler;

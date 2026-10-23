@@ -16,6 +16,9 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 
 export function userFacingMessageHandlingError(error: unknown): string {
   if (error instanceof CodexTurnExecutionError) {
+    if (error.status === "failed" && error.failureCode === "model-capacity") {
+      return `[codex-im-gateway] ${codexFailureSummary(error.failureCode)}\nCodex 原生轮次已确认失败，当前没有继续重试。可稍后在原会话重试或手动选择其他模型；Gateway 未重新执行任务或切换模型。`;
+    }
     return error.status === "interrupted" ? "[codex-im-gateway] Codex 本轮任务已中断；未自动重启或重发消息。"
       : `[codex-im-gateway] ${codexFailureSummary(error.failureCode)}\n这是已确认的任务失败，不是钉钉投递失败；Gateway 未自动重试或换后端重发。`;
   }

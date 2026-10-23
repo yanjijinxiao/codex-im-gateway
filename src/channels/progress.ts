@@ -22,6 +22,8 @@ export type ChannelStreamCheckpoint = {
   finished: boolean;
   /** Presentation notice, never a task-completion receipt. */
   communicationNotice?: string;
+  /** Native execution recovery, independent of transport/delivery retry. */
+  recoveryNotice?: string;
   /** Terminal delivery may be retried, but progress must never resume. */
   terminal?: { text: string; error: boolean };
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
@@ -63,6 +65,7 @@ export class ChannelTurnTextStream {
   private startedAt = Date.now();
   private finished = false;
   private communicationNotice?: string;
+  private recoveryNotice?: string;
   private opening?: Promise<boolean>;
   private readonly progressEntries: string[] = [];
   private thought = "正在理解任务并规划下一步…";
@@ -104,6 +107,7 @@ export class ChannelTurnTextStream {
       this.answerPreview = saved.answerPreview;
       this.finished = saved.finished;
       this.communicationNotice = saved.communicationNotice;
+      this.recoveryNotice = saved.recoveryNotice;
       this.terminal = saved.terminal;
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
       this.resultPageBytes = saved.resultPageBytes;
@@ -119,6 +123,7 @@ export class ChannelTurnTextStream {
       progressEntries: [...this.progressEntries], thought: this.thought,
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
+      ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
         terminalPages: this.terminalPages.map(page => ({ ...page })) } : {}),
@@ -173,6 +178,7 @@ export class ChannelTurnTextStream {
     const content = summarizeProgress(text);
     if (!content) return false;
     this.communicationNotice = undefined;
+    this.recoveryNotice = undefined;
     if (content.startsWith("🤔")) {
       this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
     } else {
@@ -195,6 +201,7 @@ export class ChannelTurnTextStream {
     const content = text.trim();
     if (!content) return false;
     this.communicationNotice = undefined;
+    this.recoveryNotice = undefined;
     this.answerPreview = boundedProgressText(content, 2_400);
     this.thought = "正在组织最终回复…";
     return this.publish(this.render());
@@ -221,6 +228,7 @@ export class ChannelTurnTextStream {
     // Set the terminal guard before awaiting any in-flight operation. A failed
     // final frame retains its handle and terminal payload for later recovery.
     this.terminal ??= { text: content, error };
+    this.recoveryNotice = undefined;
     this.stopTimers();
     this.persistence?.save(this.checkpoint());
     if (this.finalizing) return this.finalizing;
@@ -333,9 +341,25 @@ export class ChannelTurnTextStream {
   async waitForBackend(text: string): Promise<boolean> {
     if (this.finished || this.terminal || this.suspended) return false;
     this.communicationNotice = text.trim();
+    this.recoveryNotice = undefined;
     this.persistence?.save(this.checkpoint());
     if (!this.supported) {
       try { await this.sendPlainText(text); return true; } catch { return false; }
+    }
+    const published = await this.publish(this.render());
+    await this.flush();
+    return published && this.deliveryState() === "active";
+  }
+
+  /** Native retry keeps the same handle and is never a terminal frame. */
+  async waitForRecovery(text: string): Promise<boolean> {
+    if (this.finished || this.terminal || this.suspended || !text.trim()) return false;
+    if (this.recoveryNotice === text.trim()) return true;
+    this.recoveryNotice = text.trim();
+    this.communicationNotice = undefined;
+    this.persistence?.save(this.checkpoint());
+    if (!this.supported) {
+      try { return await this.textProgress!.push(text); } catch { return false; }
     }
     const published = await this.publish(this.render());
     await this.flush();
@@ -426,8 +450,8 @@ export class ChannelTurnTextStream {
 
   private render(): string {
     const sections = [
-      this.communicationNotice ? "⏳ **等待后端确认**" : "🤔 **正在思考**",
-      this.communicationNotice || this.thought || "正在处理当前任务…"
+      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**" : "🤔 **正在思考**",
+      this.communicationNotice || this.recoveryNotice || this.thought || "正在处理当前任务…"
     ];
     if (this.progressEntries.length) {
       const entries = this.progressEntries.map((entry) => `- ${entry.replace(/\n/g, "\n  ")}`).join("\n");
@@ -437,6 +461,7 @@ export class ChannelTurnTextStream {
       sections.push(`---\n✍️ **正在组织回复**\n\n${this.answerPreview}`);
     }
     sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
+      : this.recoveryNotice ? "_保留本张进度卡；等待 Codex 后续进展或最终状态_"
       : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行，发送 /stop 可停止_`);
     return sections.join("\n\n");
   }

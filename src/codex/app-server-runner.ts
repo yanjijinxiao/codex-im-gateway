@@ -8,6 +8,7 @@ import { parseUserInputRequest } from "./user-input.js";
 import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
 import { codexFailureCode, lastCodexTurnFailure, type CodexFailureCode } from "./turn-failure.js";
+import { codexTurnRecovery, codexRecoverySummary, type CodexTurnRecovery } from "./turn-recovery.js";
 import { readDesktopSessionCatalog, isDesktopCatalogThread } from "./desktop-session-catalog.js";
 
 import { resolveCodexCommand } from "./exec-runner.js";
@@ -111,13 +112,14 @@ type TurnWaiter = {
 type TurnStream = {
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
+  onRecovery?: (recovery: CodexTurnRecovery) => Promise<void> | void;
   chain: Promise<void>;
 };
 
 type QueuedTurnEvent = {
   type: "delta" | "progress";
   text: string;
-};
+} | { type: "recovery"; recovery: CodexTurnRecovery };
 
 type AppServerSandboxPolicy =
   | { readonly type: "dangerFullAccess" }
@@ -160,6 +162,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly completedTurns = new Map<string, TurnCompletion>();
   private readonly turnStreams = new Map<string, TurnStream>();
   private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
+  private readonly turnRecoveries = new Map<string, CodexTurnRecovery>();
+  private readonly turnErrorCodes = new Map<string, CodexFailureCode>();
   private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
   private readonly reasoningSummariesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
@@ -368,15 +372,20 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       activeFlags: [],
       latestTurnStatus: "inProgress",
       activeTurnId: turnId,
+      ...(this.turnRecoveries.has(turnKey(threadId, turnId)) ? { recovery: this.turnRecoveries.get(turnKey(threadId, turnId)) } : {}),
       ...(previousState?.cwd ? { cwd: previousState.cwd } : { cwd: input.cwd }),
       ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
       ...(previousState?.title ? { title: previousState.title } : {})
     });
-    if (input.onDelta || input.onProgress) {
+    // Bind the accepted identity/presentation before draining notifications
+    // that can arrive ahead of the turn/start receipt.
+    await input.onTurnStarted?.({ threadId, turnId });
+    if (input.onDelta || input.onProgress || input.onRecovery) {
       const key = turnKey(threadId, turnId);
       this.turnStreams.set(key, {
         onDelta: input.onDelta,
         onProgress: input.onProgress,
+        onRecovery: input.onRecovery,
         chain: Promise.resolve()
       });
       for (const event of this.queuedTurnEvents.get(key) ?? []) {
@@ -384,7 +393,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }
       this.queuedTurnEvents.delete(key);
     }
-    await input.onTurnStarted?.({ threadId, turnId });
     try { return await this.waitForTurn(threadId, turnId); }
     catch (error) { throw communicationError(error, { phase: "observation", operation: "turn/observe", threadId, turnId }); }
     } finally {
@@ -466,6 +474,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         state.activeTurnId = activeTurnId;
         state.latestTurnStatus = "inProgress";
         state.runtimeStatus = "active";
+        state.recovery = this.turnRecoveries.get(turnKey(threadId, activeTurnId)) ?? state.recovery;
       }
       this.threadStates.set(threadId, state);
       return state;
@@ -785,7 +794,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus; startedAt?: number }> };
       const turns = (response.data ?? []).slice().reverse();
       const failure = lastCodexTurnFailure(turns.at(-1));
-      return { state: { ...state, lastTurnFailure: failure }, turns: turns.map((turn) => ({
+      const activeId = state.activeTurnId ?? turns.filter(turn => turn.status === "inProgress").at(-1)?.id;
+      const active = turns.find(turn => turn.id === activeId && turn.status === "inProgress");
+      const recovery = state.runtimeStatus === "active" && active
+        ? this.turnRecoveries.get(turnKey(threadId, active.id)) ?? codexTurnRecovery(threadId, active) : undefined;
+      return { state: { ...state, lastTurnFailure: failure, recovery,
+        ...(state.runtimeStatus === "active" && active ? { activeTurnId: active.id } : {}) }, turns: turns.map((turn) => ({
         id: turn.id, status: turn.status, ...(unixTimestampToIso(turn.startedAt) ? { startedAt: unixTimestampToIso(turn.startedAt) } : {}),
         messages: parseThreadHistory({ turns: [turn] })
       })) };
@@ -988,10 +1002,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
       this.bindUserInputHandlers(input.threadId, input);
     }
-    this.turnStreams.set(key, { onDelta: input.onDelta, onProgress: input.onProgress, chain: Promise.resolve() });
+    await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+    this.turnStreams.set(key, { onDelta: input.onDelta, onProgress: input.onProgress, onRecovery: input.onRecovery, chain: Promise.resolve() });
     for (const event of this.queuedTurnEvents.get(key) ?? []) this.enqueueTurnEvent(key, event);
     this.queuedTurnEvents.delete(key);
-    await input.onTurnStarted?.({ threadId: input.threadId, turnId });
     if (this.completedTurns.has(key)) return await this.waitForTurn(input.threadId, turnId);
     if (turn.status !== "inProgress") {
       if (input.clientUserMessageId) this.nativeQueueOrigins.delete(input.clientUserMessageId);
@@ -1278,6 +1292,25 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleNotification(method: string, params: Record<string, unknown>, raw: string): void {
+    if (method === "error") {
+      const { threadId, turnId } = params;
+      // Error notifications are not completion events. Only the native active
+      // identity can update a card; a late/foreign error cannot resurrect it.
+      if (typeof threadId !== "string" || typeof turnId !== "string"
+        || this.activeTurns.get(threadId) !== turnId || typeof params.willRetry !== "boolean") return;
+      const key = turnKey(threadId, turnId);
+      const recovery: CodexTurnRecovery = { threadId, turnId, code: codexFailureCode(params.error), willRetry: params.willRetry };
+      const previous = this.turnRecoveries.get(key);
+      this.turnRecoveries.set(key, recovery);
+      this.turnErrorCodes.set(key, recovery.code);
+      const state = this.threadStates.get(threadId);
+      if (state) this.threadStates.set(threadId, { ...state, recovery });
+      if (previous?.code === recovery.code && previous.willRetry === recovery.willRetry) return;
+      const event: QueuedTurnEvent = { type: "recovery", recovery };
+      if (this.turnStreams.has(key)) this.enqueueTurnEvent(key, event);
+      else this.queueTurnEvent(key, event);
+      return;
+    }
     if (method === "serverRequest/resolved") {
       const key = JSON.stringify([params.threadId, typeof params.requestId, params.requestId]);
       const pending = this.userInputRequests.get(key);
@@ -1303,6 +1336,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           ...parseRuntimeStatus(params.status),
           ...(previous?.latestTurnStatus ? { latestTurnStatus: previous.latestTurnStatus } : {}),
           ...(previous?.activeTurnId ? { activeTurnId: previous.activeTurnId } : {}),
+          ...(previous?.recovery ? { recovery: previous.recovery } : {}),
           ...(previous?.cwd ? { cwd: previous.cwd } : {}),
           ...(previous?.projectId ? { projectId: previous.projectId } : {}),
           ...(previous?.title ? { title: previous.title } : {}),
@@ -1386,6 +1420,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (!key || !itemId || !delta || this.itemPhasesByTurn.get(key)?.get(itemId) === "commentary") {
         return;
       }
+      this.clearTurnRecovery(key);
       if (this.turnStreams.has(key)) {
         this.enqueueTurnEvent(key, { type: "delta", text: delta });
       } else {
@@ -1407,13 +1442,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         if (item.phase === "commentary") {
           const progress = item.text.trim();
           if (progress) {
-            if (this.turnStreams.has(key)) {
-              this.enqueueTurnEvent(key, { type: "progress", text: progress });
-            } else {
-              this.queueTurnEvent(key, { type: "progress", text: progress });
-            }
+            this.emitProgress(key, progress);
           }
         } else {
+          this.clearTurnRecovery(key);
           this.turnTexts.set(key, item.text);
         }
       } else {
@@ -1443,9 +1475,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       status,
       text: this.turnTexts.get(key) ?? extractAgentMessageFromTurn(turn),
       raw: (this.turnEvents.get(key) ?? []).join("\n"),
-      failureCode: status === "failed" ? codexFailureCode(errorValue) : undefined,
+      failureCode: status === "failed" ? errorValue ? codexFailureCode(errorValue) : this.turnErrorCodes.get(key) ?? "upstream-error" : undefined,
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
+    this.turnRecoveries.delete(key);
+    this.turnErrorCodes.delete(key);
     if (this.activeTurns.get(threadId) === turnId) this.activeTurns.delete(threadId);
     const nativeClientId = this.nativeTurnClients.get(key);
     if (nativeClientId) { this.nativeQueueOrigins.delete(nativeClientId); this.nativeTurnClients.delete(key); }
@@ -1562,6 +1596,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private emitProgress(key: string, text: string): void {
+    this.clearTurnRecovery(key);
     if (this.turnStreams.has(key)) {
       this.enqueueTurnEvent(key, { type: "progress", text });
     } else {
@@ -1572,14 +1607,23 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private enqueueTurnEvent(key: string, event: QueuedTurnEvent): void {
     const stream = this.turnStreams.get(key);
     if (!stream) return;
-    const callback = event.type === "progress" ? stream.onProgress : stream.onDelta;
-    if (!callback) return;
     stream.chain = stream.chain
-      .then(() => callback(event.text))
+      .then(() => event.type === "recovery"
+        ? stream.onRecovery ? stream.onRecovery(event.recovery) : stream.onProgress?.(codexRecoverySummary(event.recovery))
+        : event.type === "progress" ? stream.onProgress?.(event.text) : stream.onDelta?.(event.text))
       .then(() => undefined)
       .catch((error) => {
         console.warn(`Codex ${event.type} callback failed: ${error instanceof Error ? error.message : String(error)}`);
       });
+  }
+
+  private clearTurnRecovery(key: string): void {
+    this.turnRecoveries.delete(key);
+    const threadId = key.slice(0, key.indexOf("\u0000"));
+    const state = this.threadStates.get(threadId);
+    if (state?.recovery && turnKey(threadId, state.recovery.turnId) === key) {
+      this.threadStates.set(threadId, { ...state, recovery: undefined });
+    }
   }
 
   private handleServerRequest(message: WireMessage): void {
@@ -1738,6 +1782,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.completedTurns.clear();
     this.turnStreams.clear();
     this.queuedTurnEvents.clear();
+    this.turnRecoveries.clear();
+    this.turnErrorCodes.clear();
     this.itemPhasesByTurn.clear();
     this.reasoningSummariesByTurn.clear();
     this.runtimeInfoByThread.clear();
@@ -2104,6 +2150,8 @@ function parseThreadState(
     activeFlags: parsedRuntime.activeFlags,
     ...(latestTurnStatus ? { latestTurnStatus } : {}),
     ...(lastCodexTurnFailure(latestTurn) ? { lastTurnFailure: lastCodexTurnFailure(latestTurn) } : {}),
+    ...(runtimeStatus === "active" && codexTurnRecovery(threadId, latestTurn)
+      ? { recovery: codexTurnRecovery(threadId, latestTurn) } : {}),
     ...(latestTurnStatus === "inProgress" && typeof latestTurn?.id === "string"
       ? { activeTurnId: latestTurn.id }
       : {}),

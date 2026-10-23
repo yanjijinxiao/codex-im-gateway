@@ -3,7 +3,7 @@ import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "./progress.
 import type { ChannelTextClient } from "./types.js";
 
 export type TurnReplyStream = Pick<ChannelTurnTextStream, "supported" | "checkpoint" | "deliveryState" | "suspend"
-  | "flush" | "synchronize" | "progress" | "answer" | "finalize" | "fail" | "waitForBackend" | "reportTerminalFailure">;
+  | "flush" | "synchronize" | "progress" | "answer" | "finalize" | "fail" | "waitForBackend" | "waitForRecovery" | "reportTerminalFailure">;
 type Persistence = NonNullable<ConstructorParameters<typeof ChannelTurnTextStream>[2]>;
 type Segment = NonNullable<ChannelStreamCheckpoint["segments"]>["previous"][number];
 type Boundary = { id: string; kind: "answer" | "steer" };
@@ -168,6 +168,7 @@ export class ChannelTurnPresentation implements TurnReplyStream {
   }
   fail(text: string): Promise<boolean> { return this.finalize(text, true); }
   waitForBackend(text: string): Promise<boolean> { return this.run(() => this.current.waitForBackend(text)); }
+  waitForRecovery(text: string): Promise<boolean> { return this.run(() => this.current.waitForRecovery(text)); }
   reportTerminalFailure(): Promise<boolean> { return this.run(() => this.current.reportTerminalFailure()); }
   flush(): Promise<void> { return this.run(() => this.current.flush()); }
   synchronize(options: Parameters<ChannelTurnTextStream["synchronize"]>[0] = {}): ReturnType<ChannelTurnTextStream["synchronize"]> {

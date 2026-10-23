@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { CodexBridgeBackend, CodexThreadSnapshot, CodexThreadState } from "../codex/backend.js";
 import { codexFailureSummary } from "../codex/turn-failure.js";
+import { codexRecoverySummary } from "../codex/turn-recovery.js";
 import type { ChannelTextClient } from "../channels/types.js";
 import type { ChannelStreamCheckpoint } from "../channels/progress.js";
 import { completedCardForMentions } from "../channels/completion-mentions.js";
@@ -497,6 +498,15 @@ export class ThreadEventHub {
         if (turn.status === "inProgress" && (!state.turnId || state.turnId === turn.id)) {
           state.turnId = turn.id; this.save();
         }
+        // Managed Desktop runs are observed through owner snapshots too. A
+        // native retry is presentation-only, never a second execution owner.
+        if (turn.status === "inProgress" && snapshot.state.runtimeStatus === "active"
+          && (!snapshot.state.activeTurnId || snapshot.state.activeTurnId === turn.id)
+          && state.turnId === turn.id && snapshot.state.recovery?.threadId === sub.threadId
+          && snapshot.state.recovery.turnId === turn.id && state.checkpoint
+          && sub.progressEnabled !== false) {
+          await this.stream(sub).waitForRecovery(codexRecoverySummary(snapshot.state.recovery));
+        }
         continue;
       }
       if (turn.status === "inProgress") {
@@ -508,6 +518,10 @@ export class ThreadEventHub {
         const progress = turn.messages.filter((message) => message.role === "assistant" && message.kind === "progress");
         if (!progress.length) await this.deliver(sub, turn.id, "已连接正在执行的任务，等待新的进展。");
         for (const message of progress) await this.deliver(sub, turn.id, message.text);
+        if (snapshot.state.recovery?.threadId === sub.threadId && snapshot.state.recovery.turnId === turn.id
+          && sub.progressEnabled !== false) {
+          await this.stream(sub).waitForRecovery(codexRecoverySummary(snapshot.state.recovery));
+        }
       } else {
         // A private App Server reconstructs foreign, unloaded turns as
         // completed/interrupted even while Desktop is still executing them.
@@ -516,7 +530,10 @@ export class ThreadEventHub {
         if (turn.id !== state.turnId && !afterFollowBoundary(turn, turns, boundary)) continue;
         const final = turn.messages.filter((message) => message.role === "assistant" && message.kind !== "progress")
           .map((message) => message.text).join("\n\n");
-        await this.finish(sub, turn.id, final || (turn.status === "completed" ? "任务已完成。" : "任务已停止或执行失败。"),
+        const failure = snapshot.state.lastTurnFailure;
+        await this.finish(sub, turn.id, final || (turn.status === "failed" && failure?.turnId === turn.id
+          ? `${codexFailureSummary(failure.code)}\n原生轮次已确认失败；Gateway 未重新执行任务或切换模型。`
+          : turn.status === "completed" ? "任务已完成。" : "任务已停止或执行失败。"),
           Boolean(state.turnId && state.completed.includes(state.turnId)));
       }
     }

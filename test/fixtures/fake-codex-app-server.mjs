@@ -548,6 +548,32 @@ rl.on("line", (line) => {
       }
     }
     activeTurns.set(message.params.threadId, turnId);
+    if (prompt.startsWith("fixture-capacity-")) {
+      const threadId = message.params.threadId;
+      const error = { message: "Selected model is at capacity. Please try a different model.",
+        codexErrorInfo: "serverOverloaded", additionalDetails: "PRIVATE_TOKEN /private/provider" };
+      send({ method: "turn/started", params: { threadId, turn: completedTurn(turnId, "inProgress") } });
+      const notify = (willRetry, id = turnId) => send({ method: "error", params: { threadId, turnId: id, error, willRetry } });
+      if (prompt === "fixture-capacity-before-ack") notify(true);
+      respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+      if (prompt !== "fixture-capacity-before-ack") { notify(true); notify(true); }
+      notify(true, "foreign-turn");
+      setTimeout(() => {
+        if (prompt === "fixture-capacity-exhausted") {
+          notify(false);
+          send({ method: "turn/completed", params: { threadId, turn: completedTurn(turnId, "failed") } });
+        } else {
+          send({ method: "item/completed", params: { threadId, turnId,
+            item: { id: "recovered-progress", type: "agentMessage", phase: "commentary", text: "模型恢复，继续执行。" } } });
+          send({ method: "item/completed", params: { threadId, turnId,
+            item: { id: "recovered-answer", type: "agentMessage", phase: "final_answer", text: "恢复后的完整结果" } } });
+          send({ method: "turn/completed", params: { threadId, turn: completedTurn(turnId, "completed") } });
+        }
+        activeTurns.delete(threadId);
+        notify(true); // Late error must not reopen the completed turn/card.
+      }, 60);
+      return;
+    }
     if (prompt === "delayed-turn-receipt") {
       setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 150);
     } else respond(message.id, { turn: completedTurn(turnId, "inProgress") });
