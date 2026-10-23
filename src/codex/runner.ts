@@ -7,7 +7,7 @@ import {
 import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
-import { assertCodexThreadRunnable, CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError } from "./backend.js";
+import { assertCodexThreadRunnable, assertCapacityResume, CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError, type CodexCapacityResumeInput } from "./backend.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
@@ -51,7 +51,8 @@ export type CodexBackendRouterOptions = {
   timeoutMs?: number;
   codexHome?: string;
   desktopRunner?: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage" | "resumeAfterCapacity">>;
+  onThreadMutation?: (threadId: string, hostId: string) => void;
   appServerBackend?: CodexAppServerBackend;
   execBackend?: CodexBackendAdapter;
   remoteTransportResolver?: typeof resolveRemoteCodexTransport;
@@ -72,7 +73,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly appServer: CodexAppServerBackend;
   private readonly exec: CodexBackendAdapter;
   private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
-    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage">>;
+    Partial<Pick<DesktopCodexRunner, "refreshTaskList" | "readThreadSnapshot" | "inspectThread" | "submitThreadMessage" | "resumeAfterCapacity">>;
   private readonly remoteAppServers = new Map<string, CodexAppServerBackend>();
   private readonly remoteTransports = new Map<string, ReturnType<typeof resolveRemoteCodexTransport>>();
   private readonly runTails = new Map<string, Promise<void>>();
@@ -113,6 +114,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    if (input.threadId) this.options.onThreadMutation?.(input.threadId, input.hostId ?? "local");
     const queueKey = input.queueKey ?? input.threadId;
     const routedQueueKey = queueKey ? `${input.hostId ?? "local"}:${queueKey}` : undefined;
     if (!routedQueueKey) return this.runImmediately(input);
@@ -147,6 +149,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   };
 
   async steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult> {
+    this.options.onThreadMutation?.(input.threadId, hostId ?? "local");
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).steer(input);
     if (this.selectedBackend === "exec") return this.exec.steer(input);
     const state = await this.inspectThread(input.threadId);
@@ -160,7 +163,21 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     }
   }
 
+  async resumeAfterCapacity(input: CodexCapacityResumeInput): Promise<CodexRunResult> {
+    if (this.selectedBackend === "exec") throw new CodexInterventionError("CLI 后端不支持空输入容量恢复，未重发原消息或切换后端。");
+    const snapshot = await this.readThreadSnapshot(input.threadId, input.hostId);
+    assertCapacityResume(snapshot, input.failedTurnId);
+    if ((await this.listQueuedSubmissions(input.threadId, undefined, input.hostId)).data.length) {
+      throw new CodexInterventionError("原生队列已有输入，容量恢复未抢先执行。");
+    }
+    input.assertCurrent();
+    const owner = snapshot.state.executionOwner === "desktop" ? this.desktop : this.appServerFor(input.hostId);
+    if (!owner.resumeAfterCapacity) throw new CodexInterventionError("当前执行者不支持空输入容量恢复，未切换执行者。");
+    return owner.resumeAfterCapacity(input);
+  }
+
   async submitThreadMessage(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt> {
+    this.options.onThreadMutation?.(input.threadId, hostId ?? "local");
     if (this.selectedBackend === "exec") throw new CodexBackendCapabilityError("turnSteering", "exec");
     const state = await this.inspectThread(input.threadId, hostId);
     assertCodexThreadRunnable(state);
@@ -187,6 +204,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async addQueuedSubmission(input: CodexQueueAddInput, hostId?: string) {
+    this.options.onThreadMutation?.(input.threadId, hostId ?? "local");
     return this.nativeQueue(hostId).addQueuedSubmission(input);
   }
   async listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string) {
@@ -276,6 +294,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async stop(threadId?: string, hostId?: string): Promise<CodexStopResult> {
+    if (threadId) this.options.onThreadMutation?.(threadId, hostId ?? "local");
     if (isRemoteHost(hostId)) {
       return this.appServerFor(hostId).stop(threadId);
     }
@@ -480,6 +499,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async archiveThread(threadId: string, hostId?: string): Promise<void> {
+    this.options.onThreadMutation?.(threadId, hostId ?? "local");
     await this.backendForSharedOperation(hostId).archiveThread(threadId);
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }
@@ -491,6 +511,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async deleteThread(threadId: string, hostId?: string): Promise<void> {
+    this.options.onThreadMutation?.(threadId, hostId ?? "local");
     await this.backendForSharedOperation(hostId).deleteThread(threadId);
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }

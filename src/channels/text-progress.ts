@@ -1,4 +1,4 @@
-import { summarizeProgress } from "./progress-summary.js";
+import { summarizeProgress, progressKind } from "./progress-summary.js";
 
 /** Native progress for text-only channels; never a fallback from an AI Card. */
 export class TextProgressBatcher {
@@ -13,6 +13,7 @@ export class TextProgressBatcher {
   async push(text: string): Promise<boolean> {
     if (this.closed) return true;
     const clean = summarizeProgress(text, 180);
+    if (["activity", "thought"].includes(progressKind(clean))) return true;
     if (!clean || this.seen.has(clean)) return true;
     this.seen.add(clean);
     if (this.seen.size > 200) this.seen.delete(this.seen.values().next().value!);

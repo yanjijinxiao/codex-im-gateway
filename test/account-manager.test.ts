@@ -677,7 +677,7 @@ test("streams externally owned Codex progress into a bound channel session and f
   });
   assert.equal(streamStarts.length, 1);
   assert.equal(streamStarts[0]?.toUserId, "alice@im.wechat");
-  assert.match(streamStarts[0]?.text ?? "", /最近进展[\s\S]*正在核对测试结果/);
+  assert.match(streamStarts[0]?.text ?? "", /当前进展[\s\S]*正在核对测试结果/);
 
   await emitCodexCompletion({
     sessionId: "desktop-live-thread",

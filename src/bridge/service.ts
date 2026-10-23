@@ -132,6 +132,7 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
+  deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
@@ -2361,6 +2362,12 @@ export class BridgeService {
       });
     } catch (error) {
       if (queued && !acceptedQueueTurn) throw error;
+      if (error instanceof CodexTurnExecutionError && error.status === "failed" && error.failureCode === "model-capacity"
+        && acceptedTurnId && session.threadId && stillBound()
+        && this.options.deferCapacityFailure?.({ hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, turnId: acceptedTurnId })) {
+        await this.options.onSubscriptionsChanged?.();
+        return; // Coordinator owns recovery; do not terminalize, notify, or replay input.
+      }
       error = communicationError(error, { phase: acceptedTurnId ? "observation" : backendEntered ? "submission" : "preflight",
         operation: acceptedTurnId ? "turn/observe" : backendEntered ? "turn/submit" : "turn/prepare", threadId: session.threadId, turnId: acceptedTurnId });
       if (error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
@@ -2402,6 +2409,20 @@ export class BridgeService {
       }
     }
     });
+  }
+
+  /** Explicit recovery finalization only, not arbitrary history replay. The
+   * coordinator journals completion before invoking this once; ambiguous media
+   * sends are not replayed after restart. */
+  async applyRecoveredOutput(sessionId: string, text: string): Promise<void> {
+    const session = this.options.stateStore.getSession(sessionId);
+    if (!session || this.options.stateStore.getBoundSession(session.senderId)?.id !== session.id) return;
+    const parsed = parseActionBlocks(text);
+    for (const memory of parsed.actions.remember) this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
+    for (const action of parsed.actions.send) {
+      if (this.options.stateStore.getBoundSession(session.senderId)?.id !== session.id) break;
+      await this.sendLocalMedia(session.senderId, action);
+    }
   }
 
   private async codexProjectCandidates(): Promise<readonly CodexProjectCandidate[]> {

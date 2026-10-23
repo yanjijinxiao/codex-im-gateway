@@ -427,7 +427,9 @@ test("command summaries remove heredoc scripts and arguments from cards and nati
   await textOnly.progress(done);
   t.mock.timers.tick(30_000);
   await settle();
-  assert.equal(texts.length, 2);
+  assert.equal(texts.length, 0); // Routine tool receipts no longer occupy native progress messages.
+  await textOnly.progress("已定位调度缺陷，需要补充回归测试。");
+  assert.equal(texts.length, 1);
   assert.ok(texts.every((text) => text.length < 650 && !text.includes("SECRET_ARGUMENT") && !text.includes("/bin/zsh")));
 });
 

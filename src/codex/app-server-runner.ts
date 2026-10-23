@@ -28,6 +28,8 @@ import {
   CodexTurnExecutionError,
   assertCodexThreadRunnable,
   assertCodexProjectBinding,
+  assertCapacityResume,
+  type CodexCapacityResumeInput,
   type CodexAppServerBackend,
   type CodexDynamicToolCall,
   type CodexDynamicToolHandler,
@@ -190,17 +192,38 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
   }
 
-  private async runWithLease(input: CodexRunnerInput & Partial<Pick<CodexQueuedRunInput, "queuedSubmissionId" | "clientUserMessageId" | "onQueueStarting">>): Promise<CodexRunResult> {
+  async resumeAfterCapacity(resume: CodexCapacityResumeInput): Promise<CodexRunResult> {
+    this.operationLeases++;
+    let accepted!: () => void, failed!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => { accepted = resolve; failed = reject; });
+    void ready.catch(() => undefined);
+    try {
+      const snapshot = await this.readThreadSnapshot(resume.threadId);
+      assertCapacityResume(snapshot, resume.failedTurnId);
+      return await this.runWithLease({ prompt: "", cwd: snapshot.state.cwd ?? "", threadId: resume.threadId,
+        onTurnStarted: async event => {
+          try { await resume.onTurnStarted(event); accepted(); }
+          catch (error) { failed(error); throw error; }
+        }, onProgress: resume.onProgress, onRecovery: resume.onRecovery,
+        onApproval: resume.onApproval ? async request => { await ready; return resume.onApproval!(request); } : undefined,
+        onUserInput: resume.onUserInput ? async request => { await ready; return resume.onUserInput!(request); } : undefined,
+        onUserInputResult: resume.onUserInputResult ? async (request, result) => { await ready; await resume.onUserInputResult!(request, result); } : undefined }, resume);
+    } catch (error) { failed(error); throw error;
+    } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+  }
+
+  private async runWithLease(input: CodexRunnerInput & Partial<Pick<CodexQueuedRunInput, "queuedSubmissionId" | "clientUserMessageId" | "onQueueStarting">>, resume?: CodexCapacityResumeInput): Promise<CodexRunResult> {
     await this.ensureConnected();
 
     if (input.threadId) {
       try {
-        assertCodexThreadRunnable(await this.inspectThread(input.threadId));
+        if (resume) assertCapacityResume(await this.readThreadSnapshot(input.threadId), resume.failedTurnId);
+        else assertCodexThreadRunnable(await this.inspectThread(input.threadId));
         // inspectThread intentionally recycles a private stdio app-server so a
         // read-only probe cannot retain Desktop's writer lock. Reconnect for
         // the actual queued turn lifecycle.
         await this.ensureConnected();
-        await this.waitForThreadIdle(input.threadId, input.onProgress);
+        if (!resume) await this.waitForThreadIdle(input.threadId, input.onProgress);
       } catch (error) {
         throw normalizeThreadOperationError(error, input.threadId);
       }
@@ -220,10 +243,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           ...(alreadySubscribed ? { includeTurns: false } : {}),
           ...(input.threadId ? { threadId: input.threadId } : {}),
           ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
-          cwd: input.cwd,
+          cwd: resume ? undefined : input.cwd,
           model: input.model,
           developerInstructions: input.developerInstructions,
-          approvalPolicy: input.queuedSubmissionId && input.onApproval ? "on-request" : "never",
+          approvalPolicy: resume ? undefined : input.queuedSubmissionId && input.onApproval ? "on-request" : "never",
           ...(!input.threadId && nativeProjectId ? { projectId: nativeProjectId } : {}),
           ...(!input.threadId && input.projectBinding === "none" ? { projectId: null } : {}),
           ...(!input.threadId && input.dynamicTools ? { dynamicTools: input.dynamicTools } : {})
@@ -284,10 +307,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
     const turnParams = compactObject({
       threadId,
-      input: [{ type: "text", text: input.prompt, text_elements: [] }],
-      cwd: input.cwd,
-      approvalPolicy: input.onApproval ? "on-request" : "never",
-      sandboxPolicy: appServerSandboxPolicy(input.sandbox ?? this.options.sandbox),
+      input: resume ? [] : [{ type: "text", text: input.prompt, text_elements: [] }],
+      ...(resume ? { clientUserMessageId: resume.clientUserMessageId, turnTrigger: "capacity_retry_automatic" } : {}),
+      cwd: resume ? undefined : input.cwd,
+      approvalPolicy: resume ? undefined : input.onApproval ? "on-request" : "never",
+      sandboxPolicy: resume ? undefined : appServerSandboxPolicy(input.sandbox ?? this.options.sandbox),
       model: input.model,
       effort: input.effort,
       outputSchema: input.outputSchema,
@@ -330,10 +354,15 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           throw error;
         }
       } else {
+        if (resume) {
+          assertCapacityResume(await this.readThreadSnapshot(threadId), resume.failedTurnId);
+          if ((await this.listQueuedSubmissions(threadId)).data.length) throw new Error("Native queue takes precedence over capacity recovery");
+          resume.assertCurrent();
+        }
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       }
     } catch (error) {
-      if (input.queuedSubmissionId || !input.threadId || !isThreadBusyError(error)) {
+      if (resume || input.queuedSubmissionId || !input.threadId || !isThreadBusyError(error)) {
         if (isCodexCommunicationFailure(error)) this.unconfirmedStarts.add(threadId);
         else {
           this.approvalHandlersByThread.delete(threadId);

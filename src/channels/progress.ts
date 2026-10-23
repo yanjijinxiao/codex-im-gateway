@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { ChannelTextClient } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
-import { summarizeProgress } from "./progress-summary.js";
+import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
@@ -24,6 +24,7 @@ export type ChannelStreamCheckpoint = {
   communicationNotice?: string;
   /** Native execution recovery, independent of transport/delivery retry. */
   recoveryNotice?: string;
+  toolActivity?: { completed: number; failed: number; active?: string; last?: string };
   /** Terminal delivery may be retried, but progress must never resume. */
   terminal?: { text: string; error: boolean };
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
@@ -66,6 +67,7 @@ export class ChannelTurnTextStream {
   private finished = false;
   private communicationNotice?: string;
   private recoveryNotice?: string;
+  private toolActivity = { completed: 0, failed: 0 } as NonNullable<ChannelStreamCheckpoint["toolActivity"]>;
   private opening?: Promise<boolean>;
   private readonly progressEntries: string[] = [];
   private thought = "正在理解任务并规划下一步…";
@@ -102,7 +104,11 @@ export class ChannelTurnTextStream {
       this.presentationFailure = saved.presentationFailure;
       if (this.bootstrap?.stage === "delivered") this.messageId ??= this.bootstrap.messageId;
       this.startedAt = saved.startedAt;
-      this.progressEntries.push(...saved.progressEntries.map((entry) => summarizeProgress(entry)));
+      this.progressEntries.push(...meaningfulProgress(saved.progressEntries));
+      this.toolActivity = saved.toolActivity ? { ...saved.toolActivity } : {
+        completed: saved.progressEntries.filter(entry => entry.startsWith("✅")).length,
+        failed: saved.progressEntries.filter(entry => entry.startsWith("❌")).length
+      };
       this.thought = saved.thought;
       this.answerPreview = saved.answerPreview;
       this.finished = saved.finished;
@@ -124,6 +130,7 @@ export class ChannelTurnTextStream {
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
+      toolActivity: { ...this.toolActivity },
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
         terminalPages: this.terminalPages.map(page => ({ ...page })) } : {}),
@@ -179,20 +186,28 @@ export class ChannelTurnTextStream {
     if (!content) return false;
     this.communicationNotice = undefined;
     this.recoveryNotice = undefined;
-    if (content.startsWith("🤔")) {
+    const kind = progressKind(content);
+    if (kind === "thought") {
       this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
+    } else if (kind === "activity" || kind === "failure") {
+      if (this.toolActivity.last !== content) {
+        this.toolActivity.last = content;
+        if (kind === "failure") this.toolActivity.failed++;
+        else if (content.startsWith("✅")) this.toolActivity.completed++;
+      }
+      this.toolActivity.active = /^[🔎✏️]/u.test(content) ? boundedProgressText(content, 100) : undefined;
+      if (kind === "failure") this.progressEntries.push(boundedProgressText(content, 600));
     } else {
       const entry = boundedProgressText(content, 600);
       if (entry && this.progressEntries.at(-1) !== entry) {
         this.progressEntries.push(entry);
-        if (this.progressEntries.length > 5) this.progressEntries.shift();
       }
-      this.thought = thinkingStatusForProgress(content);
     }
+    this.progressEntries.splice(0, this.progressEntries.length, ...meaningfulProgress(this.progressEntries));
     this.persistence?.save(this.checkpoint());
     if (this.supported) { await this.publish(this.render()); return true; }
     // Native text-only channels retain their normal progress presentation.
-    try { return await this.textProgress!.push(content.startsWith("🤔") ? "任务正在执行，等待新的进展。" : content); }
+    try { return kind === "thought" || kind === "activity" ? true : await this.textProgress!.push(content); }
     catch { console.warn("[codex-im-gateway] text progress delivery failed"); return true; }
   }
 
@@ -449,14 +464,24 @@ export class ChannelTurnTextStream {
   }
 
   private render(): string {
+    const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
     const sections = [
-      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**" : "🤔 **正在思考**",
-      this.communicationNotice || this.recoveryNotice || this.thought || "正在处理当前任务…"
+      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**" : current ? "**当前进展**" : "**任务执行中**",
+      this.communicationNotice || this.recoveryNotice || current || this.thought || "等待新的可展示进展。"
     ];
-    if (this.progressEntries.length) {
-      const entries = this.progressEntries.map((entry) => `- ${entry.replace(/\n/g, "\n  ")}`).join("\n");
-      sections.push(`**最近进展**\n${entries}`);
+    // Keep an actual public reasoning summary available without replacing a
+    // concrete task update with a generated, generic "thinking" sentence.
+    if (current && this.thought && this.thought !== current
+      && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步)/.test(this.thought)) {
+      sections.push(`**公开摘要**\n${boundedProgressText(this.thought, 240)}`);
     }
+    const recent = this.progressEntries.filter(entry => entry !== current);
+    if (recent.length) {
+      const entries = recent.map((entry) => `- ${entry.replace(/\n/g, "\n  ")}`).join("\n");
+      sections.push(`**关键进展与异常**\n${entries}`);
+    }
+    if (this.toolActivity.active) sections.push(`_工具活动：${this.toolActivity.active}_`);
+    else if (this.toolActivity.completed || this.toolActivity.failed) sections.push(`_工具活动：${this.toolActivity.completed} 次成功${this.toolActivity.failed ? `，${this.toolActivity.failed} 次失败（不代表整体任务失败）` : ""}_`);
     if (this.answerPreview) {
       sections.push(`---\n✍️ **正在组织回复**\n\n${this.answerPreview}`);
     }
@@ -569,18 +594,6 @@ export class ChannelTurnTextStream {
       ...(delayMs !== undefined ? { delayMs } : {})
     })}`);
   }
-}
-
-function thinkingStatusForProgress(progress: string): string {
-  if (/命令|工具|检索|查询|检查|读取|下载/.test(progress) && !/完成|失败/.test(progress)) {
-    return "正在等待当前步骤返回结果…";
-  }
-  if (/修改|写入|补丁/.test(progress) && !/完成|失败/.test(progress)) {
-    return "正在应用并检查代码修改…";
-  }
-  if (/完成|成功/.test(progress)) return "正在分析刚完成步骤的结果并决定下一步…";
-  if (/失败|错误/.test(progress)) return "正在分析失败原因并寻找可行的下一步…";
-  return "正在处理当前步骤并决定下一步…";
 }
 
 function boundedProgressText(value: string, max: number): string {

@@ -20,6 +20,7 @@ import { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
 import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
+import { CapacityRecoveryCoordinator } from "./capacity-recovery.js";
 import {
   userFacingMessageHandlingError,
   wasMessageHandlingErrorReported
@@ -286,6 +287,7 @@ export class AccountManager {
   private readonly sessionControls: SessionControlJournal;
   private readonly turnAudience: TurnAudienceJournal;
   private readonly nativeQueue: NativeQueueCoordinator;
+  private readonly capacityRecovery: CapacityRecoveryCoordinator;
   private nativeQueueTimer?: NodeJS.Timeout;
   private readonly nativeQueueWarningAt = new Map<string, number>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
@@ -311,8 +313,45 @@ export class AccountManager {
       turnAudience: this.turnAudience,
       subscriptions: () => this.threadSubscriptions(),
       backend: () => this.runnerFor(this.configProvider()),
+      onCapacityFailure: scope => this.capacityRecovery.offer(scope),
+      holdsCapacityStart: scope => this.capacityRecovery.holdsStart(scope),
       acceptedInputs: () => [ ...this.sessionControls.acceptedPresentationInputs(),
         ...[...this.entries.values()].flatMap(entry => entry.service?.acceptedPresentationInputs?.() ?? []) ]
+    });
+    this.capacityRecovery = new CapacityRecoveryCoordinator({
+      filePath: path.join(options.paths.runtimeDir, "capacity-recovery.json"),
+      backend: () => this.runnerFor(this.configProvider()),
+      eligible: scope => [...this.entries.values()].some(entry => entry.status === "running" && entry.store?.listSessions().some(session =>
+        session.threadId === scope.threadId && session.follow !== false
+        && (session.hostId ?? entry.store?.getProject(session.projectId ?? "")?.hostId ?? "local") === scope.hostId
+        && entry.store?.getBoundSession(session.senderId)?.id === session.id)),
+      notice: (scope, text) => this.threadEvents.capacityNotice(scope, text),
+      accepted: (scope, turnId) => {
+        this.interactionRouting.inheritTurn(scope.hostId, scope.threadId, scope.turnId, turnId);
+        return this.threadEvents.capacityAccepted(scope, turnId);
+      },
+      progress: (scope, text) => this.threadEvents.activity(scope.hostId, scope.threadId, scope.turnId, text),
+      handlers: scope => ({
+        onApproval: request => {
+          const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), request.turnId).destination;
+          const session = route && this.entries.get(route.accountId)?.store?.getSession(route.sessionId);
+          return route && session ? this.requestSessionApproval(route.accountId, session, request) : Promise.resolve("decline" as const);
+        },
+        onUserInput: request => {
+          const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), request.turnId).destination;
+          return route ? this.entries.get(route.accountId)?.service?.requestUserInput(route.recipientId, request, scope.hostId)
+            ?? Promise.resolve(undefined) : Promise.resolve(undefined);
+        },
+        onUserInputResult: (request, result) => {
+          const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), request.turnId).destination;
+          return route ? this.entries.get(route.accountId)?.service?.reportUserInputResult(route.recipientId, request, result, scope.hostId) : undefined;
+        }
+      }),
+      terminal: async (scope, text) => {
+        await this.threadEvents.capacityTerminal(scope, parseActionBlocks(text).visibleText.trim() || "处理完成。");
+        const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), scope.turnId).destination;
+        if (route) await this.entries.get(route.accountId)?.service?.applyRecoveredOutput(route.sessionId, text);
+      }
     });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
     this.adapterFactory = options.adapterFactory ?? channelFactoryWithLegacyOverrides(options);
@@ -321,7 +360,8 @@ export class AccountManager {
       backend: config.codexBackend,
       appServerTransport: config.codexAppServerTransport,
       codexBin: config.codexBin,
-      execSandbox: config.codexExecSandbox
+      execSandbox: config.codexExecSandbox,
+      onThreadMutation: (threadId, hostId) => this.capacityRecovery.cancel(threadId, hostId)
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
@@ -348,10 +388,12 @@ export class AccountManager {
     this.ensureCodexDesktopRequestMonitor();
     this.ensureCodexSessionMonitor();
     this.threadEvents.start();
+    this.capacityRecovery.start();
     this.startTaskboardMonitor();
   }
 
   async stopAll(): Promise<void> {
+    this.capacityRecovery.stop();
     this.codexDesktopRequestMonitor?.stop();
     this.codexDesktopRequestMonitor = undefined;
     await this.codexSessionMonitor?.stop();
@@ -422,9 +464,13 @@ export class AccountManager {
     const service = this.bridgeFactory({
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
+      deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
       sessionControls: this.sessionControls,
       turnAudience: this.turnAudience,
-      onAcceptedInput: input => this.threadEvents.acceptedInput(input),
+      onAcceptedInput: input => {
+        this.capacityRecovery.cancel(input.threadId, input.hostId);
+        return this.threadEvents.acceptedInput(input);
+      },
       sessionFollow: {
         status: (session) => this.threadEvents.status(JSON.stringify([account.accountId, session.id])),
         synchronize: async (session, recovery) => {
@@ -1643,6 +1689,9 @@ export class AccountManager {
   }
 
   private async notifyExternalCodexCompletion(completion: CodexSessionCompletion): Promise<void> {
+    if (this.capacityRecovery.holdsStart({ hostId: "local", threadId: completion.sessionId, turnId: completion.turnId })) return;
+    if (!completion.success && completion.failureCode === "model-capacity"
+      && this.capacityRecovery.offer({ hostId: "local", threadId: completion.sessionId, turnId: completion.turnId })) return;
     const accounts = listAccounts(this.options.paths);
     const stores = accounts.map((account) => ({ account, store: this.storeFor(account.accountId) }));
     const managedByService = stores.some(({ account, store }) =>

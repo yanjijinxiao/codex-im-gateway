@@ -1720,12 +1720,12 @@ test("streams progress and answer deltas into one channel AI Card and finalizes 
   });
 
   assert.equal(starts.length, 1);
-  assert.match(starts[0] ?? "", /🤔 \*\*正在思考\*\*/);
+  assert.match(starts[0] ?? "", /\*\*任务执行中\*\*/);
   assert.match(starts[0] ?? "", /长任务会持续执行/);
   assert.equal(ordinaryReplies.length, 0);
   assert.equal(updates.some((update) =>
     /正在核对查询结果并准备下一步/.test(update.text)
-    && /最近进展/.test(update.text)
+    && /当前进展/.test(update.text)
     && /正在查询资料/.test(update.text)
   ), true);
   assert.deepEqual(updates.at(-1), {

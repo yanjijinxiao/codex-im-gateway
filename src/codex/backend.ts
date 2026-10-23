@@ -302,6 +302,27 @@ export type CodexRunnerInput = {
   sandbox?: CodexExecSandbox;
 };
 
+/** Explicit, journaled empty-input continuation; never replay the original prompt. */
+export type CodexCapacityResumeInput = Pick<CodexRunnerInput, "onApproval" | "onUserInput" | "onUserInputResult"> & {
+  threadId: string;
+  hostId?: string;
+  failedTurnId: string;
+  clientUserMessageId: string;
+  assertCurrent: () => void;
+  onTurnStarted: NonNullable<CodexRunnerInput["onTurnStarted"]>;
+  onProgress?: CodexRunnerInput["onProgress"];
+  onRecovery?: CodexRunnerInput["onRecovery"];
+};
+
+export function assertCapacityResume(snapshot: CodexThreadSnapshot, failedTurnId: string): void {
+  const tail = snapshot.turns.at(-1);
+  if (snapshot.state.persistence !== "active" || !["idle", "systemError"].includes(snapshot.state.runtimeStatus)
+    || snapshot.state.pendingTurnWithoutId || snapshot.state.activeFlags.length || tail?.id !== failedTurnId || tail.status !== "failed"
+    || snapshot.state.lastTurnFailure?.turnId !== failedTurnId || snapshot.state.lastTurnFailure.code !== "model-capacity") {
+    throw new CodexInterventionError("容量恢复条件已变化，未启动后续轮次。");
+  }
+}
+
 export function assertCodexProjectBinding(input: CodexRunnerInput): void {
   if (input.projectBinding === "none" && (input.projectId || input.projectName)) {
     throw new Error("An independent session cannot also specify a project");
@@ -437,6 +458,7 @@ export interface CodexBackendControls {
 }
 
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
+  resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   /** Read metadata without loading the complete turn history for message preflight. */
   inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState>;
   readonly id: "app-server";
@@ -444,6 +466,7 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   stageAttachments?: import("./inbound-files.js").StageInboundFiles;
   backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;

@@ -306,6 +306,35 @@ async function desktopOwnerFixture(t: test.TestContext, snapshot: () => Record<s
   return { runner, received, root };
 }
 
+for (const runtime of ["idle", "systemError"]) {
+test(`Desktop capacity continuation inherits settings and sends empty input: ${runtime}`, async t => {
+  const { runner, root, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: runtime },
+    turns: [{ turnId: "failed", status: "failed", items: [], error: { message: "capacity", codexErrorInfo: "serverOverloaded" } }] }),
+    { result: { turnId: "continued" } });
+  const result = await runner.resumeAfterCapacity({ threadId: "thread", failedTurnId: "failed", clientUserMessageId: "stable-attempt", assertCurrent() {},
+    onTurnStarted() {
+      const timestamp = new Date().toISOString();
+      fs.writeFileSync(path.join(root, "sessions", "continued.jsonl"), [
+        { timestamp, type: "session_meta", payload: { id: "thread", cwd: root } },
+        { timestamp, type: "event_msg", payload: { type: "task_started", turn_id: "continued" } },
+        { timestamp, type: "event_msg", payload: { type: "task_complete", turn_id: "continued", last_agent_message: "recovered" } }
+      ].map(e => JSON.stringify(e)).join("\n") + "\n");
+    } });
+  assert.equal(result.turnId, "continued"); assert.equal(result.text, "recovered");
+  const start = received.find(m => m.method === "thread-follower-start-turn") as { params: { turnStart: { request: Record<string, unknown>; context: unknown } } };
+  assert.deepEqual(start.params.turnStart.request, { threadId: "thread", input: [], clientUserMessageId: "stable-attempt", turnTrigger: "capacity_retry_automatic" });
+  assert.deepEqual(start.params.turnStart.context, { inheritThreadSettings: true });
+  assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 1);
+});
+}
+
+test("Desktop capacity recovery refuses a changed tail or cancelled plan before any write", async t => {
+  const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [
+    { turnId: "newer", status: "completed", items: [] }] }));
+  await assert.rejects(runner.resumeAfterCapacity({ threadId: "thread", failedTurnId: "failed", clientUserMessageId: "never", assertCurrent() {}, onTurnStarted() {} }), /恢复条件已变化/);
+  assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 0);
+});
+
 test("Desktop systemError is authoritative, and no ordinary input or idle start is sent", async t => {
   const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "systemError" },
     turns: [{ turnId: "failed-turn", status: "failed", items: [], error: { message:

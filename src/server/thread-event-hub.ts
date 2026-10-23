@@ -60,6 +60,8 @@ type FollowState = {
   presentationInputBaseline?: string[];
 };
 type Options = {
+  onCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
+  holdsCapacityStart?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   turnAudience?: TurnAudienceJournal;
   filePath: string;
   subscriptions: () => ThreadSubscription[];
@@ -423,6 +425,8 @@ export class ThreadEventHub {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);
     state.runtime = snapshot.state;
+    if (snapshot.state.activeTurnId && this.options.holdsCapacityStart?.({ hostId: sub.hostId,
+      threadId: sub.threadId, turnId: snapshot.state.activeTurnId })) return;
     state.observedAt = new Date().toISOString();
     // Runtime availability is an observation, never evidence that a particular
     // turn completed. Keep its binding, card and real result journal untouched.
@@ -528,6 +532,9 @@ export class ThreadEventHub {
         // Only a loaded runtime or an explicit lifecycle event can end a card.
         if (snapshot.state.runtimeStatus === "notLoaded" || snapshot.state.runtimeStatus === "unknown") continue;
         if (turn.id !== state.turnId && !afterFollowBoundary(turn, turns, boundary)) continue;
+        if (turn.status === "failed" && snapshot.state.lastTurnFailure?.turnId === turn.id
+          && snapshot.state.lastTurnFailure.code === "model-capacity"
+          && this.options.onCapacityFailure?.({ hostId: sub.hostId, threadId: sub.threadId, turnId: turn.id })) continue;
         const final = turn.messages.filter((message) => message.role === "assistant" && message.kind !== "progress")
           .map((message) => message.text).join("\n\n");
         const failure = snapshot.state.lastTurnFailure;
@@ -549,6 +556,7 @@ export class ThreadEventHub {
   }
   /** Only an actual start event (or a loaded backend snapshot) may switch turns. */
   async started(hostId: string, threadId: string, turnId: string, startedAt: string): Promise<void> {
+    if (this.options.holdsCapacityStart?.({ hostId, threadId, turnId })) return;
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false
       && sub.hostId === hostId && sub.threadId === threadId)
       .map((sub) => this.queue.run(sub.key, async () => {
@@ -566,6 +574,7 @@ export class ThreadEventHub {
   }
   /** A notification is a hint, not authority to target a different host. */
   async activity(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
+    if (this.options.holdsCapacityStart?.({ hostId, threadId, turnId })) return;
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false && sub.hostId === hostId && sub.threadId === threadId)
       .map((sub) => this.queue.run(sub.key, async () => {
         if (!this.isLive(sub)) return;
@@ -581,9 +590,45 @@ export class ThreadEventHub {
       })));
   }
   async completion(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
+    if (this.options.holdsCapacityStart?.({ hostId, threadId, turnId })) return;
     await Promise.all(this.options.subscriptions().filter((sub) =>
       sub.enabled !== false && sub.hostId === hostId && sub.threadId === threadId && !sub.managed)
       .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text))));
+  }
+
+  /** An explicitly accepted empty continuation changes native identity only;
+   * presentation and audience stay attached to the same recovery operation. */
+  async capacityAccepted(scope: { hostId: string; threadId: string; turnId: string }, acceptedTurnId: string): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
+      && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
+        if (!this.isLive(sub)) return;
+        const state = this.state(sub);
+        if (state.turnId !== scope.turnId || state.completed.includes(acceptedTurnId) || state.checkpoint?.terminal) return;
+        const oldScope = { ...scope, bindingKey: sub.key, conversationId: sub.recipientId };
+        for (const participant of this.options.turnAudience?.participants(oldScope) ?? []) {
+          this.options.turnAudience?.record({ ...oldScope, turnId: acceptedTurnId },
+            { bindingKey: sub.key, conversationId: sub.recipientId, actorId: participant.actorId, mention: participant.mention }, participant.acceptedAt);
+        }
+        state.completed = [...state.completed, scope.turnId].slice(-200);
+        state.turnId = acceptedTurnId; state.checkpointTurnId = acceptedTurnId;
+        state.terminalPending = undefined;
+        state.sequence++; this.save();
+        await this.stream(sub).waitForRecovery("容量自动恢复已获 Codex 接收，正在原会话中继续执行。沿用本张卡片，未重新发送原问题。");
+      })));
+  }
+
+  async capacityNotice(scope: { hostId: string; threadId: string; turnId: string }, text: string): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false && sub.progressEnabled !== false
+      && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
+        if (this.isLive(sub) && this.state(sub).turnId === scope.turnId) await this.stream(sub).waitForRecovery(text);
+      })));
+  }
+
+  async capacityTerminal(scope: { hostId: string; threadId: string; turnId: string }, text: string): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
+      && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
+        if (this.isLive(sub) && this.state(sub).turnId === scope.turnId) await this.finish(sub, scope.turnId, text);
+      })));
   }
   async recoverCompletion(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false

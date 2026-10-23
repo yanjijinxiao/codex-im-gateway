@@ -42,6 +42,10 @@ export class InteractionRoutingJournal {
   pinInteraction(destination: InteractionDestination, turnId: string): void {
     this.retainTurn(destination, turnId, false);
   }
+  inheritTurn(hostId: string, threadId: string, fromTurnId: string, toTurnId: string): void {
+    const destination = this.state.origins[turnScope(hostId, threadId, fromTurnId)];
+    if (destination) this.retainTurn(destination, toTurnId, false);
+  }
   private retainTurn(destination: InteractionDestination, turnId: string, promoteDefault: boolean): void {
     const key = turnScope(destination.hostId, destination.threadId, turnId);
     // A turn already owns its interaction destination. Primary changes affect

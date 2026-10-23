@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { codexTurnRecovery } from "./turn-recovery.js";
 import { setTimeout as sleep } from "node:timers/promises";
-import { assertCodexThreadRunnable, CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
+import { assertCodexThreadRunnable, assertCapacityResume, type CodexCapacityResumeInput, CodexInterventionError, CodexOwnerUnavailableError, CodexTurnExecutionError } from "./backend.js";
 import { lastCodexTurnFailure } from "./turn-failure.js";
 import { communicationError, CodexCommunicationError, isCodexCommunicationFailure } from "./communication-error.js";
 import { IpcFrameDecoder, IpcFrameSizeError } from "./ipc-frames.js";
@@ -219,6 +219,15 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
+    return this.execute(input);
+  }
+
+  async resumeAfterCapacity(resume: CodexCapacityResumeInput): Promise<CodexRunResult> {
+    return this.execute({ threadId: resume.threadId, cwd: "", prompt: "", onTurnStarted: resume.onTurnStarted,
+      onProgress: resume.onProgress, onRecovery: resume.onRecovery }, resume);
+  }
+
+  private async execute(input: CodexRunnerInput, resume?: CodexCapacityResumeInput): Promise<CodexRunResult> {
     if (this.closed) throw new Error("Codex Desktop runner is closed");
     if (!input.threadId) throw new Error("Codex Desktop relay requires an existing thread id");
     if (input.dynamicTools?.length || input.onDynamicToolCall) {
@@ -230,7 +239,8 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     try {
       await this.ensureMonitorReady();
       await input.onProgress?.("当前会话由 Codex Desktop 持有，已转交桌面端继续执行。");
-      const request = compactObject({
+      const request = resume ? { threadId: input.threadId, input: [], clientUserMessageId: resume.clientUserMessageId,
+        turnTrigger: "capacity_retry_automatic" } : compactObject({
         threadId: input.threadId,
         input: [{ type: "text", text: input.prompt, text_elements: [] }],
         cwd: input.cwd,
@@ -260,12 +270,13 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
             observe: () => this.observeOwner(input.threadId!),
             threadId: input.threadId,
             request,
+            resume,
             onSnapshot: (snapshot) => {
               previousTurnIds = new Set(snapshot.turns.map((turn) => turn.id));
             }
           });
         } catch (error) {
-          if (!isDesktopTurnBusyError(error)) throw error;
+          if (resume || !isDesktopTurnBusyError(error)) throw error;
           if (!queuedNoticeSent) {
             queuedNoticeSent = true;
             await input.onProgress?.("当前会话的上一条任务仍在处理中，已加入队列。");
@@ -483,6 +494,7 @@ type FollowerRequest = {
   threadId: string;
   request: Record<string, unknown>;
   onSnapshot?: (snapshot: CodexThreadSnapshot) => void;
+  resume?: CodexCapacityResumeInput;
 };
 
 class ObservationStages {
@@ -535,21 +547,26 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   try {
     observation = await input.observe();
     const { connection, snapshot } = observation;
-    assertCodexThreadRunnable(snapshot.state);
+    if (input.resume) assertCapacityResume(snapshot, input.resume.failedTurnId);
+    else assertCodexThreadRunnable(snapshot.state);
     if (snapshot.state.pendingTurnWithoutId && snapshot.state.runtimeStatus !== "active") {
       throw new CodexInterventionError("Codex App 残留了没有轮次 ID 的运行中消息，但后端没有执行任务。为避免重复提交，未发送新消息；请先重新加载 Codex App 并检查 /history。");
     }
     if (snapshot.state.runtimeStatus === "active") throw new Error("Codex Desktop thread has an active turn");
-    if (snapshot.state.runtimeStatus !== "idle") {
+    if (snapshot.state.runtimeStatus !== "idle" && !(input.resume && snapshot.state.runtimeStatus === "systemError")) {
       throw new CodexInterventionError("无法确认 Codex Desktop 会话处于空闲状态，未发送新消息。请检查 /status 后重试。");
     }
     input.onSnapshot?.(snapshot);
+    if (input.resume) {
+      assertCapacityResume(snapshot, input.resume.failedTurnId);
+      input.resume.assertCurrent();
+    }
     phase = "submission";
     return await connection.request("thread-follower-start-turn", 2, {
       conversationId: input.threadId,
       turnStart: {
         request: input.request,
-        context: {
+        context: input.resume ? { inheritThreadSettings: true } : {
           inheritThreadSettings: false,
           useAppServerPermissionDefault: true,
           usePermissionSelection: false
