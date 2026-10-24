@@ -106,7 +106,7 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
   const body=new URLSearchParams({token:grant.token,entryId:remoteEntry.id}).toString();
   assert.equal((await fetch(local+"/authorize",{method:"POST",headers:{Origin:management},body})).status,404,"grant cannot be consumed on a foreign host entrance");
   const login=await remoteRequest(origin,ca,"/authorize",{method:"POST",headers:{Origin:management},body});
-  assert.equal(login.status,200); assert.match(login.headers["set-cookie"]![0],/Secure/);
+  assert.equal(login.status,303); assert.match(login.headers["set-cookie"]![0],/Secure/);
   const cookie=login.headers["set-cookie"]![0].split(";")[0];
   const landing=await remoteRequest(origin,ca,"/workspace/"+remoteEntry.id,{headers:{Cookie:cookie}});
   const csrf=/name="csrf" value="([^"]+)"/.exec(landing.body)![1];
@@ -125,7 +125,7 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
   await until(()=>attempts>=2&&access.statuses().some(s=>s.hostId===hostId&&s.state==="ready"));
   assert.equal(launches,1); assert.equal(stops,0); assert.deepEqual(fs.readFileSync(path.join(root,"ide",authFile)),before);
   assert.deepEqual(fs.readFileSync(manager.configStore.filePath),configBefore); assert.equal(manager.entry("account","remote")!.url,remoteEntry.url);
-  assert.match((await remoteRequest(origin,ca,"/workspace/"+remoteEntry.id,{headers:{Cookie:cookie}})).body,/打开 Web IDE/);
+  assert.equal((await remoteRequest(origin,ca,"/workspace/"+remoteEntry.id,{headers:{Cookie:cookie}})).status,303);
   await access.close(); access=new IDEEndpointManager(manager,{ingressIO:io,ingressTiming:{retryMs:5,probeMs:100}}); access.setManagementOrigin(management); await access.reload(false);
   await until(()=>access.statuses().some(s=>s.hostId===hostId&&s.state==="ready"));
   assert.match((await remoteRequest(origin,ca,"/workspace/"+remoteEntry.id,{headers:{Cookie:cookie}})).body,/打开 Web IDE/);

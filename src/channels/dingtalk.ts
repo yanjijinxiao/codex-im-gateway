@@ -18,7 +18,6 @@ import type { ChannelMessage } from "./message.js";
 import type { ChannelAdapter, ChannelClient, ChannelConnectionStatus, ChannelMonitorOptions, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart, ChannelMediaInput, ChannelMentionInput } from "./types.js";
 import type { ChannelActionCard } from "./action-card.js";
 import { renderMarkdownTable, escapeTableMarkdown } from "./table.js";
-import { chunkText } from "../bridge/format.js";
 import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, ChannelProgressError, channelProgressError } from "./errors.js";
 import { DingTalkFileClient, type DingTalkFileTarget, type DingTalkProactiveFileTarget } from "./dingtalk-files.js";
 import { DiagnosticDingTalkStreamClient } from "./dingtalk-stream-diagnostics.js";
@@ -298,9 +297,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
     const parts: ChannelDeliveryPart[] = [];
     try {
-      for (const text of chunkText(card.fallbackText)) {
-        const result = await this.sendWebhookText({ toUserId: input.toUserId, text });
-        parts.push({ messageId: result.messageId, text });
+      for (const page of resultPages(card.fallbackText, 1800)) {
+        const result = await this.sendWebhookText({ toUserId: input.toUserId, text: page.text });
+        parts.push({ messageId: result.messageId, text: page.text });
       }
     } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
     return { messageId: parts.at(-1)!.messageId, parts };

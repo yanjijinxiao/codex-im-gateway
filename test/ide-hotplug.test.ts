@@ -90,7 +90,7 @@ async function fixture(t: test.TestContext, legacy = false) {
   async function login(host: string) {
     const entry = manager.entry("account", host)!, grant = await access.grant(entry.id);
     const result = await request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() });
-    assert.equal(result.status, 200); return { entry, cookie: result.headers["set-cookie"]![0].split(";")[0] };
+    assert.equal(result.status, 303); return { entry, cookie: result.headers["set-cookie"]![0].split(";")[0] };
   }
   async function open(browser: Awaited<ReturnType<typeof login>>) {
     const page = await request(`/workspace/${browser.entry.id}`, { headers: { Cookie: browser.cookie } });
@@ -127,7 +127,7 @@ test("local direct HTTPS is a separate publication and audience; adding it prese
   const body = new URLSearchParams({ token: grant.token, entryId: a.entry.id }).toString();
   assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body })).status, 401, "direct token cannot be consumed by the old ingress");
   const authorized = await f.request("/authorize", { method: "POST", headers: { Origin: management }, body }, direct);
-  assert.equal(authorized.status, 200);
+  assert.equal(authorized.status, 303);
   const cookie = authorized.headers["set-cookie"]![0].split(";")[0];
   const page = await f.request(`/workspace/${a.entry.id}`, { headers: { Cookie: cookie } }, direct);
   const csrf = /name="csrf" value="([^"]+)"/.exec(page.body)![1];
@@ -209,7 +209,7 @@ for (const legacy of [false, true]) test(`${legacy ? "legacy" : "shared"} hot-ad
   assert.equal(f.access.pendingAccess().find(r => r.id === request.id)?.code, request.code);
   await f.access.approveAccess(request.id, a.entry.id);
   assert.equal((await f.request(`/workspace/${a.entry.id}`, { headers: { Cookie: pending.headers["set-cookie"]![0].split(";")[0] } })).status, 303);
-  assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: unused.token, entryId: remote.entry.id }).toString() })).status, 200);
+  assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: unused.token, entryId: remote.entry.id }).toString() })).status, 303);
   const b = await f.login(secondHost), bSocket = await f.open(b), bGrant = await f.access.grant(b.entry.id);
   await f.request(`/workspace/${b.entry.id}`);
   const bRequest = f.access.pendingAccess().find(r => r.entryId === b.entry.id)!;

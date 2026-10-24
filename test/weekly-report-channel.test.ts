@@ -175,11 +175,12 @@ test("injects installed Skill shortcuts and natural-language commands into a run
   });
 
   await send("help-before", "/help");
-  assert.doesNotMatch(replies.at(-1) ?? "", /\/weekly/);
+  assert.doesNotMatch(replies.join("\n"), /\/weekly/);
 
   installWeeklySkill(codexHome);
+  const beforeHelp = replies.length;
   await send("help-after", "/help");
-  assert.match(replies.at(-1) ?? "", /\/weekly/);
+  assert.match(replies.slice(beforeHelp).join("\n"), /\/weekly/);
 
   await send("mail", "/wr mail");
   assert.equal(intentResolverCalls, 0);

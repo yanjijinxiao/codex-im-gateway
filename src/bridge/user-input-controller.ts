@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CodexUserInputAnswer, CodexUserInputQuestion, CodexUserInputRequest, CodexUserInputResult } from "../codex/backend.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
+import { copyBlock } from "../channels/copyable.js";
 import type { ChannelMention, ChannelReceipt } from "../channels/types.js";
 import { isDirectedMentionId } from "../channels/mentions.js";
 import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
@@ -382,7 +383,7 @@ function questionCard(record: QuestionRecord, index: number, total: number): Cha
   const title = `Codex 问题 ${id}${total > 1 ? ` · ${index + 1}/${total}` : ""}`;
   const body = question.isSecret ? "此问题需要敏感输入，请在 Codex App 中回答。"
     : [question.question, ...(question.options ?? []).map((option, index) => `${index + 1}. ${option.label}\n${option.description}`),
-      `回答：/answer ${id} 回答内容`, ...(question.options?.length ? [`选择：/answer ${id} --option 1`] : []), `跳过：/skip ${id}`].join("\n\n");
+      `自定义回答（将“回答内容”替换为你的回答）：\n\n${copyBlock(`/answer ${id} 回答内容`)}`].join("\n\n");
   return { ...createChoiceCard({ title, body, fallbackText: `【${title}】\n\n${body}`, template: "orange",
     choices: question.isSecret ? [] : [...(question.options ?? []).map((option, index) => ({ label: option.label,
       command: "answer" as const, arg: `${id} --option ${index + 1}` })), { label: "跳过", command: "skip" as const, arg: id }] }),

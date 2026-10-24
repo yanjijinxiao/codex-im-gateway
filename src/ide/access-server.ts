@@ -215,8 +215,7 @@ export class IDEAccessServer {
       const access = this.authorization.consume(form.get("token") ?? "", id, this.scope(id));
       if (!access) { this.page(res, 401, "授权已失效", "请从 Gateway 管理页重新打开；授权只能使用一次。"); return; }
       this.setCookie(res, COOKIE + id, access.token, IDE_SESSION_TTL_MS / 1000);
-      this.page(res, 200, "Gateway 已授权", `无需额外密码。本次授权仅用于当前项目，${IDE_SESSION_DAYS} 天内有效，Gateway 重启后仍保留；可在管理页随时撤销。${access.session.trustWorkspace ? "已一并允许当前目录的任务、调试及扩展运行。" : "本次只批准访问，未自动信任目录代码。"}`,
-        `<a href="/workspace/${id}">进入项目 Web IDE</a>`); return;
+      this.redirect(res, `/workspace/${id}`); return;
     }
     if (method !== "GET" && method !== "HEAD" && !this.validOrigin(req)) { res.writeHead(403).end(); return; }
     const workspace = /^\/workspace\/([a-f0-9]{32})$/.exec(url.pathname);
@@ -244,9 +243,15 @@ export class IDEAccessServer {
         this.page(res, 200, "等待 Gateway 授权", "当前浏览器尚未授权，不代表管理员登记丢失。核对下方项目、主机、目录和权限，再复制所选命令发给对应机器人。无需 Web IDE 密码。",
           `<section data-ide-wait>${choiceControls}${copyField("浏览器识别码（仅核对用，无需单独发送）", pending.request.code)}</section><p>只批准你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天。管理员登记独立持久保存，不因 Gateway 重启失效，也不受这两个期限影响。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何登记审批管理员</summary><p>仅未登记的个人身份需要首次设置；已登记者无需重复操作。本页尚未验证你的钉钉身份，不判断你是否已登记。请在机器人私聊发送下方命令，查看本人真实登记状态。</p>${copyField("查询本人登记状态的命令", "/ide identity")}<p>命令确认未登记时，再到运行 Gateway 的电脑管理页「Web IDE → 授权管理员」登记个人 ID，不要填写群 ID。群白名单和 session 权限不等于 IDE 审批资格。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}/#ide">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
       }
+      const endpoint = this.manager.endpoint(id, session.trustWorkspace === true);
+      if (endpoint) { this.redirect(res, `/ide/${id}/?folder=${encodeURIComponent(endpoint.workspace)}`); return; }
+      // GET remains read-only: a nonce-protected same-origin form performs the
+      // existing CSRF-checked POST. Link previews cannot start an IDE or grant
+      // workspace trust. With scripts disabled there is an explicit fallback.
       const target = this.manager.resolve(id);
-      this.page(res, 200, target.projectName, `${target.hostId} · ${target.workspace}`,
-        `<p>工作区目录：<code>${escape(target.workspace)}</code>。打开后左侧 Explorer 应显示此目录；单文件夹工作区不需要额外创建 .code-workspace 文件。</p><p>${session.trustWorkspace ? "Gateway 已授权并信任当前目录：此专属 IDE 实例允许任务、调试和扩展运行，不再弹出 VS Code 的二次信任确认。不会修改其他实例或全局 VS Code 设置。" : "本次仅批准访问，未信任目录代码；可在 Gateway 管理页选择「批准并信任此目录」后重新进入。"}</p><p>文件、终端和语言服务均在项目所在主机运行。打开 IDE 不会向 Codex 发新消息。此 IDE 具备运行用户的开发权限，不是文件系统沙箱。</p><form method="post" action="/open/${id}"><input type="hidden" name="csrf" value="${session.csrf}"><button>打开 Web IDE</button></form><form method="post" action="/logout/${id}"><input type="hidden" name="csrf" value="${session.csrf}"><button>退出授权</button></form>`); return;
+      this.page(res, 200, "正在打开 Web IDE", `${target.projectName} · ${target.hostId} · ${target.workspace}`,
+        `<p>当前浏览器已授权，正在自动进入 code-server，无需再次批准。${session.trustWorkspace ? "Gateway 已授权并信任当前目录，沿用既有权限。" : "本次仅批准访问，沿用既有权限，不自动信任目录代码。"}</p><form data-ide-auto-open method="post" action="/open/${id}"><input type="hidden" name="csrf" value="${session.csrf}"><button type="submit">未自动继续时，点击进入</button></form>`,
+        `document.querySelector('[data-ide-auto-open]').requestSubmit();`); return;
     }
     const open = /^\/open\/([a-f0-9]{32})$/.exec(url.pathname);
     if (method === "POST" && open && session) {
@@ -256,16 +261,13 @@ export class IDEAccessServer {
       try { instance = await this.manager.open(open[1], session.trustWorkspace === true, session.trustedDirectory); }
       catch (error) {
         if (!(error instanceof IDEInstallPendingError)) throw error;
-        this.page(res, 202, "正在准备 code-server", error.message, `<p><a href="/workspace/${open[1]}">准备完成后重试打开</a></p>`); return;
+        this.page(res, 202, "正在准备 code-server", error.message, `<p>准备完成后会自动进入，无需再次批准。</p><a data-ide-retry href="/workspace/${open[1]}">立即检查进度</a>`,
+          `setTimeout(()=>location.replace(document.querySelector('[data-ide-retry]').href),3000);`); return;
       }
       if (!this.authorization.active(session)) { res.writeHead(401).end(); return; }
       const destination = `/ide/${open[1]}/?folder=${encodeURIComponent(instance.workspace)}`;
-      if (instance.profile?.warning) {
-        this.page(res, 200, "IDE 已启动，配置需要处理", instance.profile.warning === "settings-unmodified"
-          ? "原 settings.json 无法安全补充，已保留原文件；请在 IDE 设置中检查。"
-          : "所选扩展未准备完成，编辑器仍可使用。请在 Gateway 管理页查看未就绪项，检查 Open VSX 网络、扩展兼容性及目录权限，停止该 IDE 后重试准备扩展。",
-        `<p>不会重新执行 Codex 任务或改变绑定。</p><a href="${escape(destination)}">仍然进入 Web IDE</a>`); return;
-      }
+      // Extension preparation warnings remain visible in management status;
+      // they must not add another gate in front of an authorized editor.
       this.redirect(res, destination); return;
     }
     const ide = /^\/ide\/([a-f0-9]{32})(\/.*)$/.exec(url.pathname);
@@ -337,11 +339,11 @@ export class IDEAccessServer {
     if (!previous) socket.once("close", () => { const entry = this.connections.get(socket); if (entry) clearTimeout(entry.timer); this.connections.delete(socket); });
   }
   private redirect(res: ServerResponse, location: string): void { res.writeHead(303, { Location: location }).end(); }
-  private page(res: ServerResponse, status: number, title: string, text: string, body = ""): void {
+  private page(res: ServerResponse, status: number, title: string, text: string, body = "", script = ""): void {
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     const nonce = crypto.randomBytes(16).toString("base64");
     res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`);
-    res.writeHead(status).end(`<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>body{margin:10vh auto;max-width:620px;padding:24px;color:#25342d;background:#f6f8f5;font:17px Georgia,serif}h1{font-size:30px}p{line-height:1.7;overflow-wrap:anywhere}label{display:grid;gap:8px}input,button{font:inherit;padding:12px;margin:12px 0}button{background:#214f3a;color:white;border:0;border-radius:6px;cursor:pointer}input{border:1px solid #aab7af}${COPY_STYLE}</style><h1>${escape(title)}</h1><p>${escape(text)}</p>${body}<script nonce="${nonce}">${COPY_SCRIPT}</script></html>`);
+    res.writeHead(status).end(`<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>body{margin:10vh auto;max-width:620px;padding:24px;color:#25342d;background:#f6f8f5;font:17px Georgia,serif}h1{font-size:30px}p{line-height:1.7;overflow-wrap:anywhere}label{display:grid;gap:8px}input,button{font:inherit;padding:12px;margin:12px 0}button{background:#214f3a;color:white;border:0;border-radius:6px;cursor:pointer}input{border:1px solid #aab7af}${COPY_STYLE}</style><h1>${escape(title)}</h1><p>${escape(text)}</p>${body}<script nonce="${nonce}">${COPY_SCRIPT}\n${script}</script></html>`);
   }
 }
 async function readBody(req: IncomingMessage): Promise<string> {

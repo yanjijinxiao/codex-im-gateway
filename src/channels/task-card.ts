@@ -28,6 +28,7 @@ type ChannelTaskCardBase = {
   readonly identifier: string;
   readonly actions: readonly ChannelTaskAction[];
   readonly fallbackText: string;
+  readonly copyText?: string;
   readonly taskboardUrl?: string;
 };
 

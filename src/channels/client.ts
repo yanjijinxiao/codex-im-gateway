@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { chunkText } from "../bridge/format.js";
 import { resultPages } from "./result-pages.js";
 import { isDirectedMentionId } from "./mentions.js";
+import { copyableTaskCard } from "./task-card-copy.js";
 import { ChannelCapabilityError, ChannelDeliveryError, ChannelPartialDeliveryError, InboundMediaTooLargeError, channelProgressError } from "./errors.js";
 import type { ChannelAttachment } from "./message.js";
 import type { Capability, ChannelCapabilities, ChannelClient, ChannelTextClient, ChannelReceipt, ChannelDeliveryPart } from "./types.js";
@@ -45,9 +45,9 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
   const fallback = async (toUserId: string, text: string, contextToken?: string) => {
     const parts: ChannelDeliveryPart[] = [];
     try {
-      for (const chunk of chunkText(text)) {
-        const result = await sendText({ toUserId, text: chunk, ...(contextToken ? { contextToken } : {}) });
-        parts.push({ messageId: result.messageId, text: chunk });
+      for (const page of resultPages(text, Math.min(caps.resultPageBytes ?? 1800, 1800))) {
+        const result = await acknowledged("sendText", driver.sendText({ toUserId, text: page.text, ...(contextToken ? { contextToken } : {}) }));
+        parts.push({ messageId: result.messageId, text: page.text });
       }
     } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
     return { messageId: parts.at(-1)!.messageId, parts };
@@ -136,6 +136,7 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
         : fallback(input.toUserId, input.card.fallbackText, input.contextToken);
     },
     sendTaskCard(input) {
+      input = { ...input, card: copyableTaskCard(input.card) };
       return caps.tasks === "available"
         ? acknowledged("sendTaskCard", required(driver.sendTaskCard, "tasks").call(driver, input))
         : fallback(input.toUserId, input.card.fallbackText, input.contextToken);
@@ -146,7 +147,7 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
     },
     async updateTaskCard(input) {
       requireFeature("cardUpdates", caps.cardUpdates);
-      await required(driver.updateTaskCard, "cardUpdates").call(driver, input);
+      await required(driver.updateTaskCard, "cardUpdates").call(driver, { ...input, card: copyableTaskCard(input.card) });
     },
     async sendTyping(input) {
       requireFeature("typing", caps.typing);

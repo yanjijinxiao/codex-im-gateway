@@ -82,7 +82,7 @@ test("HTTPS retains native authorization, Secure cookies, WSS scopes and persist
   assert.equal((await request(origin + "/api/bootstrap", ca)).status, 401);
   const grant = await access.grant(entry.id);
   const logged = await request(origin + "/authorize", ca, { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() });
-  assert.equal(logged.status, 200); assert.match(logged.headers["set-cookie"]![0], /Secure/);
+  assert.equal(logged.status, 303); assert.match(logged.headers["set-cookie"]![0], /Secure/);
   const cookie = logged.headers["set-cookie"]![0].split(";")[0];
   const landing = await request(entry.url, ca, { headers: { Cookie: cookie } }), csrf = /name="csrf" value="([^"]+)"/.exec(landing.body)![1];
   assert.equal((await request(origin + "/open/" + entry.id, ca, { method: "POST", headers: { Cookie: cookie, Origin: "https://evil.invalid" }, body: new URLSearchParams({ csrf }).toString() })).status, 403);
@@ -94,7 +94,7 @@ test("HTTPS retains native authorization, Secure cookies, WSS scopes and persist
   const originalFingerprint = landing.fingerprint;
   await access.tls.prepare("127.0.0.1", true); await access.refreshCertificate();
   const renewed = await request(entry.url, ca, { headers: { Cookie: cookie } });
-  assert.notEqual(renewed.fingerprint, originalFingerprint); assert.match(renewed.body, /打开 Web IDE/); assert.equal(socket.destroyed, false, "certificate reload must not close active terminals");
+  assert.notEqual(renewed.fingerprint, originalFingerprint); assert.equal(renewed.status, 303); assert.match(renewed.headers.location!, /\/ide\//); assert.equal(socket.destroyed, false, "certificate reload must not close active terminals");
   await access.close(); access = new IDEAccessServer(manager); await access.reload(false);
   assert.match((await request(entry.url, ca, { headers: { Cookie: cookie } })).body, /打开 Web IDE/);
   assert.deepEqual(access.tls.caCertificate(), ca); access.revoke();

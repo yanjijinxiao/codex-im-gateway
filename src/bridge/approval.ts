@@ -3,6 +3,7 @@ import type {
   CodexApprovalRequest
 } from "../codex/approval.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
+import { copyBlock } from "../channels/copyable.js";
 
 const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60_000;
 
@@ -116,8 +117,8 @@ function approvalNotice(id: string, request: CodexApprovalRequest, timeoutMs: nu
     ...details,
     request.cwd ? `工作目录：${request.cwd}` : undefined,
     request.reason ? `原因：${limit(request.reason)}` : undefined,
-    `回复 /approve ${id}（/ok ${id}）批准一次`,
-    `回复 /reject ${id}（/no ${id}）拒绝`,
+    `批准一次：\n\n${copyBlock(`/approve ${id}`)}`,
+    `拒绝：\n\n${copyBlock(`/reject ${id}`)}`,
     timeout
   ].filter(Boolean).join("\n");
   const body = [

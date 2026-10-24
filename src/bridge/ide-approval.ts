@@ -2,13 +2,7 @@ import type { IDEApprovalService } from "../ide/approval-service.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
 import type { ChannelMessage } from "../channels/message.js";
 import { IDE_APPROVAL_CHOICES, ideConfirmationCommand } from "../ide/approval-presentation.js";
-
-/** One value per block; even provider IDs containing backticks stay inert. */
-function copyBlock(value: string): string {
-  const width = Math.max(3, ...Array.from(value.matchAll(/`+/g), match => match[0].length + 1));
-  const fence = "`".repeat(width);
-  return `\n\n${fence}text\n${value}\n${fence}\n\n`;
-}
+import { copyBlock } from "../channels/copyable.js";
 
 /** Explicit control commands only; never resolved from model/friendly intent or
  * quoted content. Unknown conversation kinds fail closed, even if IDs match. */
@@ -29,7 +23,7 @@ export async function ideApprovalCommand(input: { service?: IDEApprovalService; 
         : status === "unregistered"
           ? "审批资格：当前个人身份未登记。首次请在本机 Gateway → Web IDE → 授权管理员选择该渠道账号并登记个人 ID。不要填写群 ID。"
           : "审批资格：暂时无法核验。请在本机管理页检查管理员记录或渠道配置；无法核验不表示登记已丢失。";
-      return `IDE 个人身份与审批资格\n渠道账号：${principal.accountId}\n渠道：${principal.channel}\n${description}\n个人 ID（单独复制下方内容）：${copyBlock(principal.actorId)}`;
+      return `IDE 个人身份与审批资格\n渠道账号：${principal.accountId}\n渠道：${principal.channel}\n${description}\n\n个人 ID（单独复制下方内容）：\n\n${copyBlock(principal.actorId)}`;
     }
     if (args.length === 2 && args[0] === "auth" && /^\d{6}$/.test(args[1])) {
       const { request, token, shortCode } = input.service.preview(principal, args[1]);
@@ -37,7 +31,7 @@ export async function ideApprovalCommand(input: { service?: IDEApprovalService; 
       const panel = request.url ? `\n\n[打开确认复制面板](${new URL(`/approval/${token}`, request.url).href})\n面板按钮只复制命令，不会授权。复制后回到本机器人私聊发送；原浏览器申请仍为 5 分钟有效。` : "";
       return createChoiceCard({ title: "确认 Web IDE 浏览器授权", body,
         note: "支持按钮的渠道可点击；钉钉请打开确认复制面板，或发送下方一条短命令。仅当前已登记个人账号能确认。",
-        fallbackText: `${body}${panel}\n\n二次确认：仅发送你选择的一条短命令。也可直接输入，不必依赖钉钉代码块的复制图标。\n${IDE_APPROVAL_CHOICES.map(c => `${c.label}：${copyBlock(ideConfirmationCommand(shortCode, c.choice))}`).join("\n")}`,
+        fallbackText: `${body}${panel}\n\n二次确认：仅发送你选择的一条短命令。也可直接输入，不必依赖钉钉代码块的复制图标。\n\n${IDE_APPROVAL_CHOICES.map(c => `${c.label}\n\n${copyBlock(ideConfirmationCommand(shortCode, c.choice))}`).join("\n\n")}`,
         choices: IDE_APPROVAL_CHOICES.map(c => ({ label: c.label, command: "ide", arg: `${c.choice} ${shortCode}`, style: c.style })) });
     }
     const short = args.length === 2 && ["trust", "access", "deny"].includes(args[0]) && /^[a-f0-9]{12}$/.test(args[1]);

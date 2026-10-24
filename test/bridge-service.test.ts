@@ -1216,7 +1216,9 @@ test("buffers inbound image attachments and includes local paths in prompt done"
   const savedPath = prompt.match(/saved to ([^\]]+)/)?.[1];
   assert.ok(savedPath);
   assert.deepEqual(fs.readFileSync(savedPath), plaintext);
-  assert.equal(textReplies.filter((reply) => reply === "Buffered. Send /prompt done when ready.").length, 2);
+  const bufferedReplies = textReplies.filter(reply => reply.startsWith("Buffered. Send /prompt done when ready."));
+  assert.equal(bufferedReplies.length, 2);
+  for (const reply of bufferedReplies) assert.match(reply, /```text\n\/prompt done\n```/);
 });
 
 test("replies directly when a WeChat attachment exceeds 100 MiB", async (t) => {

@@ -112,7 +112,7 @@ test("separate browser authentication guards HTTP/WS, strips credentials, denies
   const login = (originHeader: string) => fetch(`${origin}/authorize`, { method: "POST", headers: { Origin: originHeader }, redirect: "manual",
     body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
   assert.equal((await login("https://evil.invalid")).status, 403);
-  const logged = await login(managementOrigin); assert.equal(logged.status, 200);
+  const logged = await login(managementOrigin); assert.equal(logged.status, 303);
   assert.equal((await login(managementOrigin)).status, 401, "grant cannot be replayed");
   const cookie = logged.headers.get("set-cookie")!.split(";")[0]; assert.match(logged.headers.get("set-cookie")!, /HttpOnly; SameSite=Strict/);
   assert.match(logged.headers.get("set-cookie")!, /Max-Age=1296000/);
@@ -165,7 +165,7 @@ test("browser cookie survives access-server restart and trusted workbench cannot
     return { access, manager, transport };
   }
   const first = await start(), entry = first.manager.entry("a", "s")!, grant = await first.access.grant(entry.id, true);
-  const login = await freshFetch(`${origin}/authorize`, { method: "POST", headers: { Origin: managementOrigin },
+  const login = await freshFetch(`${origin}/authorize`, { method: "POST", redirect: "manual", headers: { Origin: managementOrigin },
     body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
   const cookie = login.headers.get("set-cookie")!.split(";")[0];
   await login.text();
@@ -225,8 +225,8 @@ test("local Gateway mints IDE access only behind mutation protection and no pass
   assert.equal((await fetch(`${server.url}/api/ide/access`, { method: "POST", body })).status, 403);
   const grant = await (await fetch(`${server.url}/api/ide/access`, { method: "POST", headers, body })).json();
   assert.equal(grant.action, settings.publicOrigin + "/authorize"); assert.ok(grant.token);
-  const login = await fetch(grant.action, { method: "POST", headers: { Origin: server.url }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
-  assert.equal(login.status, 200); const cookie = login.headers.get("set-cookie")!.split(";")[0];
+  const login = await fetch(grant.action, { method: "POST", redirect: "manual", headers: { Origin: server.url }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
+  assert.equal(login.status, 303); const cookie = login.headers.get("set-cookie")!.split(";")[0];
   const hotConfig = { ...ide.config(), hosts: [...ide.config().hosts, { hostId: "remote:new", enabled: true, autoInstall: false, binary: "code-server" }] };
   assert.equal((await fetch(`${server.url}/api/ide/config`, { method: "PUT", headers, body: JSON.stringify({ config: hotConfig }) })).status, 400, "an arbitrary host cannot be hot-enabled");
   projects.push({ hostId: "remote:new" });
@@ -333,7 +333,7 @@ test("final IDE entry is in the same result body passed to participant @ deliver
   assert.ok(finals.some(text => text.includes(url))); assert.deepEqual(notices, [withIDEEntry("result", url)]);
 });
 
-test("authorized browser sees explicit degraded-profile warning before entering the still usable IDE", async t => {
+test("authorized browser enters the usable IDE directly while degraded-profile warnings stay in management status", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-profile-warning-")), transport = new FakeTransport();
   const originalLaunch = transport.launch.bind(transport);
   transport.launch = async input => {
@@ -346,12 +346,12 @@ test("authorized browser sees explicit degraded-profile warning before entering 
   const access = new IDEAccessServer(manager); access.setManagementOrigin("http://127.0.0.1:18788"); await access.reload();
   t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const entry = manager.entry("a", "s")!, grant = await access.grant(entry.id);
-  const login = await fetch(`${origin}/authorize`, { method: "POST", headers: { Origin: "http://127.0.0.1:18788" }, body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
+  const login = await fetch(`${origin}/authorize`, { method: "POST", redirect: "manual", headers: { Origin: "http://127.0.0.1:18788" }, body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
   const cookie = login.headers.get("set-cookie")!.split(";")[0];
   const landing = await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), csrf = /name="csrf" value="([^"]+)"/.exec(landing)![1];
   const opened = await fetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }), redirect: "manual" });
-  assert.equal(opened.status, 200); const html = await opened.text();
-  assert.match(html, /所选扩展未准备完成/); assert.match(html, /仍然进入 Web IDE/);
+  assert.equal(opened.status, 303); assert.match(opened.headers.get("location")!, /^\/ide\//);
+  assert.equal(manager.list()[0].profile?.warning, "extensions-unavailable");
   assert.equal(manager.list()[0].status, "running"); assert.ok(manager.endpoint(entry.id));
   assert.equal((await fetch(`${origin}/ide/${entry.id}/`, { headers: { Cookie: cookie } })).status, 200);
   assert.equal((await fetch(`${origin}/ide/${entry.id}/`, { redirect: "manual" })).status, 303);

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ChannelTable } from "./table.js";
+import { copyableChoices } from "./copyable.js";
 
 const channelCommandActionValueSchema = z.object({
   version: z.literal(1),
@@ -114,6 +115,8 @@ export type ChannelChoice = {
   readonly arg: string;
   readonly style?: ChannelCardAction["style"];
   readonly confirm?: string;
+  /** Public, actor-scoped reply when the callback contains an internal ID. */
+  readonly copyValue?: string;
 };
 
 type CreateChoiceCardInput = {
@@ -133,14 +136,16 @@ export function createChoiceCard(input: CreateChoiceCardInput): ChannelActionCar
     value: { version: 1, command: choice.command, arg: choice.arg },
     ...(choice.confirm ? { confirm: choice.confirm } : {})
   }));
+  const values = actions.map((action, index) => ({ label: action.label,
+    value: input.choices[index].copyValue ?? formatChannelActionCommand(action.value)! }));
   return {
     title: input.title,
     template: input.template ?? "blue",
-    body: input.body,
+    body: copyableChoices(input.body, values),
     ...(input.table ? { table: input.table } : {}),
     ...(input.note ? { note: input.note } : {}),
     actionGroups: groupActions(actions),
-    fallbackText: input.fallbackText
+    fallbackText: copyableChoices(input.fallbackText, values)
   };
 }
 

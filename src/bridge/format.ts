@@ -14,6 +14,11 @@ const LEGACY_BRIDGE_ACTION_INSTRUCTIONS = [
   BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-actions"),
   BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-server-actions")
 ];
+const BRIDGE_COPY_INSTRUCTIONS = [
+  "Bridge reply presentation rule: whenever you ask the user to return, copy, paste or choose a value, put each exact reply in its own fenced text code block.",
+  "This includes every suggested option, command, identifier and confirmation phrase. Keep its explanation outside the block; do not combine multiple choices or commands in one block.",
+  "Use copy-enabled controls when the surface supports them. Copying must not submit an answer, execute a command, grant permission or select an option. Do not ask the user to copy secrets into IM."
+].join("\n");
 const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
 const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
 export type AttachmentSource = "WeChat" | "Web" | "DingTalk" | "Feishu" | "WeCom" | "IM";
@@ -52,7 +57,7 @@ export function buildPromptParts(
   }
   return {
     prompt: lines.join("\n\n").trim(),
-    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", attachmentSource), buildKnowledgeContext(knowledge, attachmentSource)].join("\n\n")
+    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", attachmentSource), BRIDGE_COPY_INSTRUCTIONS, buildKnowledgeContext(knowledge, attachmentSource)].join("\n\n")
   };
 }
 
@@ -108,6 +113,7 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
       break;
     }
   }
+  if (normalized.startsWith(BRIDGE_COPY_INSTRUCTIONS)) normalized = normalized.slice(BRIDGE_COPY_INSTRUCTIONS.length).trim();
   normalized = normalized.replace(
     new RegExp(`^${escapeRegExp(KNOWLEDGE_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(KNOWLEDGE_CONTEXT_END)}\\s*`),
     ""

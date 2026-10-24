@@ -6,3 +6,15 @@
 .gateway-copy small { grid-column:1/-1; min-height:1.5em; font-size:13px; font-weight:400; overflow-wrap:anywhere; }
 .gateway-copy :focus-visible { outline:3px solid #719f89; outline-offset:2px; }
 @media(max-width:420px) { .gateway-copy { gap:8px; } .gateway-copy button { padding-inline:12px; } }
+.gateway-copy-tools { display:inline-flex; flex-wrap:wrap; align-items:center; gap:6px; max-width:100%; margin:4px 6px 4px 0; vertical-align:middle; font-size:12px; line-height:1.4; font-family:inherit; }
+.gateway-copy-tools > button { flex:none; min-height:32px; margin:0; padding:5px 10px; border:1px solid #aab7af; border-radius:5px; color:inherit; background:transparent; font:inherit; cursor:pointer; }
+.gateway-copy-tools > small { overflow-wrap:anywhere; font-size:12px; line-height:1.4; font-family:inherit; }
+.gateway-copy-tools > textarea { flex-basis:100%; box-sizing:border-box; width:100%; min-width:160px; max-width:100%; min-height:64px; padding:8px; color:inherit; background:transparent; border:1px solid #aab7af; border-radius:5px; font:14px/1.5 monospace; }
+.gateway-copy-tools > textarea[hidden] { display:none; }
+.gateway-copy-tools :focus-visible { outline:3px solid #719f89; outline-offset:2px; }
+.gateway-copy-options { flex-basis:100%; min-width:0; }
+.gateway-copy-options > summary { cursor:pointer; min-height:32px; display:list-item; align-content:center; }
+.gateway-copy-options .gateway-copy { margin:8px 0; }
+.gateway-copy-options .gateway-copy label { font-size:12px; }
+.gateway-copy-options .gateway-copy textarea { min-height:40px; padding:8px; font-size:14px; }
+.gateway-copy-options .gateway-copy button { min-height:40px; padding:8px; font-size:12px; }

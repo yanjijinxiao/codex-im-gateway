@@ -21,15 +21,15 @@ test("copy fields are inert, independently labelled and identical across the SSR
   assert.doesNotMatch(html,/<script>|onclick=|onfocus=/);assert.match(html,/&lt;\/textarea&gt;/);
   assert.match(html,/readonly/);assert.match(html,/type="button"/);assert.match(html,/aria-live="polite"/);
 });
-test("copy writes the exact standalone value once and reports success only after clipboard completion",async()=>{
+test("copy requests the exact standalone value once and acknowledges only after the API completes",async()=>{
   let release!:()=>void,calls=0;
   const f=fixture(async value=>{assert.equal(value,"/ide auth 123456");calls++;await new Promise<void>(r=>release=r);});
   const pending=f.api.copy(f.container);await f.api.copy(f.container);assert.equal(calls,1);assert.equal(f.button.disabled,true);
-  assert.notEqual(f.status.textContent,"已复制");release();await pending;assert.equal(f.status.textContent,"已复制");assert.equal(f.button.disabled,false);
+  assert.doesNotMatch(f.status.textContent,/已请求复制/);release();await pending;assert.match(f.status.textContent,/已请求复制/);assert.equal(f.button.disabled,false);
 });
-test("clipboard rejection selects the visible field and uses a verified legacy copy fallback",async()=>{
+test("synchronous copy keeps the visible manual field selected without claiming clipboard verification",async()=>{
   const f=fixture(async()=>{throw Error("permission denied");},true);await f.api.copy(f.container);
-  assert.deepEqual(f.selection(),{selected:true,focused:true});assert.equal(f.status.textContent,"已复制");
+  assert.deepEqual(f.selection(),{selected:true,focused:true});assert.match(f.status.textContent,/已请求复制/);
 });
 test("unavailable clipboard keeps a manual selection and never falsely claims success",async()=>{
   const f=fixture();await f.api.copy(f.container);assert.equal(f.selection().selected,true);

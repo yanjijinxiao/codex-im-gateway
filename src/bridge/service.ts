@@ -40,7 +40,9 @@ import {
   type FriendlyChannelIntent
 } from "./channel-intent.js";
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
-import { buildPromptParts, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
+import { buildPromptParts, buildPromptPreview, parsePrompt } from "./format.js";
+import { resultPages } from "../channels/result-pages.js";
+import { copyableTaskCard } from "../channels/task-card-copy.js";
 import { InboundReferenceStore, referenceContext } from "./inbound-references.js";
 import { PromptBuffer } from "./prompt-buffer.js";
 import { NEW_SESSION_USAGE, parseNewSessionTarget } from "./new-session.js";
@@ -1344,7 +1346,7 @@ export class BridgeService {
     const note = `按项目分组 · 组内最近更新优先 · 每页 ${listing.pageSize} 条\n选择 /session R编号 · 详情 /sessions detail R编号\n翻页 /sessions more|prev · 条数 /sessions size 50`;
     const text = [title, body, renderTextTable(table), note].filter(Boolean).join("\n\n");
     await this.replyActionCard(senderId, createChoiceCard({ title, body: escapeTableMarkdown(body), ...(pageRows.length ? { table } : {}), note, fallbackText: text,
-      choices: [...pageRows.map(({state,hostId}, i): ChannelChoice => ({ label: `R${start+i+1}`, command: "session", arg: `${state.threadId} --host ${hostId}` })),
+      choices: [...pageRows.map(({state,hostId}, i): ChannelChoice => ({ label: `R${start+i+1}`, command: "session", arg: `${state.threadId} --host ${hostId}`, copyValue: `/session R${start+i+1}` })),
         ...(listing.page > 0 ? [{ label: "上一页", command: "sessions" as const, arg: "prev" }] : []),
         ...(start + listing.pageSize < listing.rows.length ? [{ label: "下一页", command: "sessions" as const, arg: "more" }] : [])] }));
   }
@@ -2775,13 +2777,14 @@ export class BridgeService {
         throw error;
       }
       console.warn(`Action card delivery failed for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
-      for (const text of chunkText(card.fallbackText)) {
-        await this.reply(senderId, text);
+      for (const page of resultPages(card.fallbackText, 1800)) {
+        await this.reply(senderId, page.text);
       }
     }
   }
 
   private async replyTaskCard(message: ChannelMessage, card: ChannelTaskCard): Promise<void> {
+    card = copyableTaskCard(card);
     const senderId = message.senderId;
     if (message.interaction && this.channel.capabilities.cardUpdates === "available") {
       try {
