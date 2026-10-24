@@ -5,6 +5,7 @@ const channelCommandActionValueSchema = z.object({
   version: z.literal(1),
   command: z.enum([
     "help",
+    "ide",
     "status",
     "balance",
     "memory",

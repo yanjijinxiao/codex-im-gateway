@@ -14,7 +14,7 @@ export function requiredCommandRole(name: string, arg = ""): SessionRole {
   if (["stop", "approve", "reject"].includes(name)) return "controller";
   if (name === "role") return arg.trim() ? "controller" : "viewer";
   if (name === "project" && /^(?:add|a|rename|rn|delete|d)\b/i.test(arg)) return "controller";
-  if (["help", "status", "balance", "sessions", "history"].includes(name)) return "viewer";
+  if (["help", "status", "balance", "sessions", "history", "ide"].includes(name)) return "viewer";
   if (name === "queue" && (!arg.trim() || arg.trim() === "list")) return "viewer";
   if (["project", "session", "model", "effort", "memory", "goal", "mode", "policy", "follow"].includes(name) && !arg.trim()) return "viewer";
   return "participant";

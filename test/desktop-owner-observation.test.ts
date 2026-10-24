@@ -20,6 +20,7 @@ type Options = {
   defaultBudget?: boolean;
   ownerAbsent?: boolean;
   runtime?: "active" | "idle";
+  cwd?: string;
   writeTimeout?: boolean;
   onDiagnostic?: (event: DesktopOwnerObservationDiagnostic, runner: DesktopCodexRunner) => void;
 };
@@ -80,6 +81,7 @@ async function fixture(t: test.TestContext, options: Options = {}) {
         if (m.method === "thread-stream-following-changed") send({ type: "broadcast", method: "thread-stream-state-changed",
           params: { conversationId: "thread", hostId: "local", change: { type: "snapshot", conversationState: {
             title: `fresh-${attempt}`, threadRuntimeStatus: { type: options.runtime ?? "active" },
+            ...(options.cwd ? { cwd: options.cwd } : {}),
             turns: [{ turnId: `turn-${attempt}`, status: "inProgress", items: [] }]
           } } } }, delay);
         if (m.method === "thread-follower-steer-turn" && !options.writeTimeout) reply({ turnId: `turn-${attempt}` });
@@ -105,11 +107,23 @@ async function fixture(t: test.TestContext, options: Options = {}) {
     if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
     fs.rmSync(root, { recursive: true, force: true });
   });
-  return { runner, diagnostics, received, fault, connections: () => connections,
+  return { root, runner, diagnostics, received, fault, connections: () => connections,
     writes: () => received.filter(m => /start-turn|steer-turn|interrupt-turn/.test(m.method)) };
 }
 
 const input = { threadId: "thread", prompt: "private-prompt-never-log", cwd: "/tmp", clientUserMessageId: "im-id" };
+
+test("live owner metadata uses the same Desktop project identity as the catalog without writing a turn", async t => {
+  const f = await fixture(t, { cwd: "/project/worktree" });
+  const file = path.join(f.root, ".codex-global-state.json");
+  const registry = { "local-projects": { p: { id: "p", rootPaths: ["/project"] } } };
+  fs.writeFileSync(file, JSON.stringify(registry));
+  const observed = await f.runner.inspectThread("thread");
+  assert.equal(observed?.projectId, "p"); assert.equal(observed?.cwd, "/project/worktree");
+  fs.writeFileSync(file, JSON.stringify({ ...registry, "projectless-thread-ids": ["thread"] }));
+  assert.equal((await f.runner.inspectThread("thread"))?.projectId, undefined);
+  assert.equal(f.writes().length, 0);
+});
 
 for (const stage of ["connect", "initialize", "discovery", "snapshot"] as const) {
   test(`transient ${stage} observation failure recovers on a fresh connection before exactly one native write`, async t => {

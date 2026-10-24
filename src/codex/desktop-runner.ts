@@ -23,6 +23,7 @@ import type {
   CodexTurnStatus
 } from "./backend.js";
 import { parseThreadHistory } from "./app-server-runner.js";
+import { desktopSessionMembership } from "./desktop-session-membership.js";
 import {
   CodexSessionCompletionMonitor,
   type CodexSessionActivity,
@@ -103,6 +104,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   private monitorStarted = false;
   private closed = false;
   private readonly observationTimeoutMs: number;
+  private readonly codexHome?: string;
   private readonly snapshotReads = new Map<string, Promise<CodexThreadSnapshot | undefined>>();
   private readonly observationConnections = new Set<DesktopIpcConnection>();
   private readonly observationShutdown = new AbortController();
@@ -125,7 +127,10 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     try {
       observation = await this.observeOwner(threadId);
       this.unavailableOwnerLogTimes.delete(threadId);
-      return observation.snapshot;
+      // Live IPC can omit projectId even for a project-backed task. Normalize
+      // through the same fresh Desktop membership adapter as App/catalog reads;
+      // explicit projectless assignments and ambiguous roots remain unassigned.
+      return { ...observation.snapshot, state: desktopSessionMembership(this.codexHome, "local", true)(observation.snapshot.state) };
     } catch (error) {
       // Discovery is read-only. An unanswered discovery is not proof of an
       // idle Desktop task; the caller may only fall back to the app-server's
@@ -152,6 +157,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
   }
 
   constructor(options: DesktopCodexRunnerOptions = {}) {
+    this.codexHome = options.codexHome;
     this.socketPath = options.socketPath ?? path.join(os.homedir(), ".codex", "ipc", "ipc.sock");
     this.requestTimeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.busyRetryDelayMs = options.busyRetryDelayMs ?? 1_000;

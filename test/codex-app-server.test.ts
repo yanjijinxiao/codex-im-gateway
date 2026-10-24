@@ -57,6 +57,26 @@ for (const [prompt, code] of [["fixture-safety-block", "unintended-activity"], [
   });
 }
 
+for (const prompt of ["fixture-failure-before-ack", "fixture-error-before-ack"]) {
+test(`a start acknowledgement cannot overwrite newer native failure state: ${prompt}`, async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  let accepted = 0;
+  await assert.rejects(runner.run({ cwd: "/tmp/project", threadId: "thread-existing",
+    prompt, onTurnStarted() { accepted++; } }),
+    error => error instanceof CodexTurnExecutionError && error.failureCode === "context-window");
+  const internal = runner as unknown as { activeTurns: Map<string, string>;
+    threadStates: Map<string, import("../src/codex/backend.js").CodexThreadState> };
+  assert.equal(accepted, 1);
+  assert.equal(internal.activeTurns.has("thread-existing"), false);
+  assert.equal(internal.threadStates.get("thread-existing")?.runtimeStatus, "systemError");
+  assert.deepEqual(internal.threadStates.get("thread-existing")?.lastTurnFailure,
+    { turnId: "turn-1", code: "context-window" });
+});
+}
+
 test("native queue add/list/delete/start consumes the stored item and retains approval callbacks", async t => {
   const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {
     command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs")], mode: "remote-daemon"

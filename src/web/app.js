@@ -172,6 +172,9 @@ function bindEvents() {
   document.querySelector("#projectAccountInput").addEventListener("change", renderCodexProjectOptions);
   document.querySelector("#projectWorkspaceInput").addEventListener("change", updateProjectNameFromSelection);
   document.querySelector("#refreshTaskboardButton")?.addEventListener("click", () => void refreshTaskboardIssues(true));
+  document.querySelector("#taskboardOpenSettings")?.addEventListener("click", () => showView("settings"));
+  document.querySelector("#taskboardReconnect")?.addEventListener("click", () => void refreshTaskboardIssues(true));
+  document.querySelector("#taskboardEnable")?.addEventListener("click", () => void enableTaskboard());
   document.querySelector("#taskboardProjectFilter")?.addEventListener("change", renderTaskboardWorkbench);
   document.querySelector("#taskboardStatusFilter")?.addEventListener("change", renderTaskboardWorkbench);
   document.querySelector("#taskboardSearchInput")?.addEventListener("input", renderTaskboardWorkbench);
@@ -729,6 +732,7 @@ function renderSettings() {
 }
 
 function renderTaskboardStatus() {
+  renderTaskboardFrame();
   const panel = document.querySelector("#taskboardStatusPanel");
   if (!panel) return;
   const taskboard = state.taskboard;
@@ -782,17 +786,51 @@ async function loadTaskboardIssues(loadDetail = true) {
 }
 
 async function refreshTaskboardIssues(notify = false) {
-  const button = document.querySelector("#refreshTaskboardButton");
-  button.disabled = true;
+  const button = document.querySelector("#taskboardReconnect") || document.querySelector("#refreshTaskboardButton");
+  if (button) button.disabled = true;
   try {
     state.taskboard = await api("/api/taskboard");
     await loadTaskboardIssues();
     renderTaskboardStatus();
     renderTaskboardWorkbench();
     if (notify) toast("任务面板已刷新");
+  } catch (error) {
+    toast(error.message || "无法读取任务面板状态", true);
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
     drawIcons();
+  }
+}
+
+async function enableTaskboard() {
+  const button = document.querySelector("#taskboardEnable");
+  button.disabled = true;
+  try {
+    state.taskboard = await api("/api/taskboard/start", { method: "POST", body: {} });
+    state.config.taskboardEnabled = true;
+    renderTaskboardStatus();
+    toast("任务面板已启用，不影响 IM 和 Codex 任务");
+  } catch (error) {
+    toast(error.message || "任务面板启动失败", true);
+  } finally { button.disabled = false; }
+}
+
+function renderTaskboardFrame() {
+  const frame = document.querySelector("#taskboardFrame"), placeholder = document.querySelector("#taskboardUnavailable");
+  if (!frame || !placeholder) return;
+  const status = state.taskboard, url = status?.url;
+  const available = Boolean(status?.enabled && status?.available && url && URL.canParse(url));
+  frame.hidden = !available; placeholder.hidden = available;
+  if (available) {
+    const source = new URL(url).href;
+    if (frame.dataset.source !== source) { frame.src = source; frame.dataset.source = source; }
+  } else {
+    frame.removeAttribute("src"); delete frame.dataset.source;
+    document.querySelector("#taskboardUnavailableTitle").textContent = !status ? "正在检查任务面板" : status.enabled ? "任务面板暂不可用" : "任务面板尚未启用";
+    document.querySelector("#taskboardUnavailableDetail").textContent = !status ? "正在读取本机服务状态。" : status.enabled
+      ? status.error || "已启用，但未能连接本机看板服务。请检查设置中的地址及服务状态，再重新检查。"
+      : "本机配置停用了任务面板。点击启用会启动本地服务，不会重启 IM 连接、改变绑定或执行 Codex 任务。";
+    document.querySelector("#taskboardEnable").hidden = !status || status.enabled;
   }
 }
 
@@ -2249,7 +2287,8 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "taskboard", "knowledge", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "taskboard", "knowledge", "ide", "settings"].includes(name) ? name : "accounts";
+  if (valid === "ide") void window.gatewayIDE?.refresh();
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const visible = panel.dataset.viewPanel === valid;
     panel.hidden = !visible;
@@ -2264,15 +2303,7 @@ function showView(name, updateHash = true) {
   document.body.dataset.activeView = valid;
   document.querySelector("#serviceStatusBand").hidden = valid === "taskboard";
   if (valid === "taskboard") {
-    const taskboardFrame = document.querySelector("#taskboardFrame");
-    const taskboardUrl = state.taskboard?.url || state.config?.taskboardUrl;
-    if (taskboardUrl && URL.canParse(taskboardUrl)) {
-      const frameUrl = new URL(taskboardUrl);
-      if (taskboardFrame.dataset.source !== frameUrl.href) {
-        taskboardFrame.src = frameUrl.href;
-        taskboardFrame.dataset.source = frameUrl.href;
-      }
-    }
+    renderTaskboardFrame();
   }
   if (updateHash && location.hash !== `#${valid}`) history.replaceState(null, "", `#${valid}`);
   if (valid === "taskboard" && updateHash) void refreshTaskboardIssues(false);

@@ -119,6 +119,9 @@ import {
 } from "../channels/feishu-menu-sync.js";
 import { ChannelMessageWebhook } from "../webhooks/channel-message-webhook.js";
 import { resolveChannelModeSettings } from "./channel-mode-settings.js";
+import { WorkspaceIDEManager, type IDEWorkspace } from "../ide/manager.js";
+import { withIDEEntry } from "../ide/completion.js";
+import { IDEApprovalService } from "../ide/approval-service.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -269,6 +272,8 @@ export type AccountManagerOptions = {
 };
 
 export class AccountManager {
+  readonly ide: WorkspaceIDEManager;
+  readonly ideApprovals: IDEApprovalService;
   private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
   private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
   private readonly interactionRouting: InteractionRoutingJournal;
@@ -303,12 +308,21 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    this.ideApprovals = new IDEApprovalService({ root: options.paths.root,
+      accounts: () => listAccounts(options.paths).map(account => ({ accountId: account.accountId, channel: accountChannel(account),
+        providerId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId })) });
+    this.ide = new WorkspaceIDEManager({ root: options.paths.root, resolve: (accountId, sessionId) => this.ideWorkspace(accountId, sessionId),
+      refresh: (accountId, sessionId) => this.refreshIDEWorkspace(accountId, sessionId) });
     this.interactionRouting = new InteractionRoutingJournal(path.join(options.paths.runtimeDir, "interaction-routing.json"));
     this.sessionControls = new SessionControlJournal(path.join(options.paths.runtimeDir, "session-controls.json"));
     this.turnAudience = new TurnAudienceJournal(path.join(options.paths.runtimeDir, "turn-audience.json"));
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
+      decorateFinal: (sub, text) => {
+        const [accountId, sessionId] = JSON.parse(sub.key) as string[];
+        return withIDEEntry(text, this.ide.entry(accountId, sessionId)?.url);
+      },
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       turnAudience: this.turnAudience,
       subscriptions: () => this.threadSubscriptions(),
@@ -462,6 +476,9 @@ export class AccountManager {
     const client = adapter.client;
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
+      ideApprovals: this.ideApprovals,
+      ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
+      ideEntry: session => this.ide.entry(account.accountId, session.id)?.url,
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
@@ -750,6 +767,35 @@ export class AccountManager {
       return store.listSessions().map(session => this.sessionSummary(account.accountId, session,
         store.getBoundSession(session.senderId)?.id === session.id));
     }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /** Only already-managed project membership grants an IDE target. No caller
+   * supplies a path; independent/QA sessions cannot inherit a nearby project. */
+  ideWorkspace(accountId: string, sessionId: string): IDEWorkspace | undefined {
+    try {
+      const store = this.storeFor(accountId), session = store.getSession(sessionId);
+      if (!session?.projectId || session.projectBinding === "none" || session.mode === "qa") return;
+      const project = store.getProject(session.projectId); if (!project) return;
+      const hostId = session.hostId ?? project.hostId ?? "local";
+      if (hostId !== (project.hostId ?? "local") || (project.projectKind === "remote" && hostId === "local")) return;
+      return { owner: "gateway-owner", sessionId, hostId, workspace: session.workspace, projectName: project.name,
+        projectId: project.id, nativeThreadId: session.threadId };
+    } catch { return; }
+  }
+
+  private async refreshIDEWorkspace(accountId: string, sessionId: string): Promise<IDEWorkspace | undefined> {
+    const target = this.ideWorkspace(accountId, sessionId); if (!target) return;
+    const store = this.storeFor(accountId), session = store.getSession(sessionId)!;
+    if (!session.threadId || this.configProvider().codexBackend === "exec") return target;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const state = await Promise.race([this.runnerFor().inspectThread(session.threadId, target.hostId),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("无法核对原生 session 目录，未启动 IDE")), 15_000); })]);
+      const project = store.getProject(session.projectId!);
+      if (state.internal || state.persistence === "missing" || !state.cwd
+        || (project?.sourceProjectId && state.projectId !== project.sourceProjectId)) throw new Error("原生 session 项目关系已改变，未启动 IDE");
+      return { ...target, workspace: state.cwd };
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   listProjects(accountId?: string): AccountProject[] {
@@ -1250,14 +1296,14 @@ export class AccountManager {
   }
 
   private sessionSummary(accountId: string, session: ManagedSession, active: boolean): AccountSession {
-    return {
-      ...session,
-      accountId,
-      active,
-      responding: this.isSessionResponding(accountId, session.id),
-      binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active }
-    };
-  }
+        return {
+            ...session,
+            accountId,
+            active,
+            responding: this.isSessionResponding(accountId, session.id),
+            binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active }
+        };
+    }
 
   private isSessionResponding(accountId: string, sessionId: string): boolean {
     return (this.respondingSessions.get(sessionRuntimeKey(accountId, sessionId)) ?? 0) > 0;

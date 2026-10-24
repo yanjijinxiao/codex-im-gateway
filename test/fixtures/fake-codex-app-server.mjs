@@ -548,6 +548,19 @@ rl.on("line", (line) => {
       }
     }
     activeTurns.set(message.params.threadId, turnId);
+    if (prompt === "fixture-failure-before-ack" || prompt === "fixture-error-before-ack") {
+      const threadId = message.params.threadId;
+      send({ method: "thread/status/changed", params: { threadId, status: { type: "systemError" } } });
+      const complete = () => {
+        send({ method: "turn/completed", params: { threadId, turn: completedTurn(turnId, "failed",
+          { message: "provider rejected", codexErrorInfo: "ContextWindowExceeded" }) } });
+        activeTurns.delete(threadId);
+      };
+      if (prompt === "fixture-failure-before-ack") complete();
+      else setTimeout(complete, 50);
+      setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 25);
+      return;
+    }
     if (prompt.startsWith("fixture-capacity-")) {
       const threadId = message.params.threadId;
       const error = { message: "Selected model is at capacity. Please try a different model.",

@@ -272,7 +272,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   }
 
   /** Read-only table in the existing AI template; selection remains a slash command. */
-  async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<ChannelReceipt> {
+  async sendActionCard(input: { toUserId: string; card: ChannelActionCard; contextToken?: string }): Promise<ChannelReceipt> {
     const { card } = input;
     if (card.table && this.account.cardTemplateId) {
       const text = [escapeTableMarkdown(card.title), card.body, renderMarkdownTable(card.table), card.note].filter(Boolean).join("\n\n");
@@ -447,6 +447,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
           ? { mention: { userId: body.senderStaffId.trim(), ...(typeof body.senderNick === "string" && body.senderNick.trim()
             ? { name: body.senderNick.trim().slice(0, 100) } : {}) } } : {}),
         replyTargetId: conversationId,
+        ...(["1", "2"].includes(body.conversationType) ? { conversationKind: body.conversationType === "1" ? "direct" as const : "group" as const } : {}),
         text: dingTalkCommandText(body, decoded.text),
         ...(!decoded.supported ? { unsupportedMessageType: body.msgtype } : {}),
         attachments: decoded.attachments,

@@ -34,6 +34,16 @@ export function resolveRemoteCodexTransport(
   hostId: string,
   options: RemoteCodexTransportOptions = {}
 ): AppServerTransport {
+  const connection = resolveRemoteSshConnection(hostId, options);
+  return { command: connection.command, args: [...connection.args, connection.target, remoteRelayCommand()],
+    label: hostId.trim(), mode: "remote-daemon" };
+}
+
+/** Shared SSH *configuration*, never a shared process/control socket. IDE and
+ * Codex retain independent connection lifetimes and failure domains. */
+export function resolveRemoteSshConnection(hostId: string, options: RemoteCodexTransportOptions = {}): {
+  command: string; args: string[]; target: string;
+} {
   const normalizedHostId = hostId.trim();
   if (!normalizedHostId || normalizedHostId === "local") {
     throw new Error("Remote Codex routing requires a remote Desktop host id");
@@ -65,13 +75,7 @@ export function resolveRemoteCodexTransport(
   if (port) args.push("-p", String(port));
   const identity = stringValue(connection?.identity);
   if (identity) args.push("-i", identity);
-  args.push(target, remoteRelayCommand());
-  return {
-    command: options.sshBin ?? "/usr/bin/ssh",
-    args,
-    label: normalizedHostId,
-    mode: "remote-daemon"
-  };
+  return { command: options.sshBin ?? "/usr/bin/ssh", args, target };
 }
 
 function readRemoteConnections(codexHome: string): DesktopRemoteConnection[] {

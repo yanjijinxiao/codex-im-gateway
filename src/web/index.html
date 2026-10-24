@@ -7,12 +7,15 @@
   <title>Codex IM Gateway</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/copyable.css">
+  <script defer src="/copyable.js"></script>
   <script defer src="/vendor/lucide.min.js"></script>
   <script defer src="/vendor/marked.umd.js"></script>
   <script defer src="/vendor/purify.min.js"></script>
   <script defer src="/account-mode-settings.js"></script>
   <script defer src="/app.js"></script>
   <script defer src="/knowledge-bases.js"></script>
+  <script defer src="/ide.js"></script>
 </head>
 <body>
   <header class="app-header">
@@ -30,6 +33,7 @@
         <button class="tab" type="button" data-view="sessions">会话</button>
         <button class="tab" type="button" data-view="taskboard">任务面板</button>
         <button class="tab" type="button" data-view="knowledge">知识库</button>
+        <button class="tab" type="button" data-view="ide">Web IDE</button>
         <button class="tab" type="button" data-view="settings">设置</button>
       </nav>
       <div class="header-actions">
@@ -105,9 +109,11 @@
               <h2 id="chatTitle">选择一个会话</h2>
               <p class="chat-context" id="chatContext">查看历史消息并继续聊天</p>
             </div>
+            <div class="heading-actions"><button class="button button-secondary" id="sessionIDEButton" type="button" title="授权并信任当前项目精确目录，允许其任务、调试和扩展运行；不修改全局 VS Code 设置">Web IDE · 授权并信任</button>
+            <button class="button button-secondary" id="sessionIDEPrepareButton" type="button" title="在对应主机准备所选扩展">准备扩展</button>
             <button class="icon-button" id="refreshMessagesButton" type="button" title="刷新消息" aria-label="刷新消息" disabled>
               <i data-lucide="refresh-cw"></i>
-            </button>
+            </button></div>
           </header>
           <div class="chat-runtime-toolbar" id="sessionRuntimeToolbar" aria-label="当前会话模型设置">
             <span class="chat-runtime-title"><i data-lucide="sliders-horizontal"></i><span>会话设置</span></span>
@@ -150,7 +156,17 @@
     </section>
 
     <section class="view taskboard-view" id="taskboardView" data-view-panel="taskboard" hidden>
-      <iframe class="taskboard-frame" id="taskboardFrame" title="任务面板" referrerpolicy="no-referrer"></iframe>
+      <div class="taskboard-unavailable" id="taskboardUnavailable" role="status">
+        <p class="eyebrow">LOCAL TASKBOARD</p>
+        <h1 id="taskboardUnavailableTitle">正在检查任务面板</h1>
+        <p id="taskboardUnavailableDetail">读取服务状态后再连接，不会向未启动的端口加载页面。</p>
+        <div class="heading-actions">
+          <button class="button button-primary" id="taskboardEnable" type="button" hidden>启用任务面板</button>
+          <button class="button" id="taskboardReconnect" type="button">重新检查</button>
+          <button class="button" id="taskboardOpenSettings" type="button">查看设置</button>
+        </div>
+      </div>
+      <iframe class="taskboard-frame" id="taskboardFrame" title="任务面板" referrerpolicy="no-referrer" hidden></iframe>
     </section>
 
     <section class="view knowledge-view" id="knowledgeView" data-view-panel="knowledge" hidden>
@@ -178,6 +194,48 @@
       </section>
     </section>
 
+    <section class="view" id="ideView" data-view-panel="ide" hidden>
+      <div class="section-heading"><div><p class="eyebrow">PROJECT DEVELOPMENT</p><h1>项目 Web IDE</h1></div><button type="button" id="ideRefresh" class="button button-secondary">刷新状态</button></div>
+      <p>本机项目本机运行，远程项目远程运行。Gateway 统一授权，无需另设 IDE 密码。每个实例拥有独立数据目录；仅供项目所有者使用，不是多用户沙箱。</p>
+      <p id="ideMessage" role="status" aria-live="polite"></p>
+      <form id="ideForm" class="ide-form">
+        <label class="ide-inline"><input id="ideEnabled" type="checkbox">启用 Web IDE 入口</label>
+        <label class="ide-inline"><input id="idePerHostRouting" type="checkbox">启用固定远程 HTTPS 转发（本机保留回环监听）</label>
+        <label>共享 HTTPS 入口<select id="ideSharedIngressHost" aria-describedby="ideSharedIngressHint"><option value="">未选择：按项目主机分别生成链接</option></select></label>
+        <small id="ideSharedIngressHint">选择一个已启用且配置固定 HTTPS 的远程主机后，所有已启用主机的项目都只发布该固定入口的链接，供手机和电脑共用。本地项目仍在 Mac 运行，远程项目仍在对应主机运行；127.0.0.1 仅供本机维护，不发送到 IM。</small>
+        <p>不使用客户端 VPN IP 生成链接。共享入口中断时不回退到其他地址，后台自动重连。手机需能通过公司内网/VPN 访问固定端口并信任证书；本机休眠或离线时共享入口也暂不可用。请勿公开 Gateway 管理端口。</p>
+        <label>浏览器访问地址<input id="ideOrigin" type="url" required placeholder="https://ide.example.com"></label>
+        <small>本机访问可使用回环 HTTP；内网/VPN 可启用下方内置 HTTPS，无需另装反向代理。不要公开 Gateway 管理端口。</small>
+        <label>本机 IDE 入口端口<input id="idePort" type="number" min="1024" max="65535" required></label>
+        <fieldset class="ide-tls" id="ideTLSLegacyFields"><legend>共享入口 · 内网 / VPN HTTPS</legend>
+          <label class="ide-inline"><input id="ideTLSEnabled" type="checkbox">由 Gateway 直接提供 HTTPS</label>
+          <label>监听的精确本机 IP<select id="ideTLSAddress" aria-describedby="ideTLSHint"></select></label>
+          <p id="ideTLSHint">只监听所选接口，不监听全部网卡。VPN 断开或 IP 改变时需要重新配置，证书不能解决 VPN 的入站访问限制。</p>
+          <button id="ideTLSGenerate" type="button" class="button button-secondary">生成 / 复用自签证书</button>
+          <label>服务端证书文件<input id="ideTLSCert" type="text" placeholder="绝对路径，不是证书内容"></label>
+          <label>服务端私钥文件<input id="ideTLSKey" type="text" placeholder="绝对路径，私钥仅保存在本机"></label>
+          <p>生成证书只填入本表单，点击「保存并应用」后才启用入口。每台访问设备需自行导入并信任 CA，不能仅忽略浏览器警告；不提供额外 IDE 密码。CA 私钥不会下载、上传或自动加入系统信任库。</p>
+        </fieldset>
+        <p id="ideTLSStatus" role="status" aria-live="polite">未配置内置 HTTPS。</p>
+        <a id="ideTLSDownload" href="/api/ide/tls/ca.crt" download hidden>下载本地 CA 证书（供访问设备信任）</a>
+        <fieldset><legend>允许运行的主机</legend><p>通过已登记的 SSH 配置连接。可授权在用户专用目录自动安装 code-server（支持 Linux x64、macOS Intel / Apple Silicon）；主机需已有 Node，不使用 sudo，也不修改系统服务。</p><p>新机器的项目登记后，刷新本页并勾选对应主机，保存即可热接入，无需重启 Gateway。选择共享入口时，新项目主机的远程入口字段可留空：复用已有转发器，不新增 Web 端口。发现 session 不等于自动授予安装或浏览器访问权限。</p><div id="ideHosts"></div></fieldset>
+        <fieldset><legend>默认编辑器 Profile</legend><p>新实例使用此基线；已有实例只补缺失的默认项，不覆盖用户设置或项目 .vscode。缺省外观为 Dark 2026、Seti 文件图标、Default 界面图标、Menlo / Monaco / Courier New 等宽字体、12px 字号、18px 行高、普通字重、关闭连字、标签页换行；字体由浏览器设备提供。Chat 所在的右侧面板默认收起，可手动打开；已保存的布局仍由 IDE 记忆。修改 Profile 后使用独立的新实例目录。</p><label for="ideProfile">覆盖缺省值的编辑器设置（JSON）</label><textarea id="ideProfile" rows="10" spellcheck="false"></textarea><div id="ideExtensions" class="ide-extensions"></div><small>保存即声明所选扩展：打开对应实例时核验并从 Open VSX 安装缺失项，已安装的不重复下载；也可先在会话页「准备扩展」。失败不阻止编辑器打开，下方显示实际安装结果。语言工具链需在项目所在主机配置；安装成功不等于语言功能已验收。</small></fieldset>
+        <div class="heading-actions"><button id="ideSave" type="submit" class="button button-primary">保存并应用</button><button id="ideRevoke" type="button" class="button button-secondary">撤销全部 IDE 登录</button></div>
+      </form>
+      <h2>主机访问入口</h2><div id="ideEndpoints" aria-live="polite"></div>
+      <h2>跨设备 · IDE 授权管理员</h2>
+      <p>首次在本机登记你本人的个人身份。请在机器人钉钉单聊发送 <code>/ide identity</code>，核对渠道账号和个人 ID；不要填写群 ID。登记后，该个人账号可在私聊批准本渠道账号所关联项目的浏览器访问与目录信任，具备开发终端权限。群白名单、session 角色和绑定关系不会自动获得此权限。其他渠道尚未提供明确私聊类型时会拒绝 IM 审批。</p>
+      <form id="ideApproverForm" class="ide-form">
+        <label for="ideApproverAccount">渠道账号<select id="ideApproverAccount" required></select></label>
+        <label for="ideApproverActor">个人 ID<input id="ideApproverActor" type="text" maxlength="300" autocomplete="off" required placeholder="从 /ide identity 核对，不是群 ID"></label>
+        <p>添加仅授予审批资格，不直接批准任何浏览器；移除立即取消该身份的待确认审批，已签发的浏览器授权需使用页面中的「撤销全部 IDE 登录」单独处理。</p>
+        <button id="ideApproverAdd" type="submit" class="button button-secondary">登记授权管理员</button>
+      </form>
+      <p id="ideApproverStatus" role="status" aria-live="polite"></p><div id="ideApprovers"></div>
+      <h2>浏览器访问授权</h2><p>新授权有效期为 <span id="ideSessionDuration">15 天</span>，Gateway 重启后仍保留，不自动延期。新增主机或重复保存不会撤销已有授权；停用主机、改变可执行文件或 Profile 时只撤销受影响主机，改变入口安全边界时只撤销对应入口。本机会话页的「Web IDE · 授权并信任」会一并启用当前目录的任务、调试和扩展。其他设备从原浏览器授权页复制一种短命令，在对应机器人钉钉私聊发送一次即可处理；不要求该私聊绑定 session。只批准你本人发起的申请。</p><div id="ideAccessRequests" aria-live="polite"></div>
+      <h2>主机安装任务</h2><div id="ideInstallations" aria-live="polite"></div>
+      <h2>IDE 实例</h2><div id="ideInstances" aria-live="polite"></div>
+    </section>
     <section class="view settings-view" id="settingsView" data-view-panel="settings" hidden>
       <div class="section-heading">
         <div>

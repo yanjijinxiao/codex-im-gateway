@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 
 import { resolveCodexCommand } from "../codex/exec-runner.js";
-import { loadConfig, saveConfig } from "../state/config.js";
+import { loadConfig, saveConfig, type CodexImGatewayConfig } from "../state/config.js";
 import type { StatePaths } from "../state/paths.js";
 import type { CodexModelOption, CodexRuntimeInfo } from "../codex/backend.js";
 import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, SessionUpload } from "./account-manager.js";
@@ -21,6 +21,11 @@ import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
 import { selectLocalDirectory } from "./directory-picker.js";
 import { SessionBindingConflictError } from "../state/runtime-state.js";
+import { IDEEndpointManager } from "../ide/endpoint-manager.js";
+import { IDE_EXTENSIONS, ideConfigSchema } from "../ide/config.js";
+import { localIDEAddresses } from "../ide/tls.js";
+import { IDE_SESSION_DAYS } from "../ide/authorization.js";
+import { ideApproverSchema } from "../ide/approval-service.js";
 
 const bodySchema = z.record(z.string(), z.unknown());
 const webhookUrlSchema = z.string().trim().max(2_048).url().refine((value) => {
@@ -179,6 +184,7 @@ export type LocalHttpServerOptions = {
   directoryPicker?: (defaultPath?: string) => Promise<string | undefined>;
   updateService?: UpdateService;
   onUpdateInstalled?: (version: string) => void;
+  onTaskboardConfig?: (config: CodexImGatewayConfig) => Promise<void>;
 };
 
 export type LocalHttpServer = {
@@ -188,6 +194,11 @@ export type LocalHttpServer = {
 };
 
 export async function startLocalHttpServer(options: LocalHttpServerOptions): Promise<LocalHttpServer> {
+  const ideAccess = options.accountManager.ide ? new IDEEndpointManager(options.accountManager.ide) : undefined;
+  const detachApprovals = ideAccess && options.accountManager.ideApprovals?.attach(ideAccess);
+  ideAccess?.setApprovalCopies(options.accountManager.ideApprovals);
+  if (ideAccess && options.accountManager.ide.config().port === (options.port ?? 8787)) ideAccess.error = "IDE 端口不能与 Gateway 管理端口相同。";
+  else await ideAccess?.reload(false).catch(() => console.warn("[codex-im-gateway] IDE listener unavailable; management and IM remain available"));
   const requestToken = crypto.randomBytes(24).toString("base64url");
   const productVersion = options.productVersion ?? readProductVersion();
   const loginManager = options.loginManager ?? new LoginManager({
@@ -203,6 +214,7 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
       productVersion,
       requestToken,
       updateService,
+      ideAccess,
       port: actualPort
     }).catch((error: unknown) => {
       const message = requestErrorMessage(error);
@@ -213,20 +225,26 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.port ?? 8787, "127.0.0.1", () => resolve());
-  });
+  }).catch(async error => { detachApprovals?.(); await ideAccess?.close(); throw error; });
   const address = server.address();
   if (!address || typeof address === "string") {
     throw new Error("Unable to determine local server address");
   }
   actualPort = address.port;
+  ideAccess?.setManagementOrigin(`http://127.0.0.1:${actualPort}`);
   return {
     url: `http://127.0.0.1:${actualPort}`,
     requestToken,
-    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    close: async () => {
+      detachApprovals?.();
+      await ideAccess?.close();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   };
 }
 
 type HandlerContext = LocalHttpServerOptions & {
+  ideAccess?: IDEEndpointManager;
   loginManager: LoginManager;
   productVersion: string;
   requestToken: string;
@@ -263,6 +281,84 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
   }
 
+  const ide = context.accountManager.ide;
+  if (url.pathname.startsWith("/api/ide") && ide) {
+    if (method === "GET" && url.pathname === "/api/ide") {
+      sendJson(response, 200, { config: ide.config(), accessRequests: context.ideAccess?.pendingAccess() ?? [],
+        approvers: context.accountManager.ideApprovals ? { owners: context.accountManager.ideApprovals.list(),
+          accounts: context.accountManager.ideApprovals.accounts(), error: context.accountManager.ideApprovals.error } : undefined,
+        networkAddresses: localIDEAddresses(), certificate: context.ideAccess?.certificate(), endpoints: context.ideAccess?.statuses() ?? [],
+        authorization: { sessionTtlDays: IDE_SESSION_DAYS },
+        running: context.ideAccess?.running() ?? false, error: ide.configStore.error ?? context.ideAccess?.error,
+        instances: ide.list(), installations: ide.installer.list(), extensionChoices: IDE_EXTENSIONS,
+        hosts: [...new Set(["local", ...context.accountManager.listProjects().map(p => p.hostId ?? "local")])] }); return;
+    }
+    if (method === "PUT" && url.pathname === "/api/ide/config") {
+      const input = z.object({ config: ideConfigSchema }).strict().parse(await readJsonBody(request));
+      if (input.config.port === context.port) throw new Error("IDE 端口不能与 Gateway 管理端口相同");
+      const hosts = new Set(["local", ...context.accountManager.listProjects().map(p => p.hostId ?? "local")]);
+      if (input.config.hosts.some(h => !hosts.has(h.hostId))) { sendJson(response, 400, { error: "只能启用已登记项目的主机" }); return; }
+      if (context.ideAccess) await context.ideAccess.configure(input.config);
+      else ide.configStore.save(input.config);
+      sendJson(response, 200, { ok: true, config: ide.config(), running: context.ideAccess?.running() }); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/tls/prepare") {
+      const input = z.object({ address: z.string().min(1).max(100) }).strict().parse(await readJsonBody(request));
+      if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
+      const tls = await context.ideAccess.prepareTLS(input.address);
+      sendJson(response, 200, { tls, certificate: context.ideAccess.tls.details(tls) }); return;
+    }
+    if (method === "GET" && url.pathname === "/api/ide/tls/ca.crt") {
+      if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
+      const ca = context.ideAccess.tls.caCertificate();
+      response.writeHead(200, { "Content-Type": "application/x-x509-ca-cert", "Content-Disposition": 'attachment; filename="gateway-ide-ca.crt"', "Cache-Control": "no-store" });
+      response.end(ca); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/revoke") {
+      context.ideAccess?.revoke(); sendJson(response, 200, { ok: true }); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/install") {
+      const input = z.object({ hostId: z.string().min(1).max(300) }).strict().parse(await readJsonBody(request));
+      const host = ide.config().hosts.find(h => h.hostId === input.hostId && h.enabled && h.autoInstall);
+      if (!host) { sendJson(response, 409, { error: "请先保存并启用对应主机的自动安装授权" }); return; }
+      sendJson(response, 202, { installation: ide.installer.begin(host.hostId, host.binary) }); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/access") {
+      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
+      sendJson(response, 200, await context.ideAccess.grant(input.entryId, input.trustWorkspace)); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/access/approve") {
+      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), requestId: z.string().min(1).max(100), trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
+      if (context.accountManager.ideApprovals) await context.accountManager.ideApprovals.approveLocal(input.requestId, input.entryId, input.trustWorkspace);
+      else await context.ideAccess.approveAccess(input.requestId, input.entryId, input.trustWorkspace);
+      sendJson(response, 200, { ok: true }); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/approvers") {
+      const input = z.object({ principal: ideApproverSchema, remove: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      if (!context.accountManager.ideApprovals) throw new Error("IDE 审批服务不可用");
+      context.accountManager.ideApprovals.setOwner(input.principal, input.remove);
+      sendJson(response, 200, { ok: true, owners: context.accountManager.ideApprovals.list() }); return;
+    }
+    if (method === "POST" && url.pathname === "/api/ide/entry") {
+      const input = z.object({ accountId: z.string().min(1), sessionId: z.string().min(1) }).strict().parse(await readJsonBody(request));
+      const entry = ide.entry(input.accountId, input.sessionId);
+      if (!entry) { sendJson(response, 409, { error: "当前 session 没有可用项目 IDE；请先启用对应主机。" }); return; }
+      sendJson(response, 200, entry); return;
+    }
+    const workspace = matchPath(url.pathname, "/api/ide/workspaces/:id/:action");
+    if (method === "POST" && workspace && ["open", "prepare"].includes(workspace.action)) {
+      const input = z.object({ trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      const directory = input.trustWorkspace ? await ide.canonicalForTrust(workspace.id) : undefined;
+      const instance = workspace.action === "prepare" ? await ide.start(workspace.id, true, input.trustWorkspace, directory)
+        : await ide.open(workspace.id, input.trustWorkspace, directory);
+      sendJson(response, 200, { instance }); return;
+    }
+    const instance = matchPath(url.pathname, "/api/ide/instances/:id/stop");
+    if (method === "POST" && instance) { await ide.stop(instance.id); sendJson(response, 200, { ok: true }); return; }
+    sendJson(response, 404, { error: "Not found" }); return;
+  }
   if (method === "GET" && url.pathname === "/api/bootstrap") {
     const config = loadConfig(context.paths);
     const [codex, codexRuntime, codexModels] = await Promise.all([
@@ -352,6 +448,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const body = knowledgeBaseCreateSchema.parse(await readJsonBody(request));
     sendJson(response, 201, await context.accountManager.createKnowledgeBase(body.accountId, body));
     return;
+  }
+  if (method === "POST" && url.pathname === "/api/taskboard/start") {
+    z.object({}).strict().parse(await readJsonBody(request));
+    if (!context.onTaskboardConfig) { sendJson(response, 409, { error: "当前启动方式不支持动态启用任务面板，请重启 Gateway。" }); return; }
+    const next = { ...loadConfig(context.paths), taskboardEnabled: true };
+    await context.onTaskboardConfig(next);
+    saveConfig(context.paths, next);
+    sendJson(response, 200, await context.accountManager.getTaskboardStatus()); return;
   }
   if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;
   if (method === "POST" && url.pathname === "/api/projects") {
@@ -647,7 +751,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     const current = loadConfig(context.paths);
     const defaultCwd = path.resolve(input.defaultCwd);
     const allowedWorkspaces = [...new Set([...input.allowedWorkspaces.map((workspace) => path.resolve(workspace)), defaultCwd])];
-    saveConfig(context.paths, {
+    const next = {
       ...current,
       ...input,
       defaultCwd,
@@ -655,7 +759,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       codexExecSandbox: input.codexExecSandbox ?? undefined,
       model: optionalString(input.model),
       effort: optionalString(input.effort)
-    });
+    };
+    await context.onTaskboardConfig?.(next);
+    saveConfig(context.paths, next);
     await context.accountManager.restartRunning();
     sendJson(response, 200, {
       config: loadConfig(context.paths),
@@ -703,6 +809,9 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/app.js": { name: "app.js", type: "text/javascript; charset=utf-8" },
     "/account-mode-settings.js": { name: "account-mode-settings.js", type: "text/javascript; charset=utf-8" },
     "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
+    "/ide.js": { name: "ide.js", type: "text/javascript; charset=utf-8" },
+    "/copyable.js": { name: "copyable.js", type: "text/javascript; charset=utf-8" },
+    "/copyable.css": { name: "copyable.css", type: "text/css; charset=utf-8" },
     "/vendor/lucide.min.js": { name: "vendor/lucide.min.js", type: "text/javascript; charset=utf-8" },
     "/vendor/marked.umd.js": { name: "vendor/marked.umd.js", type: "text/javascript; charset=utf-8" },
     "/vendor/purify.min.js": { name: "vendor/purify.min.js", type: "text/javascript; charset=utf-8" }
@@ -725,7 +834,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
 function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
-  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   response.setHeader("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src http://127.0.0.1:* http://localhost:*; frame-ancestors app://-");
 }
 

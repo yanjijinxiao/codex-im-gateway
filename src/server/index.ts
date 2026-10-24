@@ -3,10 +3,9 @@ import { fileURLToPath } from "node:url";
 
 import open from "open";
 
-import { resolveCodexCommand } from "../codex/exec-runner.js";
 import { loadConfig } from "../state/config.js";
 import { preferredStateDir, resolveStatePaths } from "../state/paths.js";
-import { embeddedTaskboardPort, startEmbeddedTaskboard, type EmbeddedTaskboard } from "../taskboard/embedded-server.js";
+import { TaskboardLifecycle } from "../taskboard/lifecycle.js";
 import { AccountManager } from "./account-manager.js";
 import { parseServerCommand, serverHelpText } from "./arguments.js";
 import { startLocalHttpServer } from "./http-server.js";
@@ -28,7 +27,7 @@ async function main(): Promise<void> {
   const processLock = acquireServiceProcessLock(paths.root);
   const accountManager = new AccountManager({ paths });
   let server: Awaited<ReturnType<typeof startLocalHttpServer>> | undefined;
-  let taskboard: EmbeddedTaskboard | undefined;
+  const taskboard = new TaskboardLifecycle(paths.taskboardDir);
   let shuttingDown = false;
   let restartScheduled = false;
   const shutdown = async () => {
@@ -37,7 +36,7 @@ async function main(): Promise<void> {
     try {
       await accountManager.stopAll();
       await server?.close();
-      await taskboard?.close();
+      await taskboard.close();
     } finally {
       processLock.release();
     }
@@ -64,29 +63,21 @@ async function main(): Promise<void> {
     timer.unref();
   };
   try {
-    if (config.taskboardEnabled) {
-      const codexCommand = resolveCodexCommand(config.codexBin);
-      taskboard = await startEmbeddedTaskboard({
-        dataDirectory: paths.taskboardDir,
-        port: embeddedTaskboardPort(config.taskboardUrl),
-        codexExecutable: codexCommand.argsPrefix.length === 0
-          ? codexCommand.command
-          : config.codexBin
-      });
-    }
-    server = await startLocalHttpServer({ paths, accountManager, port, onUpdateInstalled: scheduleRestart });
+    await taskboard.apply(config);
+    server = await startLocalHttpServer({ paths, accountManager, port, onUpdateInstalled: scheduleRestart,
+      onTaskboardConfig: next => taskboard.apply(next) });
     await accountManager.startAll();
   } catch (error) {
     await accountManager.stopAll();
     await server?.close();
-    await taskboard?.close();
+    await taskboard.close();
     processLock.release();
     throw error;
   }
 
   console.log(`codex-im-gateway is running at ${server.url}`);
   console.log(`State directory: ${paths.root}`);
-  if (taskboard) console.log(`Taskboard is available at ${taskboard.url}`);
+  if (config.taskboardEnabled) console.log(`Taskboard is available at ${config.taskboardUrl}`);
   if ((process.env.CODEX_IM_GATEWAY_OPEN
     ?? process.env.CODEX_CHANNEL_BRIDGE_OPEN
     ?? process.env.CODEX_WEIXIN_OPEN) !== "0") {

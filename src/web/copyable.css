@@ -1,0 +1,8 @@
+.gateway-copy { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:end; gap:8px 12px; margin:16px 0; min-width:0; }
+.gateway-copy label { display:grid; gap:6px; min-width:0; font-size:14px; font-weight:600; }
+.gateway-copy textarea { display:block; box-sizing:border-box; width:100%; min-width:0; resize:vertical; min-height:48px; margin:0; padding:12px; border:1px solid #aab7af; border-radius:6px; color:#25342d; background:#fff; font:16px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
+.gateway-copy button { box-sizing:border-box; min-height:48px; margin:0; padding:10px 16px; border:0; border-radius:6px; background:#214f3a; color:white; font:inherit; cursor:pointer; }
+.gateway-copy button:disabled { opacity:.6; cursor:wait; }
+.gateway-copy small { grid-column:1/-1; min-height:1.5em; font-size:13px; font-weight:400; overflow-wrap:anywhere; }
+.gateway-copy :focus-visible { outline:3px solid #719f89; outline-offset:2px; }
+@media(max-width:420px) { .gateway-copy { gap:8px; } .gateway-copy button { padding-inline:12px; } }

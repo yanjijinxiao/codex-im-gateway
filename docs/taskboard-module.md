@@ -2,6 +2,8 @@
 
 Taskboard 已作为独立 workspace 模块放在 `taskboard/`，由 `codex-im-gateway` 进程统一启动和关闭。管理后台仍使用 `http://127.0.0.1:8787`，完整看板与 CLI API 使用 `http://127.0.0.1:47823`；两个端口由同一个进程提供。
 
+任务面板页面先读取 `/api/taskboard`。停用或服务不可用时不加载 iframe，而显示当前状态与操作入口。在停用状态点击「启用任务面板」会通过本机受保护的 `POST /api/taskboard/start` 启动同一内置服务并保存开关，不重启 IM 账号或 Codex 任务。设置页修改开关/地址也会同步应用到看板生命周期，无需重启 Gateway。
+
 ## 一键安装或核验
 
 在 `codex-im-gateway` 仓库根目录执行：

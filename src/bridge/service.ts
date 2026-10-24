@@ -8,6 +8,7 @@ import type { AcceptedPresentationInput } from "./input-presentation.js";
 import { TurnAudienceJournal, type TurnParticipantOrigin } from "./turn-audience.js";
 import { ChannelTurnPresentation, type TurnReplyStream } from "../channels/turn-presentation.js";
 import { completedCardForMentions } from "../channels/completion-mentions.js";
+import { ideEntryLink, withIDEEntry } from "../ide/completion.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
@@ -96,6 +97,8 @@ import { validateLocalAttachments } from "../channels/client.js";
 import { adaptLegacyClient } from "../channels/legacy.js";
 import { formatFollowStatus, type SessionFollowPort } from "./session-follow.js";
 import { formatInteractionRoute, type SessionInteractionPort } from "./interaction-routing.js";
+import { ideApprovalCommand, isIDEApprovalCommand } from "./ide-approval.js";
+import type { IDEApprovalService } from "../ide/approval-service.js";
 export { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "../channels/progress.js";
 import type { ChannelMessage } from "../channels/message.js";
 import type { OutboundChannelMessage } from "../webhooks/channel-message-webhook.js";
@@ -132,6 +135,10 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
+  ideApprovals?: IDEApprovalService;
+  /** Captured from the actual running adapter account, not mutable UI state. */
+  ideProviderId?: string;
+  ideEntry?: (session: ManagedSession) => string | undefined;
   deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
@@ -324,6 +331,16 @@ export class BridgeService {
       this.options.stateStore.rememberContextToken(replyTargetId, scopedMessage.contextToken);
     }
 
+    // Dedicated owner authority, before chat ACL/session gating. Source actor
+    // and provider-confirmed private context must never be rewritten to a room.
+    const control = parseCommand(message.text);
+    if (control && isIDEApprovalCommand(control.name, control.arg)) {
+      const result = await ideApprovalCommand({ service: this.options.ideApprovals, accountId: this.options.accountId,
+        providerId: this.options.ideProviderId, channel: this.channel.channel, message, arg: control.arg });
+      if (typeof result === "string") await this.reply(replyTargetId, result);
+      else await this.replyActionCard(replyTargetId, result);
+      return;
+    }
     const access = this.access.requireAccess(message.senderId, replyTargetId);
     if (!access.allowed) {
       await this.reply(replyTargetId, access.message);
@@ -477,6 +494,13 @@ export class BridgeService {
       }
     }
     switch (command.name) {
+      case "ide": {
+        const session = this.executionSession(message.senderId);
+        const url = session && this.options.ideEntry?.(session);
+        await this.reply(message.senderId, url ? `${ideEntryLink(url)}\n登录后打开，不会启动新的 Codex 任务。`
+          : "当前没有可用的 Web IDE 入口。请先绑定有项目的 session，并在 Gateway 网页端启用对应主机的 Web IDE。");
+        return;
+      }
       case "help":
       case "h":
         {
@@ -628,8 +652,8 @@ export class BridgeService {
   }
 
   private async replySessionRequired(senderId: string): Promise<void> {
-    await this.reply(senderId, "当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。");
-  }
+        await this.reply(senderId, "当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。");
+    }
 
   /** Local conversation state only; never resolve native approvals/questions. */
   clearConversationBindingState(senderId: string): void {
@@ -2328,10 +2352,12 @@ export class BridgeService {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
         const bound = stillBound();
+        let finalText = parsed.visibleText.trim() || "处理完成。";
+        try { finalText = withIDEEntry(finalText, this.options.ideEntry?.(session)); } catch { /* IDE is optional. */ }
         const journaled = bound && result.turnId && this.options.deliverTurnResult;
         const streamed = journaled
-          ? await this.options.deliverTurnResult!(session, result.turnId!, parsed.visibleText.trim() || "处理完成。")
-          : bound && replyStream ? await replyStream.finalize(parsed.visibleText.trim() || "处理完成。") : false;
+          ? await this.options.deliverTurnResult!(session, result.turnId!, finalText)
+          : bound && replyStream ? await replyStream.finalize(finalText) : false;
         let resultDelivered = Boolean(streamed);
         if (!bound) {
           await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。");
@@ -2342,7 +2368,7 @@ export class BridgeService {
         } else if (!streamed && replyStream && (replyStream.supported || replyStream.checkpoint().terminalPages?.length)) {
           await replyStream.reportTerminalFailure();
         } else if (parsed.visibleText.trim() && !streamed) {
-          await this.reply(message.senderId, parsed.visibleText);
+          await this.reply(message.senderId, finalText);
           resultDelivered = true;
         }
         if (!journaled && bound && result.turnId && resultDelivered) {

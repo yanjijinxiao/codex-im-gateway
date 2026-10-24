@@ -60,6 +60,7 @@ type FollowState = {
   presentationInputBaseline?: string[];
 };
 type Options = {
+  decorateFinal?: (sub: ThreadSubscription, text: string) => string;
   onCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   holdsCapacityStart?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   turnAudience?: TurnAudienceJournal;
@@ -866,7 +867,10 @@ export class ThreadEventHub {
     const state = this.state(sub);
     if (state.completed.includes(turnId)) { void this.notifyParticipants(sub, turnId); return; }
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
-    const clean = visibleText(text).trim() || "任务已结束。";
+    const visible = visibleText(text).trim() || "任务已结束。";
+    let clean = visible;
+    try { clean = this.options.decorateFinal?.(sub, visible) ?? visible; }
+    catch { /* Optional IDE metadata must never prevent result delivery. */ }
     state.terminalPending ??= { turnId, text: clean, fallbackSent: false };
     this.save();
     const stream = this.stream(sub);

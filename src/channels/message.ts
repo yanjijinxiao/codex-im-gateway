@@ -6,6 +6,8 @@ export type ChannelMessage = {
   mention?: import("./types.js").ChannelMention;
   /** Conversation used for replies and session bindings; defaults to senderId in a DM. */
   replyTargetId?: string;
+  /** Provider-confirmed context only. Absence must not be inferred to be a DM. */
+  conversationKind?: "direct" | "group";
   source?: "native-menu";
   contextToken?: string;
   interaction?: { readonly kind: "card"; readonly messageId: string };

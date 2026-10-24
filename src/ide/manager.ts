@@ -1,0 +1,239 @@
+import crypto from "node:crypto";
+import http from "node:http";
+import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { IDEConfigStore, type IDEConfig } from "./config.js";
+import { ProcessIDEHostTransport, type IDEHostTransport, type IDELaunch } from "./transport.js";
+import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { CodeServerInstaller, type IDEInstallerIO } from "./installer.js";
+import type { IDEProfileStatus } from "./profile.js";
+import { runtimeChanges } from "./reconfiguration.js";
+
+export type IDEWorkspace = { owner: string; sessionId: string; hostId: string; workspace: string; projectName: string;
+  projectId?: string; nativeThreadId?: string };
+type Reference = { accountId: string; sessionId: string };
+type Instance = { id: string; hostId: string; workspace: string; status: "starting" | "running" | "error" | "stopped";
+  error?: string; launch?: IDELaunch; lastUsedAt: number; trustWorkspace?: boolean; profile?: IDEProfileStatus };
+export type IDEInstanceStatus = Omit<Instance, "launch">;
+export class WorkspaceIDEManager {
+  readonly configStore: IDEConfigStore;
+  readonly installer: CodeServerInstaller;
+  private readonly references: Record<string, Reference>;
+  private readonly referencePath: string;
+  private readonly instances = new Map<string, Instance>();
+  private readonly pending = new Map<string, Promise<Instance>>();
+  private readonly cancellations = new Map<string, { controller: AbortController; hostId: string }>();
+  private readonly hostGenerations = new Map<string, number>();
+  private readonly reconfiguring = new Set<string>();
+  private readonly transport: IDEHostTransport;
+  private generation = 0;
+  private closing = false;
+  accessAvailable?: boolean;
+  accessOrigin?: (hostId: string) => string | undefined;
+  private referenceError = false;
+  onStop?: (instanceId: string) => void;
+  constructor(private readonly options: { root: string; resolve: (accountId: string, sessionId: string) => IDEWorkspace | undefined;
+    refresh?: (accountId: string, sessionId: string) => Promise<IDEWorkspace | undefined>;
+    transport?: IDEHostTransport; readyTimeoutMs?: number; installerIO?: IDEInstallerIO }) {
+    this.configStore = new IDEConfigStore(options.root);
+    this.installer = new CodeServerInstaller(options.root, { io: options.installerIO,
+      allowed: hostId => { const config = this.config(); return !this.closing && !this.reconfiguring.has(hostId)
+        && config.enabled && config.hosts.some(h => h.hostId === hostId && h.enabled && h.autoInstall); } });
+    this.referencePath = path.join(options.root, "ide", "workspaces.json");
+    try {
+      const references = readJsonFile<Record<string, Reference>>(this.referencePath, {});
+      if (!references || Array.isArray(references) || typeof references !== "object"
+        || Object.entries(references).some(([id, value]) => !/^[a-f0-9]{32}$/.test(id)
+          || !value || typeof value.accountId !== "string" || typeof value.sessionId !== "string")) throw new Error("Invalid IDE references");
+      this.references = references;
+    }
+    catch { this.references = {}; this.referenceError = true; }
+    this.transport = options.transport ?? new ProcessIDEHostTransport({ localDataRoot: path.join(options.root, "ide", "instances") });
+  }
+  entry(accountId: string, sessionId: string): { id: string; url: string } | undefined {
+    const config = this.configStore.config();
+    const target = this.options.resolve(accountId, sessionId);
+    if (!config.enabled || !target || !config.hosts.some(h => h.hostId === target.hostId && h.enabled)) return;
+    const origin = this.accessOrigin ? this.accessOrigin(target.hostId) : this.accessAvailable === false ? undefined
+      : config.routing === "per-host" && config.sharedIngressHostId ? config.hosts.find(h => h.hostId === config.sharedIngressHostId)?.access?.publicOrigin
+      : config.routing === "per-host" && target.hostId !== "local" ? config.hosts.find(h => h.hostId === target.hostId)?.access?.publicOrigin : config.publicOrigin;
+    if (!origin) return;
+    if (this.referenceError) throw new Error("IDE 入口记录无法读取，请检查专用状态文件；未覆盖旧记录");
+    const id = digest([accountId, sessionId]);
+    if (!this.references[id]) { this.references[id] = { accountId, sessionId }; writeJsonFile(this.referencePath, this.references); }
+    return { id, url: `${new URL(origin).origin}/workspace/${id}` };
+  }
+  accountForEntry(id: string): string { this.resolve(id); return this.references[id].accountId; }
+  resolve(id: string): IDEWorkspace {
+    if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("IDE 入口不存在");
+    const reference = this.references[id];
+    const target = reference && this.options.resolve(reference.accountId, reference.sessionId);
+    if (!target || !path.posix.isAbsolute(target.workspace) || /[\r\n\0]/.test(target.workspace)) throw new Error("项目或 session 已移除，IDE 入口失效");
+    return target;
+  }
+  private host(target: IDEWorkspace) {
+    const config = this.configStore.config();
+    const host = config.hosts.find(h => h.hostId === target.hostId && h.enabled);
+    if (!config.enabled || !host) throw new Error("请先在 Gateway 网页端启用该主机的 Web IDE");
+    return { config, host };
+  }
+  private identity(target: IDEWorkspace, workspace: string, trustWorkspace = false): string {
+    return digest([this.options.root, target.owner, target.hostId, workspace, "code-server", JSON.stringify(this.configStore.config().profile),
+      ...(trustWorkspace ? ["gateway-trusted-workspace-v1"] : [])]);
+  }
+  async canonicalForTrust(id: string): Promise<string> {
+    const base = this.resolve(id), expected = digest(base), reference = this.references[id];
+    const current = this.options.refresh ? await this.options.refresh(reference.accountId, reference.sessionId) : base;
+    if (!current || current.workspace !== base.workspace || digest(this.resolve(id)) !== expected) throw new Error("项目目录已改变，请同步 session 后重新授权");
+    const directory = await this.transport.canonicalDirectory(base.hostId, base.workspace);
+    if (digest(this.resolve(id)) !== expected) throw new Error("项目已改变，未授权目录");
+    return directory;
+  }
+  async start(id: string, prepare = false, trustWorkspace = false, trustedDirectory?: string): Promise<IDEInstanceStatus> {
+    if (this.closing) throw new Error("IDE 正在停止或重新配置，请稍后重试");
+    const base = this.resolve(id), reference = this.references[id], generation = this.generation;
+    const hostGeneration = this.hostGenerations.get(base.hostId) ?? 0;
+    const initial = this.host(base);
+    const check = () => {
+      const current = this.host(base);
+      if (this.closing || this.reconfiguring.has(base.hostId) || generation !== this.generation
+        || hostGeneration !== (this.hostGenerations.get(base.hostId) ?? 0)
+        || initial.host.binary !== current.host.binary || JSON.stringify(initial.config.profile) !== JSON.stringify(current.config.profile))
+        throw new Error("IDE 配置已改变，已取消启动，请刷新后重试");
+    };
+    check();
+    const target = this.options.refresh ? await this.options.refresh(reference.accountId, reference.sessionId) : base;
+    check();
+    if (!target || target.hostId !== base.hostId || target.owner !== base.owner || digest(base) !== digest(this.resolve(id))) throw new Error("项目上下文已改变，未启动 IDE");
+    const { config, host } = this.host(target);
+    const binary = host.autoInstall && host.binary === "code-server" ? await this.installer.binary(target.hostId) : host.binary;
+    check();
+    const workspace = await this.transport.canonicalDirectory(target.hostId, target.workspace);
+    if (trustWorkspace && workspace !== trustedDirectory) throw new Error("实际目录与已信任目录不一致，请重新核对授权");
+    check();
+    const instanceId = this.identity(target, workspace, trustWorkspace);
+    const inflight = this.pending.get(instanceId);
+    if (inflight) { if (prepare) throw new Error("IDE 正在启动，请稍后准备扩展"); return publicInstance(await inflight); }
+    const previous = this.instances.get(instanceId);
+    if (this.pending.size + [...this.instances.values()].filter(i => i.status === "running" && i.launch?.alive()).length
+      - Number(previous?.status === "running" && previous.launch?.alive()) >= 8) throw new Error("IDE 实例达到上限，请先停止不用的实例");
+    const cancellation = new AbortController(); this.cancellations.set(instanceId, { controller: cancellation, hostId: target.hostId });
+    const promise = (async (): Promise<Instance> => {
+      if (previous?.status === "running" && previous.launch?.alive()) {
+        if (prepare) throw new Error("请先停止 IDE 再准备扩展，以免并发写入扩展目录");
+        if (await healthy(previous.launch.socketPath)) {
+          check();
+          previous.lastUsedAt = Date.now(); return previous;
+        }
+      }
+      await previous?.launch?.stop();
+      check();
+      const instance: Instance = { id: instanceId, workspace, hostId: target.hostId, status: "starting", lastUsedAt: Date.now(), trustWorkspace };
+      this.instances.set(instanceId, instance);
+      try {
+        instance.launch = await this.transport.launch({ hostId: target.hostId, workspace, id: instanceId,
+          binary, settings: config.profile.settings, extensions: config.profile.extensions, prepare, trustWorkspace,
+          signal: cancellation.signal,
+          onProfile: status => { if (this.instances.get(instanceId) === instance && generation === this.generation
+            && hostGeneration === (this.hostGenerations.get(target.hostId) ?? 0)) instance.profile = status; } });
+        check();
+        if (prepare) { await instance.launch.stop(); instance.launch = undefined; instance.status = "stopped"; return instance; }
+        const deadline = Date.now() + (this.options.readyTimeoutMs ?? 20_000);
+        while (!await healthy(instance.launch.socketPath)) {
+          check();
+          if (!instance.launch.alive() || Date.now() >= deadline) throw new Error("IDE 健康检查未通过，请检查主机安装、目录权限和 SSH 转发");
+          await delay(150);
+        }
+        this.resolve(id); // Deleted sessions/projects cannot authorize a late startup.
+        check();
+        instance.status = "running"; return instance;
+      } catch (error) {
+        await instance.launch?.stop(); instance.launch = undefined; instance.status = "error";
+        // Do not expose subprocess stderr, SSH identities or arbitrary host output.
+        instance.error = instance.profile?.warning === "extensions-unavailable"
+          ? "所选扩展未安装完成；请检查 Open VSX 网络、扩展兼容性及目录权限后重试准备扩展。"
+          : "IDE 启动失败；请检查对应主机的 code-server、Node、SSH 与项目目录。";
+        throw error;
+      }
+    })();
+    this.pending.set(instanceId, promise);
+    try { return publicInstance(await promise); } finally {
+      if (this.pending.get(instanceId) === promise) this.pending.delete(instanceId);
+      if (this.cancellations.get(instanceId)?.controller === cancellation) this.cancellations.delete(instanceId);
+    }
+  }
+  endpoint(id: string, trustWorkspace = false): { instanceId: string; socketPath: string; workspace: string } | undefined {
+    const target = this.resolve(id); this.host(target);
+    // References can share an instance, but never cross host/owner/security profile.
+    for (const instance of this.instances.values()) {
+      const expected = this.identity(target, instance.workspace, trustWorkspace);
+      if (expected !== instance.id || instance.status !== "running" || !instance.launch?.alive()) continue;
+      // Alias/symlink mapping is recorded only following a successful resolution.
+      const opened = this.opened.get(`${id}:${trustWorkspace}`);
+      if (opened?.instanceId !== instance.id || opened.target !== digest(target)) continue;
+      instance.lastUsedAt = Date.now(); return { instanceId: instance.id, socketPath: instance.launch.socketPath, workspace: instance.workspace };
+    }
+  }
+  private readonly opened = new Map<string, { instanceId: string; target: string }>();
+  async open(id: string, trustWorkspace = false, trustedDirectory?: string): Promise<IDEInstanceStatus> {
+    const base = this.resolve(id), target = digest(base), generation = this.generation, hostGeneration = this.hostGenerations.get(base.hostId) ?? 0;
+    const instance = await this.start(id, false, trustWorkspace, trustedDirectory);
+    this.host(base);
+    if (target !== digest(this.resolve(id)) || this.closing || this.reconfiguring.has(base.hostId) || generation !== this.generation
+      || hostGeneration !== (this.hostGenerations.get(base.hostId) ?? 0)) throw new Error("项目或 IDE 配置已改变，请刷新后重试");
+    this.opened.set(`${id}:${trustWorkspace}`, { instanceId: instance.id, target }); return instance;
+  }
+  list(): IDEInstanceStatus[] {
+    return [...this.instances.values()].map(instance => publicInstance(instance.status === "running" && !instance.launch?.alive()
+      ? { ...instance, status: "error", error: "IDE 进程或 SSH 连接已断开；重新打开可重建连接。" } : instance));
+  }
+  async stop(id: string): Promise<void> {
+    if (this.pending.has(id)) throw new Error("IDE 正在准备，请完成后重试或禁用 Web IDE");
+    const instance = this.instances.get(id);
+    if (!instance) throw new Error("IDE 实例不存在");
+    this.onStop?.(id); await instance.launch?.stop(); instance.launch = undefined; instance.status = "stopped";
+  }
+  async close(): Promise<void> {
+    this.closing = true;
+    this.generation++;
+    for (const cancellation of this.cancellations.values()) cancellation.controller.abort();
+    await this.installer.close();
+    await Promise.allSettled(this.pending.values());
+    await Promise.all([...this.instances.values()].map(async instance => {
+      this.onStop?.(instance.id); await instance.launch?.stop(); instance.launch = undefined; instance.status = "stopped";
+    }));
+    this.opened.clear();
+  }
+  async reconfigure(previous: IDEConfig | undefined, next: IDEConfig): Promise<void> {
+    const { stopHosts, cancelInstalls } = runtimeChanges(previous, next);
+    // Fence before the first await, including directory/refresh work that has
+    // not yet acquired an instance ID. Unrelated hosts remain usable.
+    for (const hostId of stopHosts) {
+      this.reconfiguring.add(hostId);
+      this.hostGenerations.set(hostId, (this.hostGenerations.get(hostId) ?? 0) + 1);
+    }
+    const pending = [...this.pending].filter(([id]) => stopHosts.has(this.cancellations.get(id)!.hostId)).map(([, work]) => work);
+    for (const cancellation of this.cancellations.values()) if (stopHosts.has(cancellation.hostId)) cancellation.controller.abort();
+    try {
+      await Promise.all([this.installer.cancelHosts(cancelInstalls), Promise.allSettled(pending)]);
+      await Promise.all([...this.instances.values()].filter(instance => stopHosts.has(instance.hostId)).map(async instance => {
+        this.onStop?.(instance.id); await instance.launch?.stop(); instance.launch = undefined; instance.status = "stopped";
+      }));
+      for (const [key, opened] of this.opened) if (stopHosts.has(this.instances.get(opened.instanceId)?.hostId ?? "")) this.opened.delete(key);
+    } finally { for (const hostId of stopHosts) this.reconfiguring.delete(hostId); }
+  }
+  resume(): void { this.closing = false; }
+  config(): IDEConfig { return this.configStore.config(); }
+  authorizationFile(): string { return path.join(this.options.root, "ide", "authorization.json"); }
+}
+function digest(value: unknown): string { return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 32); }
+function publicInstance({ launch: _, ...instance }: Instance): IDEInstanceStatus { return instance; }
+function healthy(socketPath: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { request.destroy(); resolve(false); }, 1000);
+    const request = http.get({ socketPath, path: "/healthz", agent: false }, response => {
+      clearTimeout(timer); response.resume(); resolve(response.statusCode === 200);
+    });
+    request.on("error", () => { clearTimeout(timer); resolve(false); });
+  });
+}

@@ -391,21 +391,25 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       throw new CodexCommunicationError("submission", "turn/start", threadId, undefined, { code: "InvalidAcknowledgement" });
     }
 
-    this.activeTurns.set(threadId, turnId);
     this.unconfirmedStarts.delete(threadId);
-    const previousState = this.threadStates.get(threadId);
-    this.threadStates.set(threadId, {
-      threadId,
-      persistence: previousState?.persistence ?? (input.ephemeral ? "ephemeral" : "active"),
-      runtimeStatus: "active",
-      activeFlags: [],
-      latestTurnStatus: "inProgress",
-      activeTurnId: turnId,
-      ...(this.turnRecoveries.has(turnKey(threadId, turnId)) ? { recovery: this.turnRecoveries.get(turnKey(threadId, turnId)) } : {}),
-      ...(previousState?.cwd ? { cwd: previousState.cwd } : { cwd: input.cwd }),
-      ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
-      ...(previousState?.title ? { title: previousState.title } : {})
-    });
+    // JSONL notifications can complete this exact turn before its start RPC
+    // continuation runs. The acknowledgement must not resurrect terminal state.
+    if (!this.completedTurns.has(turnKey(threadId, turnId))) {
+      this.activeTurns.set(threadId, turnId);
+      const previousState = this.threadStates.get(threadId);
+      this.threadStates.set(threadId, {
+        threadId,
+        persistence: previousState?.persistence ?? (input.ephemeral ? "ephemeral" : "active"),
+        runtimeStatus: previousState?.runtimeStatus === "systemError" ? "systemError" : "active",
+        activeFlags: [],
+        latestTurnStatus: "inProgress",
+        activeTurnId: turnId,
+        ...(this.turnRecoveries.has(turnKey(threadId, turnId)) ? { recovery: this.turnRecoveries.get(turnKey(threadId, turnId)) } : {}),
+        ...(previousState?.cwd ? { cwd: previousState.cwd } : { cwd: input.cwd }),
+        ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
+        ...(previousState?.title ? { title: previousState.title } : {})
+      });
+    }
     // Bind the accepted identity/presentation before draining notifications
     // that can arrive ahead of the turn/start receipt.
     await input.onTurnStarted?.({ threadId, turnId });
