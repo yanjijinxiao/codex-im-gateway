@@ -236,7 +236,7 @@ test("real HTTP browser pairing + token-protected owner setup + private IM confi
   const copyJS=await fetch(http.url+"/copyable.js"),copyCSS=await fetch(http.url+"/copyable.css");
   assert.equal(copyJS.status,200);assert.match(copyJS.headers.get("content-type")!,/javascript/);assert.match(await copyJS.text(),/window\.gatewayCopy/);
   assert.equal(copyCSS.status,200);assert.match(copyCSS.headers.get("content-type")!,/text\/css/);assert.match(await copyCSS.text(),/\.gateway-copy/);
-  const initial = await fetch(entry.url), page = await initial.text(), proofCookie = initial.headers.get("set-cookie")!.split(";")[0];
+  const initial = await fetch(entry.url + "?auth_check=1"), page = await initial.text(), proofCookie = initial.headers.get("set-cookie")!.split(";")[0];
   const code = page.match(/<textarea[^>]*>(\d{6})<\/textarea>/)![1];
   const body = JSON.stringify({ principal: owner });
   assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers: { "Content-Type": "application/json" }, body })).status, 403);
@@ -262,18 +262,18 @@ test("real HTTP browser pairing + token-protected owner setup + private IM confi
   assert.equal((await fetch(panelURL,{method:"POST",headers:{Origin:new URL(entry.url).origin},body:"choice=trust"})).status,405);
   assert.equal((await fetch(panelURL,{method:"HEAD"})).status,405);
   assert.equal((await fetch(panelURL.replace(/[^/]+$/,"0".repeat(32)))).status,410);
-  const beforeDecision=await fetch(entry.url,{headers:{Cookie:proofCookie},redirect:"manual"});
+  const beforeDecision=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proofCookie},redirect:"manual"});
   assert.equal(beforeDecision.status,200);assert.match(await beforeDecision.text(),/等待 Gateway/);
   const confirmation = await ideApprovalCommand({ service: approvals, accountId: "account", providerId: "client", channel: "dingtalk", message, arg: card.actionGroups[0][0].value.arg });
   assert.match(String(confirmation), /已批准/);
   const expiredPanel=await fetch(panelURL);assert.equal(expiredPanel.status,410);assert.doesNotMatch((await expiredPanel.text()).split('<script nonce=')[0],/\/ide trust [a-f0-9]{12}/);
-  const copied = await fetch(entry.url, { redirect: "manual" }); assert.equal(copied.status, 200); assert.match(await copied.text(), /等待 Gateway/);
-  const exchange = await fetch(entry.url, { headers: { Cookie: proofCookie }, redirect: "manual" }); assert.equal(exchange.status, 303);
+  const copied = await fetch(entry.url + "?auth_check=1", { redirect: "manual" }); assert.equal(copied.status, 200); assert.match(await copied.text(), /等待 Gateway/);
+  const exchange = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: proofCookie }, redirect: "manual" }); assert.equal(exchange.status, 303);
   const sessionCookie = exchange.headers.get("set-cookie")!.split(";")[0];
-  const authorized = await fetch(entry.url, { headers: { Cookie: sessionCookie } }); assert.match(await authorized.text(), /已授权并信任当前目录/);
+  const authorized = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: sessionCookie } }); assert.match(await authorized.text(), /已授权并信任当前目录/);
   await http.close();
   http = await startLocalHttpServer({ paths: resolveStatePaths(f.root), port: 0, accountManager: manager });
-  const restored = await fetch(entry.url, { headers: { Cookie: sessionCookie } }); assert.match(await restored.text(), /已授权并信任当前目录/);
+  const restored = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: sessionCookie } }); assert.match(await restored.text(), /已授权并信任当前目录/);
   assert.deepEqual(new IDEApprovalService({ root: f.root, accounts: f.options.accounts }).list(), [owner]); assert.deepEqual(b.mutations, []);
 });
 
@@ -348,23 +348,23 @@ for (const choice of ["trust", "access", "deny"] as const) test(`real HTTP + one
     transport:{canonicalDirectory:async()=>f.root,async launch(){throw Error("approval must not launch an editor");}}});
   ide.configStore.save({...ide.config(),enabled:true,port,publicOrigin:`http://127.0.0.1:${port}`,hosts:[{hostId:"local",enabled:true,binary:"code-server"}]});
   const http=await startLocalHttpServer({paths:resolveStatePaths(f.root),port:0,accountManager:{ide,ideApprovals:approvals,listProjects:()=>[]} as never});t.after(()=>http.close());
-  const entry=ide.entry("account","single")!,initial=await fetch(entry.url),html=await initial.text(),proof=initial.headers.get("set-cookie")!.split(";")[0];
+  const entry=ide.entry("account","single")!,initial=await fetch(entry.url + "?auth_check=1"),html=await initial.text(),proof=initial.headers.get("set-cookie")!.split(";")[0];
   const primary=html.split("<details")[0];assert.match(primary,/发送一次/);assert.match(primary,/不会再要求第二条/);
   assert.match(primary,/项目：/);assert.match(primary,/主机：local/);assert.match(primary,/目录：/);
   assert.match(primary,/&lt;script&gt;bad&lt;\/script&gt;/);assert.doesNotMatch(primary,/\/ide auth/);
   assert.equal((primary.match(/<button[^>]*data-copy-button/g)||[]).length,4);
   const command=new RegExp(`/ide ${choice} [a-f0-9]{12}`).exec(primary)![0];
-  const reloaded=await fetch(entry.url,{headers:{Cookie:proof}});assert.ok((await reloaded.text()).includes(command),"polling preserves the displayed command");
-  assert.match(await(await fetch(entry.url,{headers:{Cookie:proof}})).text(),/等待 Gateway/);
+  const reloaded=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}});assert.ok((await reloaded.text()).includes(command),"polling preserves the displayed command");
+  assert.match(await(await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}})).text(),/等待 Gateway/);
   assert.equal(b.cards.length,0);await b.send(command);assert.equal(b.cards.length,0,"no second confirmation card");
   assert.match(b.texts.at(-1)!,choice==="deny"?/已拒绝/:/已批准/);
-  const original=await fetch(entry.url,{headers:{Cookie:proof},redirect:"manual"});
+  const original=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof},redirect:"manual"});
   if(choice==="deny"){assert.equal(original.status,200);assert.match(await original.text(),/等待 Gateway/);assert.doesNotMatch(original.headers.get("set-cookie")??"",/cig_ide_/);}
   else {
     assert.equal(original.status,303);const cookie=original.headers.get("set-cookie")!.split(";")[0];
     assert.match(original.headers.get("set-cookie")!,/Max-Age=1296000/);
-    const granted=await fetch(entry.url,{headers:{Cookie:cookie}});assert.match(await granted.text(),choice==="trust"?/已授权并信任当前目录/:/本次仅批准访问/);
-    assert.match(await(await fetch(entry.url)).text(),/等待 Gateway/,"copied URL does not authenticate a different browser");
+    const granted=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:cookie}});assert.match(await granted.text(),choice==="trust"?/已授权并信任当前目录/:/本次仅批准访问/);
+    assert.match(await(await fetch(entry.url + "?auth_check=1")).text(),/等待 Gateway/,"copied URL does not authenticate a different browser");
   }
   await b.send(command);assert.match(b.texts.at(-1)!,/已失效/);
   assert.deepEqual(b.mutations,[]);assert.equal(JSON.stringify(b.store.snapshot),stateBefore);

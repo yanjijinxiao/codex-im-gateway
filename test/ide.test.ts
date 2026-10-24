@@ -85,6 +85,43 @@ test("canonical host/owner/profile instance reuse, concurrent opens and fresh ta
   assert.equal(manager.entry("account", "none"), undefined);
 });
 
+test("external first hop silently rechecks Strict cookies without approval UI, grants or IDE startup", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-first-hop-")), transport = new FakeTransport();
+  const manager = new WorkspaceIDEManager({ root, transport, resolve: () => ({ owner: "owner", sessionId: "s",
+    workspace: "/project", hostId: "local", projectName: "project" }) });
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`, management = "http://127.0.0.1:18788";
+  manager.configStore.save(config(manager.configStore, port));
+  const access = new IDEAccessServer(manager); access.setManagementOrigin(management); await access.reload(false);
+  t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const entry = manager.entry("a", "s")!, checked = `${entry.url}?auth_check=1`;
+  const first = await fetch(entry.url, { headers: { "Sec-Fetch-Site": "cross-site" } }), html = await first.text();
+  assert.equal(first.status, 200); assert.match(html, /正在核验已有授权/);
+  assert.doesNotMatch(html, /等待 Gateway 授权|<section data-ide-wait|<form/);
+  assert.match(html, new RegExp(`location\\.replace\\("/workspace/${entry.id}\\?auth_check=1"\\)`));
+  assert.equal(first.headers.get("set-cookie"), null); assert.equal(first.headers.get("refresh"), null);
+  assert.match(first.headers.get("content-security-policy")!, /script-src 'nonce-/);
+  assert.equal(access.pendingAccess().length, 0); assert.equal(transport.launches.length, 0);
+  const unauthenticated = await fetch(checked);
+  assert.match(await unauthenticated.text(), /等待 Gateway 授权/);
+  assert.equal(access.pendingAccess().length, 1, "the public marker is not authorization");
+  assert.equal(transport.launches.length, 0);
+  const grant = await access.grant(entry.id);
+  const login = await fetch(origin + "/authorize", { method: "POST", redirect: "manual", headers: { Origin: management },
+    body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
+  assert.match(login.headers.get("set-cookie")!, /HttpOnly; SameSite=Strict/);
+  const cookie = login.headers.get("set-cookie")!.split(";")[0];
+  const verified = await fetch(checked, { headers: { Cookie: cookie, "Sec-Fetch-Site": "same-origin" } });
+  const ready = await verified.text();
+  assert.match(ready, /data-ide-auto-open/); assert.doesNotMatch(ready, /等待 Gateway 授权/);
+  assert.equal(transport.launches.length, 0, "GET recheck must remain read-only");
+  const csrf = /name="csrf" value="([^"]+)"/.exec(ready)![1];
+  const opened = await fetch(`${origin}/open/${entry.id}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }) });
+  assert.equal(opened.status, 303);
+  const again = await fetch(entry.url, { headers: { Cookie: cookie }, redirect: "manual" });
+  assert.equal(again.status, 303); assert.match(again.headers.get("location")!, /^\/ide\//);
+  assert.equal(transport.launches.length, 1);
+});
+
 test("separate browser authentication guards HTTP/WS, strips credentials, denies foreign origins and revokes sockets", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-access-")), transport = new FakeTransport();
   const manager = new WorkspaceIDEManager({ root, transport, resolve: () => ({ owner: "owner", sessionId: "s", workspace: "/project", hostId: "local", projectName: "<project>" }),
@@ -95,7 +132,7 @@ test("separate browser authentication guards HTTP/WS, strips credentials, denies
   const managementOrigin = "http://127.0.0.1:18788"; access.setManagementOrigin(managementOrigin);
   t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const entry = manager.entry("account", "s")!;
-  const anon = await fetch(entry.url), waitingPage=await anon.text(); assert.match(waitingPage, /等待 Gateway 授权/); assert.equal(transport.launches.length, 0);
+  const anon = await fetch(entry.url + "?auth_check=1"), waitingPage=await anon.text(); assert.match(waitingPage, /等待 Gateway 授权/); assert.equal(transport.launches.length, 0);
   assert.equal(anon.headers.get("refresh"), null, "HTTP refresh must not interrupt the copy control");
   const nonce=/<script nonce="([^"]+)">/.exec(waitingPage)![1];
   assert.match(anon.headers.get("content-security-policy")!,new RegExp(`script-src 'nonce-${nonce.replace(/[+]/g,"\\+")}'`));
@@ -116,7 +153,7 @@ test("separate browser authentication guards HTTP/WS, strips credentials, denies
   assert.equal((await login(managementOrigin)).status, 401, "grant cannot be replayed");
   const cookie = logged.headers.get("set-cookie")!.split(";")[0]; assert.match(logged.headers.get("set-cookie")!, /HttpOnly; SameSite=Strict/);
   assert.match(logged.headers.get("set-cookie")!, /Max-Age=1296000/);
-  const landing = await fetch(entry.url, { headers: { Cookie: cookie } }); const html = await landing.text();
+  const landing = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } }); const html = await landing.text();
   assert.match(html, /&lt;project&gt;/); const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1];
   assert.equal((await fetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: "csrf=wrong" })).status, 403);
   const opened = await fetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }), redirect: "manual" });
@@ -170,7 +207,7 @@ test("browser cookie survives access-server restart and trusted workbench cannot
   const cookie = login.headers.get("set-cookie")!.split(";")[0];
   await login.text();
   await first.access.close();
-  const second = await start(), landing = await (await freshFetch(entry.url, { headers: { Cookie: cookie } })).text();
+  const second = await start(), landing = await (await freshFetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text();
   assert.doesNotMatch(landing, /等待 Gateway 授权/); assert.match(landing, /Gateway 已授权并信任/);
   const csrf = /name="csrf" value="([^"]+)"/.exec(landing)![1];
   const opened = await freshFetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }), redirect: "manual" });
@@ -178,7 +215,7 @@ test("browser cookie survives access-server restart and trusted workbench cannot
   assert.equal((await freshFetch(`${origin}/ide/${entry.id}/?folder=/different/project`, { headers: { Cookie: cookie } })).status, 403);
   assert.equal((await freshFetch(`${origin}/ide/${entry.id}/?folder=/exact/project`, { headers: { Cookie: cookie } })).status, 200);
   second.access.revoke(); await second.access.close();
-  await start(); assert.match(await (await freshFetch(entry.url, { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
+  await start(); assert.match(await (await freshFetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
 });
 
 test("an IM entry pairs only the approved browser and project changes invalidate existing grants", async t => {
@@ -191,17 +228,17 @@ test("an IM entry pairs only the approved browser and project changes invalidate
   const access = new IDEAccessServer(manager); access.setManagementOrigin("http://127.0.0.1:18788"); await access.reload();
   t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const entry = manager.entry("a", "one")!, other = manager.entry("a", "two")!;
-  const visit = await fetch(entry.url), proofCookie = visit.headers.get("set-cookie")!.split(";")[0];
+  const visit = await fetch(entry.url + "?auth_check=1"), proofCookie = visit.headers.get("set-cookie")!.split(";")[0];
   assert.doesNotMatch(await visit.text(), /type="password"/);
   const pending = access.pendingAccess()[0]; assert.equal("proof" in pending, false);
   await access.approveAccess(pending.id, entry.id);
-  const stranger = await fetch(entry.url); assert.match(await stranger.text(), /等待 Gateway 授权/);
-  const confirmed = await fetch(entry.url, { headers: { Cookie: proofCookie }, redirect: "manual" });
+  const stranger = await fetch(entry.url + "?auth_check=1"); assert.match(await stranger.text(), /等待 Gateway 授权/);
+  const confirmed = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: proofCookie }, redirect: "manual" });
   assert.equal(confirmed.status, 303); const cookie = confirmed.headers.get("set-cookie")!.split(";")[0];
-  assert.match(await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), /打开 Web IDE/);
-  assert.match(await (await fetch(other.url, { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
+  assert.match(await (await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /打开 Web IDE/);
+  assert.match(await (await fetch(other.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
   const grant = await access.grant(entry.id); workspace = "/new-project";
-  assert.match(await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
+  assert.match(await (await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
   const stale = await fetch(`${origin}/authorize`, { method: "POST", headers: { Origin: "http://127.0.0.1:18788" },
     body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
   assert.equal(stale.status, 401); assert.equal(transport.launches.length, 0);
@@ -234,7 +271,7 @@ test("local Gateway mints IDE access only behind mutation protection and no pass
   assert.equal((await fetch(`${server.url}/api/ide/config`, { method: "PUT", body: JSON.stringify({ config: hotConfig }) })).status, 403);
   assert.equal((await fetch(`${server.url}/api/ide/config`, { method: "PUT", headers, body: JSON.stringify({ config: hotConfig }) })).status, 200);
   assert.ok(ide.entry("a", "remote")); assert.equal(transport.launches.length, 0);
-  assert.match(await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), /打开 Web IDE/, "the protected config API preserves unrelated browser grants");
+  assert.match(await (await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /打开 Web IDE/, "the protected config API preserves unrelated browser grants");
   assert.equal((await fetch(`${settings.publicOrigin}/login`, { method: "POST", headers: { Origin: settings.publicOrigin }, body: "password=x" })).status, 401);
   const revoke = await fetch(`${server.url}/api/ide/revoke`, { method: "POST", headers }); assert.equal(revoke.status, 200);
 });
@@ -348,7 +385,7 @@ test("authorized browser enters the usable IDE directly while degraded-profile w
   const entry = manager.entry("a", "s")!, grant = await access.grant(entry.id);
   const login = await fetch(`${origin}/authorize`, { method: "POST", redirect: "manual", headers: { Origin: "http://127.0.0.1:18788" }, body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
   const cookie = login.headers.get("set-cookie")!.split(";")[0];
-  const landing = await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), csrf = /name="csrf" value="([^"]+)"/.exec(landing)![1];
+  const landing = await (await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), csrf = /name="csrf" value="([^"]+)"/.exec(landing)![1];
   const opened = await fetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }), redirect: "manual" });
   assert.equal(opened.status, 303); assert.match(opened.headers.get("location")!, /^\/ide\//);
   assert.equal(manager.list()[0].profile?.warning, "extensions-unavailable");

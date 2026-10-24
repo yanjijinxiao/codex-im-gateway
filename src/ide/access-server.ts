@@ -230,6 +230,16 @@ export class IDEAccessServer {
       if (!id) { this.page(res, 200, "项目 Web IDE", "请从 Gateway 管理页或 IM 中的项目链接进入，无需另设密码。"); return; }
       this.assertEntry(id);
       if (!session) {
+        // Strict cookies may be omitted on an external link's first request.
+        // Commit a same-origin document, then recheck immediately before showing
+        // any approval UI. The marker controls presentation only: it never
+        // authenticates, creates a grant, trusts a directory or starts an IDE.
+        if (url.searchParams.get("auth_check") !== "1") {
+          const destination = `/workspace/${id}?auth_check=1`;
+          this.page(res, 200, "正在核验已有授权", "正在检查当前浏览器的访问权限，无需重复批准。",
+            `<a href="${destination}">未自动继续时，点击核验并进入</a>`,
+            `location.replace(${JSON.stringify(destination)});`); return;
+        }
         const pairCookie = this.cookie(req, `cig_request_${id}`)?.split(".");
         const approved = pairCookie?.length === 2 && this.authorization.exchangeRequest(pairCookie[0], pairCookie[1], id, this.scope(id));
         if (approved) { this.setCookie(res, COOKIE + id, approved.token, IDE_SESSION_TTL_MS / 1000); this.redirect(res, `/workspace/${id}`); return; }

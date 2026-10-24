@@ -77,14 +77,14 @@ test("HTTPS retains native authorization, Secure cookies, WSS scopes and persist
   manager.configStore.save({ ...manager.config(), enabled: true, port, publicOrigin: origin, tls: files, hosts: [{ hostId: "local", enabled: true, binary: "code-server" }] });
   await access.reload(false); access.setManagementOrigin(management); t.after(() => access.close());
   const entry = manager.entry("account", "session")!;
-  await assert.rejects(request(entry.url), /certificate|issuer/i, "untrusted clients must not bypass TLS verification");
-  assert.match((await request(entry.url, ca)).body, /等待 Gateway 授权/);
+  await assert.rejects(request(entry.url + "?auth_check=1"), /certificate|issuer/i, "untrusted clients must not bypass TLS verification");
+  assert.match((await request(entry.url + "?auth_check=1", ca)).body, /等待 Gateway 授权/);
   assert.equal((await request(origin + "/api/bootstrap", ca)).status, 401);
   const grant = await access.grant(entry.id);
   const logged = await request(origin + "/authorize", ca, { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() });
   assert.equal(logged.status, 303); assert.match(logged.headers["set-cookie"]![0], /Secure/);
   const cookie = logged.headers["set-cookie"]![0].split(";")[0];
-  const landing = await request(entry.url, ca, { headers: { Cookie: cookie } }), csrf = /name="csrf" value="([^"]+)"/.exec(landing.body)![1];
+  const landing = await request(entry.url + "?auth_check=1", ca, { headers: { Cookie: cookie } }), csrf = /name="csrf" value="([^"]+)"/.exec(landing.body)![1];
   assert.equal((await request(origin + "/open/" + entry.id, ca, { method: "POST", headers: { Cookie: cookie, Origin: "https://evil.invalid" }, body: new URLSearchParams({ csrf }).toString() })).status, 403);
   assert.equal((await request(origin + "/open/" + entry.id, ca, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }).toString() })).status, 303);
   const socket = await new Promise<net.Socket>((resolve, reject) => {
@@ -93,12 +93,12 @@ test("HTTPS retains native authorization, Secure cookies, WSS scopes and persist
   });
   const originalFingerprint = landing.fingerprint;
   await access.tls.prepare("127.0.0.1", true); await access.refreshCertificate();
-  const renewed = await request(entry.url, ca, { headers: { Cookie: cookie } });
+  const renewed = await request(entry.url + "?auth_check=1", ca, { headers: { Cookie: cookie } });
   assert.notEqual(renewed.fingerprint, originalFingerprint); assert.equal(renewed.status, 303); assert.match(renewed.headers.location!, /\/ide\//); assert.equal(socket.destroyed, false, "certificate reload must not close active terminals");
   await access.close(); access = new IDEAccessServer(manager); await access.reload(false);
-  assert.match((await request(entry.url, ca, { headers: { Cookie: cookie } })).body, /打开 Web IDE/);
+  assert.match((await request(entry.url + "?auth_check=1", ca, { headers: { Cookie: cookie } })).body, /打开 Web IDE/);
   assert.deepEqual(access.tls.caCertificate(), ca); access.revoke();
-  assert.match((await request(entry.url, ca, { headers: { Cookie: cookie } })).body, /等待 Gateway 授权/);
+  assert.match((await request(entry.url + "?auth_check=1", ca, { headers: { Cookie: cookie } })).body, /等待 Gateway 授权/);
 });
 test("certificate preparation is a local mutation, refuses arbitrary addresses and does not apply network changes", async t => {
   const root = temporary(t), manager = new WorkspaceIDEManager({ root, resolve: () => undefined });

@@ -25,7 +25,9 @@ async function until(check: () => boolean) { for (let i = 0; i < 250; i++) { if 
 function remoteRequest(origin: string, ca: Buffer, route: string, options: { method?: string; headers?: Record<string,string>; body?: string } = {}) {
   const url = new URL(origin);
   return new Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
-    const req = https.request({ host: "127.0.0.1", port: url.port, path: route, ca, agent: false, method: options.method,
+    // Raw HTTP tests enter the post-navigation verification step explicitly.
+    const checked = route.startsWith("/workspace/") ? route + "?auth_check=1" : route;
+    const req = https.request({ host: "127.0.0.1", port: url.port, path: checked, ca, agent: false, method: options.method,
       checkServerIdentity: (_host, cert) => tls.checkServerIdentity(url.hostname, cert),
       headers: { Host: url.host, ...options.headers } }, res => {
       let body = ""; res.on("data", chunk => body += chunk); res.on("end", () => resolve({ status: res.statusCode!, body, headers: res.headers }));
@@ -157,12 +159,12 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
     assert.equal((await fetch(local+panelPath)).status,410,"a valid panel cannot leak across entrance audiences");
     assert.equal((await remoteRequest(origin,ca,panelPath,{method:"POST",headers:{Origin:origin},body:"trust"})).status,405);
     const pairCookie = waiting.headers["set-cookie"]![0].split(";")[0];
-    const localWaiting = await fetch(local+"/workspace/"+localEntry.id);
+    const localWaiting = await fetch(local+"/workspace/"+localEntry.id+"?auth_check=1");
     const localCode = /<textarea[^>]*>(\d{6})<\/textarea>/.exec(await localWaiting.text())![1];
     const localRequest = access.pendingAccess().find(r => r.code === localCode && r.entryId === localEntry.id)!;
     await assert.rejects(access.approveAccess(request.id,remoteEntry.id,true));
     await access.approveAccess(request.id,localEntry.id,true);
-    assert.match(await (await fetch(local+"/workspace/"+localEntry.id,{headers:{Cookie:localWaiting.headers.get("set-cookie")!.split(";")[0]}})).text(),/等待 Gateway 授权/);
+    assert.match(await (await fetch(local+"/workspace/"+localEntry.id+"?auth_check=1",{headers:{Cookie:localWaiting.headers.get("set-cookie")!.split(";")[0]}})).text(),/等待 Gateway 授权/);
     const localPending = access.pendingAccess().find(r=>r.id===localRequest.id)!;
     assert.equal(localPending.approved,false,"shared approval cannot approve a loopback browser request");
     const stranger = await remoteRequest(origin,ca,"/workspace/"+localEntry.id);
@@ -185,7 +187,7 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
     localSocket.destroy();
     assert.match((await remoteRequest(origin,ca,"/workspace/"+remoteEntry.id,{headers:{Cookie:localProjectCookie}})).body,/等待 Gateway 授权/,"local project grant cannot access remote project");
     await access.approveAccess(localRequest.id,localEntry.id,false);
-    const localAccepted=await fetch(local+"/workspace/"+localEntry.id,{redirect:"manual",headers:{Cookie:localWaiting.headers.get("set-cookie")!.split(";")[0]}});
+    const localAccepted=await fetch(local+"/workspace/"+localEntry.id+"?auth_check=1",{redirect:"manual",headers:{Cookie:localWaiting.headers.get("set-cookie")!.split(";")[0]}});
     assert.equal(localAccepted.status,303,"loopback maintenance approval still targets its own request");
     access.rejectAccess(access.pendingAccess().find(r=>r.entryId===localEntry.id&&!r.approved)!.id,localEntry.id);
     const beforeDisable=manager.config();

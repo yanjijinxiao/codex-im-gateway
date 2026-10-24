@@ -80,7 +80,9 @@ async function fixture(t: test.TestContext, legacy = false) {
     const url = new URL(publicOrigin), ca = legacy ? undefined : access.tls.caCertificate();
     return new Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
       const client = legacy ? http : https;
-      const req = client.request({ host: "127.0.0.1", port: url.port, path: route, ca, agent: false, method: options.method,
+      // Raw HTTP does not execute the first-hop same-origin navigation script.
+      const checked = route.startsWith("/workspace/") ? route + "?auth_check=1" : route;
+      const req = client.request({ host: "127.0.0.1", port: url.port, path: checked, ca, agent: false, method: options.method,
         checkServerIdentity: (_host: string, cert: tls.PeerCertificate) => tls.checkServerIdentity(url.hostname, cert),
         headers: { Host: url.host, ...options.headers } }, res => {
         let body = ""; res.on("data", chunk => body += chunk); res.on("end", () => resolve({ status: res.statusCode!, body, headers: res.headers }));
