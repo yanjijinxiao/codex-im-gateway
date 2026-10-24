@@ -4,6 +4,7 @@ import { parseCodexExecSandbox, type CodexExecSandbox } from "../codex/sandbox.j
 import type { AppServerConnectionMode } from "../codex/app-server-daemon.js";
 import { readJsonFile, writeJsonFile } from "./json-store.js";
 import { defaultStateDir, type StatePaths } from "./paths.js";
+import { DEFAULT_BINDING_IDLE_DAYS, idleDays } from "./binding-expiry.js";
 
 export const MAX_INBOUND_BYTES = 100 * 1024 * 1024;
 const LEGACY_DEFAULT_INBOUND_BYTES = 50 * 1024 * 1024;
@@ -21,6 +22,7 @@ export type CodexImGatewayConfig = {
   streamReplies: boolean;
   /** Default busy-session policy. A ManagedSession may explicitly override it. */
   activeMessagePolicy: "ask" | "steer" | "queue";
+  bindingIdleDays: number;
   maxBufferItems: number;
   promptBufferTtlMs: number;
   maxInboundBytes: number;
@@ -41,6 +43,7 @@ export function defaultConfig(cwd = defaultStateDir()): CodexImGatewayConfig {
     codexAppServerTransport: "auto",
     streamReplies: true,
     activeMessagePolicy: "steer",
+    bindingIdleDays: DEFAULT_BINDING_IDLE_DAYS,
     maxBufferItems: 50,
     promptBufferTtlMs: 10 * 60_000,
     maxInboundBytes: MAX_INBOUND_BYTES,
@@ -64,6 +67,7 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfi
     codexExecSandbox,
     streamReplies: typeof loaded.streamReplies === "boolean" ? loaded.streamReplies : base.streamReplies,
     activeMessagePolicy: normalizeActiveMessagePolicy(loaded.activeMessagePolicy),
+    bindingIdleDays: idleDays(loaded.bindingIdleDays),
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
     taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
       ? loaded.taskboardUrl.trim()
@@ -93,6 +97,7 @@ export function saveConfig(paths: StatePaths, config: CodexImGatewayConfig): voi
   writeJsonFile(paths.configPath, {
     ...config,
     activeMessagePolicy: normalizeActiveMessagePolicy(config.activeMessagePolicy),
+    bindingIdleDays: idleDays(config.bindingIdleDays),
     maxInboundBytes: normalizeInboundBytes(config.maxInboundBytes, MAX_INBOUND_BYTES)
   });
 }

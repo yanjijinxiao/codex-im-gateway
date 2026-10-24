@@ -190,6 +190,7 @@ export class BridgeService {
   }>();
   private readonly actor = new AsyncLocalStorage<string>();
   private readonly participant = new AsyncLocalStorage<Pick<TurnParticipantOrigin, "actorId" | "conversationId" | "mention">>();
+  private readonly conversationWork = new Map<string, number>();
   private readonly turnAudience: TurnAudienceJournal;
   private audienceSuspended = false;
   private readonly controls: SessionControlJournal;
@@ -248,8 +249,9 @@ export class BridgeService {
     this.llmWiki = options.llmWiki ?? new LlmWikiMcpClientPool();
     this.modeSettings = normalizeChannelModeSettings(options.modeSettings);
     this.userInputs = new ChannelUserInputController(
-      async (senderId, card) => {
+      async (senderId, card, mentions) => {
         const receipt = await this.channel.sendActionCard({ toUserId: senderId, card,
+          ...(mentions?.length ? { mentions } : {}),
           contextToken: this.options.stateStore.getContextToken(senderId) });
         this.reportCardDelivery(senderId, receipt, card.fallbackText);
         return receipt;
@@ -258,6 +260,12 @@ export class BridgeService {
         validate: (senderId, request) => {
           const session = this.executionSession(senderId);
           return session?.threadId === request.threadId && (this.sessionHostId(session) ?? "local") === request.hostId;
+        },
+        resolveMentions: (senderId, request) => {
+          const session = this.executionSession(senderId);
+          if (!session || session.threadId !== request.threadId || (this.sessionHostId(session) ?? "local") !== request.hostId) return;
+          return this.turnAudience.mentions({ bindingKey: JSON.stringify([this.options.accountId ?? "standalone", session.id]),
+            conversationId: senderId, ...request });
         },
         ...(this.channel.capabilities.cardUpdates === "available" ? {
           updateCard: (messageId: string, card: ChannelActionCard) => this.channel.updateActionCard({ messageId, card })
@@ -299,11 +307,14 @@ export class BridgeService {
         project?.id, this.options.stateStore.getInteractionMode(conversationId)]);
     };
     const before = binding();
+    this.conversationWork.set(conversationId, (this.conversationWork.get(conversationId) ?? 0) + 1);
     try {
       await this.participant.run({ actorId: message.senderId, conversationId,
         ...(message.mention ? { mention: message.mention } : {}) }, () => this.actor.run(message.senderId, () =>
         this.cardInteraction.run(message.interaction, () => this.handleInboundMessage(message))));
     } finally {
+      const remaining = (this.conversationWork.get(conversationId) ?? 1) - 1;
+      if (remaining) this.conversationWork.set(conversationId, remaining); else this.conversationWork.delete(conversationId);
       // All binding entry points (new, project, Taskboard, catalog and leave)
       // use the same subscription invalidation boundary.
       if (binding() !== before) await this.options.onSubscriptionsChanged?.();
@@ -347,6 +358,7 @@ export class BridgeService {
       return;
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
+    this.options.stateStore.recordBindingHumanActivity(replyTargetId);
     scopedMessage = this.options.inboundReferences?.resolve(scopedMessage) ?? scopedMessage;
     scopedMessage = await this.channel.resolveReferences(scopedMessage);
     if (message.unsupportedMessageType) {
@@ -652,8 +664,9 @@ export class BridgeService {
   }
 
   private async replySessionRequired(senderId: string): Promise<void> {
-        await this.reply(senderId, "当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。");
-    }
+    const expired = this.options.stateStore.getBindingExpiry(senderId, this.options.config.bindingIdleDays)?.endedReason === "idle";
+    await this.reply(senderId, `${expired ? "此 IM 对话因长期没有人工消息已自动解绑；原 session 和任务均保留。\n\n" : ""}当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。`);
+  }
 
   /** Local conversation state only; never resolve native approvals/questions. */
   clearConversationBindingState(senderId: string): void {
@@ -2890,6 +2903,9 @@ export class BridgeService {
   }
 
   suspendUserInputs(): void { this.audienceSuspended = true; this.userInputs.close(); }
+  hasBindingWork(senderId: string): boolean {
+    return this.conversationWork.has(senderId) || this.approvals.hasPending(senderId) || this.userInputs.hasUnsettled(senderId);
+  }
 
   reconcileUserInputs(): void { this.userInputs.suspendInvalidBindings(); }
 

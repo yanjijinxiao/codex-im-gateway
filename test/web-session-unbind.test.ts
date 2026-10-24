@@ -6,6 +6,8 @@ import test from "node:test";
 const source = fs.readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8");
 const render = source.slice(source.indexOf("function renderSessions()"), source.indexOf("function renderSettings()"));
 const handle = source.slice(source.indexOf("async function handleSessionAction("), source.indexOf("async function handleProjectAction("));
+const expirySource = fs.readFileSync(new URL("../src/web/binding-expiry.js", import.meta.url), "utf8");
+const renderExpiry = expirySource.slice(expirySource.indexOf("function renderBindingExpiry("), expirySource.indexOf("function openBindingExpiryDialog("));
 const selected = { accountId: "one/account", id: "managed-record", senderId: "group/with+symbols=", title: "same title", workspace: "/same/path",
   active: true, threadId: "native-thread", updatedAt: "2026-10-19T00:00:00Z",
   binding: { conversationId: "group/with+symbols=", hostId: "remote-host", threadId: "native-thread", bound: true } };
@@ -20,7 +22,7 @@ test("web list distinguishes exact IM conversation/native IDs and keeps unbind s
   const context = vm.createContext({ state, els, selectedSession: () => selected, sessionKey: (s: typeof selected) => s.id,
     accountDisplayName: () => "DingTalk account", escapeAttr: escape, escapeHtml: escape, relativeTime: () => "just now",
     renderChatPanel() {}, drawIcons() {} });
-  vm.runInContext(`${render}\nrenderSessions();`, context);
+  vm.runInContext(`${renderExpiry}\n${render}\nrenderSessions();`, context);
   const html = els.sessionsList.innerHTML;
   assert.match(html, /对话：group\/with\+symbols=/);
   assert.match(html, /主机：remote-host/);

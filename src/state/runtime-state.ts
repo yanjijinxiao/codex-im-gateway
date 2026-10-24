@@ -13,6 +13,7 @@ import {
 } from "./knowledge.js";
 import type { StatePaths } from "./paths.js";
 import { DEFAULT_SESSION_PAGE_SIZE, isSessionPageSize } from "./session-list-settings.js";
+import { bindingExpiry, normalizeBindingActivity, idleDays, validIdleDays, type BindingActivity, type BindingExpiry } from "./binding-expiry.js";
 
 export type ManagedSession = {
   id: string;
@@ -101,6 +102,8 @@ export type RuntimeState = {
   activeProjectIds: Record<string, string>;
   /** An explicit /unbind or /leave survives restarts and project selection. */
   detachedSessionSenders: string[];
+  /** Activity/policy only; activeSessionIds/activeQaSessionIds still own bindings. */
+  bindingActivity: Record<string, BindingActivity>;
   interactionModes: Record<string, ProjectInteractionMode>;
   pendingDeliveries: Array<{
     id: string;
@@ -128,6 +131,7 @@ export function emptyRuntimeState(): RuntimeState {
     activeQaSessionIds: {},
     activeProjectIds: {},
     detachedSessionSenders: [],
+    bindingActivity: {},
     interactionModes: {},
     pendingDeliveries: [],
     knowledge: [],
@@ -140,6 +144,11 @@ export class RuntimeStateStore {
 
   constructor(private readonly paths: StatePaths) {
     this.state = normalizeRuntimeState(readJsonFile<Partial<RuntimeState>>(paths.statePath, {}));
+    for (const sender of new Set([...Object.keys(this.state.activeSessionIds), ...Object.keys(this.state.activeQaSessionIds)])) {
+      if (this.getBoundSession(sender) && (!this.state.bindingActivity[sender] || this.state.bindingActivity[sender].endedAt)) {
+        this.renewBindingActivity(sender);
+      }
+    }
     this.save();
   }
 
@@ -195,13 +204,16 @@ export class RuntimeStateStore {
     this.save();
   }
 
-  leaveSession(senderId: string): void {
+  leaveSession(senderId: string, reason: "manual" | "idle" = "manual"): void {
+    const endedSessionId = this.getBoundSession(senderId)?.id;
     for (const session of [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]) {
       if (session) session.follow = false;
     }
     delete this.state.activeSessionIds[senderId];
     delete this.state.activeQaSessionIds[senderId];
     this.state.detachedSessionSenders = [...new Set([...this.state.detachedSessionSenders, senderId])];
+    const activity = this.state.bindingActivity[senderId];
+    if (activity) Object.assign(activity, { generation: crypto.randomUUID(), endedAt: new Date().toISOString(), endedReason: reason, endedSessionId });
     this.save();
   }
 
@@ -223,7 +235,7 @@ export class RuntimeStateStore {
       threadId: session.threadId ?? null };
   }
 
-  unbindSession(sessionId: string, expected: SessionBindingTarget): { session: ManagedSession; changed: boolean } {
+  unbindSession(sessionId: string, expected: SessionBindingTarget, reason: "manual" | "idle" = "manual"): { session: ManagedSession; changed: boolean } {
     const session = this.mutableSession(sessionId);
     const target = this.sessionBindingTarget(session);
     if (target.conversationId !== expected.conversationId || target.hostId !== expected.hostId || target.threadId !== expected.threadId) {
@@ -235,8 +247,69 @@ export class RuntimeStateStore {
     const selected = this.state.activeSessionIds[session.senderId] === session.id
       || this.state.activeQaSessionIds[session.senderId] === session.id;
     if (!selected) return { session: structuredClone(session), changed: false };
-    this.leaveSession(session.senderId);
+    this.leaveSession(session.senderId, reason);
     return { session: structuredClone(session), changed: true };
+  }
+
+  private renewBindingActivity(senderId: string, now = Date.now()): void {
+    const previous = this.state.bindingActivity[senderId];
+    Object.defineProperty(this.state.bindingActivity, senderId, { enumerable: true, configurable: true, writable: true,
+      value: { generation: crypto.randomUUID(), baselineAt: new Date(now).toISOString(),
+        ...(previous?.lastHumanAt ? { lastHumanAt: previous.lastHumanAt } : {}),
+        ...(previous?.idleDays !== undefined ? { idleDays: previous.idleDays } : {}),
+        ...(previous?.policyBasisDays !== undefined ? { policyBasisDays: previous.policyBasisDays } : {}) } });
+  }
+
+  recordBindingHumanActivity(senderId: string, now = Date.now()): void {
+    if (!this.getBoundSession(senderId)) return;
+    if (!this.state.bindingActivity[senderId]) this.renewBindingActivity(senderId, now);
+    const activity = this.state.bindingActivity[senderId];
+    activity.lastHumanAt = new Date(Math.max(now, Date.parse(activity.lastHumanAt ?? activity.baselineAt))).toISOString();
+    activity.generation = crypto.randomUUID(); this.save();
+  }
+
+  /** Apply a changed policy with a full grace period, including across restart. */
+  prepareBindingExpiry(defaultDays: number, now = Date.now()): void {
+    let changed = false;
+    for (const [sender, activity] of Object.entries(this.state.bindingActivity)) {
+      if (!this.getBoundSession(sender)) continue;
+      const days = activity.idleDays ?? idleDays(defaultDays);
+      if (activity.policyBasisDays === days) continue;
+      activity.policyBasisDays = days; activity.baselineAt = new Date(now).toISOString();
+      activity.generation = crypto.randomUUID(); changed = true;
+    }
+    if (changed) this.save();
+  }
+
+  getBindingExpiry(senderId: string, defaultDays: number, now = Date.now()): BindingExpiry | undefined {
+    const activity = this.state.bindingActivity[senderId];
+    return activity && bindingExpiry(structuredClone(activity), Boolean(this.getBoundSession(senderId)), defaultDays, now);
+  }
+
+  selectedConversationSessions(senderId: string): ManagedSession[] {
+    if (this.isSessionDetached(senderId)) return [];
+    return [this.getActiveSession(senderId), this.getActiveQaSession(senderId)].filter((session): session is ManagedSession => Boolean(session));
+  }
+
+  setBindingIdleDays(sessionId: string, expected: SessionBindingTarget & { generation: string }, days: number | null, defaultDays: number): void {
+    if (days !== null && !validIdleDays(days)) throw new Error("自动解绑期限必须是 0–3650 的整数天数。");
+    const session = this.state.sessions.find(item => item.id === sessionId);
+    if (!session) throw new SessionBindingConflictError();
+    const target = this.sessionBindingTarget(session);
+    const activity = this.state.bindingActivity[session.senderId];
+    if (this.getBoundSession(session.senderId)?.id !== sessionId || !activity || activity.generation !== expected.generation
+      || target.conversationId !== expected.conversationId || target.hostId !== expected.hostId || target.threadId !== expected.threadId) throw new SessionBindingConflictError();
+    if (days === null) delete activity.idleDays; else activity.idleDays = days;
+    activity.policyBasisDays = days ?? idleDays(defaultDays); activity.baselineAt = new Date().toISOString();
+    activity.generation = crypto.randomUUID(); this.save();
+  }
+
+  expireBinding(sessionId: string, expected: SessionBindingTarget & { generation: string }, defaultDays: number, now = Date.now()): boolean {
+    const session = this.getSession(sessionId);
+    if (!session || this.getBoundSession(session.senderId)?.id !== sessionId) return false;
+    const expiry = this.getBindingExpiry(session.senderId, defaultDays, now);
+    if (!expiry || expiry.generation !== expected.generation || expiry.status !== "due") return false;
+    return this.unbindSession(sessionId, expected, "idle").changed;
   }
 
   save(): void {
@@ -641,7 +714,9 @@ export class RuntimeStateStore {
   }
 
   setInteractionMode(senderId: string, mode: ProjectInteractionMode): void {
+    const previous = this.getInteractionMode(senderId);
     this.state.interactionModes[senderId] = mode;
+    if (previous !== mode && this.getBoundSession(senderId)) this.renewBindingActivity(senderId);
     this.save();
   }
 
@@ -736,6 +811,7 @@ export class RuntimeStateStore {
     else delete this.state.activeProjectIds[senderId];
     if (mode === "qa") this.state.activeQaSessionIds[senderId] = session.id;
     else this.state.activeSessionIds[senderId] = session.id;
+    this.renewBindingActivity(senderId);
     this.save();
     return structuredClone(session);
   }
@@ -774,6 +850,7 @@ export class RuntimeStateStore {
     else this.state.activeSessionIds[session.senderId] = session.id;
     if (session.projectId) this.state.activeProjectIds[session.senderId] = session.projectId;
     else if (session.projectBinding === "none") delete this.state.activeProjectIds[session.senderId];
+    this.renewBindingActivity(session.senderId);
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -782,6 +859,7 @@ export class RuntimeStateStore {
   resetSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
     delete session.threadId;
+    if (this.getBoundSession(session.senderId)?.id === sessionId) this.renewBindingActivity(session.senderId);
     session.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(session);
@@ -959,6 +1037,10 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     ...value,
     detachedSessionSenders: Array.isArray(value.detachedSessionSenders)
       ? value.detachedSessionSenders.filter((id): id is string => typeof id === "string") : [],
+    bindingActivity: Object.fromEntries(Object.entries(value.bindingActivity && typeof value.bindingActivity === "object"
+      && !Array.isArray(value.bindingActivity) ? value.bindingActivity : {}).flatMap(([sender, activity]) => {
+      const normalized = normalizeBindingActivity(activity); return normalized ? [[sender, normalized]] : [];
+    })),
     approvalSequence: Number.isSafeInteger(value.approvalSequence) && value.approvalSequence! >= 0
       ? value.approvalSequence! : 0,
     sessionPageSizes: value.sessionPageSizes && typeof value.sessionPageSizes === "object" && !Array.isArray(value.sessionPageSizes)

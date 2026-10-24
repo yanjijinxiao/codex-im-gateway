@@ -13,6 +13,7 @@
   <script defer src="/vendor/marked.umd.js"></script>
   <script defer src="/vendor/purify.min.js"></script>
   <script defer src="/account-mode-settings.js"></script>
+  <script defer src="/binding-expiry.js"></script>
   <script defer src="/app.js"></script>
   <script defer src="/knowledge-bases.js"></script>
   <script defer src="/ide.js"></script>
@@ -283,6 +284,11 @@
                 <option value="ask">Ask · 先询问（兼容）</option>
               </select>
               <small class="field-hint">仅影响忙碌会话；/policy 可覆盖。后端不支持时明确提示，不自动切换策略。</small>
+            </label>
+            <label>
+              <span>无人工消息自动解绑（天）</span>
+              <input id="bindingIdleDaysInput" name="bindingIdleDays" type="number" min="0" max="3650" step="1" value="15" required>
+              <small class="field-hint">默认 15 天，0 为关闭。心跳、轮询和机器人回复不续期；有任务、队列、待答题或状态不明时暂缓。每个 IM 对话可单独覆盖。</small>
             </label>
             <label>
               <span>Codex 文件权限</span>
@@ -786,6 +792,19 @@
     </form>
   </dialog>
 
+  <dialog id="bindingExpiryDialog" class="modal" aria-labelledby="bindingExpiryTitle">
+    <form id="bindingExpiryForm">
+      <div class="modal-header"><h2 id="bindingExpiryTitle">此 IM 对话的自动解绑</h2><button class="icon-button" type="button" data-close-dialog="bindingExpiryDialog" aria-label="关闭自动解绑设置"><i data-lucide="x"></i></button></div>
+      <div class="modal-body binding-expiry-form">
+        <p id="bindingExpiryTarget" class="field-hint"></p>
+        <label class="binding-expiry-inherit"><input id="bindingExpiryInherit" type="checkbox"><span>继承全局期限</span></label>
+        <label><span>连续无人工消息的天数</span><input id="bindingExpiryDays" type="number" min="0" max="3650" step="1" required><small class="field-hint">0 表示当前对话永不自动解绑。修改后重新给予完整宽限期，不会立即清理旧绑定。</small></label>
+        <p class="field-hint">只解除当前 IM 对话的绑定，不删除 session 或停止任务；其他 IM 对话不受影响。运行、排队、等待交互或状态无法确认时保留绑定。</p>
+        <p id="bindingExpiryError" role="alert" hidden></p>
+      </div>
+      <div class="modal-footer"><button class="button button-secondary" type="button" data-close-dialog="bindingExpiryDialog">取消</button><button class="button button-primary" type="submit">保存期限</button></div>
+    </form>
+  </dialog>
   <div class="toast-region" id="toastRegion" aria-live="polite"></div>
 </body>
 </html>

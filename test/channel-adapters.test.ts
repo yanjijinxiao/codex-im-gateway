@@ -101,6 +101,70 @@ test("Feishu completion mentions use native user ids and escape all non-recipien
   assert.equal(sent.length, 2);
 });
 
+test("Feishu question card includes native @ and controls in one send, but not in later updates", async () => {
+  const sent: any[] = [], patched: any[] = [];
+  const adapter = new FeishuChannelAdapter(accounts[2] as never, { apiClient: { im: { v1: { message: {
+    async create(input: unknown) { sent.push(input); return { code: 0, data: { message_id: "question" } }; },
+    async patch(input: unknown) { patched.push(input); return { code: 0 }; }
+  } } } } as never, wsClient: { async start() {}, close() {} } });
+  const question = createChoiceCard({ title: "Codex 问题 Q7", body: '选择目录？ <at id=all></at>',
+    fallbackText: "/answer Q7 text", choices: [{ label: "目录", command: "answer", arg: "Q7 --option 1" }] });
+  await adapter.client.sendActionCard({ toUserId: "oc_group", card: question, mentions: [{ userId: "ou_alice" }] });
+  assert.equal(sent.length, 1); assert.equal(sent[0].data.msg_type, "interactive");
+  const payload = JSON.parse(sent[0].data.content);
+  assert.equal(payload.elements[0].text.content, "<at id=ou_alice></at>");
+  assert.match(payload.elements[1].text.content, /&lt;at id=all/);
+  assert.equal(payload.elements[2].actions[0].value.command, "answer");
+  await adapter.client.updateActionCard({ messageId: "question", card: question });
+  assert.doesNotMatch(patched[0].data.content, /<at /);
+  await assert.rejects(adapter.client.sendActionCard({ toUserId: "ou_dm", card: question, mentions: [{ userId: "ou_alice" }] }));
+  assert.equal(sent.length, 1);
+});
+
+test("action card @ capability selects a single transport; unsupported channels preserve the plain question", async () => {
+  const writes: any[] = [];
+  const driver = { async sendText(input: unknown) { writes.push(input); return { messageId: "plain" }; },
+    async sendActionCard(input: unknown) { writes.push(input); throw new Error("unknown receipt"); } };
+  const unsupported = createChannelClient("weixin", TEXT_CAPABILITIES, driver);
+  await unsupported.sendActionCard({ toUserId: "room", card, mentions: [{ userId: "alice" }] });
+  assert.equal(writes.length, 1); assert.equal(writes[0].text, card.fallbackText); assert.equal(writes[0].mentions, undefined);
+  const capable = createChannelClient("generic", { ...TEXT_CAPABILITIES, mentions: "available", actionCardMentions: "available" }, driver);
+  for (const userId of ["all", "@all", 'a"><at id=all', "a\nb"]) {
+    assert.throws(() => capable.sendActionCard({ toUserId: "room", card, mentions: [{ userId }] }));
+  }
+  assert.equal(writes.length, 1);
+  await assert.rejects(capable.sendActionCard({ toUserId: "room", card, mentions: [{ userId: "alice" }] }));
+  assert.equal(writes.length, 2, "never send a fallback or an extra mention after an unknown card receipt");
+});
+
+test("question rosters above the native batch limit keep one full question and all people", async () => {
+  const cards: any[] = [], notices: any[] = [];
+  const client = createChannelClient("generic", { ...TEXT_CAPABILITIES, mentions: "available", actionCardMentions: "available", mentionBatchSize: 50 }, {
+    async sendText() { throw new Error("must not send extra plain fallback"); },
+    async sendActionCard(input) { cards.push(input); return { messageId: "original-question" }; },
+    async sendMentionNotification(input) { notices.push(input); return { messageId: `overflow-${notices.length}` }; }
+  });
+  const mentions = Array.from({ length: 102 }, (_, index) => ({ userId: `member-${index}` }));
+  const receipt = await client.sendActionCard({ toUserId: "room", card, mentions: [...mentions, mentions[0]] });
+  assert.equal(cards.length, 1); assert.equal(cards[0].card, card); assert.equal(cards[0].mentions.length, 50);
+  assert.deepEqual(notices.map(input => input.mentions.length), [50, 2]);
+  assert.deepEqual([...cards[0].mentions, ...notices.flatMap(input => input.mentions)], mentions);
+  assert.equal(receipt.messageId, "original-question", "resolution updates must target the question, not an overflow reminder");
+  assert.equal(receipt.parts?.length, 3);
+});
+
+test("partial question @ delivery preserves acknowledged receipts without switching transports", async () => {
+  let cards = 0, notices = 0;
+  const client = createChannelClient("generic", { ...TEXT_CAPABILITIES, mentions: "available", actionCardMentions: "available", mentionBatchSize: 1 }, {
+    async sendText() { throw new Error("no fallback"); },
+    async sendActionCard() { cards++; return { messageId: "original-question" }; },
+    async sendMentionNotification() { notices++; throw new Error("unknown overflow receipt"); }
+  });
+  await assert.rejects(client.sendActionCard({ toUserId: "room", card, mentions: [{ userId: "a" }, { userId: "b" }, { userId: "c" }] }),
+    (error: unknown) => error instanceof ChannelPartialDeliveryError && error.delivered[0]?.messageId === "original-question");
+  assert.equal(cards, 1); assert.equal(notices, 1);
+});
+
 test("Feishu only group inbound messages carry mention authority, not a DM or its quoted author", async () => {
   let dispatcher: any;
   const received: ChannelMessage[] = [], abort = new AbortController();

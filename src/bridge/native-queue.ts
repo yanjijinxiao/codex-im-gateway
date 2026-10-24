@@ -38,6 +38,10 @@ export class NativeQueueCoordinator {
     return Object.values(this.receipts).filter(r => r.accountId === accountId
       && (!conversationId || r.conversationId === conversationId)).map(r => structuredClone(r));
   }
+  hasUnsettledThread(threadId: string, hostId: string): boolean {
+    return Object.values(this.receipts).some(r => r.threadId === threadId && r.hostId === hostId
+      && (unsettled.has(r.status) || r.status === "completed" && !r.delivered));
+  }
   async enqueue(origin: QueueOrigin, prompt: string, backend: CodexBridgeBackend,
     handlers: Pick<CodexQueueAddInput, "onApproval" | "onUserInput" | "onUserInputResult"> = {}): Promise<QueueReceipt> {
     if (!backend.addQueuedSubmission || backend.backendInfo(origin.hostId).capabilities.nativeQueue === false) {

@@ -97,9 +97,42 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
       catch (error) { throw channelProgressError(error); }
     },
     sendActionCard(input) {
+      const mentions = caps.actionCardMentions === "available" && caps.mentions === "available" ? input.mentions
+        ?.filter((item, index, all) => all.findIndex(other => other.userId === item.userId) === index) : undefined;
+      if (mentions?.some(item => !isDirectedMentionId(item.userId))) throw new Error("Invalid directed mention recipients");
+      // Select one transport before writing. Unsupported adapters still deliver
+      // the question normally; never append fake @ text or send an extra notice.
+      const { mentions: _mentions, ...ordinary } = input;
+      if (mentions?.length) {
+        const limit = caps.mentionBatchSize ?? 50;
+        if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid mention batch size");
+        const sendCard = required(driver.sendActionCard, "actionCardMentions");
+        if (mentions.length <= limit) return acknowledged("sendActionCard", sendCard.call(driver, { ...ordinary, mentions }));
+        // One full question. Only overflow batches need short directed notices;
+        // never duplicate the body or truncate the roster at the provider limit.
+        const sendNotice = required(driver.sendMentionNotification, "mentions");
+        return (async () => {
+          const parts: ChannelDeliveryPart[] = [];
+          let questionId: string;
+          try {
+            const first = await acknowledged("sendActionCard", sendCard.call(driver, { ...ordinary, mentions: mentions.slice(0, limit) }));
+            questionId = first.messageId;
+            parts.push(...first.parts ?? [{ messageId: first.messageId, text: input.card.fallbackText }]);
+            for (let i = limit; i < mentions.length; i += limit) {
+              const text = `待回答：${input.card.title}。请查看上方完整问题与回答命令。`;
+              const notice = await acknowledged("sendMentionNotification", sendNotice.call(driver, { toUserId: input.toUserId,
+                contextToken: input.contextToken, text, mentions: mentions.slice(i, i + limit) }));
+              parts.push({ messageId: notice.messageId, text });
+            }
+          } catch (error) {
+            throw new ChannelPartialDeliveryError([...parts, ...(error instanceof ChannelPartialDeliveryError ? error.delivered : [])], error);
+          }
+          return { messageId: questionId, parts };
+        })();
+      }
       // Rendering a table does not imply support for interactive buttons.
       return caps.actions === "available" || (input.card.table && caps.tableLayout === "markdown")
-        ? acknowledged("sendActionCard", required(driver.sendActionCard, "actions").call(driver, input))
+        ? acknowledged("sendActionCard", required(driver.sendActionCard, "actions").call(driver, ordinary))
         : fallback(input.toUserId, input.card.fallbackText, input.contextToken);
     },
     sendTaskCard(input) {

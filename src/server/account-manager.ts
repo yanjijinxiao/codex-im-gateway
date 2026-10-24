@@ -122,6 +122,8 @@ import { resolveChannelModeSettings } from "./channel-mode-settings.js";
 import { WorkspaceIDEManager, type IDEWorkspace } from "../ide/manager.js";
 import { withIDEEntry } from "../ide/completion.js";
 import { IDEApprovalService } from "../ide/approval-service.js";
+import { BindingExpiryCoordinator, type ExpiringBinding } from "./binding-expiry.js";
+import type { BindingExpiry } from "../state/binding-expiry.js";
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
@@ -142,7 +144,7 @@ export type AccountSession = ManagedSession & {
   accountId: string;
   active: boolean;
   responding: boolean;
-  binding: SessionBindingTarget & { bound: boolean };
+  binding: SessionBindingTarget & { bound: boolean; expiry?: BindingExpiry };
 };
 
 export type AccountProject = ManagedProject & {
@@ -293,6 +295,7 @@ export class AccountManager {
   private readonly turnAudience: TurnAudienceJournal;
   private readonly nativeQueue: NativeQueueCoordinator;
   private readonly capacityRecovery: CapacityRecoveryCoordinator;
+  private readonly bindingExpiry: BindingExpiryCoordinator;
   private nativeQueueTimer?: NodeJS.Timeout;
   private readonly nativeQueueWarningAt = new Map<string, number>();
   private readonly taskboardClientFactory: (url: string) => TaskboardClient;
@@ -368,6 +371,18 @@ export class AccountManager {
       }
     });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
+    this.bindingExpiry = new BindingExpiryCoordinator({
+      candidates: () => this.expiringBindings(), current: binding => this.bindingExpiryCurrent(binding),
+      idle: binding => this.bindingExpiryIdle(binding),
+      expire: async binding => {
+        if (!this.bindingExpiryCurrent(binding)) return;
+        const entry = this.entries.get(binding.accountId)!;
+        if (!entry.store!.expireBinding(binding.sessionId, binding.expected, this.configProvider().bindingIdleDays)) return;
+        entry.service?.clearConversationBindingState?.(binding.expected.conversationId);
+        this.refreshDesktopRequestSubscriptions();
+        await this.threadEvents.refresh();
+      }
+    });
     this.adapterFactory = options.adapterFactory ?? channelFactoryWithLegacyOverrides(options);
     this.bridgeFactory = options.bridgeFactory ?? ((input) => new BridgeService(input));
     this.runnerFactory = options.runnerFactory ?? ((config) => new CodexBackendRouter({
@@ -407,6 +422,7 @@ export class AccountManager {
   }
 
   async stopAll(): Promise<void> {
+    this.bindingExpiry.stop();
     this.capacityRecovery.stop();
     this.codexDesktopRequestMonitor?.stop();
     this.codexDesktopRequestMonitor = undefined;
@@ -472,6 +488,7 @@ export class AccountManager {
       ...(account.webhookProvider ? { webhookProvider: account.webhookProvider } : {})
     });
     const config = this.configProvider();
+    store.prepareBindingExpiry(config.bindingIdleDays);
     const adapter = this.adapterFactory(account, { inboundDir: statePaths.inboundDir, maxInboundBytes: config.maxInboundBytes });
     const client = adapter.client;
     const runner = this.runnerFor(config);
@@ -563,6 +580,7 @@ export class AccountManager {
     });
     const entry: RuntimeEntry = { status: "starting", controller, service, store, client, webhook };
     this.entries.set(account.accountId, entry);
+    this.bindingExpiry.start();
     this.ensureNativeQueueRecovery();
     this.refreshDesktopRequestSubscriptions();
 
@@ -1068,6 +1086,69 @@ export class AccountManager {
     return { session: this.sessionSummary(accountId, result.session, false), changed: result.changed };
   }
 
+  setBindingIdleDays(accountId: string, sessionId: string, expected: SessionBindingTarget & { generation: string }, days: number | null): AccountSession {
+    const store = this.storeFor(accountId);
+    store.setBindingIdleDays(sessionId, expected, days, this.configProvider().bindingIdleDays);
+    return this.sessionSummary(accountId, store.getSession(sessionId)!, true);
+  }
+
+  /** Exposed for deterministic local verification; never submits native input. */
+  checkBindingExpiry(): Promise<void> { return this.bindingExpiry.runOnce(); }
+
+  private bindingExpiryRelated(store: RuntimeStateStore, conversationId: string): ExpiringBinding["related"] {
+    return store.selectedConversationSessions(conversationId).map(session => ({ sessionId: session.id,
+      hostId: store.sessionBindingTarget(session).hostId, threadId: session.threadId ?? null }));
+  }
+
+  private expiringBindings(): ExpiringBinding[] {
+    const result: ExpiringBinding[] = [], days = this.configProvider().bindingIdleDays;
+    for (const [accountId, entry] of this.entries) {
+      if (entry.status !== "running" || !entry.store) continue;
+      entry.store.prepareBindingExpiry(days);
+      for (const session of entry.store.listSessions()) {
+        if (entry.store.getBoundSession(session.senderId)?.id !== session.id) continue;
+        const expiry = entry.store.getBindingExpiry(session.senderId, days);
+        if (expiry?.status !== "due") continue;
+        result.push({ accountId, sessionId: session.id,
+          expected: { ...entry.store.sessionBindingTarget(session), generation: expiry.generation },
+          related: this.bindingExpiryRelated(entry.store, session.senderId) });
+      }
+    }
+    return result;
+  }
+
+  private bindingExpiryCurrent(binding: ExpiringBinding): boolean {
+    const entry = this.entries.get(binding.accountId), store = entry?.store;
+    if (entry?.status !== "running" || !store || entry.service?.hasBindingWork?.(binding.expected.conversationId)) return false;
+    const session = store.getBoundSession(binding.expected.conversationId);
+    if (session?.id !== binding.sessionId || JSON.stringify(this.bindingExpiryRelated(store, session.senderId)) !== JSON.stringify(binding.related)) return false;
+    const expiry = store.getBindingExpiry(session.senderId, this.configProvider().bindingIdleDays);
+    if (expiry?.generation !== binding.expected.generation || expiry.status !== "due") return false;
+    return binding.related.every(related => !this.isSessionResponding(binding.accountId, related.sessionId)
+      && !(this.threadEvents.status(JSON.stringify([binding.accountId, related.sessionId])).resultDelivery?.pending)
+      && (!related.threadId || !this.nativeQueue.hasUnsettledThread(related.threadId, related.hostId)
+        && !this.capacityRecovery.hasPending(related.threadId, related.hostId)));
+  }
+
+  private async bindingExpiryIdle(binding: ExpiringBinding): Promise<boolean> {
+    if (!this.bindingExpiryCurrent(binding)) return false;
+    const backend = this.runnerFor();
+    for (const related of binding.related) {
+      if (!related.threadId) continue; // No native task exists for this slot yet.
+      const caps = backend.backendInfo(related.hostId).capabilities;
+      if (!caps.threadInspection) return false;
+      const state = await backend.inspectThread(related.threadId, related.hostId);
+      if (state.threadId !== related.threadId || state.persistence !== "active" || state.runtimeStatus !== "idle"
+        || state.activeTurnId || state.pendingTurnWithoutId || state.activeFlags.length || state.latestTurnStatus === "inProgress") return false;
+      if (caps.nativeQueue !== false) {
+        if (!backend.listQueuedSubmissions) return false;
+        const queue = await backend.listQueuedSubmissions(related.threadId, undefined, related.hostId);
+        if (queue.data.length || queue.nextCursor) return false;
+      }
+    }
+    return this.bindingExpiryCurrent(binding);
+  }
+
   async getSessionMessages(accountId: string, sessionId: string): Promise<SessionHistoryMessage[]> {
     const messages = await this.readSessionMessages(accountId, sessionId);
     return messages.map((message) => ({
@@ -1296,14 +1377,16 @@ export class AccountManager {
   }
 
   private sessionSummary(accountId: string, session: ManagedSession, active: boolean): AccountSession {
-        return {
-            ...session,
-            accountId,
-            active,
-            responding: this.isSessionResponding(accountId, session.id),
-            binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active }
-        };
-    }
+    const expiry = this.storeFor(accountId).getBindingExpiry(session.senderId, this.configProvider().bindingIdleDays);
+    return {
+      ...session,
+      accountId,
+      active,
+      responding: this.isSessionResponding(accountId, session.id),
+      binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active,
+        ...((active || expiry?.endedSessionId === session.id) ? { expiry } : {}) }
+    };
+  }
 
   private isSessionResponding(accountId: string, sessionId: string): boolean {
     return (this.respondingSessions.get(sessionRuntimeKey(accountId, sessionId)) ?? 0) > 0;
@@ -1334,6 +1417,7 @@ export class AccountManager {
   }
 
   private closeRunner(): void {
+    this.bindingExpiry.stop();
     if (this.nativeQueueTimer) clearInterval(this.nativeQueueTimer);
     this.nativeQueueTimer = undefined;
     this.runner?.close();

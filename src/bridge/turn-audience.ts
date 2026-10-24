@@ -77,6 +77,13 @@ export class TurnAudienceJournal {
     return structuredClone(this.records[keyOf(scope)]?.participants ?? []);
   }
 
+  /** One trusted roster for questions and completion, scoped to this binding.
+   * Native questions do not identify a particular human answerer. */
+  mentions(scope: TurnAudienceScope): ChannelMention[] {
+    return this.participants(scope).flatMap(item => item.mention && isDirectedMentionId(item.mention.userId) ? [item.mention] : [])
+      .filter((item, index, all) => all.findIndex(other => other.userId === item.userId) === index);
+  }
+
   async notify(scope: TurnAudienceScope, client: ChannelTextClient, options: {
     isCurrent: () => boolean;
     contextToken?: string;
@@ -90,8 +97,7 @@ export class TurnAudienceJournal {
     }
     if (!record || record.unavailable) return;
     if (!record.notices) {
-      const mentions = record.participants.flatMap(item => item.mention && isDirectedMentionId(item.mention.userId) ? [item.mention] : [])
-        .filter((item, index, all) => all.findIndex(other => other.userId === item.userId) === index);
+      const mentions = this.mentions(scope);
       if (!mentions.length || client.capabilities?.mentions !== "available" || !client.sendMentionNotification) {
         record.unavailable = true; this.save(); return;
       }

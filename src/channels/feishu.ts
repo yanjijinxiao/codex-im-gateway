@@ -59,7 +59,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     this.inboundDir = options.inboundDir;
     this.maxInboundBytes = options.maxInboundBytes ?? 100 * 1024 * 1024;
     this.client = createChannelClient("feishu", {
-      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50,
+      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50, actionCardMentions: "available",
       tableLayout: "native",
       inbound: { ...NO_MEDIA, image: options.inboundDir ? "available" : "not-configured", file: options.inboundDir ? "available" : "not-configured" },
       outbound: { ...NO_MEDIA, image: "available" },
@@ -112,13 +112,14 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
     return feishuMessageReceipt(result, "sendImage");
   }
 
-  async sendActionCard(input: { toUserId: string; card: ChannelActionCard }): Promise<{ messageId: string }> {
+  async sendActionCard(input: import("./types.js").ChannelActionCardInput): Promise<{ messageId: string }> {
+    if (input.mentions?.length && recipientType(input.toUserId) !== "chat_id") throw new Error("Directed mentions require a group chat");
     const result = await this.apiClient.im.v1.message.create({
       params: { receive_id_type: recipientType(input.toUserId) },
       data: {
         receive_id: input.toUserId,
         msg_type: "interactive",
-        content: JSON.stringify(feishuActionCard(input.card))
+        content: JSON.stringify(feishuActionCard(input.card, input.mentions))
       }
     });
     return feishuMessageReceipt(result, "sendActionCard");

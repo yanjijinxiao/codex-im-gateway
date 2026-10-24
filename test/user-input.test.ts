@@ -10,6 +10,7 @@ import { desktopAsyncUserInputs, asyncUserInputReply, asyncAnswerDigest, desktop
 import { formatChannelActionCommand, parseChannelActionValue, type ChannelActionCard } from "../src/channels/action-card.js";
 import { feishuActionCard } from "../src/channels/feishu-action-card.js";
 import { parseCommand } from "../src/bridge/channel-commands.js";
+import { ChannelPartialDeliveryError } from "../src/channels/errors.js";
 
 const request: CodexUserInputRequest = { hostId: "local", requestId: 42, threadId: "thread", turnId: "turn", itemId: "item",
   questions: [{ id: "native-question", header: "问题", question: "farming 是项目还是目录？" }], autoResolutionMs: null };
@@ -136,6 +137,68 @@ test("restart resumes the same Q ID, does not repeat its card or a partial answe
   restarted.answer("room", "Q2 /workspace/farming");
   assert.deepEqual(await resumed, { "native-question": { answers: ["目录"] }, second: { answers: ["/workspace/farming"] } });
   restarted.close();
+});
+
+test("question group freezes all participants, and restart/resolution never re-pings", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "question-mentions-")), filePath = path.join(root, "questions.json");
+  const sent: any[] = [], updates: ChannelActionCard[] = [], controllers: ChannelUserInputController[] = [];
+  let roster = [{ userId: "alice" }, { userId: "bob" }];
+  const create = () => {
+    const controller = new ChannelUserInputController(async (to, card, mentions) => {
+      sent.push({ to, card, mentions }); return { messageId: `q-${sent.length}` };
+    }, undefined, { filePath, resolveMentions: () => roster,
+      updateCard: async (_id, card) => { updates.push(card); } });
+    controllers.push(controller); return controller;
+  };
+  t.after(() => { controllers.forEach(item => item.close()); fs.rmSync(root, { recursive: true, force: true }); });
+  const group = { ...request, questions: [...request.questions, { id: "next", header: "Next", question: "继续吗？" }] };
+  const first = create(), pending = first.request("room", group);
+  assert.equal(first.request("room", group), pending);
+  roster = [{ userId: "carol" }]; first.answer("room", "Q1 yes"); await tick();
+  const expected = [{ userId: "alice" }, { userId: "bob" }];
+  assert.deepEqual(sent.map(item => item.mentions), [expected, expected]);
+  first.close(); await pending;
+  const restarted = create(), resumed = restarted.request("room", group);
+  assert.equal(sent.length, 2);
+  restarted.answer("room", "Q2 done"); await resumed;
+  await restarted.reportResult("room", group, "confirmed");
+  await restarted.reportResult("room", group, "confirmed");
+  assert.equal(sent.length, 2); assert.equal(updates.length, 2);
+  assert.ok(updates.every(card => !Object.hasOwn(card, "mentions")), "@ is transport intent, never copied to state updates");
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")).records.map((item: any) => item.mentions), [expected, expected]);
+});
+
+test("lost question receipt does not resend its native @ after restart", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "question-mention-lost-"));
+  const filePath = path.join(root, "questions.json"); let attempts = 0;
+  const create = () => new ChannelUserInputController(async () => { attempts++; throw new Error("ack unknown"); }, undefined,
+    { filePath, resolveMentions: () => [{ userId: "alice" }] });
+  const first = create(), pending = first.request("room", request); await tick(); first.close(); await pending;
+  const second = create(), resumed = second.request("room", request); await tick();
+  assert.equal(attempts, 1); assert.match(second.answer("room", "list"), /Q1/);
+  second.close(); await resumed; fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("unavailable mention lookup cannot prevent the native question from reaching IM", async () => {
+  let cards = 0;
+  const controller = new ChannelUserInputController(async (_to, _card, mentions) => {
+    cards++; assert.equal(mentions, undefined); return { messageId: "question" };
+  }, undefined, { resolveMentions() { throw new Error("optional provenance unavailable"); } });
+  const pending = controller.request("room", request);
+  assert.equal(cards, 1); controller.answer("room", "Q1 yes");
+  assert.deepEqual(await pending, { "native-question": { answers: ["yes"] } }); controller.close();
+});
+
+test("overflow @ failure keeps the acknowledged question card for its answer update, without re-pinging", async () => {
+  let attempts = 0; const updates: string[] = [];
+  const controller = new ChannelUserInputController(async () => {
+    attempts++; throw new ChannelPartialDeliveryError([{ messageId: "original-question", text: "question" }], new Error("unknown overflow"));
+  }, undefined, { resolveMentions: () => [{ userId: "alice" }, { userId: "bob" }],
+    updateCard: async id => { updates.push(id); } });
+  const pending = controller.request("room", request); await tick();
+  controller.answer("room", "Q1 yes"); await pending;
+  await controller.reportResult("room", request, "confirmed");
+  assert.equal(attempts, 1); assert.deepEqual(updates, ["original-question"]); controller.close();
 });
 
 test("restart never replays a submission without a native receipt", async t => {

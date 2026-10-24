@@ -58,6 +58,34 @@ test("audience preserves first participation order, actor deduplication and exac
   assert.doesNotMatch(fs.readFileSync(file, "utf8"), /prompt|answerDigest|accessToken/);
 });
 
+test("question @ uses every confirmed turn participant in original order, not a guessed answerer", t => {
+  const file = path.join(root(t), "audience.json"), journal = new TurnAudienceJournal(file);
+  journal.record(scope, origin("alice"), 10);
+  journal.record(scope, origin("bob"), 20);
+  journal.record(scope, origin("alice"), 30);
+  journal.record(scope, origin("bob"), 20); // Re-reading an older receipt is not a new input.
+  assert.deepEqual(journal.mentions(scope), [{ userId: "alice" }, { userId: "bob" }]);
+  assert.deepEqual(journal.participants(scope).map(item => item.actorId), ["alice", "bob"]);
+  const restarted = new TurnAudienceJournal(file);
+  assert.deepEqual(restarted.mentions(scope), [{ userId: "alice" }, { userId: "bob" }]);
+  for (const other of [{ ...scope, conversationId: "other" }, { ...scope, bindingKey: "other" },
+    { ...scope, hostId: "remote" }, { ...scope, threadId: "other" }, { ...scope, turnId: "other" }]) {
+    assert.deepEqual(restarted.mentions(other), []);
+  }
+  restarted.record(scope, { ...origin("dm"), mention: undefined }, 40);
+  assert.deepEqual(restarted.mentions(scope), [{ userId: "alice" }, { userId: "bob" }], "missing identities never become fake @ names");
+});
+
+test("question recipients reject unsafe identities and deduplicate native user IDs", t => {
+  const journal = new TurnAudienceJournal(path.join(root(t), "audience.json"));
+  assert.deepEqual(journal.mentions(scope), []);
+  journal.record(scope, origin("alice"), 10); journal.record(scope, origin("bob"), 10);
+  assert.deepEqual(journal.mentions(scope), [{ userId: "alice" }, { userId: "bob" }]);
+  journal.record(scope, { ...origin("alternate-actor"), mention: { userId: "alice" } }, 15);
+  journal.record(scope, { ...origin("unsafe"), mention: { userId: "all" } }, 20);
+  assert.deepEqual(journal.mentions(scope), [{ userId: "alice" }, { userId: "bob" }]);
+});
+
 test("unknown notification acknowledgement and a crash after the write-ahead claim never trigger a replay", async t => {
   const dir = root(t), writes: ChannelMentionInput[] = [];
   const file = path.join(dir, "audience.json");
@@ -175,6 +203,7 @@ test("real Bridge collects initial sender and accepted steer contributors withou
   assert.deepEqual(notices[0].mentions.map(item => item.userId), ["alice", "bob"]);
   const ownScope = { ...scope, bindingKey: JSON.stringify(["account", session.id]) };
   assert.deepEqual(audience.participants(ownScope).map(item => item.actorId), ["alice", "bob"]);
+  assert.deepEqual(audience.mentions(ownScope), [{ userId: "alice" }, { userId: "bob" }]);
   assert.deepEqual(audience.participants({ ...ownScope, bindingKey: JSON.stringify(["account", other.id]), conversationId: "other-group" })
     .map(item => item.actorId), ["carol"]);
 });

@@ -34,6 +34,20 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
     } };
 }
 
+test("only authorized inbound human messages renew the binding idle clock", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_800_000_000_000 });
+  const f = fixture(t), session = f.store.createSession("chat", f.root, "normal", f.project.id);
+  f.store.prepareBindingExpiry(15);
+  const initial = f.store.getBindingExpiry("chat", 15)!;
+  t.mock.timers.tick(86_400_000);
+  await f.send("/status", "intruder", "other-room");
+  assert.equal(f.store.getBindingExpiry("chat", 15)?.generation, initial.generation);
+  await f.send("/help", "actor", "chat");
+  assert.equal(f.store.getBoundSession("chat")?.id, session.id);
+  assert.notEqual(f.store.getBindingExpiry("chat", 15)?.generation, initial.generation);
+  assert.equal(f.store.getBindingExpiry("chat", 15)?.lastHumanAt, new Date().toISOString());
+});
+
 for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
   test(`${channel}: unbound ordinary messages only explain binding, without creating tasks or sessions`, async t => {
     const f = fixture(t, channel);

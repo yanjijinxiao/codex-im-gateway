@@ -3,9 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CodexUserInputAnswer, CodexUserInputQuestion, CodexUserInputRequest, CodexUserInputResult } from "../codex/backend.js";
 import { createChoiceCard, type ChannelActionCard } from "../channels/action-card.js";
-import type { ChannelReceipt } from "../channels/types.js";
+import type { ChannelMention, ChannelReceipt } from "../channels/types.js";
+import { isDirectedMentionId } from "../channels/mentions.js";
 import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
-import { channelProgressError } from "../channels/errors.js";
+import { ChannelPartialDeliveryError, channelProgressError } from "../channels/errors.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import type { TurnParticipantOrigin } from "./turn-audience.js";
 
@@ -20,6 +21,8 @@ type QuestionRecord = {
   noticeAttempts?: number; noticeRetryAt?: number;
   presentation?: AcceptedPresentationInput;
   origin?: TurnParticipantOrigin;
+  /** Frozen turn participants, distinct from the eventual answer author. */
+  mentions?: ChannelMention[];
 };
 type Waiter = { resolve: (answer: string | undefined) => void; timer?: NodeJS.Timeout };
 const MAX_RESOLUTION_CARD_ATTEMPTS = 3;
@@ -31,6 +34,7 @@ type Options = {
   noticeRetryDelayMs?: number;
   onAcceptedInput?: (input: AcceptedPresentationInput) => Promise<void>;
   holdAudience?: (origin: TurnParticipantOrigin, request: Pick<QuestionRecord, "hostId" | "threadId" | "turnId">) => () => void;
+  resolveMentions?: (senderId: string, request: Pick<QuestionRecord, "hostId" | "threadId" | "turnId">) => readonly ChannelMention[] | undefined;
 };
 
 /** Account-scoped application controller. No Codex RPC or provider payloads. */
@@ -43,7 +47,7 @@ export class ChannelUserInputController {
   private resolutionRetryTimer?: NodeJS.Timeout;
   private closed = false;
 
-  constructor(private readonly sendCard: (senderId: string, card: ChannelActionCard) => Promise<ChannelReceipt | void>,
+  constructor(private readonly sendCard: (senderId: string, card: ChannelActionCard, mentions?: readonly ChannelMention[]) => Promise<ChannelReceipt | void>,
     private readonly defaultTimeoutMs?: number, private readonly options: Options = {}) {
     this.state = options.filePath && fs.existsSync(options.filePath)
       ? JSON.parse(fs.readFileSync(options.filePath, "utf8")) : { sequence: 0, records: [] };
@@ -71,6 +75,17 @@ export class ChannelUserInputController {
 
   private async runRequest(senderId: string, request: CodexUserInputRequest, key: string): Promise<CodexUserInputAnswer | undefined> {
     const answers: CodexUserInputAnswer = {};
+    // One roster decision for the whole native question group, persisted
+    // before any send. Restart/answering Q1 must not retarget or re-ping Q2.
+    const previous = this.state.records.find(record => record.requestKey === key);
+    let resolved = previous?.mentions;
+    if (!previous) {
+      try { resolved = this.options.resolveMentions?.(senderId,
+        { hostId: request.hostId ?? "local", threadId: request.threadId, turnId: request.turnId })?.map(item => ({ ...item })); }
+      catch { console.warn("[codex-im-gateway] question mention unavailable; question delivery preserved"); }
+    }
+    const mentions = resolved?.filter(item => isDirectedMentionId(item.userId))
+      .filter((item, index, all) => all.findIndex(other => other.userId === item.userId) === index);
     for (const [index, question] of request.questions.entries()) {
       const recordKey = JSON.stringify([key, question.id, crypto.createHash("sha256").update(JSON.stringify(question)).digest("hex")]);
       let record = this.state.records.find(item => item.key === recordKey);
@@ -80,12 +95,14 @@ export class ChannelUserInputController {
         const timeout = request.autoResolutionMs === null ? undefined : request.autoResolutionMs ?? this.defaultTimeoutMs;
         record = { id: `Q${++this.state.sequence}`, key: recordKey, requestKey: key, senderId,
           hostId: request.hostId ?? "local", threadId: request.threadId, turnId: request.turnId,
-          question, kind: request.kind, status: "pending", ...(timeout !== undefined ? { deadline: Date.now() + timeout } : {}) };
+          question, kind: request.kind, status: "pending", ...(mentions?.length ? { mentions } : {}),
+          ...(timeout !== undefined ? { deadline: Date.now() + timeout } : {}) };
         this.state.records.push(record); this.save();
       }
       record.kind ??= request.kind;
       if (!["pending", "answered"].includes(record.status)) return undefined;
       if (record.status === "pending") {
+        if (!this.matchesBinding(senderId, record)) return undefined;
         const answer = await this.ask(record, index, request.questions.length);
         if (!["answered", "expired"].includes(record.status)) return undefined;
         if (answer !== undefined) answers[question.id] = { answers: [answer] };
@@ -167,10 +184,13 @@ export class ChannelUserInputController {
     if (!record.deliveryAttempted) {
       record.deliveryAttempted = true; this.save();
       try {
-        const sent = await this.sendCard(record.senderId, questionCard(record, index, total));
+        const sent = await this.sendCard(record.senderId, questionCard(record, index, total), record.mentions);
         if (sent?.messageId) record.messageId = sent.messageId;
         this.save();
-      } catch {
+      } catch (error) {
+        if (error instanceof ChannelPartialDeliveryError && error.delivered[0]?.messageId) {
+          record.messageId = error.delivered[0].messageId; this.save();
+        }
         console.warn("[codex-im-gateway] user-input notice unconfirmed; original native request retained");
       }
     }
@@ -296,6 +316,10 @@ export class ChannelUserInputController {
       record.status = "withdrawn"; delete record.answer; this.release(record.id);
     }
     this.save();
+  }
+  hasUnsettled(senderId: string): boolean {
+    return this.state.records.some(record => this.matchesBinding(senderId, record)
+      && ["pending", "answered", "submitting", "unconfirmed"].includes(record.status));
   }
   hasRequest(senderId: string, request: CodexUserInputRequest): boolean {
     return this.state.records.some(record => record.requestKey === requestKey(senderId, request)

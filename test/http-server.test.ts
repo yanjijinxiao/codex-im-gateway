@@ -74,6 +74,36 @@ test("exact unbind API protects mutations, requires the full edge and returns co
   assert.match((await rejected.json()).error, /刷新/);
 });
 
+test("binding expiry settings require same-origin token, exact binding generation and bounded days", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-expiry-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const calls: unknown[] = [], target = { conversationId: "room", hostId: "local", threadId: "thread",
+    generation: "11111111-1111-4111-8111-111111111111" };
+  let conflict = false;
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {
+    setBindingIdleDays(accountId: string, sessionId: string, expected: unknown, days: number | null) {
+      if (conflict) throw new SessionBindingConflictError(); calls.push({ accountId, sessionId, expected, days }); return { id: sessionId };
+    }
+  } as never });
+  t.after(() => server.close());
+  const endpoint = `${server.url}/api/sessions/account/session/binding-expiry`;
+  const asset = await fetch(`${server.url}/binding-expiry.js`);
+  assert.equal(asset.status, 200); assert.match(await asset.text(), /function renderBindingExpiry/);
+  const html = await (await fetch(server.url)).text();
+  assert.ok(html.indexOf('src="/binding-expiry.js"') < html.indexOf('src="/app.js"'));
+  const headers = { "Content-Type": "application/json", Origin: server.url, "X-Codex-Im-Gateway-Token": server.requestToken };
+  assert.equal((await fetch(endpoint, { method: "POST", body: JSON.stringify({ ...target, idleDays: 15 }) })).status, 403);
+  for (const invalid of [{ ...target, idleDays: -1 }, { ...target, idleDays: 1.1 }, { ...target, idleDays: 3651 },
+    { ...target, idleDays: "15" }, { ...target, generation: undefined, idleDays: 15 }, { ...target, idleDays: 15, accountId: "other" }]) {
+    assert.equal((await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(invalid) })).status, 400);
+  }
+  assert.equal(calls.length, 0);
+  for (const days of [0, 15, null]) assert.equal((await fetch(endpoint, { method: "POST", headers,
+    body: JSON.stringify({ ...target, idleDays: days }) })).status, 200);
+  assert.deepEqual(calls.map((item: any) => item.days), [0, 15, null]);
+  conflict = true; assert.equal((await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ ...target, idleDays: 7 }) })).status, 409);
+});
+
 test("account deletion passes the session-history retention choice", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-delete-api-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

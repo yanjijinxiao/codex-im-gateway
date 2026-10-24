@@ -744,3 +744,14 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
 .ide-tls p { margin: 0; overflow-wrap: anywhere; }
 .ide-tls > button { justify-self: start; }
 @media (max-width: 650px) { .ide-host, .ide-extensions { grid-template-columns: 1fr; } .ide-instance { align-items: flex-start; flex-direction: column; } }
+.session-expiry { display: block; color: var(--ink-soft); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.session-expiry.is-due { color: #9a6700; }
+.session-expiry.is-expired { color: var(--ink-soft); }
+.binding-expiry-form { display: grid; gap: 16px; }
+.binding-expiry-form label { display: grid; gap: 8px; }
+.binding-expiry-form .binding-expiry-inherit { display: flex; align-items: center; gap: 8px; }
+.binding-expiry-inherit input[type="checkbox"] { appearance: auto; width: 16px; height: 16px; min-height: 0; margin: 0; padding: 0; flex: none; accent-color: var(--green); }
+.binding-expiry-inherit span { display: inline; margin: 0; }
+.binding-expiry-form input:disabled { color: var(--ink-soft); background: var(--canvas, #f4f6f4); cursor: not-allowed; }
+#bindingExpiryTarget { white-space: pre-wrap; overflow-wrap: anywhere; }
+#bindingExpiryError { color: #b42318; }

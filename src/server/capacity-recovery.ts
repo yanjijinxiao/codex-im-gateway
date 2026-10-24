@@ -84,6 +84,10 @@ export class CapacityRecoveryCoordinator {
       && record.turnId !== scope.turnId && record.status === "running"
       || record.turnId === scope.turnId && (record.status === "waiting" || record.status === "uncertain" && !record.acceptedTurnId)));
   }
+  hasPending(threadId: string, hostId: string): boolean {
+    const record = this.records[keyOf({ threadId, hostId, turnId: "" })];
+    return Boolean(record && !["finished", "cancelled"].includes(record.status));
+  }
   private cancelled(record: RecordState): boolean { return this.stopped || record.status === "cancelled"; }
   cancel(threadId: string, hostId = "local"): void {
     const key = keyOf({ threadId, hostId, turnId: "" });

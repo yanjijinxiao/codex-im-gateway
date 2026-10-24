@@ -77,6 +77,10 @@ export class ChannelApprovalController {
     }
   }
 
+  hasPending(senderId: string): boolean {
+    return [...this.pending.values()].some(item => item.senderId === senderId);
+  }
+
   private resolveId(senderId: string, rawId: string): string | undefined {
     const normalized = rawId.trim().toUpperCase();
     if (normalized) return this.pending.has(this.key(senderId, normalized)) ? normalized : undefined;

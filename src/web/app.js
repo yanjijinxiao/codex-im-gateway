@@ -663,12 +663,14 @@ function renderSessions() {
         <span class="session-binding-id">对话：${escapeHtml(session.senderId)}</span>
         <span class="session-binding-id">主机：${escapeHtml(session.binding?.hostId || session.hostId || "local")}</span>
         <span class="session-binding-id">Session：${escapeHtml(session.threadId || "尚未创建 Codex session")}</span>
+        ${renderBindingExpiry(session)}
         <span class="session-workspace" title="${escapeAttr(session.workspace)}">${escapeHtml(session.workspace)}</span>
         <span class="session-thread${session.responding ? " is-responding" : ""}">${session.responding ? "对方正在输入…" : session.threadId ? "已连接 Codex" : "等待首条消息"}</span>
       </button>
       <div class="session-actions">
         <button class="icon-button" type="button" data-session-action="activate" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.active ? "disabled" : ""} title="绑定到此记录的 IM 对话" aria-label="绑定到此记录的 IM 对话"><i data-lucide="circle-play"></i></button>
         <button class="button button-secondary session-unbind" type="button" data-session-action="unbind" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding?.bound ? "" : "disabled"} title="仅解除此 IM 对话的绑定，不删除或停止 Codex session"><i data-lucide="unlink"></i><span>解绑</span></button>
+        <button class="icon-button" type="button" data-session-action="expiry" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding?.bound ? "" : "disabled"} title="自动解绑期限" aria-label="设置此 IM 对话的自动解绑期限"><i data-lucide="timer"></i></button>
         <button class="icon-button" type="button" data-session-action="rename" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" title="重命名会话" aria-label="重命名会话"><i data-lucide="pencil"></i></button>
         <button class="icon-button" type="button" data-session-action="reset" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.threadId ? "" : "disabled"} title="重置 Codex 上下文" aria-label="重置 Codex 上下文"><i data-lucide="rotate-ccw"></i></button>
         <button class="icon-button is-danger" type="button" data-session-action="delete" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" title="删除受管会话" aria-label="删除受管会话"><i data-lucide="trash-2"></i></button>
@@ -720,6 +722,7 @@ function renderSettings() {
   document.querySelector("#allowedWorkspacesInput").value = (state.config.allowedWorkspaces || []).join("\n");
   document.querySelector("#backendInput").value = state.config.codexBackend || "auto";
   document.querySelector("#activeMessagePolicyInput").value = state.config.activeMessagePolicy || "steer";
+  document.querySelector("#bindingIdleDaysInput").value = state.config.bindingIdleDays ?? 15;
   document.querySelector("#appServerTransportInput").value = state.config.codexAppServerTransport || "auto";
   document.querySelector("#sandboxInput").value = state.config.codexExecSandbox || "";
   document.querySelector("#streamRepliesInput").checked = Boolean(state.config.streamReplies);
@@ -1259,6 +1262,7 @@ async function handleSessionAction(event) {
   if (!session) return;
   if (action === "open") return selectSession(session);
   if (action === "rename") return openRenameSessionDialog(session);
+  if (action === "expiry") return openBindingExpiryDialog(session);
   try {
     button.disabled = true;
     if (action === "unbind") {
@@ -2264,6 +2268,7 @@ async function saveSettings(event) {
         allowedWorkspaces: document.querySelector("#allowedWorkspacesInput").value.split("\n").map((line) => line.trim()).filter(Boolean),
         codexBackend: document.querySelector("#backendInput").value,
         activeMessagePolicy: document.querySelector("#activeMessagePolicyInput").value,
+        bindingIdleDays: Number(document.querySelector("#bindingIdleDaysInput").value),
         codexAppServerTransport: document.querySelector("#appServerTransportInput").value,
         codexExecSandbox: document.querySelector("#sandboxInput").value || null,
         model: document.querySelector("#modelInput").value.trim(),

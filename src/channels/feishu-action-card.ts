@@ -1,13 +1,25 @@
 import type { ChannelActionCard, ChannelCardAction } from "./action-card.js";
 import { feishuTableCard, type FeishuTableCardPayload } from "./feishu-table-card.js";
 import type { FeishuButton, FeishuElement, FeishuTaskCardPayload } from "./feishu-task-card-types.js";
+import type { ChannelMention } from "./types.js";
+import { isDirectedMentionId } from "./mentions.js";
 
-export function feishuActionCard(card: ChannelActionCard): FeishuTaskCardPayload | FeishuTableCardPayload {
-  if (card.table?.rows.length) return feishuTableCard(card);
+export function feishuActionCard(card: ChannelActionCard, mentions?: readonly ChannelMention[]): FeishuTaskCardPayload | FeishuTableCardPayload {
+  if (mentions?.some(item => !isDirectedMentionId(item.userId))) throw new Error("Invalid directed mention recipients");
+  // Model/body text must not grant @ authority. Only the separate trusted list
+  // renders native tags; updates call this without mentions and cannot re-ping.
+  const safeCard = { ...card, body: card.body.replace(/<(\/?at)(?=[\s>])/gi, "&lt;$1") };
+  const tags = mentions?.map(item => `<at id=${item.userId}></at>`).join(" ");
+  const mentionElement: FeishuElement[] = tags ? [{ tag: "div", text: { tag: "lark_md", content: tags } }] : [];
+  if (card.table?.rows.length) {
+    const payload = feishuTableCard(safeCard);
+    return { ...payload, body: { elements: [...(tags ? [{ tag: "markdown", content: tags }] : []), ...payload.body.elements] } };
+  }
   const elements: FeishuElement[] = [{
     tag: "div",
-    text: { tag: "lark_md", content: card.body }
+    text: { tag: "lark_md", content: safeCard.body }
   }];
+  elements.unshift(...mentionElement);
   if (card.note) {
     elements.push({ tag: "note", elements: [{ tag: "plain_text", content: card.note }] });
   }

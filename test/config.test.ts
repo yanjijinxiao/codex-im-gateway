@@ -33,6 +33,18 @@ test("busy-message defaults migrate to steer and explicit policies are preserved
   assert.equal(loadConfig(paths).activeMessagePolicy, "steer");
 });
 
+test("binding idle policy defaults to 15 days, supports disabling, and rejects corrupt config values", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-expiry-config-")), paths = resolveStatePaths(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.equal(defaultConfig().bindingIdleDays, 15);
+  for (const days of [0, 7, 15, 3650]) {
+    saveConfig(paths, { ...defaultConfig(root), bindingIdleDays: days }); assert.equal(loadConfig(paths).bindingIdleDays, days);
+  }
+  for (const value of [-1, 1.1, "15", 3651, null]) {
+    fs.writeFileSync(paths.configPath, JSON.stringify({ bindingIdleDays: value })); assert.equal(loadConfig(paths).bindingIdleDays, 15);
+  }
+});
+
 test("uses the selected legacy state root as the workspace fallback", (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-bridge-config-legacy-"));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));

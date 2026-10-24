@@ -32,7 +32,7 @@ import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartIn
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
 import { dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
 import { dingTalkMentionCard, dingTalkCardAtParameters } from "./dingtalk-mentions.js";
-import { DEFAULT_RESULT_PAGE_BYTES } from "./result-pages.js";
+import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import {
   PinnedNetworkLifecycleTransport,
   type NetworkFamilyPolicy
@@ -183,7 +183,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     this.now = options.now ?? Date.now;
     this.fileClient = new DingTalkFileClient(this.apiTransport, undefined, undefined, this.now);
     this.client = createChannelClient("dingtalk", {
-      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50,
+      ...TEXT_CAPABILITIES, mentions: "available", mentionBatchSize: 50, actionCardMentions: "available",
       completionMentionCard: account.cardTemplateId?.trim() ? "available" : "not-configured",
       inbound: { ...NO_MEDIA, image: "available", file: "available" },
       outbound: { ...NO_MEDIA, file: "available" },
@@ -272,8 +272,21 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   }
 
   /** Read-only table in the existing AI template; selection remains a slash command. */
-  async sendActionCard(input: { toUserId: string; card: ChannelActionCard; contextToken?: string }): Promise<ChannelReceipt> {
+  async sendActionCard(input: import("./types.js").ChannelActionCardInput): Promise<ChannelReceipt> {
     const { card } = input;
+    if (input.mentions?.length) {
+      // This template has no native choice controls: keep the complete Q/slash
+      // instructions and native @ together. Only the first page notifies people.
+      const parts: ChannelDeliveryPart[] = [];
+      try {
+        for (const page of resultPages(card.fallbackText, DEFAULT_RESULT_PAGE_BYTES - 1_024)) {
+          const sent = parts.length ? await this.sendText({ toUserId: input.toUserId, text: page.text })
+            : await this.sendMentionNotification({ toUserId: input.toUserId, text: page.text, mentions: input.mentions });
+          parts.push({ messageId: sent.messageId, text: page.text });
+        }
+      } catch (error) { throw new ChannelPartialDeliveryError(parts, error); }
+      return { messageId: parts.at(-1)!.messageId, parts };
+    }
     if (card.table && this.account.cardTemplateId) {
       const text = [escapeTableMarkdown(card.title), card.body, renderMarkdownTable(card.table), card.note].filter(Boolean).join("\n\n");
       try {

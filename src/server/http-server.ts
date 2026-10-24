@@ -149,7 +149,11 @@ const sessionUnbindSchema = z.object({
   hostId: z.string().min(1).max(500),
   threadId: z.string().min(1).max(500).nullable()
 }).strict();
+const bindingExpirySchema = sessionUnbindSchema.extend({
+  generation: z.string().uuid(), idleDays: z.number().int().min(0).max(3650).nullable()
+}).strict();
 const configSchema = z.object({
+  bindingIdleDays: z.number().int().min(0).max(3650).optional(),
   activeMessagePolicy: z.enum(["ask", "steer", "queue"]).optional(),
   defaultCwd: z.string().min(1),
   allowedWorkspaces: z.array(z.string().min(1)).min(1),
@@ -650,6 +654,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   const sessionAction = matchPath(url.pathname, "/api/sessions/:accountId/:sessionId/:action");
+  if (method === "POST" && sessionAction?.action === "binding-expiry") {
+    const { idleDays, ...expected } = bindingExpirySchema.parse(await readJsonBody(request));
+    sendJson(response, 200, { session: context.accountManager.setBindingIdleDays(sessionAction.accountId, sessionAction.sessionId, expected, idleDays) });
+    return;
+  }
   if (method === "POST" && sessionAction?.action === "unbind") {
     const expected = sessionUnbindSchema.parse(await readJsonBody(request));
     sendJson(response, 200, await context.accountManager.unbindSession(sessionAction.accountId, sessionAction.sessionId, expected));
@@ -808,6 +817,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/styles.css": { name: "styles.css", type: "text/css; charset=utf-8" },
     "/app.js": { name: "app.js", type: "text/javascript; charset=utf-8" },
     "/account-mode-settings.js": { name: "account-mode-settings.js", type: "text/javascript; charset=utf-8" },
+    "/binding-expiry.js": { name: "binding-expiry.js", type: "text/javascript; charset=utf-8" },
     "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
     "/ide.js": { name: "ide.js", type: "text/javascript; charset=utf-8" },
     "/copyable.js": { name: "copyable.js", type: "text/javascript; charset=utf-8" },

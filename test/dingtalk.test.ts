@@ -1285,6 +1285,73 @@ test("DingTalk completion @ uses native webhook recipients, with no AI Card recr
   } finally { abort.abort(); await monitor; }
 });
 
+test("DingTalk IDE approval gets provider-confirmed DM/group context, never infers it from matching IDs", async () => {
+  for (const [conversationType, expected] of [["1", "direct"], ["2", "group"], ["unknown", undefined]] as const) {
+    let listener: ((message: DWClientDownStream) => void) | undefined;
+    const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake", savedAt: "", enabled: true }, {
+      emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }) });
+    const abort = new AbortController(), ready = Promise.withResolvers<NormalizedWeixinMessage>();
+    const monitor = adapter.monitor({ signal: abort.signal, async onMessage(message) { ready.resolve(message); } });
+    try {
+      listener!(frame(robotMessage({ conversationType, conversationId: "staff-123" })));
+      const message = await ready.promise;
+      assert.equal(message.senderId, "staff-123"); assert.equal(message.replyTargetId, "staff-123");
+      assert.equal(message.conversationKind, expected);
+    } finally { abort.abort(); await monitor; }
+  }
+});
+
+test("DingTalk question and native @ share one webhook message, not a second reminder", async () => {
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  const writes: any[] = [];
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
+    clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
+    webhookSender: async input => { writes.push(input); return { messageId: "question" }; },
+    cardClient: { async create() { throw new Error("no extra card"); }, async update() {} },
+    emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }), now: () => 1_800_000_000_000
+  });
+  const abort = new AbortController(), ready = Promise.withResolvers<void>();
+  const monitor = adapter.monitor({ signal: abort.signal, async onMessage() { ready.resolve(); } });
+  try {
+    listener!(frame(robotMessage())); await ready.promise;
+    const question = createChoiceCard({ title: "Codex 问题 Q7", body: "项目在哪里？", fallbackText: "【Codex 问题 Q7】\n项目在哪里？\n/answer Q7 路径", choices: [] });
+    const receipt = await adapter.client.sendActionCard({ toUserId: "conversation-123", card: question, mentions: [{ userId: "staff-123" }] });
+    assert.equal(writes.length, 1); assert.equal(receipt.messageId, "question");
+    assert.deepEqual(writes[0].atUserIds, ["staff-123"]); assert.equal(writes[0].text, `@staff-123\n${question.fallbackText}`);
+  } finally { abort.abort(); await monitor; }
+});
+
+test("DingTalk question @ uses persisted card routing after restart, with full Q instructions", async () => {
+  const created: any[] = [], updated: any[] = [];
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true }, { cardRouting: cardRouting(),
+    cardClient: { async create(input) { created.push(input); }, async update(input) { updated.push(input); } },
+    streamClient: { async getAccessToken() { return "fake"; } } as never,
+    async webhookSender() { throw new Error("no ephemeral webhook after restart"); } });
+  const question = createChoiceCard({ title: "Codex 问题 Q8", body: "继续吗？", fallbackText: "【Codex 问题 Q8】\n继续吗？\n/answer Q8 yes", choices: [] });
+  await adapter.client.sendActionCard({ toUserId: "cid-test", card: question, mentions: [{ userId: "staff-123", name: "Tester" }] });
+  assert.equal(created.length, 1); assert.equal(updated.length, 1);
+  assert.deepEqual(created[0].atUserIds, { "staff-123": "Tester" });
+  assert.equal(created[0].text, `<a atId=staff-123>Tester</a>\n\n${question.fallbackText}`);
+  assert.equal(updated[0].text, created[0].text);
+});
+
+test("long DingTalk questions preserve every page and notify only on the first page", async () => {
+  const created: any[] = [];
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
+    cardTemplateId: "template", savedAt: "", enabled: true }, { cardRouting: cardRouting(),
+    cardClient: { async create(input) { created.push(input); }, async update() {} },
+    streamClient: { async getAccessToken() { return "fake"; } } as never });
+  const text = `【Codex 问题 Q9】\n${"中文说明".repeat(2_000)}\n/answer Q9 text`;
+  const question = createChoiceCard({ title: "Codex 问题 Q9", body: text, fallbackText: text, choices: [] });
+  const receipt = await adapter.client.sendActionCard({ toUserId: "cid-test", card: question, mentions: [{ userId: "staff-123" }] });
+  assert.ok(created.length > 1); assert.equal(created.filter(item => item.atUserIds).length, 1);
+  assert.ok(created.every(item => Buffer.byteLength(item.text) <= 6_000));
+  assert.equal(receipt.parts?.length, created.length);
+  assert.match(created.at(-1)!.text, /\/answer Q9 text/);
+  assert.equal((created.map(item => item.text).join("").match(/中文说明/g) ?? []).length, 2_000);
+});
+
 for (const transport of ["https", "sdk"] as const) {
   test(`DingTalk ${transport} completion card @ survives ephemeral webhook loss using the persisted group route`, async () => {
     const deliveries: any[] = [], creations: any[] = [], frames: string[] = [];
