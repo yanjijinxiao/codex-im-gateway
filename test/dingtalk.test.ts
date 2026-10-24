@@ -1285,17 +1285,20 @@ test("DingTalk completion @ uses native webhook recipients, with no AI Card recr
   } finally { abort.abort(); await monitor; }
 });
 
-test("DingTalk IDE approval gets provider-confirmed DM/group context, never infers it from matching IDs", async () => {
-  for (const [conversationType, expected] of [["1", "direct"], ["2", "group"], ["unknown", undefined]] as const) {
+test("DingTalk IDE approval keeps the real staff identity separate from group routing and never infers context from matching IDs", async () => {
+  for (const [conversationType, conversationId, expected] of [["1", "staff-123", "direct"], ["2", "cid-group", "group"], ["2", "staff-123", "group"], ["unknown", "staff-123", undefined]] as const) {
     let listener: ((message: DWClientDownStream) => void) | undefined;
     const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake", savedAt: "", enabled: true }, {
       emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }) });
     const abort = new AbortController(), ready = Promise.withResolvers<NormalizedWeixinMessage>();
     const monitor = adapter.monitor({ signal: abort.signal, async onMessage(message) { ready.resolve(message); } });
     try {
-      listener!(frame(robotMessage({ conversationType, conversationId: "staff-123" })));
+      const command = "/ide access abcdef123456";
+      listener!(frame(robotMessage({ conversationType, conversationId, senderId: "encrypted-other-id",
+        text: { content: conversationType === "2" ? `<@fake> ${command}` : command } })));
       const message = await ready.promise;
-      assert.equal(message.senderId, "staff-123"); assert.equal(message.replyTargetId, "staff-123");
+      assert.equal(message.senderId, "staff-123"); assert.equal(message.replyTargetId, conversationId);
+      assert.equal(message.text, command, "a group mention before the explicit command does not change its actor or arguments");
       assert.equal(message.conversationKind, expected);
     } finally { abort.abort(); await monitor; }
   }

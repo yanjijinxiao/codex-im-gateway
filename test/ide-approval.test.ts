@@ -128,6 +128,40 @@ test("unbound private approval uses original human and provider DM metadata befo
   assert.deepEqual(b.mutations, []); assert.equal(JSON.stringify(b.store.snapshot), before);
 });
 
+test("registered human can preview and approve in an unbound group without granting the room authority", async t => {
+  const f = fixture(t), b = bridgeFixture(t, f); f.service.setOwner(owner);
+  const before = JSON.stringify(b.store.snapshot);
+  await b.send("/ide identity", "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已登记为 IDE 审批管理员/);
+  assert.match(b.texts.at(-1)!, /```text\nowner\n```/);
+  await b.send("/ide auth 123456", "owner", "group", "group");
+  assert.equal(b.cards.length, 1); assert.match(b.cards[0].body, /exact\/project/);
+  const action = b.cards[0].actionGroups[0][0].value;
+  await b.send(`/ide ${action.arg}`, "stranger", "group", "group");
+  assert.match(b.texts.at(-1)!, /不是 IDE/); assert.deepEqual(f.decisions, []);
+  await b.send(`/ide ${action.arg}`, "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已批准原浏览器并信任/);
+  assert.deepEqual(f.decisions, [{ id: "request", entryId: "entry", trust: true }]);
+  await b.send(`/ide ${action.arg}`, "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已失效/);
+  assert.deepEqual(b.mutations, []); assert.equal(JSON.stringify(b.store.snapshot), before);
+  assert.deepEqual(f.service.list(), [owner], "neither the room nor its members become approvers");
+});
+
+test("a copied one-pass group command still requires the registered human and is consumed once", async t => {
+  const f = fixture(t), b = bridgeFixture(t, f); f.service.setOwner(owner);
+  const offer = f.service.offer("request", "entry")!, command = `/ide access ${offer.shortCode}`;
+  await b.send(command, "stranger", "group", "group");
+  assert.match(b.texts.at(-1)!, /不是 IDE/); assert.deepEqual(f.decisions, []);
+  await b.send(command, "group", "group", "group");
+  assert.match(b.texts.at(-1)!, /区分真实发送人/); assert.deepEqual(f.decisions, []);
+  await b.send(command, "owner", "group", "group");
+  assert.deepEqual(f.decisions, [{ id: "request", entryId: "entry", trust: false }]);
+  await b.send(command, "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已失效/); assert.equal(f.decisions.length, 1);
+  assert.deepEqual(b.mutations, []);
+});
+
 test("short confirmation aliases are owner-bound, bounded, fresh per preview and consumed with the long token", async t => {
   const f=fixture(t); f.service.setOwner(owner); f.service.setOwner({...owner,actorId:"second"});
   const first=f.service.preview(owner,"123456");assert.match(first.shortCode,/^[a-f0-9]{12}$/);
@@ -177,10 +211,13 @@ test("short confirmation guessing has a per-principal limit; invalid choices can
   assert.deepEqual(f.decisions,[{id:"request",entryId:"entry",deny:true}]);
 });
 
-test("group ACL, same-ID groups, unknown context, another human and unregistered DMs cannot approve or see project metadata", async t => {
+test("group ACL, contradictory group identities, unknown context and unregistered humans cannot approve or see project metadata", async t => {
   const f = fixture(t), b = bridgeFixture(t, f); f.service.setOwner(owner);
-  await b.send("/ide auth 123456", "owner", "group", "group"); assert.match(b.texts.at(-1)!, /仅支持/);
+  await b.send("/ide auth 123456", "stranger", "group", "group"); assert.match(b.texts.at(-1)!, /不是 IDE/);
+  await b.send("/ide auth 123456", "owner", "group", "owner"); assert.match(b.texts.at(-1)!, /仅支持/);
   await b.send("/ide identity", "group", "group", "group"); assert.match(b.texts.at(-1)!, /仅支持/);
+  await b.bridge.handleMessage({ id: "missing-group", senderId: "owner", conversationKind: "group", text: "/ide auth 123456", attachments: [], raw: {} });
+  assert.match(b.texts.at(-1)!, /仅支持/);
   await b.bridge.handleMessage({ id: "unknown", senderId: "owner", text: "/ide auth 123456", attachments: [], raw: {} });
   assert.match(b.texts.at(-1)!, /仅支持/);
   await b.send("/ide auth 123456", "stranger"); assert.match(b.texts.at(-1)!, /不是 IDE/);
@@ -194,6 +231,14 @@ test("preview and confirmation both require explicit commands; quoted commands n
   await b.bridge.handleMessage({ id: "quoted", senderId: "owner", replyTargetId: "dm", conversationKind: "direct", text: "看看引用", attachments: [],
     references: [{ type: "text", text: "/ide auth 123456", attachments: [], availability: "available" }], raw: {} });
   assert.equal(b.cards.length, 0); assert.deepEqual(f.decisions, []); assert.deepEqual(b.mutations, []);
+});
+
+test("quoted approval text in a group is data, not a registered human decision", async t => {
+  const f = fixture(t), b = bridgeFixture(t, f); f.service.setOwner(owner);
+  const offer = f.service.offer("request", "entry")!;
+  await b.bridge.handleMessage({ id: "group-quote", senderId: "owner", replyTargetId: "group", conversationKind: "group",
+    text: "看看引用", references: [{ type: "text", text: `/ide trust ${offer.shortCode}`, attachments: [], availability: "available" }], attachments: [], raw: {} });
+  assert.deepEqual(f.decisions, []); assert.equal(f.requests[0].approved, false); assert.deepEqual(b.mutations, []);
 });
 
 test("a still-running old bot connection cannot borrow a replacement bot's registered owner identity", async t => {
@@ -339,7 +384,7 @@ test("a pre-registered replacement bot owner cannot reuse a browser command issu
   await assert.rejects(service.decide(replacement,offered.shortCode,"trust"),/不属于/);
 });
 
-for (const choice of ["trust", "access", "deny"] as const) test(`real HTTP + one private ${choice} command needs no auth preview, does not run Codex and only authorizes the original browser`, async t => {
+for (const conversationKind of ["direct", "group"] as const) for (const choice of ["trust", "access", "deny"] as const) test(`real HTTP + one ${conversationKind} ${choice} command needs no auth preview, does not run Codex and only authorizes the original browser`, async t => {
   const fetch=(input:string,init:RequestInit={})=>globalThis.fetch(input,{...init,headers:{Connection:"close",...init.headers}});
   const f=fixture(t),port=await freePort();
   const approvals=new IDEApprovalService({root:f.root,accounts:f.options.accounts});approvals.setOwner(owner);
@@ -356,7 +401,8 @@ for (const choice of ["trust", "access", "deny"] as const) test(`real HTTP + one
   const command=new RegExp(`/ide ${choice} [a-f0-9]{12}`).exec(primary)![0];
   const reloaded=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}});assert.ok((await reloaded.text()).includes(command),"polling preserves the displayed command");
   assert.match(await(await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}})).text(),/等待 Gateway/);
-  assert.equal(b.cards.length,0);await b.send(command);assert.equal(b.cards.length,0,"no second confirmation card");
+  const sendCommand = () => b.send(command, "owner", conversationKind, conversationKind === "group" ? "group" : "dm-conversation");
+  assert.equal(b.cards.length,0);await sendCommand();assert.equal(b.cards.length,0,"no second confirmation card");
   assert.match(b.texts.at(-1)!,choice==="deny"?/已拒绝/:/已批准/);
   const original=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof},redirect:"manual"});
   if(choice==="deny"){assert.equal(original.status,200);assert.match(await original.text(),/等待 Gateway/);assert.doesNotMatch(original.headers.get("set-cookie")??"",/cig_ide_/);}
@@ -366,6 +412,6 @@ for (const choice of ["trust", "access", "deny"] as const) test(`real HTTP + one
     const granted=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:cookie}});assert.match(await granted.text(),choice==="trust"?/已授权并信任当前目录/:/本次仅批准访问/);
     assert.match(await(await fetch(entry.url + "?auth_check=1")).text(),/等待 Gateway/,"copied URL does not authenticate a different browser");
   }
-  await b.send(command);assert.match(b.texts.at(-1)!,/已失效/);
+  await sendCommand();assert.match(b.texts.at(-1)!,/已失效/);
   assert.deepEqual(b.mutations,[]);assert.equal(JSON.stringify(b.store.snapshot),stateBefore);
 });

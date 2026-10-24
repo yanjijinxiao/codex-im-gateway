@@ -345,7 +345,7 @@ export class BridgeService {
     }
 
     // Dedicated owner authority, before chat ACL/session gating. Source actor
-    // and provider-confirmed private context must never be rewritten to a room.
+    // and provider-confirmed conversation kind must never be rewritten to a room.
     const control = parseCommand(message.text);
     if (control && isIDEApprovalCommand(control.name, control.arg)) {
       const result = await ideApprovalCommand({ service: this.options.ideApprovals, accountId: this.options.accountId,

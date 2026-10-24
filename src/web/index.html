@@ -232,7 +232,7 @@
       </form>
       <h2>主机访问入口</h2><div id="ideEndpoints" aria-live="polite"></div>
       <h2>跨设备 · IDE 授权管理员</h2>
-      <p>首次在本机登记你本人的个人身份。请在机器人钉钉单聊发送 <code>/ide identity</code>，核对渠道账号和个人 ID；不要填写群 ID。登记后，该个人账号可在私聊批准本渠道账号所关联项目的浏览器访问与目录信任，具备开发终端权限。群白名单、session 角色和绑定关系不会自动获得此权限。其他渠道尚未提供明确私聊类型时会拒绝 IM 审批。</p>
+      <p>首次在本机登记你本人的个人身份。请在机器人钉钉私聊或群聊发送 <code>/ide identity</code>，核对渠道账号和个人 ID；不要填写群 ID。登记后，该个人账号可在私聊或群聊批准本渠道账号所关联项目的浏览器访问与目录信任，具备开发终端权限。群内回复对群成员可见；群白名单、session 角色和绑定关系不会自动获得审批资格或浏览器权限。渠道未提供明确会话类型和真实发送人时会拒绝 IM 审批。</p>
       <form id="ideApproverForm" class="ide-form">
         <label for="ideApproverAccount">渠道账号<select id="ideApproverAccount" required></select></label>
         <label for="ideApproverActor">个人 ID<input id="ideApproverActor" type="text" maxlength="300" autocomplete="off" required placeholder="从 /ide identity 核对，不是群 ID"></label>
@@ -240,7 +240,7 @@
         <button id="ideApproverAdd" type="submit" class="button button-secondary">登记授权管理员</button>
       </form>
       <p id="ideApproverStatus" role="status" aria-live="polite"></p><div id="ideApprovers"></div>
-      <h2>浏览器访问授权</h2><p>新授权有效期为 <span id="ideSessionDuration">15 天</span>，Gateway 重启后仍保留，不自动延期。新增主机或重复保存不会撤销已有授权；停用主机、改变可执行文件或 Profile 时只撤销受影响主机，改变入口安全边界时只撤销对应入口。本机会话页的「Web IDE · 授权并信任」会一并启用当前目录的任务、调试和扩展。其他设备从原浏览器授权页复制一种短命令，在对应机器人钉钉私聊发送一次即可处理；不要求该私聊绑定 session。只批准你本人发起的申请。</p><div id="ideAccessRequests" aria-live="polite"></div>
+      <h2>浏览器访问授权</h2><p>新授权有效期为 <span id="ideSessionDuration">15 天</span>，Gateway 重启后仍保留，不自动延期。新增主机或重复保存不会撤销已有授权；停用主机、改变可执行文件或 Profile 时只撤销受影响主机，改变入口安全边界时只撤销对应入口。本机会话页的「Web IDE · 授权并信任」会一并启用当前目录的任务、调试和扩展。其他设备从原浏览器授权页复制一种短命令，由已登记本人在对应机器人钉钉私聊或群聊发送一次即可处理；不要求聊天绑定 session。只批准你本人发起的申请。</p><div id="ideAccessRequests" aria-live="polite"></div>
       <h2>主机安装任务</h2><div id="ideInstallations" aria-live="polite"></div>
       <h2>IDE 实例</h2><div id="ideInstances" aria-live="polite"></div>
     </section>

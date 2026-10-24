@@ -62,7 +62,7 @@ window.gatewayIDE = (() => {
     try {
       const result = await api("/api/ide/approvers", { method: "POST", body: { principal, remove } });
       if (current?.approvers) current.approvers.owners = result.owners;
-      status.textContent = remove ? "已移除审批资格，待确认审批已失效；如需撤销已签发访问，请另行撤销浏览器授权。" : "已登记并持久保存。其他设备打开 IDE 后，请在机器人钉钉私聊发送 /ide auth 六位识别码。无需该私聊绑定 session。";
+      status.textContent = remove ? "已移除审批资格，待确认审批已失效；如需撤销已签发访问，请另行撤销浏览器授权。" : "已登记并持久保存。其他设备打开 IDE 后，由本人复制授权页所选命令，在对应机器人钉钉私聊或群聊发送一次。无需聊天绑定 session，群白名单不能代替个人审批资格。";
       status.classList.remove("ide-error");
     } catch (error) { status.textContent = `未保存：${error.message}。原审批配置未改变，请检查后重试。`; status.classList.add("ide-error"); }
     finally { approverBusy = false; if (current?.approvers) renderApprovers(current.approvers); else $("#ideApproverAdd").disabled = false; }

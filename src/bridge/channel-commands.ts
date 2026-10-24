@@ -62,7 +62,7 @@ const SESSION_HELP_LINES = [
   "/history（/hist）[1-20] - 查看最近对话，例如 /history 10",
   "/history more - 继续查看更早的对话",
   "/ide [status] - 获取当前项目的 Web IDE 入口；不会提交任务，浏览器另行鉴权",
-  "/ide identity - 私聊查看个人身份，首次在本机 Web IDE 页登记授权管理员",
+  "/ide identity - 私聊或群聊查看本人身份，首次在本机 Web IDE 页登记授权管理员",
   "/ide auth 六位识别码 - 管理员私聊核对浏览器申请，再发送确认命令；不要求绑定 session",
   "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/follow sync --retry-delivery - 控制者明确重试原实例的未知投递，可能重复通知，不创建新卡",
