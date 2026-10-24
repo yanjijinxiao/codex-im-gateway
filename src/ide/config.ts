@@ -46,12 +46,25 @@ export const remoteIDEAccessSchema = z.object({
   port: z.number().int().min(1).max(65535)
 }).strict();
 export type RemoteIDEAccess = z.infer<typeof remoteIDEAccessSchema>;
+// Separate from remote relay bindings: this listener is owned by the Gateway
+// itself and its advertised IP must equal the exact local listening address.
+const localIDEAccessSchema = z.object({
+  publicOrigin: z.string().url().max(500), bindAddress: exactAddress,
+  port: z.number().int().min(1024).max(65535)
+}).strict().superRefine((access, context) => {
+  if (!URL.canParse(access.publicOrigin)) return;
+  const u = new URL(access.publicOrigin);
+  if (u.protocol !== "https:" || u.hostname.replace(/^\[|\]$/g, "") !== access.bindAddress
+    || Number(u.port || 443) !== access.port || u.username || u.password || u.pathname !== "/" || u.search || u.hash)
+    context.addIssue({ code: "custom", message: "本机直连入口必须为所选精确 IP 和端口的 HTTPS origin，不接受凭据或路径" });
+});
 export const ideConfigSchema = z.object({
   enabled: z.boolean(),
   routing: z.literal("per-host").optional(),
   // Browser publication is independent of where a project's code-server runs.
   // Reuse one explicitly configured remote ingress; never infer a VPN address.
   sharedIngressHostId: z.string().min(1).max(300).optional(),
+  localAccess: localIDEAccessSchema.optional(),
   port: z.number().int().min(1024).max(65535),
   publicOrigin: z.string().url().max(500).refine(value => {
     if (!URL.canParse(value)) return false;
@@ -80,13 +93,16 @@ export const ideConfigSchema = z.object({
     context.addIssue({ code: "custom", path: ["sharedIngressHostId"], message: "共享入口必须选择分主机模式中已启用且配置固定 HTTPS 的远程主机" });
   if (config.routing === "per-host") {
     if (origin.protocol !== "http:" || origin.hostname !== "127.0.0.1" || config.tls)
-      context.addIssue({ code: "custom", path: ["publicOrigin"], message: "分主机模式的本地入口必须使用 HTTP 127.0.0.1，不监听 VPN IP" });
+      context.addIssue({ code: "custom", path: ["publicOrigin"], message: "分主机模式的维护入口必须使用 HTTP 127.0.0.1；跨设备直连请配置独立本机 HTTPS 入口" });
     const origins = config.hosts.filter(h => h.enabled && h.access).map(h => new URL(h.access!.publicOrigin).origin);
+    if (config.localAccess && URL.canParse(config.localAccess.publicOrigin)) origins.push(new URL(config.localAccess.publicOrigin).origin);
     if (new Set(origins).size !== origins.length) context.addIssue({ code: "custom", path: ["hosts"], message: "远程入口不能重复" });
     if (config.hosts.some(h => h.hostId === "local" && h.access)) context.addIssue({ code: "custom", path: ["hosts"], message: "本地主机不能配置远程转发" });
     const binds = config.hosts.filter(h => h.enabled && h.access).map(h => `${h.hostId}:${h.access!.bindAddress}:${h.access!.port}`);
     if (new Set(binds).size !== binds.length) context.addIssue({ code: "custom", path: ["hosts"], message: "远程监听重复" });
   } else if (config.hosts.some(h => h.access)) context.addIssue({ code: "custom", path: ["routing"], message: "远程入口需要启用分主机模式" });
+  if (config.localAccess && (config.routing !== "per-host" || !config.hosts.some(h => h.hostId === "local")))
+    context.addIssue({ code: "custom", path: ["localAccess"], message: "本机直连入口需要分主机模式并登记本地主机" });
   if (config.tls && (origin.protocol !== "https:" || Number(origin.port || 443) !== config.port)) context.addIssue({ code: "custom", path: ["tls"], message: "内置 HTTPS 入口的协议和端口必须与浏览器地址一致" });
   if (origin.protocol === "http:" && Number(origin.port || 80) !== config.port) context.addIssue({ code: "custom", path: ["publicOrigin"], message: "本机 HTTP 入口端口必须与 IDE 监听端口一致" });
 });

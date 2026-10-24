@@ -6,9 +6,9 @@ import { IDETLSManager, loadIDETLS, localIDEAddresses } from "./tls.js";
 import type { WorkspaceIDEManager } from "./manager.js";
 import { RemoteIDEIngress, type IDEIngressIO, type IDEIngressState } from "./remote-ingress.js";
 import type { IDEApprovalCopyPort } from "./approval-service.js";
-import { entrances, runtimeChanges, type IDEEntrance } from "./reconfiguration.js";
+import { entrances, publicationKey, runtimeChanges, type IDEEntrance } from "./reconfiguration.js";
 
-export type IDEEndpointStatus = { hostId: string; publicOrigin: string; shared?: boolean; state: "starting" | "ready" | "error" | "connecting" | "reconnecting";
+export type IDEEndpointStatus = { hostId: string; publicOrigin: string; shared?: boolean; localDirect?: boolean; state: "starting" | "ready" | "error" | "connecting" | "reconnecting";
   error?: string };
 type Endpoint = { server: IDEAccessServer; context: IDEAccessContext; config: IDEConfig; fingerprint: string;
   status: IDEEndpointStatus; ingress?: RemoteIDEIngress };
@@ -17,19 +17,20 @@ type Endpoint = { server: IDEAccessServer; context: IDEAccessContext; config: ID
  * grants are separate resources: adding a backend never restarts the ingress. */
 export class IDEEndpointManager {
   readonly tls: IDETLSManager;
-  private readonly endpoints = new Map<string, Endpoint>();
+  private readonly endpoints = new Map<string | symbol, Endpoint>();
   private applied?: IDEConfig;
   private transition: Promise<void> = Promise.resolve();
   private managementOrigin?: string;
   private approvalCopies?: IDEApprovalCopyPort;
   error?: string;
-  constructor(private readonly manager: WorkspaceIDEManager, private readonly options: { ingressIO?: IDEIngressIO; ingressTiming?: { retryMs: number; probeMs: number } } = {}) {
+  constructor(private readonly manager: WorkspaceIDEManager, private readonly options: { ingressIO?: IDEIngressIO; ingressTiming?: { retryMs: number; probeMs: number };
+    localAddresses?: typeof localIDEAddresses } = {}) {
     this.tls = new IDETLSManager(path.join(path.dirname(manager.configStore.filePath), "tls"));
     manager.accessAvailable = false;
     manager.accessOrigin = hostId => {
       const config = manager.config();
-      const endpoint = this.endpoints.get(config.routing === "per-host" ? config.sharedIngressHostId ?? hostId : "legacy");
-      return endpoint?.status.state === "ready" && endpoint.server.running() ? endpoint.status.publicOrigin : undefined;
+      const endpoint = this.endpoints.get(publicationKey(config, hostId));
+      return endpoint && this.endpointStatus(endpoint).state === "ready" && endpoint.server.running() ? endpoint.status.publicOrigin : undefined;
     };
     manager.onStop = id => { for (const endpoint of this.endpoints.values()) endpoint.context.onStop?.(id); };
   }
@@ -48,6 +49,12 @@ export class IDEEndpointManager {
     });
   }
   async validateConfig(config: IDEConfig): Promise<void> {
+    if (config.enabled && config.hosts.some(h => h.hostId === "local" && h.enabled) && config.localAccess) {
+      // An offline existing local address must not block unrelated remote
+      // hot-adds. A new/changed binding is always validated before commit.
+      if (JSON.stringify(config.localAccess) !== JSON.stringify(this.applied?.localAccess)) this.requireLocalAddress(config.localAccess.bindAddress);
+      await this.tls.prepare(config.localAccess.bindAddress);
+    }
     if (config.tls) {
       if (this.tls.owns(config.tls)) await this.tls.prepare(config.tls.certificateAddress ?? config.tls.bindAddress);
       loadIDETLS(config.tls, config.publicOrigin);
@@ -56,8 +63,19 @@ export class IDEEndpointManager {
       await this.tls.prepare(new URL(host.access!.publicOrigin).hostname.replace(/^\[|\]$/g, ""));
   }
   async prepareTLS(address: string) {
-    if (!localIDEAddresses().some(item => item.address === address)) throw new Error("请选择 Gateway 本机当前已分配的内网/VPN 地址");
+    this.requireLocalAddress(address);
     return this.tls.prepare(address);
+  }
+  private requireLocalAddress(address: string): void {
+    if (!(this.options.localAddresses ?? localIDEAddresses)().some(item => item.address === address))
+      throw new Error("所选本机 IP 当前未分配；请在管理页重新选择内网/VPN 地址，不会自动回退到其他入口");
+  }
+  private endpointStatus(record: Endpoint): IDEEndpointStatus {
+    if (record.status.localDirect) {
+      try { this.requireLocalAddress(record.config.localAccess!.bindAddress); }
+      catch { return { ...record.status, state: "error", error: "本机直连 IP 当前已离线或发生变化；请重新选择地址。旧 IP 链接无法自动恢复，不会改发回环或远程入口。" }; }
+    }
+    return { ...record.status };
   }
   private async apply(config: IDEConfig, revoke: boolean, commit?: () => void): Promise<void> {
     const desired = new Map(entrances(config).map(spec => [spec.key, spec]));
@@ -99,6 +117,7 @@ export class IDEEndpointManager {
     const hostId = spec.hostId, record = {} as Endpoint;
     Object.assign(record, { fingerprint: spec.fingerprint, config: spec.config,
       status: { hostId: hostId ?? "local", publicOrigin: spec.config.publicOrigin,
+        ...(spec.localDirect ? { localDirect: true } : {}),
         ...(hostId && spec.config.sharedIngressHostId === hostId ? { shared: true } : {}), state: "starting" } });
     const resolve = (id: string) => {
       const target = this.manager.resolve(id), current = this.manager.config();
@@ -108,7 +127,8 @@ export class IDEEndpointManager {
     };
     record.context = {
       configStore: this.manager.configStore, config: () => record.config, resolve,
-      authorizationFile: () => hostId ? path.join(path.dirname(this.manager.authorizationFile()), `authorization-${hostKey(hostId)}.json`) : this.manager.authorizationFile(),
+      authorizationFile: () => spec.localDirect ? path.join(path.dirname(this.manager.authorizationFile()), "authorization-local-direct.json")
+        : hostId ? path.join(path.dirname(this.manager.authorizationFile()), `authorization-${hostKey(hostId)}.json`) : this.manager.authorizationFile(),
       canonicalForTrust: id => { resolve(id); return this.manager.canonicalForTrust(id); },
       open: (id, trust, directory) => { resolve(id); return this.manager.open(id, trust, directory); },
       endpoint: (id, trust) => { resolve(id); return this.manager.endpoint(id, trust); },
@@ -120,7 +140,11 @@ export class IDEEndpointManager {
     this.endpoints.set(spec.key, record);
     try {
       record.server.revokeEntries(id => { try { resolve(id); return false; } catch { return true; } });
-      if (hostId && hostId !== "local") {
+      if (spec.localDirect) {
+        this.requireLocalAddress(record.config.localAccess!.bindAddress);
+        const files = await this.tls.prepare(record.config.localAccess!.bindAddress);
+        record.config = { ...record.config, tls: files };
+      } else if (hostId && hostId !== "local") {
         const certificateAddress = new URL(record.config.publicOrigin).hostname.replace(/^\[|\]$/g, "");
         const files = await this.tls.prepare(certificateAddress);
         record.config = { ...record.config, tls: { ...files, bindAddress: "127.0.0.1", certificateAddress } };
@@ -141,8 +165,8 @@ export class IDEEndpointManager {
       if (!hostId) this.error = record.server.error ?? record.status.error;
     }
   }
-  running(): boolean { return [...this.endpoints.values()].some(e => e.status.state === "ready" && e.server.running()); }
-  statuses(): IDEEndpointStatus[] { return this.applied?.routing === "per-host" ? [...this.endpoints.values()].map(e => ({ ...e.status })) : []; }
+  running(): boolean { return [...this.endpoints.values()].some(e => this.endpointStatus(e).state === "ready" && e.server.running()); }
+  statuses(): IDEEndpointStatus[] { return this.applied?.routing === "per-host" ? [...this.endpoints.values()].map(e => this.endpointStatus(e)) : []; }
   certificate() {
     const config = this.manager.config();
     const tls = config.tls ?? [...this.endpoints.values()].find(e => e.config.tls)?.config.tls;
@@ -158,8 +182,8 @@ export class IDEEndpointManager {
   }
   private serverFor(id: string): IDEAccessServer {
     const target = this.manager.resolve(id), config = this.manager.config();
-    const endpoint = this.endpoints.get(config.routing === "per-host" ? config.sharedIngressHostId ?? target.hostId : "legacy");
-    if (!endpoint || endpoint.status.state !== "ready") throw new Error("此项目的浏览器入口尚未就绪；请查看 Web IDE 入口状态，后台正在重连。不会改用其他地址。");
+    const endpoint = this.endpoints.get(publicationKey(config, target.hostId));
+    if (!endpoint || this.endpointStatus(endpoint).state !== "ready") throw new Error("此项目的浏览器入口尚未就绪；请查看 Web IDE 入口状态，后台正在重连。不会改用其他地址。");
     return endpoint.server;
   }
   grant(id: string, trustWorkspace = false) { return this.serverFor(id).grant(id, trustWorkspace); }

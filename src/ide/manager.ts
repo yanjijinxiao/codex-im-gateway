@@ -55,6 +55,7 @@ export class WorkspaceIDEManager {
     const target = this.options.resolve(accountId, sessionId);
     if (!config.enabled || !target || !config.hosts.some(h => h.hostId === target.hostId && h.enabled)) return;
     const origin = this.accessOrigin ? this.accessOrigin(target.hostId) : this.accessAvailable === false ? undefined
+      : config.routing === "per-host" && target.hostId === "local" && config.localAccess ? config.localAccess.publicOrigin
       : config.routing === "per-host" && config.sharedIngressHostId ? config.hosts.find(h => h.hostId === config.sharedIngressHostId)?.access?.publicOrigin
       : config.routing === "per-host" && target.hostId !== "local" ? config.hosts.find(h => h.hostId === target.hostId)?.access?.publicOrigin : config.publicOrigin;
     if (!origin) return;

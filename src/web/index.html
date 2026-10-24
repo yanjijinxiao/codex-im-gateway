@@ -203,8 +203,15 @@
         <label class="ide-inline"><input id="ideEnabled" type="checkbox">启用 Web IDE 入口</label>
         <label class="ide-inline"><input id="idePerHostRouting" type="checkbox">启用固定远程 HTTPS 转发（本机保留回环监听）</label>
         <label>共享 HTTPS 入口<select id="ideSharedIngressHost" aria-describedby="ideSharedIngressHint"><option value="">未选择：按项目主机分别生成链接</option></select></label>
-        <small id="ideSharedIngressHint">选择一个已启用且配置固定 HTTPS 的远程主机后，所有已启用主机的项目都只发布该固定入口的链接，供手机和电脑共用。本地项目仍在 Mac 运行，远程项目仍在对应主机运行；127.0.0.1 仅供本机维护，不发送到 IM。</small>
-        <p>不使用客户端 VPN IP 生成链接。共享入口中断时不回退到其他地址，后台自动重连。手机需能通过公司内网/VPN 访问固定端口并信任证书；本机休眠或离线时共享入口也暂不可用。请勿公开 Gateway 管理端口。</p>
+        <small id="ideSharedIngressHint">选择已配置固定 HTTPS 的远程主机后，项目默认发布该共享入口；启用下方「本机项目直连」时，仅本机项目改用自己的入口，远程项目不变。每个项目只发布一个链接，手机和电脑共用；127.0.0.1 只用于本机维护。</small>
+        <p>共享入口中断时不回退到其他地址，后台自动重连。手机需能通过公司内网/VPN 访问对应端口并信任证书；本机休眠或离线时入口也暂不可用。请勿公开 Gateway 管理端口。</p>
+        <fieldset class="ide-tls" id="ideLocalAccessFields" hidden><legend>本机项目 · 内网 / VPN 直连</legend>
+          <label class="ide-inline"><input id="ideLocalDirectEnabled" type="checkbox">本机项目使用 Gateway 自己的 IP，不经过远程转发器</label>
+          <label>监听的精确本机 IP<select id="ideLocalDirectAddress" aria-describedby="ideLocalDirectHint"></select></label>
+          <label>直连 HTTPS 端口<input id="ideLocalDirectPort" type="number" min="1024" max="65535" value="8790"></label>
+          <p id="ideLocalDirectHint">保存时使用原有 CA 自动准备该 IP 的证书，只开放 IDE 数据面，审批仍由 Gateway 负责；不开放管理端口或裸 code-server。本机维护入口和远程入口不变。</p>
+          <p>VPN IP 可能变化，不是固定地址；变化后旧直连链接失效，需要重新选择地址。地址离线时停止发布该入口，不自动改发其他地址。启用新的地址后，浏览器需重新批准一次，授权仍为 15 天。手机到该 IP 的连通性需单独确认。</p>
+        </fieldset>
         <label>浏览器访问地址<input id="ideOrigin" type="url" required placeholder="https://ide.example.com"></label>
         <small>本机访问可使用回环 HTTP；内网/VPN 可启用下方内置 HTTPS，无需另装反向代理。不要公开 Gateway 管理端口。</small>
         <label>本机 IDE 入口端口<input id="idePort" type="number" min="1024" max="65535" required></label>

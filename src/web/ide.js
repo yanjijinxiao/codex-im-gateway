@@ -38,7 +38,7 @@ window.gatewayIDE = (() => {
     renderRequests();
     renderInstances(data.instances || []);
     const states = { starting: "正在启动", connecting: "正在连接", ready: "已就绪", reconnecting: "正在自动重连", error: "连接失败，后台重试" };
-    const markup = data.endpoints?.length ? data.endpoints.map(endpoint => `<article class="ide-instance"><div><strong>${escapeHtml(endpoint.shared ? `共享浏览器入口 · ${endpoint.hostId}` : endpoint.hostId === "local" ? "本机维护入口 · 仅本机浏览器" : endpoint.hostId)}</strong><p role="status">${escapeHtml(states[endpoint.state] || endpoint.state)}</p><p>${escapeHtml(endpoint.publicOrigin)}</p>${endpoint.error ? `<p class="ide-error">${escapeHtml(endpoint.error)}</p>` : ""}</div></article>`).join("") : '<p>未配置固定远程入口。入口不可达时不会改发其他地址。</p>';
+    const markup = data.endpoints?.length ? data.endpoints.map(endpoint => `<article class="ide-instance"><div><strong>${escapeHtml(endpoint.localDirect ? "本机项目 · 内网 / VPN 直连" : endpoint.shared ? `共享浏览器入口 · ${endpoint.hostId}` : endpoint.hostId === "local" ? "本机维护入口 · 仅本机浏览器" : endpoint.hostId)}</strong><p role="status">${escapeHtml(endpoint.localDirect && endpoint.state === "error" ? "入口未就绪，请检查后重新保存" : states[endpoint.state] || endpoint.state)}</p><p>${escapeHtml(endpoint.publicOrigin)}</p>${endpoint.error ? `<p class="ide-error">${escapeHtml(endpoint.error)}</p>` : ""}</div></article>`).join("") : '<p>未配置固定远程入口。入口不可达时不会改发其他地址。</p>';
     if (markup !== endpointMarkup) { endpointMarkup = markup; $("#ideEndpoints").innerHTML = markup; }
   }
   function renderApprovers(data) {
@@ -71,6 +71,7 @@ window.gatewayIDE = (() => {
     const perHost = $("#idePerHostRouting").checked;
     $("#ideSharedIngressHost").disabled = !perHost;
     $("#ideTLSLegacyFields").hidden = perHost; $("#ideOrigin").readOnly = perHost;
+    $("#ideLocalAccessFields").hidden = !perHost;
     if (perHost) { $("#ideOrigin").value = `http://127.0.0.1:${$("#idePort").value}`; $("#ideTLSEnabled").checked = false; }
   }
   function renderInstances(instances) {
@@ -133,6 +134,13 @@ window.gatewayIDE = (() => {
       const ingressHosts = config.hosts.filter(host => host.hostId !== "local");
       $("#ideSharedIngressHost").innerHTML = '<option value="">未选择：按项目主机分别生成链接</option>' + ingressHosts.map(host => `<option value="${escapeAttr(host.hostId)}">${escapeHtml(host.hostId)}${host.enabled && host.access ? "" : "（需启用并配置固定 HTTPS）"}</option>`).join("");
       $("#ideSharedIngressHost").value = config.sharedIngressHostId || "";
+      $("#ideLocalDirectEnabled").checked = Boolean(config.localAccess);
+      $("#ideLocalDirectPort").value = config.localAccess?.port || 8790;
+      const directAddresses = [...(current.networkAddresses || [])];
+      if (config.localAccess && !directAddresses.some(item => item.address === config.localAccess.bindAddress))
+        directAddresses.unshift({ name: "已配置，当前不在线", address: config.localAccess.bindAddress });
+      $("#ideLocalDirectAddress").innerHTML = '<option value="">请选择本机当前地址</option>' + directAddresses.map(item => `<option value="${escapeAttr(item.address)}">${escapeHtml(item.name)} · ${escapeHtml(item.address)}</option>`).join("");
+      $("#ideLocalDirectAddress").value = config.localAccess?.bindAddress || "";
       const addresses = [...(current.networkAddresses || [])];
       if (config.tls && !addresses.some(item => item.address === config.tls.bindAddress)) addresses.unshift({ name: "已配置，当前不在线", address: config.tls.bindAddress });
       $("#ideTLSAddress").innerHTML = addresses.map(item => `<option value="${escapeAttr(item.address)}" ${config.tls?.bindAddress === item.address ? "selected" : ""}>${escapeHtml(item.name)} · ${escapeHtml(item.address)}</option>`).join("");
@@ -170,10 +178,16 @@ window.gatewayIDE = (() => {
         ...(perHost ? { routing: "per-host", ...($("#ideSharedIngressHost").value ? { sharedIngressHostId: $("#ideSharedIngressHost").value } : {}) } : {}),
         ...(!perHost && $("#ideTLSEnabled").checked ? { tls: { bindAddress: $("#ideTLSAddress").value, certFile: $("#ideTLSCert").value.trim(), keyFile: $("#ideTLSKey").value.trim() } } : {}),
         profile: { settings: JSON.parse($("#ideProfile").value), extensions: [...document.querySelectorAll("#ideExtensions input:checked")].map(el => el.value) } };
+      if (perHost && $("#ideLocalDirectEnabled").checked) {
+        const bindAddress = $("#ideLocalDirectAddress").value, port = Number($("#ideLocalDirectPort").value);
+        if (!bindAddress || !Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("请选择本机直连 IP 和有效端口");
+        config.localAccess = { bindAddress, port, publicOrigin: `https://${bindAddress.includes(":") ? `[${bindAddress}]` : bindAddress}:${port}` };
+      }
       const previous = current.config;
       const affectsExisting = previous.enabled && (!config.enabled || previous.routing !== config.routing
         || previous.sharedIngressHostId !== config.sharedIngressHostId || previous.port !== config.port || previous.publicOrigin !== config.publicOrigin
         || JSON.stringify(previous.tls) !== JSON.stringify(config.tls) || JSON.stringify(previous.profile) !== JSON.stringify(config.profile)
+        || (previous.localAccess && JSON.stringify(previous.localAccess) !== JSON.stringify(config.localAccess))
         || previous.hosts.filter(h => h.enabled).some(h => { const next = hosts.find(n => n.hostId === h.hostId);
           return !next?.enabled || next.binary !== h.binary || JSON.stringify(next.access) !== JSON.stringify(h.access); }));
       if (affectsExisting && current.instances.some(i => ["starting", "running"].includes(i.status))

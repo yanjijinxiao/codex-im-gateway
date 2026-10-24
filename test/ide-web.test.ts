@@ -170,3 +170,26 @@ test("session extension preparation deduplicates clicks and releases controls on
   release(); await operation; assert.equal(calls, 2);
   assert.equal(node("#sessionIDEPrepareButton").disabled, false); assert.equal(node("#sessionIDEButton").disabled, false);
 });
+
+test("local direct management preserves its independent binding on save, including an offline selected address", async () => {
+  const localAccess = { publicOrigin: "https://30.1.2.3:8790", bindAddress: "30.1.2.3", port: 8790 };
+  const config = { enabled: true, routing: "per-host", sharedIngressHostId: "remote:test", port: 8790, publicOrigin: "http://127.0.0.1:8790", localAccess,
+    hosts: [{ hostId: "local", enabled: true, binary: "code-server" }], profile: { settings: {}, extensions: [] } };
+  let saved: any;
+  const { ui, node, context } = fixture(async (url, options) => {
+    if (url === "/api/ide") return { config, hosts: ["local"], networkAddresses: [], extensionChoices: [], instances: [] };
+    assert.equal(url, "/api/ide/config"); saved = options.body.config;
+  });
+  await ui.refresh(); assert.equal(node("#ideLocalAccessFields").hidden, false);
+  assert.equal(node("#ideLocalDirectEnabled").checked, true);
+  assert.match(node("#ideLocalDirectAddress").innerHTML, /已配置，当前不在线/);
+  assert.equal(node("#ideLocalDirectAddress").value, localAccess.bindAddress);
+  context.document.querySelectorAll = (selector: string) => selector === "[data-ide-host]" ? [{ dataset: { ideHost: "local" }, checked: true }]
+    : selector === "[data-ide-auto]" ? [{ dataset: { ideAuto: "local" }, checked: false }]
+    : selector === "[data-ide-binary]" ? [{ dataset: { ideBinary: "local" }, value: "code-server" }] : [];
+  await ui.save({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.localAccess)), localAccess);
+  assert.equal(saved.sharedIngressHostId, "remote:test"); assert.equal(saved.publicOrigin, config.publicOrigin);
+  ui.renderActivity({ endpoints: [{ hostId: "local", localDirect: true, state: "ready", publicOrigin: localAccess.publicOrigin }] });
+  assert.match(node("#ideEndpoints").innerHTML, /本机项目 · 内网 \/ VPN 直连/);
+});

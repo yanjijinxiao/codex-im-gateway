@@ -9,7 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { IDEEndpointManager } from "../src/ide/endpoint-manager.js";
 import { WorkspaceIDEManager } from "../src/ide/manager.js";
-import type { IDEConfig } from "../src/ide/config.js";
+import { ideConfigSchema, type IDEConfig } from "../src/ide/config.js";
 import type { IDELaunchInput } from "../src/ide/transport.js";
 import { runtimeChanges } from "../src/ide/reconfiguration.js";
 
@@ -29,6 +29,7 @@ async function fixture(t: test.TestContext, legacy = false) {
   const url = new URL(origin);
   const launches: IDELaunchInput[] = [], stops: string[] = [], relays: string[] = [];
   const gates = new Map<string, ReturnType<typeof latch>>(), launchGates = new Map<string, ReturnType<typeof latch>>(), offline = new Set<string>();
+  const localAddresses = [{ name: "isolated-loopback-fixture", address: "127.0.0.1" }];
   const manager = new WorkspaceIDEManager({ root, resolve: (_account, sessionId) => ({ owner: "owner", sessionId,
     hostId: sessionId.split("/")[0], projectName: "fixture", workspace: root }),
     transport: { canonicalDirectory: async hostId => { await gates.get(hostId)?.promise; return root; }, launch: async input => {
@@ -57,7 +58,7 @@ async function fixture(t: test.TestContext, legacy = false) {
   manager.configStore.save({ ...manager.config(), enabled: true, ...(legacy ? {} : { routing: "per-host", sharedIngressHostId: ingressHost }),
     port, publicOrigin: `http://127.0.0.1:${port}`, hosts: [{ hostId: "local", enabled: true, binary: "code-server" },
       { hostId: ingressHost, enabled: true, binary: "code-server", ...(legacy ? {} : { access: { publicOrigin: origin, bindAddress: "192.168.5.3", port: 80 } }) }] });
-  const access = new IDEEndpointManager(manager, { ingressTiming: { retryMs: 5, probeMs: 100 }, ingressIO: {
+  const access = new IDEEndpointManager(manager, { localAddresses: () => localAddresses, ingressTiming: { retryMs: 5, probeMs: 100 }, ingressIO: {
     connect: async input => {
       relays.push(input.hostId); if (offline.has(input.hostId)) throw Error("fixture offline ingress");
       const sockets = new Set<net.Socket>(), server = net.createServer(client => {
@@ -104,8 +105,97 @@ async function fixture(t: test.TestContext, legacy = false) {
   }
   const files = () => new Map(fs.readdirSync(path.join(root, "ide")).filter(name => /^authorization.*\.json$/.test(name)).map(name => [name, fs.readFileSync(path.join(root, "ide", name), "utf8")]));
   const enabledHost = (hostId: string) => ({ hostId, enabled: true, binary: "code-server", autoInstall: false });
-  return { root, manager, access, origin, request, login, open, files, launches, stops, relays, gates, launchGates, offline, enabledHost };
+  return { root, manager, access, origin, request, login, open, files, launches, stops, relays, gates, launchGates, offline, enabledHost, localAddresses };
 }
+
+test("local direct HTTPS is a separate publication and audience; adding it preserves the shared relay, live WS and grants", async t => {
+  const f = await fixture(t), a = await f.login("local"), remote = await f.login(ingressHost);
+  const socket = await f.open(remote), before = f.files(), ca = f.access.tls.caCertificate();
+  const port = await freePort(), direct = `https://127.0.0.1:${port}`;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: direct, bindAddress: "127.0.0.1", port } });
+  assert.equal(new URL(f.manager.entry("account", "local")!.url).origin, direct);
+  assert.equal(new URL(f.manager.entry("account", ingressHost)!.url).origin, f.origin);
+  for (const [name, bytes] of before) assert.equal(f.files().get(name), bytes, "existing grants unchanged");
+  assert.deepEqual(f.access.tls.caCertificate(), ca); assert.equal(f.relays.length, 1); assert.equal(f.stops.length, 0);
+  assert.equal(socket.destroyed, false); assert.equal(f.access.statuses().length, 3);
+  assert.equal(f.access.statuses().find(s => s.localDirect)?.state, "ready");
+  assert.equal((await f.request("/api/ide", {}, direct)).status, 401, "management API is never exposed");
+  assert.equal((await f.request(`/workspace/${remote.entry.id}`, {}, direct)).status, 404, "direct listener only serves local projects");
+  assert.match((await f.request(`/workspace/${a.entry.id}`, { headers: { Cookie: a.cookie } }, direct)).body, /等待 Gateway 授权/, "shared cookie cannot grant direct access");
+  const grant = await f.access.grant(a.entry.id);
+  assert.equal(grant.action, direct + "/authorize");
+  const body = new URLSearchParams({ token: grant.token, entryId: a.entry.id }).toString();
+  assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body })).status, 401, "direct token cannot be consumed by the old ingress");
+  const authorized = await f.request("/authorize", { method: "POST", headers: { Origin: management }, body }, direct);
+  assert.equal(authorized.status, 200);
+  const cookie = authorized.headers["set-cookie"]![0].split(";")[0];
+  const page = await f.request(`/workspace/${a.entry.id}`, { headers: { Cookie: cookie } }, direct);
+  const csrf = /name="csrf" value="([^"]+)"/.exec(page.body)![1];
+  assert.equal((await f.request(`/open/${a.entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: direct }, body: new URLSearchParams({ csrf }).toString() }, direct)).status, 303);
+  assert.equal((await f.request(`/ide/${a.entry.id}/`, { headers: { Cookie: cookie } }, direct)).body, "fixture IDE");
+  const directFile = f.files().get("authorization-local-direct.json"); assert.ok(directFile);
+  await f.access.configure(f.manager.config());
+  assert.equal(f.files().get("authorization-local-direct.json"), directFile, "no-op save preserves durable direct grants");
+  assert.equal(socket.destroyed, false); assert.equal(f.relays.length, 1);
+});
+
+test("missing local IP suppresses direct publication without affecting remote availability or hot-add", async t => {
+  const f = await fixture(t), config = f.manager.config(), port = await freePort();
+  const localAccess = { publicOrigin: `https://127.0.0.1:${port}`, bindAddress: "127.0.0.1", port };
+  f.localAddresses.length = 0;
+  await assert.rejects(f.access.configure({ ...config, localAccess }), /当前未分配/);
+  assert.deepEqual(f.manager.config(), config, "new unassigned binding is not committed");
+  f.localAddresses.push({ name: "fixture", address: "127.0.0.1" });
+  await f.access.configure({ ...config, localAccess });
+  f.localAddresses.length = 0;
+  assert.equal(f.manager.entry("account", "local"), undefined);
+  assert.match(f.access.statuses().find(s => s.localDirect)!.error!, /已离线或发生变化/);
+  await f.access.configure({ ...f.manager.config(), hosts: [...config.hosts, f.enabledHost(secondHost)] });
+  assert.equal(new URL(f.manager.entry("account", secondHost)!.url).origin, f.origin);
+  assert.equal((await f.request("/")).status, 200); assert.equal(f.relays.length, 1);
+});
+
+test("a direct port conflict fails independently; explicit retry repairs only that listener", async t => {
+  const f = await fixture(t), remote = await f.login(ingressHost), socket = await f.open(remote), before = f.files();
+  const blocker = net.createServer(); await new Promise<void>(resolve => blocker.listen(0, "127.0.0.1", resolve));
+  t.after(() => { if (blocker.listening) blocker.close(); });
+  const port = (blocker.address() as net.AddressInfo).port;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: `https://127.0.0.1:${port}`, bindAddress: "127.0.0.1", port } });
+  assert.equal(f.access.statuses().find(s => s.localDirect)?.state, "error");
+  assert.equal(f.manager.entry("account", "local"), undefined, "no fallback to old URL");
+  assert.equal(new URL(f.manager.entry("account", ingressHost)!.url).origin, f.origin);
+  for (const [name, bytes] of before) assert.equal(f.files().get(name), bytes);
+  assert.equal(socket.destroyed, false); assert.equal(f.relays.length, 1);
+  await new Promise<void>(resolve => blocker.close(() => resolve())); await f.access.configure(f.manager.config());
+  assert.equal(f.access.statuses().find(s => s.localDirect)?.state, "ready"); assert.equal(socket.destroyed, false);
+});
+
+test("direct rebind revokes only its audience; removing it restores the previous canonical publication", async t => {
+  const f = await fixture(t), remote = await f.login(ingressHost), socket = await f.open(remote), before = f.files();
+  const port = await freePort(), origin = `https://127.0.0.1:${port}`;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: origin, bindAddress: "127.0.0.1", port } });
+  const entry = f.manager.entry("account", "local")!, grant = await f.access.grant(entry.id);
+  const nextPort = await freePort(), nextOrigin = `https://127.0.0.1:${nextPort}`;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: nextOrigin, bindAddress: "127.0.0.1", port: nextPort } });
+  assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() }, nextOrigin)).status, 401);
+  const { localAccess: _, ...withoutDirect } = f.manager.config(); await f.access.configure(withoutDirect);
+  assert.equal(new URL(f.manager.entry("account", "local")!.url).origin, f.origin);
+  for (const [name, bytes] of before) assert.equal(f.files().get(name), bytes);
+  assert.equal(socket.destroyed, false); assert.equal(f.stops.length, 0); assert.equal(f.relays.length, 1);
+});
+
+test("local direct schema enforces exact IP/port HTTPS, per-host scope and unique origins", () => {
+  const localAccess = { publicOrigin: "https://30.1.2.3:8790", bindAddress: "30.1.2.3", port: 8790 };
+  const config = { enabled: true, routing: "per-host", publicOrigin: "http://127.0.0.1:8790", port: 8790, localAccess,
+    hosts: [{ hostId: "local", enabled: true, binary: "code-server" }], profile: { settings: {}, extensions: [] } };
+  assert.ok(ideConfigSchema.safeParse(config).success);
+  for (const overrides of [{ publicOrigin: "http://30.1.2.3:8790" }, { bindAddress: "0.0.0.0" }, { publicOrigin: "https://30.1.2.4:8790" },
+    { port: 8791 }, { port: 80 }, { publicOrigin: "https://30.1.2.3:8790/path" }, { publicOrigin: "https://u:p@30.1.2.3:8790" }])
+    assert.equal(ideConfigSchema.safeParse({ ...config, localAccess: { ...localAccess, ...overrides } }).success, false);
+  assert.equal(ideConfigSchema.safeParse({ ...config, routing: undefined }).success, false);
+  assert.equal(ideConfigSchema.safeParse({ ...config, hosts: [] }).success, false);
+  assert.equal(ideConfigSchema.safeParse({ ...config, hosts: [...config.hosts, { hostId: "remote:test", enabled: true, binary: "code-server", access: { ...localAccess, port: 80 } }] }).success, false);
+});
 
 for (const legacy of [false, true]) test(`${legacy ? "legacy" : "shared"} hot-add/no-op preserves HTTP, live WS, grants and pending requests; disable is host-scoped and durable`, async t => {
   const f = await fixture(t, legacy), a = await f.login("local"), remote = await f.login(ingressHost);
