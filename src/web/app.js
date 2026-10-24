@@ -923,7 +923,7 @@ function renderTaskboardDetail() {
     <section class="taskboard-comments"><div class="taskboard-detail-section-title"><h3>进展记录</h3><span>${detail.comments.length}</span></div>
       <div class="taskboard-comment-list">${detail.comments.length ? detail.comments.map((comment) => `<article><div class="markdown-body">${renderMarkdown(comment.body)}</div><time>${escapeHtml(messageTime(comment.createdAt))}</time></article>`).join("") : `<p class="taskboard-no-comments">还没有进展记录。</p>`}</div>
     </section>
-    ${canManage ? `<form class="taskboard-comment-form" id="taskboardCommentForm"><label><span>添加进展</span><textarea id="taskboardCommentInput" rows="3" maxlength="100000" required placeholder="记录验证结果、阻塞原因或交付证据"></textarea></label><button class="button button-secondary" type="submit"><i data-lucide="message-square-plus"></i><span>添加评论</span></button></form>` : `<p class="taskboard-thread-warning"><i data-lucide="link-2-off"></i><span>该任务尚未绑定 Codex 线程，请先在聊天中执行 <code>/task start ${escapeHtml(issue.identifier)}</code>。</span></p>`}
+    ${canManage ? `<form class="taskboard-comment-form" id="taskboardCommentForm"><label><span>添加进展</span><textarea id="taskboardCommentInput" rows="3" maxlength="100000" required placeholder="记录验证结果、阻塞原因或交付证据"></textarea></label><button class="button button-secondary" type="submit"><i data-lucide="message-square-plus"></i><span>添加评论</span></button></form>` : `<p class="taskboard-thread-warning"><i data-lucide="link-2-off"></i><span>该任务尚未绑定 Codex 线程，请先在聊天中执行 <code data-copy-purpose="reply" data-copy-label="在 IM 中开始此任务的命令">/task start ${escapeHtml(issue.identifier)}</code>。</span></p>`}
     <footer class="taskboard-detail-actions">${canManage ? taskboardActionButtons(issue) : ""}</footer>`;
 }
 
@@ -2398,16 +2398,17 @@ function renderChannelIdentifiers(account) {
   const webhookStatus = account.webhookConfigured ? `已配置 · ${provider.label}` : "未配置";
   const actor = `<div><dt>最近 Actor ID（发消息的用户）</dt><dd><code>${escapeHtml(accountAccessIdentity(account).actorId || "未获取")}</code></dd></div>`;
   const webhook = `${actor}<div><dt>Webhook</dt><dd><code>${escapeHtml(webhookStatus)}</code></dd></div>`;
+  const recipient = `<div><dt>最近接收会话 ID</dt><dd>${account.lastActiveSenderId ? `<code data-copy-purpose="transfer" data-copy-label="填入项目通知接收人的会话 ID">${escapeHtml(account.lastActiveSenderId)}</code>` : "等待消息"}</dd></div>`;
   if (channel === "wecom") {
-    return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div><div><dt>最近会话 ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
+    return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId)}">${escapeHtml(account.botId)}</code></dd></div>${recipient}${webhook}`;
   }
   if (channel === "feishu") {
-    return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div><div><dt>最近 Chat ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
+    return `<div><dt>App ID</dt><dd><code title="${escapeAttr(account.appId)}">${escapeHtml(account.appId)}</code></dd></div>${recipient}${webhook}`;
   }
   if (channel === "dingtalk") {
-    return `<div><dt>Client ID</dt><dd><code title="${escapeAttr(account.clientId)}">${escapeHtml(account.clientId)}</code></dd></div><div><dt>最近 Conversation ID</dt><dd><code>${escapeHtml(account.lastActiveSenderId || "等待消息")}</code></dd></div>${webhook}`;
+    return `<div><dt>Client ID</dt><dd><code title="${escapeAttr(account.clientId)}">${escapeHtml(account.clientId)}</code></dd></div>${recipient}${webhook}`;
   }
-  return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>${webhook}`;
+  return `<div><dt>Bot ID</dt><dd><code title="${escapeAttr(account.botId || account.accountId)}">${escapeHtml(account.botId || account.accountId)}</code></dd></div><div><dt>User ID</dt><dd><code title="${escapeAttr(account.userId || "未返回")}">${escapeHtml(account.userId || "未返回")}</code></dd></div>${recipient}${webhook}`;
 }
 
 function statusText(status) {

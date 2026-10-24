@@ -146,7 +146,7 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
     assert.equal(access.statuses().find(s => s.hostId === hostId)?.shared, true);
     const waiting = await remoteRequest(origin,ca,"/workspace/"+localEntry.id);
     assert.doesNotMatch(waiting.body,/127\.0\.0\.1|打开本机 Gateway 管理页/);
-    const code = /<textarea[^>]*>(\d{6})<\/textarea>/.exec(waiting.body)![1];
+    const code = /<strong>(\d{6})<\/strong>/.exec(waiting.body)![1];
     const request = access.pendingAccess().find(r => r.code === code && r.entryId === localEntry.id)!;
     assert.equal(request.hostId,"local"); assert.equal(request.accountId,"account");
     const approval=new IDEApprovalService({root,accounts:()=>[{accountId:"account",channel:"dingtalk",providerId:"fixture"}]});
@@ -160,7 +160,7 @@ for (const shared of [false, true]) test(`${shared ? "shared" : "host"} entrance
     assert.equal((await remoteRequest(origin,ca,panelPath,{method:"POST",headers:{Origin:origin},body:"trust"})).status,405);
     const pairCookie = waiting.headers["set-cookie"]![0].split(";")[0];
     const localWaiting = await fetch(local+"/workspace/"+localEntry.id+"?auth_check=1");
-    const localCode = /<textarea[^>]*>(\d{6})<\/textarea>/.exec(await localWaiting.text())![1];
+    const localCode = /<strong>(\d{6})<\/strong>/.exec(await localWaiting.text())![1];
     const localRequest = access.pendingAccess().find(r => r.code === localCode && r.entryId === localEntry.id)!;
     await assert.rejects(access.approveAccess(request.id,remoteEntry.id,true));
     await access.approveAccess(request.id,localEntry.id,true);

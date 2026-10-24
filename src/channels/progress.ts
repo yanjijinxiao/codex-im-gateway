@@ -4,6 +4,7 @@ import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
 import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
+import { copyBlock } from "./copyable.js";
 import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
 const MAX_RECOVERY_PROBES = 3;
@@ -487,7 +488,7 @@ export class ChannelTurnTextStream {
     }
     sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
       : this.recoveryNotice ? "_保留本张进度卡；等待 Codex 后续进展或最终状态_"
-      : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行，发送 /stop 可停止_`);
+      : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行_\n\n停止当前任务（会中断执行）：\n\n${copyBlock("/stop")}`);
     return sections.join("\n\n");
   }
 

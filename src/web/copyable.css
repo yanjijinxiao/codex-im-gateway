@@ -12,9 +12,3 @@
 .gateway-copy-tools > textarea { flex-basis:100%; box-sizing:border-box; width:100%; min-width:160px; max-width:100%; min-height:64px; padding:8px; color:inherit; background:transparent; border:1px solid #aab7af; border-radius:5px; font:14px/1.5 monospace; }
 .gateway-copy-tools > textarea[hidden] { display:none; }
 .gateway-copy-tools :focus-visible { outline:3px solid #719f89; outline-offset:2px; }
-.gateway-copy-options { flex-basis:100%; min-width:0; }
-.gateway-copy-options > summary { cursor:pointer; min-height:32px; display:list-item; align-content:center; }
-.gateway-copy-options .gateway-copy { margin:8px 0; }
-.gateway-copy-options .gateway-copy label { font-size:12px; }
-.gateway-copy-options .gateway-copy textarea { min-height:40px; padding:8px; font-size:14px; }
-.gateway-copy-options .gateway-copy button { min-height:40px; padding:8px; font-size:12px; }

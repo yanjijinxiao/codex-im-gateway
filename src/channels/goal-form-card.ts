@@ -1,4 +1,5 @@
 import type { ChannelTaskFormCard } from "./task-card.js";
+import { copyBlock } from "./copyable.js";
 
 export function createGoalFormCard(projectName: string): ChannelTaskFormCard {
   return {
@@ -35,6 +36,6 @@ export function createGoalFormCard(projectName: string): ChannelTaskFormCard {
       style: "default",
       value: { version: 1, command: "mode", arg: "" }
     }],
-    fallbackText: "当前渠道不支持目标输入卡片，可发送 /goal 目标内容。"
+    fallbackText: `文字模式：把“目标内容”替换为实际目标后发送以下模板。\n\n${copyBlock("/goal 目标内容")}`
   };
 }

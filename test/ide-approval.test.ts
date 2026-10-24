@@ -133,7 +133,8 @@ test("registered human can preview and approve in an unbound group without grant
   const before = JSON.stringify(b.store.snapshot);
   await b.send("/ide identity", "owner", "group", "group");
   assert.match(b.texts.at(-1)!, /已登记为 IDE 审批管理员/);
-  assert.match(b.texts.at(-1)!, /```text\nowner\n```/);
+  assert.match(b.texts.at(-1)!, /个人 ID：owner/);
+  assert.doesNotMatch(b.texts.at(-1)!, /```text\nowner\n```/);
   await b.send("/ide auth 123456", "owner", "group", "group");
   assert.equal(b.cards.length, 1); assert.match(b.cards[0].body, /exact\/project/);
   const action = b.cards[0].actionGroups[0][0].value;
@@ -282,7 +283,7 @@ test("real HTTP browser pairing + token-protected owner setup + private IM confi
   assert.equal(copyJS.status,200);assert.match(copyJS.headers.get("content-type")!,/javascript/);assert.match(await copyJS.text(),/window\.gatewayCopy/);
   assert.equal(copyCSS.status,200);assert.match(copyCSS.headers.get("content-type")!,/text\/css/);assert.match(await copyCSS.text(),/\.gateway-copy/);
   const initial = await fetch(entry.url + "?auth_check=1"), page = await initial.text(), proofCookie = initial.headers.get("set-cookie")!.split(";")[0];
-  const code = page.match(/<textarea[^>]*>(\d{6})<\/textarea>/)![1];
+  const code = page.match(/浏览器识别码（仅核对用，无需单独发送）：<strong>(\d{6})<\/strong>/)![1];
   const body = JSON.stringify({ principal: owner });
   assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers: { "Content-Type": "application/json" }, body })).status, 403);
   const headers = { "Content-Type": "application/json", "x-codex-im-gateway-token": http.requestToken, Origin: http.url };
@@ -397,7 +398,8 @@ for (const conversationKind of ["direct", "group"] as const) for (const choice o
   const primary=html.split("<details")[0];assert.match(primary,/发送一次/);assert.match(primary,/不会再要求第二条/);
   assert.match(primary,/项目：/);assert.match(primary,/主机：local/);assert.match(primary,/目录：/);
   assert.match(primary,/&lt;script&gt;bad&lt;\/script&gt;/);assert.doesNotMatch(primary,/\/ide auth/);
-  assert.equal((primary.match(/<button[^>]*data-copy-button/g)||[]).length,4);
+  assert.equal((primary.match(/<button[^>]*data-copy-button/g)||[]).length,3);
+  assert.doesNotMatch(primary, /<textarea[^>]*>\d{6}<\/textarea>/, "browser code is reference-only; copy complete reply commands instead");
   const command=new RegExp(`/ide ${choice} [a-f0-9]{12}`).exec(primary)![0];
   const reloaded=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}});assert.ok((await reloaded.text()).includes(command),"polling preserves the displayed command");
   assert.match(await(await fetch(entry.url + "?auth_check=1",{headers:{Cookie:proof}})).text(),/等待 Gateway/);

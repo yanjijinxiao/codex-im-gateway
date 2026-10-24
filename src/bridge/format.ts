@@ -14,10 +14,17 @@ const LEGACY_BRIDGE_ACTION_INSTRUCTIONS = [
   BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-actions"),
   BRIDGE_ACTION_INSTRUCTIONS.replaceAll("codex-im-gateway-actions", "codex-weixin-server-actions")
 ];
-const BRIDGE_COPY_INSTRUCTIONS = [
+const LEGACY_BRIDGE_COPY_INSTRUCTIONS = [
   "Bridge reply presentation rule: whenever you ask the user to return, copy, paste or choose a value, put each exact reply in its own fenced text code block.",
   "This includes every suggested option, command, identifier and confirmation phrase. Keep its explanation outside the block; do not combine multiple choices or commands in one block.",
   "Use copy-enabled controls when the surface supports them. Copying must not submit an answer, execute a command, grant permission or select an option. Do not ask the user to copy secrets into IM."
+].join("\n");
+const BRIDGE_COPY_INSTRUCTIONS = [
+  "Bridge reply presentation rule: provide copy controls only when the user must send an exact reply or transfer a value to another surface (for example, an IM authorization command or a personal ID needed for administrator enrollment).",
+  "Put each exact reply, complete command or required transfer value in its own fenced text code block. Keep explanations outside; never combine choices or commands in one block.",
+  "Show reference-only project paths, status, existing IDs, explanations and ordinary code examples normally. Do not add copy controls merely because text is a path, identifier, option or button label.",
+  "Native form fields, dropdowns and action buttons should work directly; do not duplicate their labels or internal enum values as copyable answers. For a reply through IM, provide the complete valid command or answer, not an unusable bare internal value. Clearly label templates that require editing.",
+  "Copying must not submit an answer, execute a command, grant permission or select an option. Do not ask the user to copy secrets into IM."
 ].join("\n");
 const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
 const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
@@ -113,7 +120,9 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
       break;
     }
   }
-  if (normalized.startsWith(BRIDGE_COPY_INSTRUCTIONS)) normalized = normalized.slice(BRIDGE_COPY_INSTRUCTIONS.length).trim();
+  for (const instructions of [BRIDGE_COPY_INSTRUCTIONS, LEGACY_BRIDGE_COPY_INSTRUCTIONS]) {
+    if (normalized.startsWith(instructions)) { normalized = normalized.slice(instructions.length).trim(); break; }
+  }
   normalized = normalized.replace(
     new RegExp(`^${escapeRegExp(KNOWLEDGE_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(KNOWLEDGE_CONTEXT_END)}\\s*`),
     ""

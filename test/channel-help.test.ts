@@ -47,8 +47,10 @@ test("focused session help describes policies, permissions and backend limits", 
   assert.match(text, /steer：插入当前轮次（默认）/);
   assert.match(text, /viewer：只读；participant：对话与插话；controller/);
   assert.match(text, /后端不支持时明确拒绝，不暗中排队/);
-  assert.match(text, /发送 \/help 查看全部命令/);
+  assert.match(text, /```text\n\/help\n```/);
+  assert.match(text, /以下为命令语法参考/);
+  assert.doesNotMatch(text, /```text\n\/session[^\n]*编号/);
   assert.doesNotMatch(text, /\/task new/);
   assert.equal(channelHelpText([], "all"), channelHelpText([]));
-  assert.match(channelHelpText([], "typo"), /^用法：\/help/);
+  assert.match(channelHelpText([], "typo"), /```text\n\/help session\n```/);
 });

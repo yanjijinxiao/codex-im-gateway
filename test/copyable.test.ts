@@ -17,9 +17,24 @@ function fixture(write?: (value:string)=>Promise<void>,fallback=false,waiting=fa
 }
 test("copy fields are inert, independently labelled and identical across the SSR and management surfaces",()=>{
   const f=fixture(),label='命令 <"test">',value='</textarea><script>alert(1)</script> & `';
-  const html=copyField(label,value);assert.equal(f.api.field(label,value),html);
+  const options={purpose:"reply" as const};
+  const html=copyField(label,value,options);assert.equal(f.api.field(label,value,options),html);
   assert.doesNotMatch(html,/<script>|onclick=|onfocus=/);assert.match(html,/&lt;\/textarea&gt;/);
   assert.match(html,/readonly/);assert.match(html,/type="button"/);assert.match(html,/aria-live="polite"/);
+  assert.match(html,/data-copy-purpose="reply"/);
+  assert.equal(f.api.field(label,value,{purpose:"transfer"}),copyField(label,value,{purpose:"transfer"}));
+  assert.throws(()=>f.api.field(label,value),/require a reply or transfer purpose/);
+});
+test("only explicit reply/transfer producers opt in; native forms, paths and menu options are not scanned",()=>{
+  const f=fixture();let inserted=0;
+  const marked={tagName:"CODE",closest:()=>null,getAttribute:(name:string)=>name==="data-copy-label"?"发送命令":null,
+    insertAdjacentElement(position:string){assert.equal(position,"afterend");inserted++;}};
+  Object.assign(f.document,{createElement:()=>({setAttribute(){},innerHTML:""})});
+  f.api.enhance({querySelectorAll(selector:string){
+    assert.equal(selector,'[data-copy-purpose="reply"],[data-copy-purpose="transfer"]');
+    return [marked];
+  }});
+  assert.equal(inserted,1);
 });
 test("copy requests the exact standalone value once and acknowledges only after the API completes",async()=>{
   let release!:()=>void,calls=0;

@@ -5,6 +5,7 @@ import { CodexInterventionError } from "../codex/backend.js";
 import type { PromptBufferItem } from "./prompt-buffer.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import type { TurnParticipantOrigin } from "./turn-audience.js";
+import { copyBlock } from "../channels/copyable.js";
 
 /** Serializes controls for one host/thread, without blocking controls on a running turn. */
 export class SessionControlQueue {
@@ -59,7 +60,7 @@ export class SessionControlJournal {
     return this.queue.run(key, async () => {
       const receipt = this.state.receipts[receiptId];
       if (receipt?.status === "accepted" && receipt.result) return receipt.result;
-      if (receipt) throw new CodexInterventionError("该条消息已尝试提交，但结果尚未确认；请查看 /history，避免重复执行。");
+      if (receipt) throw new CodexInterventionError(`该条消息已尝试提交，但结果尚未确认；请先核对历史，避免重复执行。\n\n${copyBlock("/history")}`);
       this.state.receipts[receiptId] = { status: "sending", ...(origin ? { origin } : {}) };
       this.save();
       try {

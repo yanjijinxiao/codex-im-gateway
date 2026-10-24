@@ -303,6 +303,9 @@ test("uses native forms for task creation and executes their canonical submit co
 
   await service.handleMessage({ id: "form", senderId: "oc_test", text: "/task form new", attachments: [], raw: {} });
   assert.equal("kind" in cards[0] ? cards[0].kind : undefined, "form");
+  assert.doesNotMatch(cards[0].copyText ?? "", /```text\n(?:none|low|medium|high|urgent)\n```/);
+  assert.match(cards[0].fallbackText, /模板/);
+  assert.match(cards[0].fallbackText, /```text\n\/task new 任务标题\n```/);
 
   const query = new URLSearchParams({
     operation: "create_todo", title: "完善飞书任务卡", description: "使用原生表单", priority: "high", labels: "feishu,channel"

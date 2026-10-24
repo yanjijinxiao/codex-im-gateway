@@ -232,7 +232,7 @@
       </form>
       <h2>主机访问入口</h2><div id="ideEndpoints" aria-live="polite"></div>
       <h2>跨设备 · IDE 授权管理员</h2>
-      <p>首次在本机登记你本人的个人身份。请在机器人钉钉私聊或群聊发送 <code>/ide identity</code>，核对渠道账号和个人 ID；不要填写群 ID。登记后，该个人账号可在私聊或群聊批准本渠道账号所关联项目的浏览器访问与目录信任，具备开发终端权限。群内回复对群成员可见；群白名单、session 角色和绑定关系不会自动获得审批资格或浏览器权限。渠道未提供明确会话类型和真实发送人时会拒绝 IM 审批。</p>
+      <p>首次在本机登记你本人的个人身份。请在机器人钉钉私聊或群聊发送 <code data-copy-purpose="reply" data-copy-label="发给机器人的身份查询命令">/ide identity</code>，核对渠道账号和个人 ID；不要填写群 ID。登记后，该个人账号可在私聊或群聊批准本渠道账号所关联项目的浏览器访问与目录信任，具备开发终端权限。群内回复对群成员可见；群白名单、session 角色和绑定关系不会自动获得审批资格或浏览器权限。渠道未提供明确会话类型和真实发送人时会拒绝 IM 审批。</p>
       <form id="ideApproverForm" class="ide-form">
         <label for="ideApproverAccount">渠道账号<select id="ideApproverAccount" required></select></label>
         <label for="ideApproverActor">个人 ID<input id="ideApproverActor" type="text" maxlength="300" autocomplete="off" required placeholder="从 /ide identity 核对，不是群 ID"></label>
@@ -437,7 +437,7 @@
             <li><span>1</span><p>进入飞书开放平台“开发者后台”，创建 <b>企业自建应用</b>，并添加机器人能力。</p></li>
             <li><span>2</span><p>在“凭证与基础信息”复制 <b>App ID</b> 和 <b>App Secret</b>，填入下方字段。</p></li>
             <li><span>3</span><p>开通机器人收发消息权限：单聊消息、群聊中 @ 机器人消息、以应用身份发消息。</p></li>
-            <li><span>4</span><p>在“事件与回调”选择 <b>长连接</b>，添加“接收消息”事件 <code>im.message.receive_v1</code>，并订阅卡片回调 <code>card.action.trigger</code>。</p></li>
+            <li><span>4</span><p>在“事件与回调”选择 <b>长连接</b>，添加“接收消息”事件 <code data-copy-purpose="transfer" data-copy-label="飞书接收消息事件名">im.message.receive_v1</code>，并订阅卡片回调 <code data-copy-purpose="transfer" data-copy-label="飞书卡片回调事件名">card.action.trigger</code>。</p></li>
             <li><span>5</span><p>创建版本并发布应用，再向机器人发送一条消息以登记接收会话。</p></li>
           </ol>
           <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open.feishu.cn/app" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开飞书开发者后台</span></a><a class="channel-doc-link" href="https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方长连接文档</span></a></div>
@@ -449,7 +449,7 @@
             <li><span>2</span><p>在“应用能力”中添加机器人，消息接收模式选择 <b>Stream 模式</b>，无需公网回调地址。</p></li>
             <li><span>3</span><p>可选：在卡片平台创建含 Markdown 字段的 AI Card 模板，并填写模板 ID 与对应内容字段名。</p></li>
             <li><span>4</span><p>完成机器人配置并发布应用，再把机器人加入目标群或直接发起单聊。</p></li>
-            <li><span>5</span><p>向机器人发送一条消息以登记会话；之后即可使用 <code>/sessions</code>、<code>/session R1</code> 和 <code>/new</code>。</p></li>
+            <li><span>5</span><p>向机器人发送一条消息以登记会话；发送 <code data-copy-purpose="reply" data-copy-label="查看会话列表的命令">/sessions</code> 后按列表选择，或用 <code data-copy-purpose="reply" data-copy-label="新建会话的命令">/new</code> 新建。</p></li>
           </ol>
           <div class="channel-doc-links"><a class="channel-doc-link is-primary" href="https://open-dev.dingtalk.com/" target="_blank" rel="noopener noreferrer"><i data-lucide="settings"></i><span>打开钉钉开发者后台</span></a><a class="channel-doc-link" href="https://opensource.dingtalk.com/developerpedia/docs/explore/tutorials/stream/overview" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i><span>查看官方 Stream 文档</span></a></div>
         </section>

@@ -171,7 +171,7 @@ test("session extension preparation deduplicates clicks and releases controls on
   assert.equal(node("#sessionIDEPrepareButton").disabled, false); assert.equal(node("#sessionIDEButton").disabled, false);
 });
 
-test("local multi-root approval shows copyable directories before submitting the exact displayed scope", async () => {
+test("local multi-root approval shows reference directories without copy controls and submits the exact displayed scope", async () => {
   const calls: any[] = [], scope = "a".repeat(64), roots = ["/bridge", "/farming"];
   const { ui, context } = fixture(async (url, options) => {
     calls.push({ url, body: options.body });
@@ -188,7 +188,8 @@ test("local multi-root approval shows copyable directories before submitting the
   const operation = ui.open(); await shown;
   assert.equal(calls.length, 1, "showing/copying scope must not grant access");
   assert.match(dialog.innerHTML, /\/bridge/); assert.match(dialog.innerHTML, /\/farming/);
-  assert.equal((dialog.innerHTML.match(/data-copy-value/g) || []).length, 3);
+  assert.equal((dialog.innerHTML.match(/data-copy-value/g) || []).length, 0);
+  assert.match(dialog.innerHTML, /ide-root-list/);
   dialog.returnValue = "approve"; close(); await operation;
   assert.equal(calls[1].body.scope, scope); assert.equal(submitted, 1);
 });

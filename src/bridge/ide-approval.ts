@@ -26,7 +26,7 @@ export async function ideApprovalCommand(input: { service?: IDEApprovalService; 
         : status === "unregistered"
           ? "审批资格：当前个人身份未登记。首次请在本机 Gateway → Web IDE → 授权管理员选择该渠道账号并登记个人 ID。不要填写群 ID。"
           : "审批资格：暂时无法核验。请在本机管理页检查管理员记录或渠道配置；无法核验不表示登记已丢失。";
-      return `IDE 个人身份与审批资格\n渠道账号：${principal.accountId}\n渠道：${principal.channel}\n${description}\n\n个人 ID（单独复制下方内容）：\n\n${copyBlock(principal.actorId)}`;
+      return `IDE 个人身份与审批资格\n渠道账号：${principal.accountId}\n渠道：${principal.channel}\n${description}\n\n${status === "unregistered" ? `个人 ID（复制到 Gateway 管理页的「个人 ID」）：\n\n${copyBlock(principal.actorId)}` : `个人 ID：${principal.actorId}`}`;
     }
     if (args.length === 2 && args[0] === "auth" && /^\d{6}$/.test(args[1])) {
       const { request, token, shortCode } = input.service.preview(principal, args[1]);

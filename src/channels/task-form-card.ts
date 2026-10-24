@@ -1,4 +1,5 @@
 import type { TaskboardIssue } from "../taskboard/client.js";
+import { copyBlock } from "./copyable.js";
 import type { ChannelFormParameter } from "./action-card.js";
 import {
   taskboardDeepLink,
@@ -95,7 +96,7 @@ function createIssueForm(input: FormBase & { readonly form: "new" | "todo" }): C
       taskCommandAction({ label: "取消", arg: "list" }),
       taskLinkAction("打开完整面板", taskboardUrl)
     ],
-    fallbackText: `请发送 /task ${input.form === "todo" ? "todo" : "new"} 任务标题。`,
+    fallbackText: `文字模式：把“任务标题”替换为实际标题后发送以下模板。\n\n${copyBlock(`/task ${input.form === "todo" ? "todo" : "new"} 任务标题`)}`,
     taskboardUrl
   };
 }
@@ -139,7 +140,7 @@ function createWorkflowForm(
       taskCommandAction({ label: "取消", arg: `detail ${input.issue.identifier}` }),
       taskLinkAction("打开完整面板", taskboardUrl)
     ],
-    fallbackText: `请发送 /task ${input.form} ${input.issue.identifier} ${config.placeholder}`,
+    fallbackText: `文字模式：把下方说明替换为实际内容后发送以下模板。\n\n${copyBlock(`/task ${input.form} ${input.issue.identifier} ${config.placeholder}`)}`,
     taskboardUrl
   };
 }

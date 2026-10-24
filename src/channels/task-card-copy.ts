@@ -12,7 +12,7 @@ export function copyableTaskCard(card: ChannelTaskCard): ChannelTaskCard {
     const value = formatChannelActionCommand(action.value);
     return value ? [{ label: action.label, value }] : [];
   });
-  if (card.kind === "form") for (const field of card.fields) if (field.kind === "select")
-    values.push(...field.options.map(option => ({ label: `${field.label} · ${option.label}`, value: option.value })));
+  // Form choices are submitted by the native form. A bare enum such as
+  // "urgent" is not a valid IM reply and must not look like one.
   return { ...card, copyText: copyableChoices("", values).trim(), fallbackText: copyableChoices(card.fallbackText, values) };
 }

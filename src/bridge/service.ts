@@ -43,6 +43,7 @@ import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPromptParts, buildPromptPreview, parsePrompt } from "./format.js";
 import { resultPages } from "../channels/result-pages.js";
 import { copyableTaskCard } from "../channels/task-card-copy.js";
+import { copyBlock, copyableChoices } from "../channels/copyable.js";
 import { InboundReferenceStore, referenceContext } from "./inbound-references.js";
 import { PromptBuffer } from "./prompt-buffer.js";
 import { NEW_SESSION_USAGE, parseNewSessionTarget } from "./new-session.js";
@@ -667,7 +668,10 @@ export class BridgeService {
 
   private async replySessionRequired(senderId: string): Promise<void> {
     const expired = this.options.stateStore.getBindingExpiry(senderId, this.options.config.bindingIdleDays)?.endedReason === "idle";
-    await this.reply(senderId, `${expired ? "此 IM 对话因长期没有人工消息已自动解绑；原 session 和任务均保留。\n\n" : ""}当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。\n\n/sessions 查看可绑定会话\n/session R编号或会话ID [--host 主机ID] 绑定已有会话\n/new 新建并绑定（需先 /project 选择项目）；/new --standalone 新建独立会话\n/help session 查看全部绑定与解绑命令。\n\n不会自动恢复旧绑定或启动任务。`);
+    await this.reply(senderId, copyableChoices(`${expired ? "此 IM 对话因长期没有人工消息已自动解绑；原 session 和任务均保留。\n\n" : ""}当前 IM 对话未绑定任何 session，这条消息未提交给 Codex。先查看会话列表，再使用列表给出的完整切换命令；不会自动恢复旧绑定或启动任务。`, [
+      { label: "查看可绑定会话", value: "/sessions" }, { label: "在当前项目新建会话（需先选择项目）", value: "/new" },
+      { label: "新建本机独立会话", value: "/new --standalone" }, { label: "查看绑定帮助", value: "/help session" }
+    ]));
   }
 
   /** Local conversation state only; never resolve native approvals/questions. */
@@ -1227,7 +1231,7 @@ export class BridgeService {
     }
     const detail = /^detail\s+r([1-9]\d*)$/i.exec(input);
     if (/^detail(?:\s|$)/i.test(input) && !detail) {
-      await this.reply(senderId, "用法：/sessions detail R1 查看详情，不会切换会话。先发送 /sessions 获取编号。"); return;
+      await this.reply(senderId, copyableChoices("请先获取当前会话列表，再使用列表提供的详情命令；查看详情不会切换会话。", [{ label: "获取当前会话编号", value: "/sessions" }])); return;
     }
     if (/^(search|page)$/i.test(input)) {
       await this.reply(senderId, "用法：/sessions search 关键词；/sessions page 页码；/sessions 查看全部会话。");
@@ -1238,11 +1242,11 @@ export class BridgeService {
     const navigation = /^(more|next|prev|page\s+\d+)$/i.test(input);
     if (numbered || navigation || detail || resized) {
       if (!listing || Date.now() - listing.createdAt > 15 * 60_000) {
-        await this.reply(senderId, "会话列表已过期，请发送 /sessions 刷新后重新选择。"); return;
+        await this.reply(senderId, copyableChoices("会话列表已过期，请刷新后重新选择。", [{ label: "刷新会话列表", value: "/sessions" }])); return;
       }
       if (detail) {
         const row = listing.rows[Number(detail[1]) - 1];
-        if (!row) { await this.reply(senderId, "没有这个编号，请查看 /sessions。"); return; }
+        if (!row) { await this.reply(senderId, copyableChoices("没有这个编号，请查看当前会话列表。", [{ label: "查看会话列表", value: "/sessions" }])); return; }
         const { state, hostId, group } = row;
         await this.reply(senderId, [
           `会话详情 · R${detail[1]}（列表快照，不切换会话）`,
@@ -1251,13 +1255,13 @@ export class BridgeService {
           `主机：${hostId}`, `目录：${state.cwd}`, `ID：${state.threadId}`,
           `状态：${projectSessionChoiceStateLabel({ title: state.title ?? "", updatedAt: state.updatedAt ?? "", candidate: codexThreadStateCandidate(state, state.cwd ?? "") })}`,
           `更新：${state.updatedAt ? formatSessionTime(state.updatedAt) : "时间未知"}`,
-          `继续此会话：/session R${detail[1]}`
+          `继续此会话：\n\n${copyBlock(`/session R${detail[1]}`)}`
         ].join("\n\n"));
         return;
       }
       if (numbered) {
         const row = listing.rows[Number(numbered[1]) - 1];
-        if (!row) { await this.reply(senderId, "没有这个编号，请查看 /sessions。"); return; }
+        if (!row) { await this.reply(senderId, copyableChoices("没有这个编号，请查看当前会话列表。", [{ label: "查看会话列表", value: "/sessions" }])); return; }
         await this.bindCatalogSession(senderId, row.state.threadId, row.hostId); return;
       }
       const requested = /^page\s+(\d+)$/i.exec(input);
@@ -1270,7 +1274,7 @@ export class BridgeService {
     } else {
       const activeProject = this.options.stateStore.getActiveProject(senderId);
       const projectOnly = input.toLowerCase() === "project";
-      if (projectOnly && !activeProject) { await this.reply(senderId, "当前没有选择项目。发送 /sessions 查看全部会话，或 /project 选择项目。"); return; }
+      if (projectOnly && !activeProject) { await this.reply(senderId, copyableChoices("当前没有选择项目，可以选择已有会话或项目。", [{ label: "查看已有会话", value: "/sessions" }, { label: "选择项目", value: "/project" }])); return; }
       const query = /^search\s+(.+)$/i.exec(input)?.[1].toLocaleLowerCase();
       const unassigned = /^(unbound|unassigned)$/i.test(input);
       const hosts = new Set(["local"]);
@@ -1362,7 +1366,9 @@ export class BridgeService {
         .filter(session => session.senderId === senderId && session.threadId === threadId)
         .map(session => this.sessionHostId(session) ?? "local"));
       if (knownHosts.size > 1) {
-        await this.reply(senderId, `这个会话 ID 对应多个主机，请明确指定：/session ${threadId} --host <主机ID>\n主机：${[...knownHosts].join("、")}`);
+        await this.reply(senderId, copyableChoices("这个会话 ID 对应多个主机，请明确选择要绑定的主机。", [...knownHosts].map(hostId => ({
+          label: `绑定主机 ${hostId} 上的会话`, value: `/session ${threadId} --host ${hostId}`
+        }))));
         return;
       }
       hostId = knownHosts.values().next().value ?? "local";
@@ -1395,13 +1401,13 @@ export class BridgeService {
   private async handleHistoryCommand(senderId: string, arg: string): Promise<void> {
     const session = this.executionSession(senderId);
     if (!session?.threadId) {
-      await this.reply(senderId, "当前会话还没有 Codex 历史。先发送一条消息，或使用 /sessions 绑定已有会话。");
+      await this.reply(senderId, copyableChoices("当前会话还没有 Codex 历史。先发送一条消息，或选择已有会话。", [{ label: "查看已有会话", value: "/sessions" }]));
       return;
     }
     const more = arg.trim().toLowerCase() === "more";
     const requested = more || !arg.trim() ? 8 : Number(arg.trim());
     if (!Number.isInteger(requested) || requested < 1 || requested > 20) {
-      await this.reply(senderId, "用法：/history [1-20|more]，例如 /history 10；/history more 查看更早的对话。");
+      await this.reply(senderId, copyableChoices("历史条数支持 1–20；请选择可直接发送的查询命令。", [{ label: "最近 10 条", value: "/history 10" }, { label: "更早的对话", value: "/history more" }]));
       return;
     }
     const hostId = this.sessionHostId(session) ?? "local";
@@ -1431,7 +1437,7 @@ export class BridgeService {
     await this.reply(senderId, visible.length
       ? [`会话“${session.title}”${more ? "更早的" : "最近"} ${visible.length} 条对话：`,
           formatConversationHistory(visible),
-          !page.exhausted || page.pending.length ? "发送 /history more 查看更早的对话。" : "已到达最早的对话。"].join("\n\n")
+          !page.exhausted || page.pending.length ? `查看更早的对话：\n\n${copyBlock("/history more")}` : "已到达最早的对话。"].join("\n\n")
       : "没有更早的可显示对话。");
   }
 
@@ -1478,7 +1484,7 @@ export class BridgeService {
       return;
     }
     if (expectedTurnId && state.activeTurnId !== expectedTurnId) {
-      await this.reply(message.senderId, "目标任务已结束或发生切换，未发送这条介入。请查看 /history 后重新发送。");
+      await this.reply(message.senderId, copyableChoices("目标任务已结束或发生切换，未发送这条介入。核对历史后再发送新的要求。", [{ label: "核对当前会话历史", value: "/history" }]));
       return;
     }
     const result = await this.observeControlAudience(session, state.activeTurnId, () => this.controls.steer(
@@ -1507,7 +1513,7 @@ export class BridgeService {
       if (session) this.options.stateStore.unbindSession(session.id, this.options.stateStore.sessionBindingTarget(session));
       else this.options.stateStore.leaveSession(senderId);
       this.clearConversationBindingState(senderId);
-      await this.reply(senderId, "当前 IM 对话已解绑，停止本对话跟随；不会删除 session、停止原任务或取消原生队列，其他对话绑定不变。\n\n请用 /sessions 查看，再 /session R编号或会话ID 绑定；或 /new 新建。解绑状态会在重启后保留。");
+      await this.reply(senderId, copyableChoices("当前 IM 对话已解绑，停止本对话跟随；不会删除 session、停止原任务或取消原生队列，其他对话绑定不变。解绑状态会在重启后保留。", [{ label: "选择已有会话", value: "/sessions" }, { label: "新建会话", value: "/new" }]));
       return;
     }
     if (command.name === "role") {
@@ -1529,7 +1535,7 @@ export class BridgeService {
       return;
     }
     const session = this.executionSession(senderId);
-    if (!session) { await this.reply(senderId, "请先使用 /sessions 选择会话。"); return; }
+    if (!session) { await this.reply(senderId, copyableChoices("请先选择会话。", [{ label: "查看可绑定会话", value: "/sessions" }])); return; }
     if (command.name === "follow") {
       if (arg === "primary") {
         if (!await this.requireRole(senderId, "controller")) return;
@@ -1541,11 +1547,11 @@ export class BridgeService {
       const retryDelivery = arg === "sync --retry-delivery";
       const action = retryDelivery ? "sync" : arg;
       if (retryDelivery && !/^\/follow\s+sync\s+--retry-delivery\s*$/i.test(sourceText.trim())) {
-        await this.reply(senderId, "未知投递可能重复通知，请使用显式命令 /follow sync --retry-delivery 确认；未尝试投递。");
+        await this.reply(senderId, copyableChoices("未知投递可能重复通知，未尝试投递。仅在明确接受重复通知风险时，发送以下完整命令。", [{ label: "明确重试原实例的未知投递（可能重复通知）", value: "/follow sync --retry-delivery" }]));
         return;
       }
       if (action && !["on", "off", "sync"].includes(action)) {
-        await this.reply(senderId, "用法：/follow [on|off|sync|primary]；primary 将当前对话设为主交互目标（控制者）；未知投递使用 /follow sync --retry-delivery 重试原实例（可能重复通知），不创建新任务。");
+        await this.reply(senderId, copyableChoices("请选择跟随操作。primary 需要控制者权限，会将当前对话设为主交互目标；普通同步不创建新任务。", [{ label: "查看同步状态", value: "/follow" }, { label: "开启并同步", value: "/follow on" }, { label: "关闭跟随", value: "/follow off" }, { label: "立即同步", value: "/follow sync" }, { label: "将本对话设为主交互目标", value: "/follow primary" }]));
         return;
       }
       if (retryDelivery && !await this.requireRole(senderId, "controller")) return;
@@ -1554,7 +1560,7 @@ export class BridgeService {
       const current = this.options.stateStore.getSession(session.id)!;
       const enabled = current.follow !== false;
       if (action === "sync" && !enabled) {
-        await this.reply(senderId, "实时跟随已关闭，未执行同步。发送 /follow on 开启并同步；/follow sync 不会改变开关或绑定。");
+        await this.reply(senderId, copyableChoices("实时跟随已关闭，未执行同步。开启后才会同步；不会改变绑定。", [{ label: "开启实时跟随并同步", value: "/follow on" }]));
         return;
       }
       const supported = this.runner.backendInfo?.(this.sessionHostId(current)).capabilities.liveFollow !== false;
@@ -1566,12 +1572,17 @@ export class BridgeService {
         ...(this.options.sessionInteractions ? [formatInteractionRoute(this.options.sessionInteractions.status(current))] : []),
         ...(!current.threadId ? ["当前绑定尚未创建 Codex thread，暂时没有可同步的任务。"]
           : supported && status ? formatFollowStatus(status) : supported ? ["同步状态：当前部署未接入跟随协调器，未确认同步成功。"] : []),
-        ...(action === "on" || action === "sync" ? ["未创建新任务、未介入或停止原任务。"] : ["发送 /follow sync 立即同步当前状态；/stream on 开启过程进度。"])
+        ...(action === "on" || action === "sync" ? ["未创建新任务、未介入或停止原任务。"] : [copyableChoices("可选择同步或开启过程进度。", [
+          { label: "同步当前状态", value: "/follow sync" }, { label: "开启过程进度", value: "/stream on" }
+        ])])
       ].join("\n\n"));
       return;
     }
     if (arg && !["ask", "steer", "queue"].includes(arg)) {
-      await this.reply(senderId, "用法：/policy [ask|steer|queue]");
+      await this.reply(senderId, copyableChoices("请选择运行中消息的处理方式；查看状态不会改变设置。", [
+        { label: "查看当前策略", value: "/policy" }, { label: "插入当前轮次", value: "/policy steer" },
+        { label: "排到下一轮", value: "/policy queue" }, { label: "每次询问", value: "/policy ask" }
+      ]));
       return;
     }
     if (arg === "steer") {
@@ -1606,12 +1617,12 @@ export class BridgeService {
     try { state = await this.runner.inspectThread(session.threadId, hostId); }
     catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId: session.threadId }); }
     if (state.threadId !== session.threadId || state.persistence !== "active" || state.internal) {
-      await this.reply(message.senderId, "绑定的会话当前不可接收消息，未提交；绑定未删除，请查看 /status。");
+      await this.reply(message.senderId, copyableChoices("绑定的会话当前不可接收消息，未提交；绑定未删除。", [{ label: "核对当前状态", value: "/status" }]));
       return true;
     }
     assertCodexThreadRunnable(state);
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
-      await this.reply(message.senderId, "Codex App 存在未确认轮次，实际任务已空闲。消息未提交，避免继续制造悬空记录；请重新加载 App 后查看 /status。");
+      await this.reply(message.senderId, copyableChoices("Codex App 存在未确认轮次，实际任务已空闲，消息未提交。请重新加载 App 后核对状态。", [{ label: "核对状态", value: "/status" }]));
       return true;
     }
     if (state.runtimeStatus !== "active") {
@@ -1716,11 +1727,13 @@ export class BridgeService {
       try { await this.nativeQueue.reconcile(this.options.accountId ?? "standalone", this.runner); }
       catch { warning = "部分后端暂时无法核对，以下为持久化回执，不代表已确认的当前状态。"; }
       const rows = this.nativeQueue.list(this.options.accountId ?? "standalone", message.senderId);
-      await this.reply(message.senderId, rows.length ? ["本聊天的原生队列回执（任务内容与顺序由 Codex 保存）：",
+      const replies = rows.filter(r => r.status === "queued" && (r.actorId === (this.actor.getStore() ?? message.senderId) || this.role(message.senderId) === "controller"))
+        .slice(-20).map(r => ({ label: `请求取消待执行消息 ${r.queuedSubmissionId ?? r.clientUserMessageId}`, value: `/queue cancel ${r.queuedSubmissionId ?? r.clientUserMessageId}` }));
+      await this.reply(message.senderId, copyableChoices(rows.length ? ["本聊天的原生队列回执（任务内容与顺序由 Codex 保存）：",
         ...(warning ? [warning] : []),
         ...rows.slice(-20).map(r => `${r.queuedSubmissionId ?? r.clientUserMessageId} · ${r.status}${r.status === "completed" ? r.delivered ? " · 结果已处理" : " · 结果未确认投递" : ""}\nSession：${r.threadId}${r.reason ? "\n" + r.reason : ""}`),
-        "取消待执行消息：/queue cancel <队列ID>；显式排队：/queue <内容>"].join("\n\n")
-        : "本聊天暂无原生队列回执。用法：/queue <内容>；/queue list；/queue cancel <队列ID>。");
+        "下方只列出当前可请求取消的待执行项；是否取消以原生队列回执为准。发送新内容排队时，使用 /queue 加实际内容，不要发送占位符。"].join("\n\n")
+        : "本聊天暂无原生队列回执。需要排队时，发送 /queue 加实际内容，不要发送占位符。", [{ label: "刷新队列回执", value: "/queue list" }, ...replies]));
       return;
     }
     if (/^cancel(?:\s|$)/.test(value)) {
@@ -1728,7 +1741,7 @@ export class BridgeService {
       if (!id || extra) { await this.reply(message.senderId, "用法：/queue cancel <队列ID>"); return; }
       const cancelled = await this.nativeQueue.cancel(this.options.accountId ?? "standalone", message.senderId,
         this.actor.getStore() ?? message.senderId, id, this.runner, this.role(message.senderId) === "controller");
-      await this.reply(message.senderId, cancelled ? "已从 Codex 原生队列取消待执行消息。" : "队列项已不在待执行列表中，未停止任务、未重发消息。请用 /queue list 核对。");
+      await this.reply(message.senderId, cancelled ? "已从 Codex 原生队列取消待执行消息。" : copyableChoices("队列项已不在待执行列表中，未停止任务、未重发消息。", [{ label: "核对队列回执", value: "/queue list" }]));
       return;
     }
     const items = await this.promptItemsFromMessageWithNotice({ ...message, text: "" });
@@ -1768,7 +1781,7 @@ export class BridgeService {
     this.options.stateStore.setSessionPromptPreview(session.id, preview);
     await this.reply(message.senderId, receipt.status === "queued" || receipt.status === "running"
       ? `已由 Codex 接收${receipt.status === "running" ? "，任务已开始" : "并加入原生队列"}。\n队列ID：${receipt.queuedSubmissionId}\nGateway 重启后只核对回执，不重发消息。任务继承该会话的原生执行设置。`
-      : `这条消息已有 ${receipt.status} 回执，未重复提交。请用 /queue list 核对。`);
+      : copyableChoices(`这条消息已有 ${receipt.status} 回执，未重复提交。`, [{ label: "核对队列回执", value: "/queue list" }]));
     void this.recoverNativeQueue().catch(() => {
       this.warnNativeQueueRecovery();
     });

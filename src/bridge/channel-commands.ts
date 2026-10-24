@@ -4,6 +4,7 @@ import {
 } from "./channel-capability.js";
 import type { ChannelCommand } from "./channel-intent.js";
 import type { CodexBackendCapabilities } from "../codex/backend.js";
+import { copyableChoices } from "../channels/copyable.js";
 
 /** One canonical command inventory for aliases, reservation and help limits. */
 export const CHANNEL_COMMAND_REGISTRY = [
@@ -63,7 +64,7 @@ const SESSION_HELP_LINES = [
   "/history more - 继续查看更早的对话",
   "/ide [status] - 获取当前项目的 Web IDE 入口；不会提交任务，浏览器另行鉴权",
   "/ide identity - 私聊或群聊查看本人身份，首次在本机 Web IDE 页登记授权管理员",
-  "/ide auth 六位识别码 - 管理员私聊核对浏览器申请，再发送确认命令；不要求绑定 session",
+  "/ide auth 六位识别码 - 兼容核对流程（私聊或群聊）；优先复制原授权页生成的完整命令",
   "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/follow sync --retry-delivery - 控制者明确重试原实例的未知投递，可能重复通知，不创建新卡",
   "/follow primary - 控制者将当前对话设为持久化主交互目标；提问/审批单处交互，进度仍可多处跟随",
@@ -152,6 +153,16 @@ export type ChannelHelpContext = {
 };
 
 export function channelHelpText(capabilities: readonly ChannelCommandCapability[], topic = "", context: ChannelHelpContext = {}): string {
+  const navigation = (text: string, sessionOnly = false) => copyableChoices(text, [
+    { label: "查看会话列表，再使用列表提供的完整切换命令", value: "/sessions" },
+    { label: "查看当前状态", value: "/status" },
+    { label: "查看最近历史", value: "/history" },
+    ...(sessionOnly ? [{ label: "查看全部命令参考", value: "/help" }] : [
+      { label: "选择项目", value: "/project" }, { label: "查看可选模型", value: "/model" },
+      { label: "查看推理强度选项", value: "/effort" }, { label: "打开当前项目 IDE", value: "/ide" }
+    ])
+  ]);
+  const referenceNote = "以下为命令语法参考：方括号、竖线及“编号/内容”等表示需要选择或填写的参数，不是现成答案。实际操作时使用当前页面或卡片给出的完整命令。";
   const describe = (line: string): string => {
     const token = /^\/(\w+)/.exec(line)?.[1];
     const command = CHANNEL_COMMAND_REGISTRY.find(item => item.name === token);
@@ -163,10 +174,10 @@ export function channelHelpText(capabilities: readonly ChannelCommandCapability[
     return line;
   };
   if (topic.trim().toLowerCase() === "session") {
-    return [...SESSION_HELP_LINES, "发送 /help 查看全部命令。"].map(describe).join("\n\n");
+    return navigation([referenceNote, ...SESSION_HELP_LINES].map(describe).join("\n\n"), true);
   }
   if (topic.trim() && topic.trim().toLowerCase() !== "all") {
-    return "用法：/help 查看全部命令；/help session 查看会话介入与跟随说明。";
+    return copyableChoices("请选择要查看的帮助。", [{ label: "全部命令参考", value: "/help" }, { label: "会话帮助", value: "/help session" }]);
   }
-  return [...BUILT_IN_HELP_LINES, ...channelCapabilityHelpLines(capabilities)].filter(Boolean).map(describe).join("\n\n");
+  return navigation([referenceNote, ...BUILT_IN_HELP_LINES, ...channelCapabilityHelpLines(capabilities)].filter(Boolean).map(describe).join("\n\n"));
 }

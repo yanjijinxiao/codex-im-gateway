@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJsonFile } from "../state/json-store.js";
 import type { ManagedSession } from "../state/runtime-state.js";
+import { copyBlock } from "../channels/copyable.js";
 
 /** Native interaction ownership is separate from multi-destination progress following. */
 export type InteractionDestination = {
@@ -95,5 +96,5 @@ export class InteractionRoutingJournal {
 export function formatInteractionRoute(status: InteractionRouteStatus): string {
   return status.destination
     ? `提问/审批路由：${status.current ? "当前对话" : `账号 ${status.destination.accountId} · 对话 ${status.destination.recipientId}`}（${status.status === "unique" ? "唯一绑定" : status.status === "origin" ? "原轮次发起方" : "持久化主交互对话"}）。`
-    : `提问/审批路由：${status.status === "ambiguous" ? `${status.bindingCount} 个对话跟随，尚未选择主交互对话` : "原交互目标不可用"}。控制者可在目标对话发送 /follow primary；不会改变其他跟随绑定。`;
+    : `提问/审批路由：${status.status === "ambiguous" ? `${status.bindingCount} 个对话跟随，尚未选择主交互对话` : "原交互目标不可用"}。控制者可在希望接收交互的目标对话发送以下命令；不会改变其他跟随绑定。\n\n${copyBlock("/follow primary")}`;
 }

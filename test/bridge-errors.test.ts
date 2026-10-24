@@ -60,7 +60,7 @@ test("returns explicit lifecycle guidance for archived and missing sessions", ()
   );
   assert.match(
     userFacingMessageHandlingError(new CodexThreadStateError("missing", "thread-b", "internal")),
-    /不存在.*\/sessions/
+    /不存在[\s\S]*```text\n\/sessions\n```/
   );
 });
 

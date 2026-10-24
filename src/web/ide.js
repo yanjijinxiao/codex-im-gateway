@@ -3,7 +3,7 @@ window.gatewayIDE = (() => {
   const receipts = new Map();
   let approverMarkup = "", approverAccountsMarkup = "", approverBusy = false;
   const $ = selector => document.querySelector(selector);
-  const rootFields = item => (item.rootPaths || [item.workspace]).map((root, index) => window.gatewayCopy.field(`目录 ${index + 1}`, root)).join("");
+  const rootFields = item => `<ul class="ide-root-list">${(item.rootPaths || [item.workspace]).map(root => `<li><code>${escapeHtml(root || "")}</code></li>`).join("")}</ul>`;
   function message(text, error = false) {
     const el = $("#ideMessage"); el.textContent = text; el.classList.toggle("ide-error", error);
   }
@@ -50,7 +50,7 @@ window.gatewayIDE = (() => {
       if ([...(data.accounts || [])].some(account => JSON.stringify(account) === value)) select.value = value;
     }
     const markup = data.error ? `<p class="ide-error">${escapeHtml(data.error)}</p>` : data.owners?.length ? data.owners.map(owner =>
-      `<article class="ide-instance"><div><strong>${escapeHtml(owner.accountId)} · ${escapeHtml(owner.channel)}</strong>${window.gatewayCopy.field("个人 ID", owner.actorId)}</div><button type="button" class="button button-secondary" data-ide-approver-remove="${escapeAttr(JSON.stringify(owner))}">移除审批资格</button></article>`).join("") : "<p>尚未登记管理员。跨设备审批尚不可用；本机网页审批不受影响。</p>";
+      `<article class="ide-instance"><div><strong>${escapeHtml(owner.accountId)} · ${escapeHtml(owner.channel)}</strong><p>个人 ID：<code>${escapeHtml(owner.actorId)}</code></p></div><button type="button" class="button button-secondary" data-ide-approver-remove="${escapeAttr(JSON.stringify(owner))}">移除审批资格</button></article>`).join("") : "<p>尚未登记管理员。跨设备审批尚不可用；本机网页审批不受影响。</p>";
     if (!approverBusy && markup !== approverMarkup) { approverMarkup = markup; $("#ideApprovers").innerHTML = markup; }
     $("#ideApproverAdd").disabled = approverBusy || Boolean(data.error) || !data.accounts?.length;
   }
@@ -90,7 +90,7 @@ window.gatewayIDE = (() => {
     const items = [...requests.filter(item => !receipts.has(item.id)), ...receipts.values()];
     const markup = items.length ? items.map(item => {
       const button = (trust, label) => `<button type="button" class="button button-secondary" data-ide-approve="${escapeAttr(item.id)}" data-ide-entry="${escapeAttr(item.entryId)}" data-ide-code="${escapeAttr(item.code)}" data-ide-trust="${trust}">${label}</button>`;
-      return `<article class="ide-instance" data-ide-request="${escapeAttr(item.id)}"><div>${window.gatewayCopy.field("浏览器识别码", item.code)}<p>${escapeHtml(item.projectName)} · ${escapeHtml(item.hostId)}</p>${item.rootPaths ? `<p>工作区包含 ${item.rootPaths.length} 个目录；权限涵盖全部所列目录。</p>` : ""}${rootFields(item)}<small>申请有效至 ${escapeHtml(new Date(item.expiresAt).toLocaleTimeString())}；新授权有效期 ${escapeHtml(sessionDuration)}，重启不丢失。</small></div><div class="ide-approval-actions">${item.approved ? `<p role="status">已批准${item.trustWorkspace ? "并信任此目录" : "访问"}。原浏览器将自动继续；若仍在等待，请在原页点击「批准后继续」。</p>` : button(true, "批准并信任此目录") + button(false, "仅批准访问")}</div></article>`;
+      return `<article class="ide-instance" data-ide-request="${escapeAttr(item.id)}"><div><p>浏览器识别码：<strong>${escapeHtml(item.code)}</strong></p><p>${escapeHtml(item.projectName)} · ${escapeHtml(item.hostId)}</p>${item.rootPaths ? `<p>工作区包含 ${item.rootPaths.length} 个目录；权限涵盖全部所列目录。</p>` : ""}${rootFields(item)}<small>申请有效至 ${escapeHtml(new Date(item.expiresAt).toLocaleTimeString())}；新授权有效期 ${escapeHtml(sessionDuration)}，重启不丢失。</small></div><div class="ide-approval-actions">${item.approved ? `<p role="status">已批准${item.trustWorkspace ? "并信任此目录" : "访问"}。原浏览器将自动继续；若仍在等待，请在原页点击「批准后继续」。</p>` : button(true, "批准并信任此目录") + button(false, "仅批准访问")}</div></article>`;
     }).join("") : '<p>没有待批准的浏览器。</p>';
     if (approval || requestMarkup === markup) return;
     requestMarkup = markup; $("#ideAccessRequests").innerHTML = markup;
@@ -230,10 +230,10 @@ window.gatewayIDE = (() => {
   }
   function confirmRootScope(rootPaths) {
     // Copy controls remain inert; only an explicit action grants this expanded
-    // scope. Do not use a native confirm dialog with uncopyable directory text.
+    // scope. Direct buttons decide; the directory list is reference text only.
     return new Promise(resolve => {
       const dialog = document.createElement("dialog"); dialog.className = "ide-root-scope";
-      dialog.innerHTML = `<h2>授权并信任多目录工作区</h2><p>本次将在同一个 IDE 中打开以下 ${rootPaths.length} 个目录，允许编辑、终端及任务运行。请核对全部目录；不会合并 Git 仓库。</p>${rootFields({ rootPaths })}${window.gatewayCopy.field("确认操作（仅复制）", "授权并信任工作区")}<form method="dialog"><button value="cancel" type="submit">取消</button><button value="approve" type="submit">授权并信任工作区</button></form>`;
+      dialog.innerHTML = `<h2>授权并信任多目录工作区</h2><p>本次将在同一个 IDE 中打开以下 ${rootPaths.length} 个目录，允许编辑、终端及任务运行。请核对全部目录；不会合并 Git 仓库。</p>${rootFields({ rootPaths })}<form method="dialog"><button value="cancel" type="submit">取消</button><button value="approve" type="submit">授权并信任工作区</button></form>`;
       dialog.addEventListener("close", () => { const approved = dialog.returnValue === "approve"; dialog.remove(); resolve(approved); }, { once: true });
       document.body.append(dialog); dialog.showModal();
     });

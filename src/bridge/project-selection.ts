@@ -1,5 +1,6 @@
 import type { ManagedProject } from "../state/runtime-state.js";
 import type { CodexProjectCandidate } from "../server/codex-projects.js";
+import { copyableChoices } from "../channels/copyable.js";
 
 export type ProjectSelection =
   | { project: ManagedProject; candidate?: never; error?: never }
@@ -20,7 +21,7 @@ export function selectChannelProject(
     const selected = code[1].toLowerCase() === "p"
       ? projects[index] && { project: projects[index] }
       : unbound[index] && { candidate: unbound[index] };
-    return selected ?? { error: "项目编号已失效，请发送 /project 刷新后重新选择。" };
+    return selected ?? { error: copyableChoices("项目编号已失效，请刷新后重新选择。", [{ label: "刷新项目列表", value: "/project" }]) };
   }
   const sameName = (name: string) => name.localeCompare(selector, undefined, { sensitivity: "accent" }) === 0;
   const matches: ProjectSelection[] = [
@@ -28,8 +29,8 @@ export function selectChannelProject(
     ...unbound.filter(p => sameName(p.name)).map(candidate => ({ candidate }))
   ];
   return matches.length === 1 ? matches[0] : {
-    error: matches.length > 1
-      ? "有多个同名项目，请发送 /project 查看列表，再用 P/C 编号选择。"
-      : "没有找到这个项目。发送 /project 查看列表，可用 P/C 编号或完整项目名选择。"
+    error: copyableChoices(matches.length > 1
+      ? "有多个同名项目，请查看列表，再用当前列表给出的完整命令选择。"
+      : "没有找到这个项目，请查看项目列表。", [{ label: "查看项目列表", value: "/project" }])
   };
 }

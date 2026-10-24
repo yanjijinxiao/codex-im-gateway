@@ -1,10 +1,12 @@
-// Shared copy-only layer, used by management, IDE SSR and the React taskboard.
-// Enhancements stay beside existing nodes: no replacement of focused inputs.
+// Shared cross-surface handoff controls, not a decoration for arbitrary text.
+// Producers explicitly opt in replies/transfers; ordinary forms stay native.
 window.gatewayCopy = (() => {
   const sources = new WeakMap(), controls = new WeakMap();
   const escape = value => String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
-  function field(label, value) {
-    return `<div class="gateway-copy" data-copy-field><label>${escape(label)}<textarea data-copy-value readonly rows="1" spellcheck="false" autocapitalize="off">${escape(value)}</textarea></label><button type="button" data-copy-button aria-label="${escape(`复制${label}`)}">复制</button><small data-copy-status role="status" aria-live="polite"></small></div>`;
+  function field(label, value, options) {
+    if (!["reply", "transfer"].includes(options?.purpose)) throw Error("Copy controls require a reply or transfer purpose");
+    const rows = options.rows === 2 ? 2 : 1;
+    return `<div class="gateway-copy" data-copy-field data-copy-purpose="${options.purpose}"><label>${escape(label)}<textarea data-copy-value readonly rows="${rows}" spellcheck="false" autocapitalize="off">${escape(value)}</textarea></label><button type="button" data-copy-button aria-label="${escape(`复制${label}`)}">复制</button><small data-copy-status role="status" aria-live="polite"></small></div>`;
   }
   async function copy(container) {
     const value = container.querySelector("[data-copy-value]"), button = container.querySelector("[data-copy-button]"), status = container.querySelector("[data-copy-status]");
@@ -33,10 +35,11 @@ window.gatewayCopy = (() => {
     return clone.textContent.trim();
   }
   function sourceValue(source) {
+    const declared = source.getAttribute("data-copy-output");
+    if (declared !== null) return declared;
     if (source.tagName === "SELECT") return [...source.selectedOptions].map(option => option.value || option.label).join("\n");
-    if (["checkbox", "radio"].includes(source.type)) return cleanText(source.labels?.[0] || source.parentElement);
     if (typeof source.value === "string") return source.value;
-    return source.getAttribute("data-copy-output") || (source.tagName === "CODE" && source.title) || cleanText(source);
+    return cleanText(source);
   }
   function sourceLabel(source) {
     let label;
@@ -46,34 +49,22 @@ window.gatewayCopy = (() => {
       label = clone.textContent.trim().slice(0, 100);
     }
     return source.getAttribute("aria-label") || label || (source.tagName === "LI" && cleanText(source).slice(0, 60))
-      || (source.tagName === "SELECT" ? "当前选项" : source.tagName === "PRE" ? "代码 / 命令" : "此项内容");
+      || "需发送或回填的内容";
   }
   function enhance(root = document) {
     if (!root.querySelectorAll) return;
-    for (const source of root.querySelectorAll("pre,code,[data-copy-output],input,textarea,select,.message-bubble,.message-bubble li,.markdown-body li,.ai-chat-markdown li,.issue-description-document li,[role=option],[role=menuitem],[role=menuitemradio],[role=menuitemcheckbox]")) {
+    for (const source of root.querySelectorAll('[data-copy-purpose="reply"],[data-copy-purpose="transfer"]')) {
       if (source.closest("[data-copy-field],[data-copy-ignore],[contenteditable=true]")) continue;
       if (source.tagName === "CODE" && source.closest("pre")) continue;
-      if (["hidden", "password", "file", "submit", "button", "reset", "image", "color", "range"].includes(source.type)) continue;
+      if (["hidden", "password", "file", "submit", "button", "reset", "image", "color", "range", "checkbox", "radio"].includes(source.type)) continue;
       if (controls.get(source)?.isConnected) continue;
-      const label = sourceLabel(source), tools = document.createElement("span");
+      const label = source.getAttribute("data-copy-label") || sourceLabel(source), tools = document.createElement("span");
       tools.className = "gateway-copy-tools"; tools.setAttribute("data-copy-field", ""); tools.setAttribute("data-copy-tools", "");
-      tools.innerHTML = `<button type="button" data-copy-button aria-label="${escape(`复制${label}`)}">复制${["checkbox", "radio"].includes(source.type) ? "选项" : ""}</button><small data-copy-status role="status" aria-live="polite"></small><textarea data-copy-value readonly hidden rows="2" aria-label="${escape(`可手动复制的${label}`)}" spellcheck="false"></textarea>`;
+      tools.innerHTML = `<button type="button" data-copy-button aria-label="${escape(`复制${label}`)}">复制</button><small data-copy-status role="status" aria-live="polite"></small><textarea data-copy-value readonly hidden rows="2" aria-label="${escape(`可手动复制的${label}`)}" spellcheck="false"></textarea>`;
       sources.set(tools, source); controls.set(source, tools);
       // Never put interactive controls inside a form label or link: that would
       // change the input's accessible name or make a copy tap activate a link.
       (source.closest("label,a") || source).insertAdjacentElement("afterend", tools);
-      if (source.tagName === "SELECT") {
-        const details = document.createElement("details"); details.className = "gateway-copy-options";
-        details.innerHTML = "<summary>逐项复制选项</summary><div data-copy-option-list></div>";
-        // Build on demand, so a large model/project catalog is not duplicated
-        // into the DOM until the user actually asks to copy its choices.
-        details.addEventListener("toggle", () => {
-          if (!details.open) return;
-          details.querySelector("[data-copy-option-list]").innerHTML = [...source.options]
-            .filter(option => !option.disabled).map(option => field(option.label, option.value || option.label)).join("");
-        });
-        tools.append(details);
-      }
     }
   }
   document.addEventListener("click", event => {

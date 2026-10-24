@@ -204,7 +204,7 @@ export class IDEAccessServer {
       try { this.assertEntry(preview.request.entryId); } catch { res.writeHead(410).end(); return; }
       const r = preview.request;
       this.page(res, 200, "二次确认 · 复制命令", "核对项目后，复制一种选择，回到刚才已登记的机器人私聊或群聊发送。此页只复制，不批准浏览器；转发本页不能取得审批资格。",
-        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}</p>${workspaceScopeHtml(r)}<p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 15 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), 2)}</section>`).join("")}`); return;
+        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}</p>${workspaceScopeHtml(r)}<p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 15 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), { purpose: "reply", rows: 2 })}</section>`).join("")}`); return;
     }
     // A one-use grant is posted from the local Gateway UI, never placed in a
     // URL or forwarded to code-server. No other cross-origin mutation is allowed.
@@ -251,10 +251,10 @@ export class IDEAccessServer {
         const local = ["127.0.0.1", "localhost", "[::1]"].includes(new URL(this.manager.config().publicOrigin).hostname);
         const offer = this.approvalCopies?.offer(pending.request.id, id);
         const choiceControls = offer
-          ? `<p>项目：<strong>${escape(offer.request.projectName)}</strong><br>主机：${escape(offer.request.hostId)}</p>${workspaceScopeHtml(offer.request)}<p>IDE 允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。请选择一种权限，复制对应命令并在本人的机器人私聊或群聊发送一次；不会再要求第二条确认命令。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(offer.shortCode, c.choice), 2)}</section>`).join("")}`
-          : `${workspaceScopeHtml(this.manager.resolve(id))}<p>一次确认命令暂未就绪，可使用兼容流程在机器人私聊或群聊核对申请。</p>${copyField("兼容流程：先核对申请", `/ide auth ${pending.request.code}`)}`;
+          ? `<p>项目：<strong>${escape(offer.request.projectName)}</strong><br>主机：${escape(offer.request.hostId)}</p>${workspaceScopeHtml(offer.request)}<p>IDE 允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。请选择一种权限，复制对应命令并在本人的机器人私聊或群聊发送一次；不会再要求第二条确认命令。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(offer.shortCode, c.choice), { purpose: "reply", rows: 2 })}</section>`).join("")}`
+          : `${workspaceScopeHtml(this.manager.resolve(id))}<p>一次确认命令暂未就绪，可使用兼容流程在机器人私聊或群聊核对申请。</p>${copyField("兼容流程：先核对申请", `/ide auth ${pending.request.code}`, { purpose: "reply" })}`;
         this.page(res, 200, "等待 Gateway 授权", "当前浏览器尚未授权，不代表管理员登记丢失。核对下方项目、主机、目录和权限，再复制所选命令发给对应机器人。无需 Web IDE 密码。",
-          `<section data-ide-wait>${choiceControls}${copyField("浏览器识别码（仅核对用，无需单独发送）", pending.request.code)}</section><p>只批准你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天。管理员登记独立持久保存，不因 Gateway 重启失效，也不受这两个期限影响。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何登记审批管理员</summary><p>仅未登记的个人身份需要首次设置；已登记者无需重复操作。本页尚未验证你的钉钉身份，不判断你是否已登记。请在机器人私聊或群聊发送下方命令，查看本人真实登记状态。</p>${copyField("查询本人登记状态的命令", "/ide identity")}<p>命令确认未登记时，再到运行 Gateway 的电脑管理页「Web IDE → 授权管理员」登记个人 ID，不要填写群 ID。群白名单和 session 权限不等于 IDE 审批资格。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}/#ide">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
+          `<section data-ide-wait>${choiceControls}<p>浏览器识别码（仅核对用，无需单独发送）：<strong>${escape(pending.request.code)}</strong></p></section><p>只批准你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天。管理员登记独立持久保存，不因 Gateway 重启失效，也不受这两个期限影响。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何登记审批管理员</summary><p>仅未登记的个人身份需要首次设置；已登记者无需重复操作。本页尚未验证你的钉钉身份，不判断你是否已登记。请在机器人私聊或群聊发送下方命令，查看本人真实登记状态。</p>${copyField("查询本人登记状态的命令", "/ide identity", { purpose: "reply" })}<p>命令确认未登记时，再到运行 Gateway 的电脑管理页「Web IDE → 授权管理员」登记个人 ID，不要填写群 ID。群白名单和 session 权限不等于 IDE 审批资格。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}/#ide">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
       }
       const endpoint = this.manager.endpoint(id, session.trustWorkspace === true);
       if (endpoint) { this.redirect(res, editorDestination(id, endpoint)); return; }
@@ -365,7 +365,7 @@ function editorDestination(id: string, endpoint: { workspace: string; workspaceF
 }
 function workspaceScopeHtml(target: { workspace: string; rootPaths?: readonly string[] }): string {
   if (!target.rootPaths) return `<p>目录：${escape(target.workspace)}</p>`;
-  return `<section data-ide-project-roots><h2>本次工作区包含 ${target.rootPaths.length} 个目录</h2><p>以下目录将同时打开；批准并信任适用于全部所列目录。目录集合改变后需重新核对授权，不会自动扩大旧授权。</p>${target.rootPaths.map((root, index) => copyField(`目录 ${index + 1} · ${path.posix.basename(root)}`, root)).join("")}</section>`;
+  return `<section data-ide-project-roots><h2>本次工作区包含 ${target.rootPaths.length} 个目录</h2><p>以下目录将同时打开；批准并信任适用于全部所列目录。目录集合改变后需重新核对授权，不会自动扩大旧授权。</p><ul>${target.rootPaths.map(root => `<li><code style="overflow-wrap:anywhere">${escape(root)}</code></li>`).join("")}</ul></section>`;
 }
 async function readBody(req: IncomingMessage): Promise<string> {
   let length = 0; const chunks: Buffer[] = [];

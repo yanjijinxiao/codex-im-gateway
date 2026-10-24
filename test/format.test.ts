@@ -26,6 +26,14 @@ test("separates Bridge policy from the app-server user message", () => {
   assert.doesNotMatch(parts.prompt, /WeChat bridge rule/);
 });
 
+test("copy policy distinguishes actual handoffs from reference text and native form choices", () => {
+  const parts = buildPromptParts("核对项目目录");
+  assert.match(parts.developerInstructions, /reference-only project paths/);
+  assert.match(parts.developerInstructions, /complete valid command/);
+  assert.match(parts.developerInstructions, /Native form/);
+  assert.equal(stripBridgeInstructions(buildPrompt("核对项目目录")), "核对项目目录");
+});
+
 test("prompt tells Codex to inspect inbound attachment paths", () => {
   const prompt = buildPrompt("analyze this voice", [{
     kind: "audio",
