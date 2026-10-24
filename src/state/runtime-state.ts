@@ -42,6 +42,7 @@ export type ManagedProject = {
   id: string;
   name: string;
   workspace: string;
+  rootPaths?: readonly string[];
   sourceProjectId?: string;
   projectKind?: "local" | "remote";
   hostId?: string;
@@ -627,7 +628,7 @@ export class RuntimeStateStore {
   createProject(
     name: string,
     workspace: string,
-    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string } = {}
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string; rootPaths?: readonly string[] } = {}
   ): ManagedProject {
     const resolvedWorkspace = path.resolve(workspace);
     const existing = this.state.projects.find((project) => (
@@ -642,6 +643,7 @@ export class RuntimeStateStore {
       id: crypto.randomUUID(),
       name: cleanProjectName(name),
       workspace: resolvedWorkspace,
+      ...(metadata.rootPaths?.length ? { rootPaths: [...metadata.rootPaths] } : {}),
       ...(metadata.sourceProjectId ? { sourceProjectId: metadata.sourceProjectId } : {}),
       ...(metadata.projectKind ? { projectKind: metadata.projectKind } : {}),
       ...(metadata.hostId ? { hostId: metadata.hostId } : {}),
@@ -663,12 +665,16 @@ export class RuntimeStateStore {
 
   updateProjectMetadata(
     projectId: string,
-    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string }
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string; rootPaths?: readonly string[] }
   ): ManagedProject {
     const project = this.mutableProject(projectId);
     if (metadata.sourceProjectId) project.sourceProjectId = metadata.sourceProjectId;
     if (metadata.projectKind) project.projectKind = metadata.projectKind;
     if (metadata.hostId) project.hostId = metadata.hostId;
+    if (Object.hasOwn(metadata, "rootPaths")) {
+      if (metadata.rootPaths?.length) project.rootPaths = [...metadata.rootPaths];
+      else delete project.rootPaths;
+    }
     project.updatedAt = new Date().toISOString();
     this.save();
     return structuredClone(project);

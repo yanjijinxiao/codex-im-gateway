@@ -171,6 +171,28 @@ test("session extension preparation deduplicates clicks and releases controls on
   assert.equal(node("#sessionIDEPrepareButton").disabled, false); assert.equal(node("#sessionIDEButton").disabled, false);
 });
 
+test("local multi-root approval shows copyable directories before submitting the exact displayed scope", async () => {
+  const calls: any[] = [], scope = "a".repeat(64), roots = ["/bridge", "/farming"];
+  const { ui, context } = fixture(async (url, options) => {
+    calls.push({ url, body: options.body });
+    if (url === "/api/ide/entry") return { id: "entry", rootPaths: roots, scope };
+    assert.equal(url, "/api/ide/access"); return { entryId: "entry", action: "/authorize", token: "fixture" };
+  });
+  let close!: () => void, submitted = 0, show!: () => void;
+  const shown = new Promise<void>(resolve => { show = resolve; });
+  const dialog: any = { returnValue: "", innerHTML: "", className: "", showModal() { show(); }, remove() {},
+    addEventListener(event: string, listener: () => void) { if (event === "close") close = listener; } };
+  context.document.createElement = () => dialog; context.document.body = { append() {} };
+  context.selectedSession = () => ({ id: "session", accountId: "account", projectId: "project" });
+  context.window.open = () => ({ close() {}, document: { body: { append() {} }, createElement: () => ({ append() {}, submit() { submitted++; } }) } });
+  const operation = ui.open(); await shown;
+  assert.equal(calls.length, 1, "showing/copying scope must not grant access");
+  assert.match(dialog.innerHTML, /\/bridge/); assert.match(dialog.innerHTML, /\/farming/);
+  assert.equal((dialog.innerHTML.match(/data-copy-value/g) || []).length, 3);
+  dialog.returnValue = "approve"; close(); await operation;
+  assert.equal(calls[1].body.scope, scope); assert.equal(submitted, 1);
+});
+
 test("local direct management preserves its independent binding on save, including an offline selected address", async () => {
   const localAccess = { publicOrigin: "https://30.1.2.3:8790", bindAddress: "30.1.2.3", port: 8790 };
   const config = { enabled: true, routing: "per-host", sharedIngressHostId: "remote:test", port: 8790, publicOrigin: "http://127.0.0.1:8790", localAccess,

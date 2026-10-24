@@ -99,19 +99,22 @@ export class IDEAccessServer {
   port(): number | undefined { const address = this.server?.address(); return address && typeof address !== "string" ? address.port : undefined; }
   setManagementOrigin(origin: string): void { this.managementOrigin = origin; }
   setApprovalCopies(port: IDEApprovalCopyPort | undefined): void { this.approvalCopies = port; }
-  async grant(entryId: string, trustWorkspace = false): Promise<{ action: string; entryId: string; token: string }> {
+  async grant(entryId: string, trustWorkspace = false, expectedScope?: string): Promise<{ action: string; entryId: string; token: string }> {
     this.assertEntry(entryId);
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
-      const scope = this.scope(entryId), directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
+      const scope = this.scope(entryId);
+      if (expectedScope !== undefined && scope !== expectedScope) throw new Error("项目目录已改变，请重新核对完整目录后授权");
+      const directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未签发授权");
       if (decision.invalidated) throw new Error("项目授权配置已改变，未签发授权");
-      return { action: `${new URL(this.manager.config().publicOrigin).origin}/authorize`, entryId, token: this.authorization.grant(entryId, scope, trustWorkspace, directory) };
+      return { action: `${new URL(this.manager.config().publicOrigin).origin}/authorize`, entryId, token: this.authorization.grant(entryId, scope, trustWorkspace, directory?.workspace, directory?.rootPaths) };
     } finally { this.decisions.delete(decision); }
   }
   pendingAccess() {
     return this.authorization.pending().flatMap(request => {
-      try { const target = this.manager.resolve(request.entryId); return [{ ...request, hostId: target.hostId, projectName: target.projectName, workspace: target.workspace, scope: this.scope(request.entryId), url: new URL(`/workspace/${request.entryId}`, this.manager.config().publicOrigin).href }]; }
+      try { const target = this.manager.resolve(request.entryId); return [{ ...request, hostId: target.hostId, projectName: target.projectName, workspace: target.workspace,
+        ...(target.rootPaths ? { rootPaths: [...target.rootPaths] } : {}), scope: this.scope(request.entryId), url: new URL(`/workspace/${request.entryId}`, this.manager.config().publicOrigin).href }]; }
       catch { return []; }
     });
   }
@@ -122,7 +125,7 @@ export class IDEAccessServer {
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未批准授权");
       if (decision.invalidated) throw new Error("项目授权配置已改变，未批准授权");
       beforeCommit?.();
-      this.authorization.approve(requestId, entryId, scope, trustWorkspace, directory);
+      this.authorization.approve(requestId, entryId, scope, trustWorkspace, directory?.workspace, directory?.rootPaths);
     } finally { this.decisions.delete(decision); }
   }
   rejectAccess(requestId: string, entryId: string): void {
@@ -201,7 +204,7 @@ export class IDEAccessServer {
       try { this.assertEntry(preview.request.entryId); } catch { res.writeHead(410).end(); return; }
       const r = preview.request;
       this.page(res, 200, "二次确认 · 复制命令", "核对项目后，复制一种选择，回到刚才已登记的机器人私聊或群聊发送。此页只复制，不批准浏览器；转发本页不能取得审批资格。",
-        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}<br>目录：${escape(r.workspace)}</p><p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 15 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), 2)}</section>`).join("")}`); return;
+        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}</p>${workspaceScopeHtml(r)}<p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 15 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), 2)}</section>`).join("")}`); return;
     }
     // A one-use grant is posted from the local Gateway UI, never placed in a
     // URL or forwarded to code-server. No other cross-origin mutation is allowed.
@@ -248,13 +251,13 @@ export class IDEAccessServer {
         const local = ["127.0.0.1", "localhost", "[::1]"].includes(new URL(this.manager.config().publicOrigin).hostname);
         const offer = this.approvalCopies?.offer(pending.request.id, id);
         const choiceControls = offer
-          ? `<p>项目：<strong>${escape(offer.request.projectName)}</strong><br>主机：${escape(offer.request.hostId)}<br>目录：${escape(offer.request.workspace)}</p><p>IDE 允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。请选择一种权限，复制对应命令并在本人的机器人私聊或群聊发送一次；不会再要求第二条确认命令。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(offer.shortCode, c.choice), 2)}</section>`).join("")}`
-          : `<p>一次确认命令暂未就绪，可使用兼容流程在机器人私聊或群聊核对申请。</p>${copyField("兼容流程：先核对申请", `/ide auth ${pending.request.code}`)}`;
+          ? `<p>项目：<strong>${escape(offer.request.projectName)}</strong><br>主机：${escape(offer.request.hostId)}</p>${workspaceScopeHtml(offer.request)}<p>IDE 允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。请选择一种权限，复制对应命令并在本人的机器人私聊或群聊发送一次；不会再要求第二条确认命令。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(offer.shortCode, c.choice), 2)}</section>`).join("")}`
+          : `${workspaceScopeHtml(this.manager.resolve(id))}<p>一次确认命令暂未就绪，可使用兼容流程在机器人私聊或群聊核对申请。</p>${copyField("兼容流程：先核对申请", `/ide auth ${pending.request.code}`)}`;
         this.page(res, 200, "等待 Gateway 授权", "当前浏览器尚未授权，不代表管理员登记丢失。核对下方项目、主机、目录和权限，再复制所选命令发给对应机器人。无需 Web IDE 密码。",
           `<section data-ide-wait>${choiceControls}${copyField("浏览器识别码（仅核对用，无需单独发送）", pending.request.code)}</section><p>只批准你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天。管理员登记独立持久保存，不因 Gateway 重启失效，也不受这两个期限影响。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何登记审批管理员</summary><p>仅未登记的个人身份需要首次设置；已登记者无需重复操作。本页尚未验证你的钉钉身份，不判断你是否已登记。请在机器人私聊或群聊发送下方命令，查看本人真实登记状态。</p>${copyField("查询本人登记状态的命令", "/ide identity")}<p>命令确认未登记时，再到运行 Gateway 的电脑管理页「Web IDE → 授权管理员」登记个人 ID，不要填写群 ID。群白名单和 session 权限不等于 IDE 审批资格。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}/#ide">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
       }
       const endpoint = this.manager.endpoint(id, session.trustWorkspace === true);
-      if (endpoint) { this.redirect(res, `/ide/${id}/?folder=${encodeURIComponent(endpoint.workspace)}`); return; }
+      if (endpoint) { this.redirect(res, editorDestination(id, endpoint)); return; }
       // GET remains read-only: a nonce-protected same-origin form performs the
       // existing CSRF-checked POST. Link previews cannot start an IDE or grant
       // workspace trust. With scripts disabled there is an explicit fallback.
@@ -268,14 +271,14 @@ export class IDEAccessServer {
       const form = new URLSearchParams(await readBody(req));
       if (form.get("csrf") !== session.csrf) { res.writeHead(403).end(); return; }
       let instance;
-      try { instance = await this.manager.open(open[1], session.trustWorkspace === true, session.trustedDirectory); }
+      try { instance = await this.manager.open(open[1], session.trustWorkspace === true, session.trustedDirectory, session.trustedRootPaths); }
       catch (error) {
         if (!(error instanceof IDEInstallPendingError)) throw error;
         this.page(res, 202, "正在准备 code-server", error.message, `<p>准备完成后会自动进入，无需再次批准。</p><a data-ide-retry href="/workspace/${open[1]}">立即检查进度</a>`,
           `setTimeout(()=>location.replace(document.querySelector('[data-ide-retry]').href),3000);`); return;
       }
       if (!this.authorization.active(session)) { res.writeHead(401).end(); return; }
-      const destination = `/ide/${open[1]}/?folder=${encodeURIComponent(instance.workspace)}`;
+      const destination = editorDestination(open[1], instance);
       // Extension preparation warnings remain visible in management status;
       // they must not add another gate in front of an authorized editor.
       this.redirect(res, destination); return;
@@ -285,12 +288,13 @@ export class IDEAccessServer {
       if (!session) { this.redirect(res, `/workspace/${ide[1]}`); return; }
       const endpoint = this.manager.endpoint(ide[1], session.trustWorkspace === true);
       if (!endpoint) { this.redirect(res, `/workspace/${ide[1]}`); return; }
-      if (session.trustWorkspace && ide[2] === "/") {
-        const folders = url.searchParams.getAll("folder");
-        if (url.searchParams.has("workspace") || url.searchParams.has("ew") || folders.length > 1 || (folders.length === 1 && folders[0] !== endpoint.workspace)) {
-          this.page(res, 403, "目录未获本次授权", "此授权仅用于当前项目目录；请从 Gateway 中打开其他项目。"); return;
+      if ((session.trustWorkspace || endpoint.workspaceFile) && ide[2] === "/") {
+        const key = endpoint.workspaceFile ? "workspace" : "folder", other = endpoint.workspaceFile ? "folder" : "workspace";
+        const values = url.searchParams.getAll(key), expected = endpoint.workspaceFile ?? endpoint.workspace;
+        if (url.searchParams.has(other) || url.searchParams.has("ew") || values.length > 1 || (values.length === 1 && values[0] !== expected)) {
+          this.page(res, 403, "目录未获本次授权", "此授权仅用于所示项目工作区；请从 Gateway 中打开其他项目。"); return;
         }
-        if (!folders.length) { this.redirect(res, `${url.pathname}?folder=${encodeURIComponent(endpoint.workspace)}`); return; }
+        if (!values.length) { this.redirect(res, editorDestination(ide[1], endpoint)); return; }
       }
       const prefix = `/ide/${ide[1]}`;
       this.track(req.socket, session, endpoint.instanceId);
@@ -355,6 +359,13 @@ export class IDEAccessServer {
     res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`);
     res.writeHead(status).end(`<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>body{margin:10vh auto;max-width:620px;padding:24px;color:#25342d;background:#f6f8f5;font:17px Georgia,serif}h1{font-size:30px}p{line-height:1.7;overflow-wrap:anywhere}label{display:grid;gap:8px}input,button{font:inherit;padding:12px;margin:12px 0}button{background:#214f3a;color:white;border:0;border-radius:6px;cursor:pointer}input{border:1px solid #aab7af}${COPY_STYLE}</style><h1>${escape(title)}</h1><p>${escape(text)}</p>${body}<script nonce="${nonce}">${COPY_SCRIPT}\n${script}</script></html>`);
   }
+}
+function editorDestination(id: string, endpoint: { workspace: string; workspaceFile?: string }): string {
+  return `/ide/${id}/?${endpoint.workspaceFile ? "workspace" : "folder"}=${encodeURIComponent(endpoint.workspaceFile ?? endpoint.workspace)}`;
+}
+function workspaceScopeHtml(target: { workspace: string; rootPaths?: readonly string[] }): string {
+  if (!target.rootPaths) return `<p>目录：${escape(target.workspace)}</p>`;
+  return `<section data-ide-project-roots><h2>本次工作区包含 ${target.rootPaths.length} 个目录</h2><p>以下目录将同时打开；批准并信任适用于全部所列目录。目录集合改变后需重新核对授权，不会自动扩大旧授权。</p>${target.rootPaths.map((root, index) => copyField(`目录 ${index + 1} · ${path.posix.basename(root)}`, root)).join("")}</section>`;
 }
 async function readBody(req: IncomingMessage): Promise<string> {
   let length = 0; const chunks: Buffer[] = [];

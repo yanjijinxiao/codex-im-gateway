@@ -796,8 +796,20 @@ export class AccountManager {
       const project = store.getProject(session.projectId); if (!project) return;
       const hostId = session.hostId ?? project.hostId ?? "local";
       if (hostId !== (project.hostId ?? "local") || (project.projectKind === "remote" && hostId === "local")) return;
+      // Desktop can change project membership while Gateway is running. Read
+      // its full root set, not just the thread cwd; never mix hosts or backends.
+      const nativeProject = this.configProvider().codexBackend === "exec" ? undefined
+        : readCodexDesktopProjects().find(candidate => (candidate.hostId ?? "local") === hostId
+          && (project.sourceProjectId ? candidate.projectId === project.sourceProjectId : candidate.workspace === project.workspace));
+      if (nativeProject?.available === false) return;
+      const roots = nativeProject?.rootPaths ?? (nativeProject ? [nativeProject.workspace] : project.rootPaths);
+      // A worktree session replaces its project's primary checkout, rather
+      // than exposing both checkouts. Sibling roots remain explicit members.
+      const rootPaths = roots?.length && !roots.includes(session.workspace)
+        ? [session.workspace, ...roots.filter(root => root !== project.workspace)] : roots;
       return { owner: "gateway-owner", sessionId, hostId, workspace: session.workspace, projectName: project.name,
-        projectId: project.id, nativeThreadId: session.threadId };
+        projectId: project.id, nativeThreadId: session.threadId,
+        ...(rootPaths && rootPaths.length > 1 ? { rootPaths: [...rootPaths] } : {}) };
     } catch { return; }
   }
 
@@ -812,7 +824,9 @@ export class AccountManager {
       const project = store.getProject(session.projectId!);
       if (state.internal || state.persistence === "missing" || !state.cwd
         || (project?.sourceProjectId && state.projectId !== project.sourceProjectId)) throw new Error("原生 session 项目关系已改变，未启动 IDE");
-      return { ...target, workspace: state.cwd };
+      return { ...target, workspace: state.cwd,
+        ...(target.rootPaths ? { rootPaths: target.rootPaths.includes(state.cwd) ? target.rootPaths
+          : target.rootPaths.map(root => root === target.workspace ? state.cwd! : root) } : {}) };
     } finally { if (timer) clearTimeout(timer); }
   }
 
@@ -927,7 +941,7 @@ export class AccountManager {
     accountId: string,
     name: string,
     workspace: string,
-    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string } = {}
+    metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string; rootPaths?: readonly string[] } = {}
   ): AccountProject {
     const config = this.configProvider();
     const targetWorkspace = path.resolve(workspace);
@@ -1310,9 +1324,11 @@ export class AccountManager {
       project.sourceProjectId === candidate.projectId
       && project.projectKind === candidate.projectKind
       && project.hostId === candidate.hostId
+      && JSON.stringify(project.rootPaths) === JSON.stringify(candidate.rootPaths)
     ) return project;
     return store.updateProjectMetadata(project.id, {
       sourceProjectId: candidate.projectId,
+      rootPaths: candidate.rootPaths,
       projectKind: candidate.projectKind,
       hostId: candidate.hostId
     });

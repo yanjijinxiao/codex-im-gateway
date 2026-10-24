@@ -5,16 +5,17 @@ import path from "node:path";
 const REQUEST_TTL = 5 * 60_000;
 export const IDE_SESSION_DAYS = 15;
 export const IDE_SESSION_TTL_MS = IDE_SESSION_DAYS * 24 * 60 * 60_000;
-export type IDEBrowserSession = { entryId: string; scope: string; expiresAt: number; csrf: string; trustWorkspace?: boolean; trustedDirectory?: string };
+type WorkspaceTrust = { trustWorkspace?: boolean; trustedDirectory?: string; trustedRootPaths?: readonly string[] };
+export type IDEBrowserSession = WorkspaceTrust & { entryId: string; scope: string; expiresAt: number; csrf: string };
 export type IDEAccessRequest = { id: string; entryId: string; code: string; expiresAt: number; approved: boolean };
-type Pending = IDEAccessRequest & { proof: string; scope: string; trustWorkspace?: boolean; trustedDirectory?: string };
+type Pending = IDEAccessRequest & WorkspaceTrust & { proof: string; scope: string };
 const random = () => crypto.randomBytes(32).toString("base64url");
 const hash = (value: string) => crypto.createHash("sha256").update(value).digest("hex");
 
 /** The local, mutation-protected Gateway API is the authority. IM URLs and
  * visible pairing codes are identifiers, never bearer credentials. */
 export class IDEAuthorization {
-  private readonly grants = new Map<string, { entryId: string; scope: string; expiresAt: number; trustWorkspace: boolean; trustedDirectory?: string }>();
+  private readonly grants = new Map<string, WorkspaceTrust & { entryId: string; scope: string; expiresAt: number }>();
   private readonly requests = new Map<string, Pending>();
   private readonly sessions = new Map<string, IDEBrowserSession>();
   private persistenceDirty = false;
@@ -30,7 +31,8 @@ export class IDEAuthorization {
       if (!record || !/^[a-f0-9]{64}$/.test(record.hash) || !record.session || typeof record.session.entryId !== "string"
         || typeof record.session.scope !== "string" || typeof record.session.csrf !== "string"
         || !Number.isFinite(record.session.expiresAt) || (record.session.trustWorkspace !== undefined && typeof record.session.trustWorkspace !== "boolean")
-        || (record.session.trustWorkspace && (typeof record.session.trustedDirectory !== "string" || !path.posix.isAbsolute(record.session.trustedDirectory)))) throw new Error("IDE 授权记录无效；未覆盖原记录。");
+        || (record.session.trustWorkspace && (typeof record.session.trustedDirectory !== "string" || !path.posix.isAbsolute(record.session.trustedDirectory)))
+        || (record.session.trustedRootPaths !== undefined && !validRoots(record.session.trustedRootPaths, record.session.trustedDirectory))) throw new Error("IDE 授权记录无效；未覆盖原记录。");
       if (record.session.expiresAt > now() && record.session.expiresAt <= now() + IDE_SESSION_TTL_MS) this.sessions.set(record.hash, record.session);
     }
   }
@@ -53,15 +55,16 @@ export class IDEAuthorization {
       for (const [id, value] of map) if (value.expiresAt <= now) map.delete(id);
     }
   }
-  grant(entryId: string, scope = entryId, trustWorkspace = false, trustedDirectory?: string): string {
+  grant(entryId: string, scope = entryId, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]): string {
     this.prune();
     if (this.grants.size >= 100) throw new Error("待使用的 IDE 授权过多，请稍后重试");
-    const token = random(); this.grants.set(hash(token), { entryId, scope, expiresAt: this.now() + 60_000, trustWorkspace, trustedDirectory }); return token;
+    const token = random(); this.grants.set(hash(token), { entryId, scope, expiresAt: this.now() + 60_000, trustWorkspace, trustedDirectory,
+      ...(trustedRootPaths ? { trustedRootPaths: [...trustedRootPaths] } : {}) }); return token;
   }
   consume(token: string, entryId: string, scope = entryId): { token: string; session: IDEBrowserSession } | undefined {
     this.prune(); const key = hash(token), grant = this.grants.get(key);
     if (!grant || grant.entryId !== entryId || grant.scope !== scope) return;
-    this.grants.delete(key); return this.createSession(entryId, scope, grant.trustWorkspace, grant.trustedDirectory);
+    this.grants.delete(key); return this.createSession(entryId, scope, grant.trustWorkspace, grant.trustedDirectory, grant.trustedRootPaths);
   }
   request(entryId: string, existing?: { id: string; proof: string }, scope = entryId): { request: IDEAccessRequest; proof: string } {
     this.prune(); const previous = existing && this.requests.get(existing.id);
@@ -74,10 +77,11 @@ export class IDEAuthorization {
     this.requests.set(request.id, request); return { request: this.public(request), proof };
   }
   pending(): IDEAccessRequest[] { this.prune(); return [...this.requests.values()].filter(r => !r.approved).map(r => this.public(r)); }
-  approve(id: string, entryId: string, scope = entryId, trustWorkspace = false, trustedDirectory?: string): void {
+  approve(id: string, entryId: string, scope = entryId, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]): void {
     this.prune(); const request = this.requests.get(id);
     if (!request || request.approved || request.entryId !== entryId || request.scope !== scope) throw new Error("浏览器申请已过期、已处理或项目不匹配，请刷新");
     request.approved = true; request.trustWorkspace = trustWorkspace; request.trustedDirectory = trustedDirectory;
+    request.trustedRootPaths = trustedRootPaths ? [...trustedRootPaths] : undefined;
   }
   reject(id: string, entryId: string, scope = entryId): void {
     this.prune(); const request = this.requests.get(id);
@@ -87,7 +91,7 @@ export class IDEAuthorization {
   exchangeRequest(id: string, proof: string, entryId: string, scope = entryId): { token: string; session: IDEBrowserSession } | undefined {
     this.prune(); const request = this.requests.get(id);
     if (!request?.approved || request.entryId !== entryId || request.scope !== scope || request.proof !== hash(proof)) return;
-    this.requests.delete(id); return this.createSession(entryId, scope, request.trustWorkspace, request.trustedDirectory);
+    this.requests.delete(id); return this.createSession(entryId, scope, request.trustWorkspace, request.trustedDirectory, request.trustedRootPaths);
   }
   authenticate(token: string | undefined, entryId: string, scope = entryId): IDEBrowserSession | undefined {
     this.prune(); const session = token && this.sessions.get(hash(token));
@@ -104,13 +108,19 @@ export class IDEAuthorization {
     // A no-op reconciliation must not rewrite or extend durable grants.
     if (persisted || this.persistenceDirty) this.persist();
   }
-  private createSession(entryId: string, scope: string, trustWorkspace = false, trustedDirectory?: string) {
+  private createSession(entryId: string, scope: string, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]) {
     if (trustWorkspace && (!trustedDirectory || !path.posix.isAbsolute(trustedDirectory))) throw new Error("未核对可信目录，未签发授权");
+    if (trustedRootPaths !== undefined && !validRoots(trustedRootPaths, trustedDirectory)) throw new Error("未核对完整目录，未签发授权");
     this.prune(); if (this.sessions.size >= 100) throw new Error("IDE 浏览器会话达到上限，请撤销不用的授权");
-    const token = random(), session = { entryId, scope, expiresAt: this.now() + IDE_SESSION_TTL_MS, csrf: random(), trustWorkspace, trustedDirectory };
+    const token = random(), session = { entryId, scope, expiresAt: this.now() + IDE_SESSION_TTL_MS, csrf: random(), trustWorkspace, trustedDirectory,
+      ...(trustedRootPaths ? { trustedRootPaths: [...trustedRootPaths] } : {}) };
     this.sessions.set(hash(token), session);
     try { this.persist(); } catch (error) { this.sessions.delete(hash(token)); throw error; }
     return { token, session };
   }
-  private public({ proof: _, scope: __, trustWorkspace: ___, trustedDirectory: ____, ...request }: Pending): IDEAccessRequest { return request; }
+  private public({ proof: _, scope: __, trustWorkspace: ___, trustedDirectory: ____, trustedRootPaths: _____, ...request }: Pending): IDEAccessRequest { return request; }
+}
+function validRoots(value: unknown, directory: string | undefined): value is string[] {
+  return Array.isArray(value) && value.length >= 2 && value.length <= 32 && value.includes(directory)
+    && new Set(value).size === value.length && value.every(root => typeof root === "string" && path.posix.isAbsolute(root) && !/[\r\n\0]/.test(root));
 }

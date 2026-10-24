@@ -735,6 +735,11 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
 .ide-extensions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 20px 0; overflow-wrap: anywhere; }
 .ide-instance { display: flex; gap: 20px; justify-content: space-between; align-items: center; border-top: 1px solid var(--ide-rule); padding: 18px 0; }
 .ide-instance p { overflow-wrap: anywhere; }
+.ide-root-scope { width: min(620px, calc(100vw - 40px)); max-height: 85vh; overflow: auto; padding: 24px; border: 1px solid var(--ide-rule); border-radius: 10px; color: #24392d; background: #fff; }
+.ide-root-scope::backdrop { background: #142b2266; }
+.ide-root-scope p { line-height: 1.7; }
+.ide-root-scope form { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 20px; }
+.ide-root-scope form button { padding: 10px 14px; cursor: pointer; }
 .ide-approval-actions { display: flex; flex-wrap: wrap; gap: 10px; max-width: 440px; min-width: 0; }
 .ide-approval-actions p { flex-basis: 100%; margin: 0; line-height: 1.7; }
 .ide-error { color: #a13232; }

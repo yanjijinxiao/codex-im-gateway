@@ -130,7 +130,7 @@ export class IDEEndpointManager {
       authorizationFile: () => spec.localDirect ? path.join(path.dirname(this.manager.authorizationFile()), "authorization-local-direct.json")
         : hostId ? path.join(path.dirname(this.manager.authorizationFile()), `authorization-${hostKey(hostId)}.json`) : this.manager.authorizationFile(),
       canonicalForTrust: id => { resolve(id); return this.manager.canonicalForTrust(id); },
-      open: (id, trust, directory) => { resolve(id); return this.manager.open(id, trust, directory); },
+      open: (id, trust, directory, roots) => { resolve(id); return this.manager.open(id, trust, directory, roots); },
       endpoint: (id, trust) => { resolve(id); return this.manager.endpoint(id, trust); },
       resume: () => this.manager.resume(), close: async () => {}
     };
@@ -186,7 +186,7 @@ export class IDEEndpointManager {
     if (!endpoint || this.endpointStatus(endpoint).state !== "ready") throw new Error("此项目的浏览器入口尚未就绪；请查看 Web IDE 入口状态，后台正在重连。不会改用其他地址。");
     return endpoint.server;
   }
-  grant(id: string, trustWorkspace = false) { return this.serverFor(id).grant(id, trustWorkspace); }
+  grant(id: string, trustWorkspace = false, expectedScope?: string) { return this.serverFor(id).grant(id, trustWorkspace, expectedScope); }
   private requestServer(requestId: string, id: string): IDEAccessServer {
     const matches = [...this.endpoints.values()].filter(({ server }) => server.pendingAccess().some(request => request.id === requestId && request.entryId === id));
     if (matches.length !== 1) throw new Error("浏览器申请已失效或不唯一，请刷新后重新申请");

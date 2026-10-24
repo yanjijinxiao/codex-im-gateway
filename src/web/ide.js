@@ -3,6 +3,7 @@ window.gatewayIDE = (() => {
   const receipts = new Map();
   let approverMarkup = "", approverAccountsMarkup = "", approverBusy = false;
   const $ = selector => document.querySelector(selector);
+  const rootFields = item => (item.rootPaths || [item.workspace]).map((root, index) => window.gatewayCopy.field(`目录 ${index + 1}`, root)).join("");
   function message(text, error = false) {
     const el = $("#ideMessage"); el.textContent = text; el.classList.toggle("ide-error", error);
   }
@@ -79,7 +80,7 @@ window.gatewayIDE = (() => {
     const markup = instances.length ? instances.map(instance => {
       const p = instance.profile;
       const profile = p ? `<p role="status">${escapeHtml(labels[p.phase] || p.phase)}${p.activeExtension ? `：${escapeHtml(p.activeExtension)}` : ""}</p>${p.installed?.length ? `<small>已安装：${p.installed.map(item => `${escapeHtml(item.id)} @ ${escapeHtml(item.version)}`).join("、")}</small>` : ""}${p.missing?.length ? `<p>未就绪：${p.missing.map(escapeHtml).join("、")}</p>` : ""}${p.warning ? `<p class="ide-error">${p.warning === "settings-unmodified" ? "IDE 设置无法安全补充，原文件未改动。请检查 settings.json。" : "扩展准备失败，编辑器仍可使用；请检查 Open VSX 网络、扩展兼容性及目录权限，停止该 IDE 后重试准备扩展。"}</p>` : ""}` : "<p>尚未核验扩展；下次启动时检查。</p>";
-      return `<article class="ide-instance"><div><strong>${escapeHtml(instance.status)}</strong><p>${escapeHtml(instance.hostId)} · ${escapeHtml(instance.workspace)}</p>${profile}${instance.error ? `<p class="ide-error">${escapeHtml(instance.error)}</p>` : ""}</div><button class="button button-secondary" data-ide-stop="${escapeAttr(instance.id)}" ${["starting", "stopped"].includes(instance.status) ? "disabled" : ""}>停止 IDE</button></article>`;
+      return `<article class="ide-instance"><div><strong>${escapeHtml(instance.status)}</strong><p>${escapeHtml(instance.hostId)}</p>${rootFields(instance)}${profile}${instance.error ? `<p class="ide-error">${escapeHtml(instance.error)}</p>` : ""}</div><button class="button button-secondary" data-ide-stop="${escapeAttr(instance.id)}" ${["starting", "stopped"].includes(instance.status) ? "disabled" : ""}>停止 IDE</button></article>`;
     }).join("") : '<p class="empty-state">尚无 IDE 实例。保存后从会话中的「Web IDE」进入。</p>';
     if (markup !== instanceMarkup) { instanceMarkup = markup; $("#ideInstances").innerHTML = markup; }
   }
@@ -89,7 +90,7 @@ window.gatewayIDE = (() => {
     const items = [...requests.filter(item => !receipts.has(item.id)), ...receipts.values()];
     const markup = items.length ? items.map(item => {
       const button = (trust, label) => `<button type="button" class="button button-secondary" data-ide-approve="${escapeAttr(item.id)}" data-ide-entry="${escapeAttr(item.entryId)}" data-ide-code="${escapeAttr(item.code)}" data-ide-trust="${trust}">${label}</button>`;
-      return `<article class="ide-instance" data-ide-request="${escapeAttr(item.id)}"><div>${window.gatewayCopy.field("浏览器识别码", item.code)}<p>${escapeHtml(item.projectName)} · ${escapeHtml(item.hostId)}</p><p>${escapeHtml(item.workspace)}</p><small>申请有效至 ${escapeHtml(new Date(item.expiresAt).toLocaleTimeString())}；新授权有效期 ${escapeHtml(sessionDuration)}，重启不丢失。</small></div><div class="ide-approval-actions">${item.approved ? `<p role="status">已批准${item.trustWorkspace ? "并信任此目录" : "访问"}。原浏览器将自动继续；若仍在等待，请在原页点击「批准后继续」。</p>` : button(true, "批准并信任此目录") + button(false, "仅批准访问")}</div></article>`;
+      return `<article class="ide-instance" data-ide-request="${escapeAttr(item.id)}"><div>${window.gatewayCopy.field("浏览器识别码", item.code)}<p>${escapeHtml(item.projectName)} · ${escapeHtml(item.hostId)}</p>${item.rootPaths ? `<p>工作区包含 ${item.rootPaths.length} 个目录；权限涵盖全部所列目录。</p>` : ""}${rootFields(item)}<small>申请有效至 ${escapeHtml(new Date(item.expiresAt).toLocaleTimeString())}；新授权有效期 ${escapeHtml(sessionDuration)}，重启不丢失。</small></div><div class="ide-approval-actions">${item.approved ? `<p role="status">已批准${item.trustWorkspace ? "并信任此目录" : "访问"}。原浏览器将自动继续；若仍在等待，请在原页点击「批准后继续」。</p>` : button(true, "批准并信任此目录") + button(false, "仅批准访问")}</div></article>`;
     }).join("") : '<p>没有待批准的浏览器。</p>';
     if (approval || requestMarkup === markup) return;
     requestMarkup = markup; $("#ideAccessRequests").innerHTML = markup;
@@ -210,12 +211,13 @@ window.gatewayIDE = (() => {
     try {
       tab = prepare ? undefined : window.open("about:blank", "_blank"); if (tab) tab.opener = null;
       const entry = await api("/api/ide/entry", { method: "POST", body: { accountId: session.accountId, sessionId: session.id } });
+      if (entry.rootPaths?.length > 1 && !await confirmRootScope(entry.rootPaths)) { tab?.close(); return; }
       if (prepare) {
         if (!window.confirm("将核验并从 Open VSX 安装该实例缺失的所选扩展；已安装的不会重复下载。需先停止对应 IDE，不会提交 Codex 任务。继续？")) return;
         toast("正在准备扩展，请勿重复操作…");
-        await api(`/api/ide/workspaces/${entry.id}/prepare`, { method: "POST", body: { trustWorkspace: true } }); toast("授权并信任目录的 IDE 实例扩展准备完成");
+        await api(`/api/ide/workspaces/${entry.id}/prepare`, { method: "POST", body: { trustWorkspace: true, ...(entry.scope ? { scope: entry.scope } : {}) } }); toast("授权并信任目录的 IDE 实例扩展准备完成");
       } else if (tab) {
-        const grant = await api("/api/ide/access", { method: "POST", body: { entryId: entry.id, trustWorkspace: true } });
+        const grant = await api("/api/ide/access", { method: "POST", body: { entryId: entry.id, trustWorkspace: true, ...(entry.scope ? { scope: entry.scope } : {}) } });
         // Form POST keeps the one-use credential out of URLs, history and logs.
         const doc = tab.document, form = doc.createElement("form"); form.method = "post"; form.action = grant.action;
         for (const [name, value] of Object.entries({ entryId: grant.entryId, token: grant.token })) {
@@ -225,6 +227,16 @@ window.gatewayIDE = (() => {
       } else toast("浏览器阻止了新窗口，请允许弹窗后重试。");
     } catch (error) { tab?.close(); toast(error.message); }
     finally { opening = false; buttons.forEach(button => { button.disabled = false; }); }
+  }
+  function confirmRootScope(rootPaths) {
+    // Copy controls remain inert; only an explicit action grants this expanded
+    // scope. Do not use a native confirm dialog with uncopyable directory text.
+    return new Promise(resolve => {
+      const dialog = document.createElement("dialog"); dialog.className = "ide-root-scope";
+      dialog.innerHTML = `<h2>授权并信任多目录工作区</h2><p>本次将在同一个 IDE 中打开以下 ${rootPaths.length} 个目录，允许编辑、终端及任务运行。请核对全部目录；不会合并 Git 仓库。</p>${rootFields({ rootPaths })}${window.gatewayCopy.field("确认操作（仅复制）", "授权并信任工作区")}<form method="dialog"><button value="cancel" type="submit">取消</button><button value="approve" type="submit">授权并信任工作区</button></form>`;
+      dialog.addEventListener("close", () => { const approved = dialog.returnValue === "approve"; dialog.remove(); resolve(approved); }, { once: true });
+      document.body.append(dialog); dialog.showModal();
+    });
   }
   document.addEventListener("DOMContentLoaded", () => {
     $("#ideApproverForm").addEventListener("submit", event => {

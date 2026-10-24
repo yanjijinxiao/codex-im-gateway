@@ -161,6 +161,17 @@ test("reads local and remote projects in Codex Desktop sidebar order", (t) => {
   ]);
 });
 
+test("keeps the complete Desktop and app-server multi-root membership including unavailable siblings", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-multi-project-")); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, "codex"), bridge = path.join(root, "bridge"), sibling = path.join(root, "farming");
+  fs.mkdirSync(home); fs.mkdirSync(bridge);
+  fs.writeFileSync(path.join(home, ".codex-global-state.json"), JSON.stringify({ "local-projects": { two: { id: "two", name: "two", rootPaths: [bridge, sibling] } } }));
+  const desktop = readCodexDesktopProjects(home); assert.deepEqual(desktop[0].rootPaths, [fs.realpathSync(bridge), sibling]);
+  const merged = mergeCodexProjectCandidates([{ id: "two", name: "stale", roots: [bridge] }], home);
+  assert.deepEqual(merged[0].rootPaths, [fs.realpathSync(bridge), sibling], "a truncated daemon catalog cannot replace Desktop membership");
+  assert.deepEqual(mergeCodexProjectCandidates([{ id: "other", name: "other", roots: [bridge, sibling] }], path.join(root, "empty"))[0].rootPaths, [bridge, sibling]);
+});
+
 test("reads and deduplicates existing projects from Codex session metadata", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-project-history-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

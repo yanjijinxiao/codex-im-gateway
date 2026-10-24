@@ -46,7 +46,7 @@ class FakeTransport implements IDEHostTransport {
       socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
     });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); }); this.servers.push(server);
-    return { socketPath, alive: () => alive, stop: async () => {
+    return { socketPath, ...(input.rootPaths ? { workspaceFile: `/private/ide/${input.id}/project.code-workspace` } : {}), alive: () => alive, stop: async () => {
       alive = false; for (const socket of this.sockets) socket.destroy();
       server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
       fs.rmSync(directory, { recursive: true, force: true });
@@ -287,6 +287,103 @@ test("workspace resolution requires actual managed project membership and host i
   assert.equal(manager.ideWorkspace("account", session.id)?.hostId, "remote:test");
   const noProject = store.createSession("other", "/project", "independent", undefined, "session", undefined, { standalone: true });
   assert.equal(manager.ideWorkspace("account", noProject.id), undefined);
+});
+
+test("same project entry opens both roots only after explicit expanded approval and persists exact trust", async t => {
+  const request = (url: string, init: RequestInit = {}) => fetch(url, { ...init, headers: { ...init.headers, Connection: "close" } });
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-multi-http-")), transport = new FakeTransport();
+  let target: IDEWorkspace = { owner: "owner", sessionId: "s", hostId: "local", workspace: "/alias/bridge", projectName: "two repos" };
+  const manager = new WorkspaceIDEManager({ root, transport, resolve: () => target });
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`, management = "http://127.0.0.1:18788";
+  manager.configStore.save(config(manager.configStore, port));
+  let access = new IDEAccessServer(manager); access.setManagementOrigin(management); await access.reload(false);
+  t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const entry = manager.entry("a", "s")!;
+  const login = async (trust: boolean) => {
+    const grant = await access.grant(entry.id, trust);
+    const response = await request(grant.action, { method: "POST", redirect: "manual", headers: { Origin: management }, body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
+    assert.equal(response.status, 303); return response.headers.get("set-cookie")!.split(";")[0];
+  };
+  const oldCookie = await login(true);
+  target = { ...target, rootPaths: ["/alias/bridge", "/alias/farming"] };
+  assert.equal(manager.entry("a", "s")!.url, entry.url, "project keeps its single stable link");
+  const pending = await request(entry.url + "?auth_check=1", { headers: { Cookie: oldCookie } });
+  const html = await pending.text(); assert.match(html, /等待 Gateway 授权/); assert.match(html, /2 个目录/);
+  assert.match(html, /\/alias\/bridge/); assert.match(html, /\/alias\/farming/);
+  assert.deepEqual(access.pendingAccess()[0].rootPaths, target.rootPaths);
+  assert.equal(transport.launches.length, 0, "old single root grant cannot launch expanded scope");
+  const cookie = await login(true), approved = await (await request(entry.url, { headers: { Cookie: cookie } })).text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(approved)![1];
+  const opened = await request(`${origin}/open/${entry.id}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }) });
+  assert.equal(opened.status, 303); const location = opened.headers.get("location")!;
+  assert.match(location, /\?workspace=/); assert.doesNotMatch(location, /\?folder=/);
+  assert.deepEqual(transport.launches[0].rootPaths, ["/canonical/bridge", "/canonical/farming"]);
+  for (const query of ["folder=/etc", "workspace=/etc/other.code-workspace", "ew=true", "workspace=a&workspace=b"]) {
+    const denied = await request(`${origin}/ide/${entry.id}/?${query}`, { headers: { Cookie: cookie }, redirect: "manual" });
+    assert.equal(denied.status, 403); await denied.text();
+  }
+  const warm = await request(entry.url, { headers: { Cookie: cookie }, redirect: "manual" }); assert.equal(warm.headers.get("location"), location);
+  const persisted = JSON.parse(fs.readFileSync(manager.authorizationFile(), "utf8"));
+  const multi = persisted.sessions.find((item: any) => item.session.trustedRootPaths);
+  assert.deepEqual(multi.session.trustedRootPaths, ["/canonical/bridge", "/canonical/farming"]);
+  const expiry = multi.session.expiresAt;
+  await access.close(); access = new IDEAccessServer(manager); access.setManagementOrigin(management); await access.reload(false);
+  const after = await (await request(entry.url, { headers: { Cookie: cookie } })).text();
+  assert.doesNotMatch(after, /等待 Gateway 授权/); assert.match(after, /data-ide-auto-open/);
+  assert.equal(JSON.parse(fs.readFileSync(manager.authorizationFile(), "utf8")).sessions.find((item: any) => item.session.trustedRootPaths).session.expiresAt, expiry);
+  const confirmedScope = manager.authorizationScope(entry.id);
+  target = { ...target, rootPaths: [...target.rootPaths!, "/alias/third"] };
+  await assert.rejects(access.grant(entry.id, true, confirmedScope), /重新核对完整目录/);
+  assert.match(await (await request(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text(), /等待 Gateway 授权/);
+});
+
+test("managed project metadata exposes all same-host IDE roots without changing session cwd or binding", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-multi-membership-")), paths = resolveStatePaths(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  saveAccount(paths, { accountId: "account", token: "test", baseUrl: "http://localhost" });
+  const store = new RuntimeStateStore(accountStatePaths(paths, "account"));
+  const project = store.createProject("two", "/bridge", { hostId: "remote:test", projectKind: "remote", rootPaths: ["/bridge", "/farming"] });
+  const session = store.createSession("conversation", "/bridge", "task", project.id); store.setSessionThread(session.id, "native");
+  const manager = new AccountManager({ paths }), target = manager.ideWorkspace("account", session.id)!;
+  assert.deepEqual(target.rootPaths, ["/bridge", "/farming"]); assert.equal(target.workspace, "/bridge"); assert.equal(target.hostId, "remote:test");
+  const unchanged = new RuntimeStateStore(accountStatePaths(paths, "account")).getSession(session.id)!;
+  assert.equal(unchanged.threadId, "native"); assert.equal(unchanged.workspace, "/bridge");
+});
+
+test("multi-root canonical checks reject retargeting, missing members and project mutations during approval", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-multi-scope-")), transport = new FakeTransport();
+  let target: IDEWorkspace = { owner: "owner", sessionId: "s", hostId: "remote:test", workspace: "/bridge", rootPaths: ["/bridge", "/farming"], projectName: "two" };
+  const manager = new WorkspaceIDEManager({ root, transport, resolve: () => target });
+  t.after(async () => { await manager.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  manager.configStore.save(config(manager.configStore)); const entry = manager.entry("a", "s")!;
+  const trust = await manager.canonicalForTrust(entry.id);
+  await assert.rejects(manager.open(entry.id, true, trust.workspace), /已信任目录不一致/);
+  transport.canonicalDirectory = async (_host, directory) => directory === "/farming" ? "/different" : directory;
+  await assert.rejects(manager.open(entry.id, true, trust.workspace, trust.rootPaths), /已信任目录不一致/);
+  transport.canonicalDirectory = async (_host, directory) => { if (directory === "/farming") throw Error("missing"); return directory; };
+  await assert.rejects(manager.open(entry.id), /missing/); assert.equal(transport.launches.length, 0);
+  transport.canonicalDirectory = async (_host, directory) => { if (directory === "/farming") target = { ...target, rootPaths: ["/bridge", "/third"] }; return directory; };
+  await assert.rejects(manager.canonicalForTrust(entry.id), /项目已改变/);
+});
+
+test("real host helper generates a private multi-root workspace without writing config into repositories", async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cig-multi-process-")));
+  const bridge = path.join(root, "bridge"), farming = path.join(root, "farming");
+  fs.mkdirSync(bridge); fs.mkdirSync(farming);
+  const manager = new WorkspaceIDEManager({ root, readyTimeoutMs: 3000, resolve: () => ({ owner: "owner", sessionId: "s", hostId: "local",
+    workspace: bridge, rootPaths: [bridge, farming], projectName: "two" }) });
+  t.after(async () => { await manager.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  manager.configStore.save({ ...config(manager.configStore), hosts: [{ hostId: "local", enabled: true, binary: path.resolve("test/fixtures/fake-code-server.mjs") }] });
+  const entry = manager.entry("a", "s")!, trust = await manager.canonicalForTrust(entry.id);
+  const instance = await manager.open(entry.id, true, trust.workspace, trust.rootPaths), endpoint = manager.endpoint(entry.id, true)!;
+  assert.ok(instance.workspaceFile); assert.equal(endpoint.workspaceFile, instance.workspaceFile);
+  assert.equal(path.dirname(instance.workspaceFile!), path.join(root, "ide", "instances", instance.id));
+  const workspace = JSON.parse(fs.readFileSync(instance.workspaceFile!, "utf8"));
+  assert.deepEqual(workspace.folders, [{ name: "bridge", path: bridge }, { name: "farming", path: farming }]);
+  assert.equal(workspace.settings["terminal.integrated.cwd"], bridge); assert.equal(fs.statSync(instance.workspaceFile!).mode & 0o777, 0o600);
+  const calls = fs.readFileSync(path.join(bridge, "cig-fixture-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.equal(calls.at(-1).at(-1), instance.workspaceFile); assert.ok(calls.at(-1).includes("--disable-workspace-trust"));
+  assert.deepEqual(fs.readdirSync(farming), []); assert.equal(fs.existsSync(path.join(bridge, ".vscode")), false);
 });
 
 test("completion entry is idempotent and separate from model history", () => {

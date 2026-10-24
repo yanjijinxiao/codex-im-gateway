@@ -7,8 +7,9 @@ import { ideSshConnection } from "./host-command.js";
 import { IDE_PROFILE_HELPER, IDE_SETTING_DEFAULTS, type IDEProfileStatus } from "./profile.js";
 
 const exec = promisify(execFile);
-export type IDELaunch = { socketPath: string; alive: () => boolean; stop: () => Promise<void> };
+export type IDELaunch = { socketPath: string; workspaceFile?: string; alive: () => boolean; stop: () => Promise<void> };
 export type IDELaunchInput = { hostId: string; workspace: string; id: string; binary: string;
+  rootPaths?: readonly string[];
   settings: Record<string, unknown>; extensions: readonly string[]; prepare?: boolean; trustWorkspace?: boolean;
   onProfile?: (status: IDEProfileStatus) => void; signal?: AbortSignal };
 export interface IDEHostTransport {
@@ -28,6 +29,16 @@ if(input.operation==='resolve'){process.stdout.write(JSON.stringify({cwd}));proc
 const root=input.dataRoot?path.join(input.dataRoot,input.id):path.join(os.homedir(),'.local','share','codex-im-gateway','ide',input.id);
 fs.mkdirSync(root,{recursive:true,mode:0o700});
 fs.chmodSync(root,0o700);
+let workspaceFile;
+if(input.rootPaths){
+ if(input.rootPaths.length<2||input.rootPaths.length>32||!input.rootPaths.includes(input.workspace))throw Error('Invalid root set');
+ const roots=input.rootPaths.map(p=>{const actual=fs.realpathSync(p);if(actual!==p||!path.isAbsolute(actual)||!fs.statSync(actual).isDirectory())throw Error('Project roots changed');return actual;});
+ if(new Set(roots).size!==roots.length||cwd!==input.workspace)throw Error('Project roots changed');
+ workspaceFile=path.join(root,'project.code-workspace');
+ const folders=roots.map(p=>({name:roots.filter(r=>path.basename(r)===path.basename(p)).length>1?p:path.basename(p),path:p}));
+ const content=JSON.stringify({folders,settings:{'terminal.integrated.cwd':cwd}},null,2);
+ if(!fs.existsSync(workspaceFile)||fs.readFileSync(workspaceFile,'utf8')!==content){const temporary=workspaceFile+'.'+process.pid+'.tmp';fs.writeFileSync(temporary,content,{mode:0o600,flag:'wx'});fs.renameSync(temporary,workspaceFile);}
+}
 const data=path.join(root,'data'),extensions=path.join(root,'extensions');
 fs.mkdirSync(path.join(data,'User'),{recursive:true,mode:0o700});
 // Seed a fresh profile, or add ONLY missing runtime defaults. Preserve JSONC,
@@ -75,10 +86,10 @@ async function listExtensions(){
  // Only an explicitly Gateway-approved directory session opts out of the
  // browser-local second trust prompt. No global VS Code setting is changed.
  const trust=input.trustWorkspace===true?['--disable-workspace-trust']:[];
- child=cp.spawn(input.binary,[...prefix,'--auth','none','--socket',socket,'--socket-mode','0600','--disable-proxy','--disable-telemetry',...trust,cwd],{cwd,detached:true,stdio:['ignore','pipe','pipe']});
+ child=cp.spawn(input.binary,[...prefix,'--auth','none','--socket',socket,'--socket-mode','0600','--disable-proxy','--disable-telemetry',...trust,workspaceFile||cwd],{cwd,detached:true,stdio:['ignore','pipe','pipe']});
  child.stdout.resume();child.stderr.resume();child.on('error',()=>{process.stderr.write('code-server executable unavailable\n');process.exitCode=1;});
  child.on('close',code=>{try{fs.rmSync(temp,{recursive:true,force:true});}catch{}process.exit(code||0);});
- process.stdout.write('CIG_SOCKET '+JSON.stringify({socket})+'\n');
+ process.stdout.write('CIG_SOCKET '+JSON.stringify({socket,workspaceFile})+'\n');
 })().catch(()=>{process.stderr.write('IDE host preparation failed\n');exitCode=1;kill();});
 `;
 
@@ -109,6 +120,7 @@ export class ProcessIDEHostTransport implements IDEHostTransport {
     processChild.stderr?.on("data", chunk => { hostReason = connectionReason(String(chunk)) ?? hostReason; });
     processChild.once("exit", (code, signal) => { if (!stopping) console.warn(`[codex-im-gateway] IDE host exited code=${code} signal=${signal} reason=${hostReason}`); });
     let tunnel: ChildProcess | undefined, temp: string | undefined;
+    let workspaceFile: string | undefined;
     const stop = async () => {
       stopping = true;
       await Promise.all([terminate(tunnel), terminate(processChild)]);
@@ -137,14 +149,19 @@ export class ProcessIDEHostTransport implements IDEHostTransport {
               if (status) { profile = status; onProfile?.(status); }
             }
             if (!line.startsWith("CIG_SOCKET ")) continue;
-            try { const value = JSON.parse(line.slice(11)).socket;
+            try { const receipt = JSON.parse(line.slice(11)), value = receipt.socket;
               if (typeof value !== "string" || !path.posix.isAbsolute(value) || /[\r\n\0]/.test(value)) throw new Error();
+              if (input.rootPaths) {
+                if (typeof receipt.workspaceFile !== "string" || !path.posix.isAbsolute(receipt.workspaceFile)
+                  || !receipt.workspaceFile.endsWith(`/${input.id}/project.code-workspace`) || /[\r\n\0]/.test(receipt.workspaceFile)) throw new Error();
+                workspaceFile = receipt.workspaceFile;
+              }
               finish(undefined, value);
             } catch { finish(new Error("无效的 IDE 主机回执")); }
           }
         });
       });
-      if (input.prepare || input.hostId === "local") return { socketPath: socket,
+      if (input.prepare || input.hostId === "local") return { socketPath: socket, ...(workspaceFile ? { workspaceFile } : {}),
         alive: () => processChild.exitCode === null && !processChild.signalCode, stop };
       temp = fs.mkdtempSync(path.join(os.tmpdir(), "cig-tunnel-")); fs.chmodSync(temp, 0o700);
       const localSocket = path.join(temp, "ide.sock");
@@ -157,7 +174,7 @@ export class ProcessIDEHostTransport implements IDEHostTransport {
       // Attach before the first asynchronous boundary; spawn failure must never
       // become an unhandled EventEmitter error that takes the Gateway down.
       let tunnelFailed = false; tunnel.on("error", () => { tunnelFailed = true; });
-      return { socketPath: localSocket, alive: () => !tunnelFailed && processChild.exitCode === null
+      return { socketPath: localSocket, ...(workspaceFile ? { workspaceFile } : {}), alive: () => !tunnelFailed && processChild.exitCode === null
         && !processChild.signalCode && tunnel!.exitCode === null && !tunnel!.signalCode, stop };
     } catch (error) { await stop(); throw error; }
   }

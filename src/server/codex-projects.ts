@@ -16,6 +16,8 @@ import { listCodexCliProjects } from "../codex/cli-projects.js";
 export type CodexProjectCandidate = {
   readonly name: string;
   readonly workspace: string;
+  /** Complete same-host project membership; omitted for legacy single roots. */
+  readonly rootPaths?: readonly string[];
   readonly lastUsedAt: string;
   readonly sessionCount: number;
   readonly projectId?: string;
@@ -213,6 +215,7 @@ export function mergeCodexProjectCandidates(
       projectKind: "local",
       name: project.name || path.basename(workspace) || workspace,
       workspace,
+      ...(project.roots.length > 1 ? { rootPaths: [...new Set(project.roots)] } : {}),
       lastUsedAt: new Date(0).toISOString(),
       sessionCount: 0,
       available: true
@@ -240,6 +243,7 @@ export function projectCandidatesFromBackendCatalog(
       projectKind: "local" as const,
       name: project.name || path.basename(workspace) || workspace,
       workspace,
+      ...(project.roots.length > 1 ? { rootPaths: [...new Set(project.roots)] } : {}),
       lastUsedAt: project.lastUsedAt ?? new Date(0).toISOString(),
       sessionCount: project.sessionCount ?? 0,
       available: true
@@ -291,14 +295,21 @@ export function readCodexDesktopProjects(
       if (!workspace) continue;
       const resolvedWorkspace = resolveDirectory(workspace);
       if (!resolvedWorkspace) continue;
+      const roots = Array.isArray(rawProject.rootPaths) ? rawProject.rootPaths : [];
+      const rootsValid = roots.length > 0 && roots.length <= 32
+        && roots.every(root => typeof root === "string" && path.isAbsolute(root) && !/[\r\n\0]/.test(root));
+      // Missing sibling directories stay in scope; malformed membership makes
+      // only this project unavailable, never the entire channel catalog.
+      const rootPaths = rootsValid ? [...new Set((roots as string[]).map(root => root === workspace ? resolvedWorkspace : path.normalize(root)))] : [];
       candidates.set(projectId, {
         projectId,
         projectKind: "local",
         name: stringValue(rawProject.name) ?? (path.basename(resolvedWorkspace) || resolvedWorkspace),
         workspace: resolvedWorkspace,
+        ...(rootPaths.length > 1 ? { rootPaths } : {}),
         lastUsedAt: timestampFromMilliseconds(rawProject.updatedAt ?? rawProject.createdAt),
         sessionCount: desktopProjectSessionCount(sessionsByProject[projectId]),
-        available: true
+        available: rootsValid
       });
     }
   }

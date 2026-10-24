@@ -328,9 +328,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       sendJson(response, 202, { installation: ide.installer.begin(host.hostId, host.binary) }); return;
     }
     if (method === "POST" && url.pathname === "/api/ide/access") {
-      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
       if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
-      sendJson(response, 200, await context.ideAccess.grant(input.entryId, input.trustWorkspace)); return;
+      if (ide.resolve(input.entryId).rootPaths && !input.scope) throw new Error("请先核对完整工作区目录后授权");
+      sendJson(response, 200, await context.ideAccess.grant(input.entryId, input.trustWorkspace, input.scope)); return;
     }
     if (method === "POST" && url.pathname === "/api/ide/access/approve") {
       const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), requestId: z.string().min(1).max(100), trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
@@ -349,14 +350,18 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       const input = z.object({ accountId: z.string().min(1), sessionId: z.string().min(1) }).strict().parse(await readJsonBody(request));
       const entry = ide.entry(input.accountId, input.sessionId);
       if (!entry) { sendJson(response, 409, { error: "当前 session 没有可用项目 IDE；请先启用对应主机。" }); return; }
-      sendJson(response, 200, entry); return;
+      const target = ide.resolve(entry.id);
+      sendJson(response, 200, { ...entry, ...(target.rootPaths ? { rootPaths: target.rootPaths, scope: ide.authorizationScope(entry.id) } : {}) }); return;
     }
     const workspace = matchPath(url.pathname, "/api/ide/workspaces/:id/:action");
     if (method === "POST" && workspace && ["open", "prepare"].includes(workspace.action)) {
-      const input = z.object({ trustWorkspace: z.boolean().default(false) }).strict().parse(await readJsonBody(request));
+      const input = z.object({ trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
+      const scope = ide.authorizationScope(workspace.id);
+      if ((ide.resolve(workspace.id).rootPaths || input.scope) && input.scope !== scope) throw new Error("请重新核对完整工作区目录后再操作");
       const directory = input.trustWorkspace ? await ide.canonicalForTrust(workspace.id) : undefined;
-      const instance = workspace.action === "prepare" ? await ide.start(workspace.id, true, input.trustWorkspace, directory)
-        : await ide.open(workspace.id, input.trustWorkspace, directory);
+      if (scope !== ide.authorizationScope(workspace.id)) throw new Error("项目目录已改变，未启动 IDE");
+      const instance = workspace.action === "prepare" ? await ide.start(workspace.id, true, input.trustWorkspace, directory?.workspace, directory?.rootPaths)
+        : await ide.open(workspace.id, input.trustWorkspace, directory?.workspace, directory?.rootPaths);
       sendJson(response, 200, { instance }); return;
     }
     const instance = matchPath(url.pathname, "/api/ide/instances/:id/stop");
@@ -483,6 +488,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 201, {
       project: context.accountManager.createProject(body.accountId, body.name, workspace, {
         sourceProjectId: candidate.projectId,
+        rootPaths: candidate.rootPaths,
         projectKind: candidate.projectKind,
         hostId: candidate.hostId
       })

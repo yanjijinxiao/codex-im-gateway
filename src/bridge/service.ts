@@ -749,6 +749,7 @@ export class BridgeService {
     if (!await this.validateProjectRoute(senderId, target)) return;
     return selected.project ?? this.options.stateStore.createProject(target.name, target.workspace, {
       sourceProjectId: selected.candidate!.projectId,
+      rootPaths: selected.candidate!.rootPaths,
       projectKind: target.projectKind,
       hostId: target.hostId
     });
@@ -2503,9 +2504,11 @@ export class BridgeService {
       project.sourceProjectId === candidate.projectId
       && project.projectKind === candidate.projectKind
       && project.hostId === candidate.hostId
+      && JSON.stringify(project.rootPaths) === JSON.stringify(candidate.rootPaths)
     ) return project;
     return this.options.stateStore.updateProjectMetadata(project.id, {
       sourceProjectId: candidate.projectId,
+      rootPaths: candidate.rootPaths,
       projectKind: candidate.projectKind,
       hostId: candidate.hostId
     });

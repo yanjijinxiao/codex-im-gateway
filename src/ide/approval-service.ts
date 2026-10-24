@@ -8,7 +8,7 @@ export const ideApproverSchema = z.object({ accountId: identifier,
   channel: z.enum(["dingtalk", "feishu", "wecom", "weixin"]), providerId: identifier, actorId: identifier }).strict();
 export type IDEApprover = z.infer<typeof ideApproverSchema>;
 export type IDEApprovalRequest = { id: string; entryId: string; code: string; expiresAt: number; approved: boolean;
-  accountId: string; hostId: string; projectName: string; workspace: string; scope: string; url?: string };
+  accountId: string; hostId: string; projectName: string; workspace: string; rootPaths?: readonly string[]; scope: string; url?: string };
 export type IDEApprovalCopyPort = Pick<IDEApprovalService, "copyPreview" | "offer">;
 export type IDEApprovalPort = {
   pendingAccess(): IDEApprovalRequest[];

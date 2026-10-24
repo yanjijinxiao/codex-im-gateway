@@ -10,10 +10,12 @@ import type { IDEProfileStatus } from "./profile.js";
 import { runtimeChanges } from "./reconfiguration.js";
 
 export type IDEWorkspace = { owner: string; sessionId: string; hostId: string; workspace: string; projectName: string;
-  projectId?: string; nativeThreadId?: string };
+  projectId?: string; nativeThreadId?: string; rootPaths?: readonly string[] };
+export type IDECanonicalWorkspace = { workspace: string; rootPaths?: readonly string[] };
 type Reference = { accountId: string; sessionId: string };
 type Instance = { id: string; hostId: string; workspace: string; status: "starting" | "running" | "error" | "stopped";
-  error?: string; launch?: IDELaunch; lastUsedAt: number; trustWorkspace?: boolean; profile?: IDEProfileStatus };
+  error?: string; launch?: IDELaunch; lastUsedAt: number; trustWorkspace?: boolean; profile?: IDEProfileStatus;
+  rootPaths?: readonly string[]; workspaceFile?: string };
 export type IDEInstanceStatus = Omit<Instance, "launch">;
 export class WorkspaceIDEManager {
   readonly configStore: IDEConfigStore;
@@ -65,11 +67,16 @@ export class WorkspaceIDEManager {
     return { id, url: `${new URL(origin).origin}/workspace/${id}` };
   }
   accountForEntry(id: string): string { this.resolve(id); return this.references[id].accountId; }
+  authorizationScope(id: string): string { return crypto.createHash("sha256").update(JSON.stringify(this.resolve(id))).digest("hex"); }
   resolve(id: string): IDEWorkspace {
     if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("IDE 入口不存在");
     const reference = this.references[id];
     const target = reference && this.options.resolve(reference.accountId, reference.sessionId);
     if (!target || !path.posix.isAbsolute(target.workspace) || /[\r\n\0]/.test(target.workspace)) throw new Error("项目或 session 已移除，IDE 入口失效");
+    if (target.rootPaths && (!Array.isArray(target.rootPaths) || target.rootPaths.length < 2 || target.rootPaths.length > 32
+      || !target.rootPaths.includes(target.workspace) || new Set(target.rootPaths).size !== target.rootPaths.length
+      || target.rootPaths.some(root => typeof root !== "string" || !path.posix.isAbsolute(root) || /[\r\n\0]/.test(root))))
+      throw new Error("项目多根目录配置无效，未开放 IDE");
     return target;
   }
   private host(target: IDEWorkspace) {
@@ -78,19 +85,27 @@ export class WorkspaceIDEManager {
     if (!config.enabled || !host) throw new Error("请先在 Gateway 网页端启用该主机的 Web IDE");
     return { config, host };
   }
-  private identity(target: IDEWorkspace, workspace: string, trustWorkspace = false): string {
+  private identity(target: IDEWorkspace, workspace: string, trustWorkspace = false, rootPaths?: readonly string[]): string {
     return digest([this.options.root, target.owner, target.hostId, workspace, "code-server", JSON.stringify(this.configStore.config().profile),
-      ...(trustWorkspace ? ["gateway-trusted-workspace-v1"] : [])]);
+      ...(trustWorkspace ? ["gateway-trusted-workspace-v1"] : []), ...(rootPaths ? ["multi-root-v1", rootPaths] : [])]);
   }
-  async canonicalForTrust(id: string): Promise<string> {
+  private async canonical(target: IDEWorkspace): Promise<IDECanonicalWorkspace> {
+    const workspace = await this.transport.canonicalDirectory(target.hostId, target.workspace);
+    if (!target.rootPaths) return { workspace };
+    const rootPaths = await Promise.all(target.rootPaths.map(root => root === target.workspace ? workspace
+      : this.transport.canonicalDirectory(target.hostId, root)));
+    if (new Set(rootPaths).size !== rootPaths.length) throw new Error("项目包含重复的实际目录，请先核对项目配置");
+    return { workspace, rootPaths };
+  }
+  async canonicalForTrust(id: string): Promise<IDECanonicalWorkspace> {
     const base = this.resolve(id), expected = digest(base), reference = this.references[id];
     const current = this.options.refresh ? await this.options.refresh(reference.accountId, reference.sessionId) : base;
-    if (!current || current.workspace !== base.workspace || digest(this.resolve(id)) !== expected) throw new Error("项目目录已改变，请同步 session 后重新授权");
-    const directory = await this.transport.canonicalDirectory(base.hostId, base.workspace);
+    if (!current || digest(current) !== expected || digest(this.resolve(id)) !== expected) throw new Error("项目目录已改变，请同步 session 后重新授权");
+    const directory = await this.canonical(base);
     if (digest(this.resolve(id)) !== expected) throw new Error("项目已改变，未授权目录");
     return directory;
   }
-  async start(id: string, prepare = false, trustWorkspace = false, trustedDirectory?: string): Promise<IDEInstanceStatus> {
+  async start(id: string, prepare = false, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]): Promise<IDEInstanceStatus> {
     if (this.closing) throw new Error("IDE 正在停止或重新配置，请稍后重试");
     const base = this.resolve(id), reference = this.references[id], generation = this.generation;
     const hostGeneration = this.hostGenerations.get(base.hostId) ?? 0;
@@ -109,10 +124,12 @@ export class WorkspaceIDEManager {
     const { config, host } = this.host(target);
     const binary = host.autoInstall && host.binary === "code-server" ? await this.installer.binary(target.hostId) : host.binary;
     check();
-    const workspace = await this.transport.canonicalDirectory(target.hostId, target.workspace);
-    if (trustWorkspace && workspace !== trustedDirectory) throw new Error("实际目录与已信任目录不一致，请重新核对授权");
+    const { workspace, rootPaths } = await this.canonical(target);
+    if (trustWorkspace && (workspace !== trustedDirectory || JSON.stringify(rootPaths) !== JSON.stringify(trustedRootPaths)))
+      throw new Error("实际目录与已信任目录不一致，请重新核对授权");
+    if (digest(base) !== digest(this.resolve(id))) throw new Error("项目目录已改变，未启动 IDE");
     check();
-    const instanceId = this.identity(target, workspace, trustWorkspace);
+    const instanceId = this.identity(target, workspace, trustWorkspace, rootPaths);
     const inflight = this.pending.get(instanceId);
     if (inflight) { if (prepare) throw new Error("IDE 正在启动，请稍后准备扩展"); return publicInstance(await inflight); }
     const previous = this.instances.get(instanceId);
@@ -129,15 +146,17 @@ export class WorkspaceIDEManager {
       }
       await previous?.launch?.stop();
       check();
-      const instance: Instance = { id: instanceId, workspace, hostId: target.hostId, status: "starting", lastUsedAt: Date.now(), trustWorkspace };
+      const instance: Instance = { id: instanceId, workspace, ...(rootPaths ? { rootPaths } : {}), hostId: target.hostId, status: "starting", lastUsedAt: Date.now(), trustWorkspace };
       this.instances.set(instanceId, instance);
       try {
-        instance.launch = await this.transport.launch({ hostId: target.hostId, workspace, id: instanceId,
+        instance.launch = await this.transport.launch({ hostId: target.hostId, workspace, ...(rootPaths ? { rootPaths } : {}), id: instanceId,
           binary, settings: config.profile.settings, extensions: config.profile.extensions, prepare, trustWorkspace,
           signal: cancellation.signal,
           onProfile: status => { if (this.instances.get(instanceId) === instance && generation === this.generation
             && hostGeneration === (this.hostGenerations.get(target.hostId) ?? 0)) instance.profile = status; } });
         check();
+        if (rootPaths && !prepare && !instance.launch.workspaceFile) throw new Error("多根工作区未生成，未开放 IDE");
+        if (instance.launch.workspaceFile) instance.workspaceFile = instance.launch.workspaceFile;
         if (prepare) { await instance.launch.stop(); instance.launch = undefined; instance.status = "stopped"; return instance; }
         const deadline = Date.now() + (this.options.readyTimeoutMs ?? 20_000);
         while (!await healthy(instance.launch.socketPath)) {
@@ -163,22 +182,23 @@ export class WorkspaceIDEManager {
       if (this.cancellations.get(instanceId)?.controller === cancellation) this.cancellations.delete(instanceId);
     }
   }
-  endpoint(id: string, trustWorkspace = false): { instanceId: string; socketPath: string; workspace: string } | undefined {
+  endpoint(id: string, trustWorkspace = false): { instanceId: string; socketPath: string; workspace: string; workspaceFile?: string } | undefined {
     const target = this.resolve(id); this.host(target);
     // References can share an instance, but never cross host/owner/security profile.
     for (const instance of this.instances.values()) {
-      const expected = this.identity(target, instance.workspace, trustWorkspace);
+      const expected = this.identity(target, instance.workspace, trustWorkspace, instance.rootPaths);
       if (expected !== instance.id || instance.status !== "running" || !instance.launch?.alive()) continue;
       // Alias/symlink mapping is recorded only following a successful resolution.
       const opened = this.opened.get(`${id}:${trustWorkspace}`);
       if (opened?.instanceId !== instance.id || opened.target !== digest(target)) continue;
-      instance.lastUsedAt = Date.now(); return { instanceId: instance.id, socketPath: instance.launch.socketPath, workspace: instance.workspace };
+      instance.lastUsedAt = Date.now(); return { instanceId: instance.id, socketPath: instance.launch.socketPath, workspace: instance.workspace,
+        ...(instance.workspaceFile ? { workspaceFile: instance.workspaceFile } : {}) };
     }
   }
   private readonly opened = new Map<string, { instanceId: string; target: string }>();
-  async open(id: string, trustWorkspace = false, trustedDirectory?: string): Promise<IDEInstanceStatus> {
+  async open(id: string, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]): Promise<IDEInstanceStatus> {
     const base = this.resolve(id), target = digest(base), generation = this.generation, hostGeneration = this.hostGenerations.get(base.hostId) ?? 0;
-    const instance = await this.start(id, false, trustWorkspace, trustedDirectory);
+    const instance = await this.start(id, false, trustWorkspace, trustedDirectory, trustedRootPaths);
     this.host(base);
     if (target !== digest(this.resolve(id)) || this.closing || this.reconfiguring.has(base.hostId) || generation !== this.generation
       || hostGeneration !== (this.hostGenerations.get(base.hostId) ?? 0)) throw new Error("项目或 IDE 配置已改变，请刷新后重试");

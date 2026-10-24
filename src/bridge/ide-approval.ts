@@ -30,7 +30,8 @@ export async function ideApprovalCommand(input: { service?: IDEApprovalService; 
     }
     if (args.length === 2 && args[0] === "auth" && /^\d{6}$/.test(args[1])) {
       const { request, token, shortCode } = input.service.preview(principal, args[1]);
-      const body = `请核对原浏览器识别码：${request.code}\n项目：${request.projectName}\n主机：${request.hostId}\n目录：${request.workspace}\n允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。\n「并信任」还会启用该目录的任务、调试及扩展。仅批准你本人发起的申请；授权 15 天，可在本机撤销。`;
+      const directories = request.rootPaths ? `工作区目录（${request.rootPaths.length} 个，权限涵盖全部所列目录）：\n${request.rootPaths.join("\n")}` : `目录：${request.workspace}`;
+      const body = `请核对原浏览器识别码：${request.code}\n项目：${request.projectName}\n主机：${request.hostId}\n${directories}\n允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。\n「并信任」还会启用所列目录的任务、调试及扩展。仅批准你本人发起的申请；授权 15 天，可在本机撤销。`;
       const panel = request.url ? `\n\n[打开确认复制面板](${new URL(`/approval/${token}`, request.url).href})\n面板按钮只复制命令，不会授权。复制后由本人在本机器人私聊或群聊发送；原浏览器申请仍为 5 分钟有效。` : "";
       return createChoiceCard({ title: "确认 Web IDE 浏览器授权", body,
         note: "支持按钮的渠道可点击；钉钉请打开确认复制面板，或发送下方一条短命令。仅当前已登记个人账号能确认。",
