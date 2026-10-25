@@ -13,6 +13,12 @@ function fenceAt(text: string, end: number): string | undefined {
   return open;
 }
 
+/** Bounded live previews may stop mid-fence; keep following UI outside code. */
+export function closeMarkdownFence(text: string): string {
+  const open = fenceAt(text, text.length);
+  return open ? `${text}\n${open.match(/^(`+|~+)/)![0]}` : text;
+}
+
 function tableHeader(text: string, offset: number): string {
   if (!/^\s*\|/.test(text.slice(offset))) return "";
   const lines = text.slice(0, offset).trimEnd().split("\n");

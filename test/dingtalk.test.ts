@@ -129,8 +129,8 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
     { url: "https://api.dingtalk.com/v1.0/card/instances/deliver", method: "POST" },
     { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
-    { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" },
+    { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" }
   ]);
@@ -151,9 +151,9 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
   assert.equal((calls[2]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, "阶段一<br>继续");
   assert.equal(calls[3]?.body.key, "msgContent");
   assert.equal(calls[3]?.body.content, "阶段一<br>继续");
-  assert.equal(calls[4]?.body.content, "阶段二");
-  assert.equal((calls[5]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, "阶段二");
-  assert.deepEqual(calls[5]?.body.cardUpdateOptions, { updateCardDataByKey: true });
+  assert.equal((calls[4]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, "阶段二");
+  assert.deepEqual(calls[4]?.body.cardUpdateOptions, { updateCardDataByKey: true });
+  assert.equal(calls[5]?.body.content, "阶段二");
   assert.equal(calls[6]?.body.isFinalize, true);
   assert.deepEqual(calls[7]?.body.cardUpdateOptions, { updateCardDataByKey: true });
 });
@@ -353,6 +353,50 @@ test("DingTalk card state snapshots use the configured content key", () => {
 });
 
 for (const mode of ["https", "sdk"] as const) {
+  test(`DingTalk ${mode} keeps native loading last, hides it while waiting, and resumes the same card`, async () => {
+    const calls: Array<{ kind: "state" | "stream"; body: any }> = [];
+    const client = mode === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
+      assert.equal(init?.method, "PUT", "no replacement create/delivery is authorized");
+      calls.push({ kind: String(url).endsWith("/streaming") ? "stream" : "state", body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ success: true, result: true }), { status: 200 });
+    }, [0], async () => undefined) : new DingTalkSdkAICardClient({
+      async createCardWithOptions() { throw new Error("no replacement card"); },
+      async deliverCardWithOptions() { throw new Error("no new delivery"); },
+      async updateCardWithOptions(body) {
+        calls.push({ kind: "state", body }); return { statusCode: 200, body: { success: true, result: true } };
+      },
+      async streamingUpdateWithOptions(body) {
+        calls.push({ kind: "stream", body }); return { statusCode: 200, body: { success: true, result: true } };
+      }
+    } as never, [0], async () => undefined);
+    const base = { accessToken: "fake", contentKey: "msgContent", outTrackId: "original", finalize: false, error: false };
+    for (const text of ["**进行中**", "已完成一个步骤，并非终态"]) {
+      const before = calls.length;
+      await client.update({ ...base, text, activity: "running" });
+      assert.deepEqual(calls.slice(before).map(call => call.kind), ["state", "stream"]);
+      assert.equal(calls.at(-1)!.body.isFinalize, false);
+      assert.equal(calls.at(-2)!.body.cardData.cardParamMap.flowStatus, "2");
+    }
+    for (const activity of ["waiting-input", "waiting-approval", "unconfirmed"] as const) {
+      const before = calls.length;
+      await client.update({ ...base, text: "正文仍写着正在执行", activity });
+      assert.deepEqual(calls.slice(before).map(call => call.kind), ["state"]);
+      assert.equal(calls.at(-1)!.body.cardData.cardParamMap.flowStatus, "3");
+      assert.equal(calls.at(-1)!.body.cardData.cardParamMap.msgContent, "正文仍写着正在执行");
+    }
+    for (const activity of ["recovering", "running"] as const) {
+      const before = calls.length;
+      await client.update({ ...base, text: "恢复后继续", activity });
+      assert.deepEqual(calls.slice(before).map(call => call.kind), ["state", "stream"]);
+      assert.equal(calls.at(-1)!.body.isFinalize, false);
+    }
+    await client.update({ ...base, text: "真实最终回执", activity: "running", finalize: true });
+    assert.equal(calls.at(-2)!.kind, "stream");
+    assert.equal(calls.at(-2)!.body.isFinalize, true);
+    assert.equal(calls.at(-1)!.body.cardData.cardParamMap.flowStatus, "3");
+    assert.ok(calls.every(call => call.body.outTrackId === "original"));
+  });
+
   test(`DingTalk ${mode} task-error bodies remain visible on their original instance`, async () => {
     const states: Array<Record<string, string>> = [];
     const streams: Array<{ isError?: boolean; isFinalize?: boolean; content?: string }> = [];

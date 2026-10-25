@@ -11,11 +11,14 @@ import { DingTalkChannelAdapter, DingTalkHttpsAICardClient } from "../src/channe
 import { DingTalkCardRouting } from "../src/channels/dingtalk-card-routing.js";
 import { ThreadEventHub } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
-import { turnStatusHeading, type TurnActivity, type TurnOutcome } from "../src/channels/turn-status.js";
+import { TURN_STATUS_BYTES, turnStatusHeading, type TurnActivity, type TurnOutcome } from "../src/channels/turn-status.js";
+import { resultPages } from "../src/channels/result-pages.js";
+import { renderTurnProgressCard } from "../src/channels/turn-progress-card.js";
+import { Lexer } from "marked";
 
 function fixture(t: test.TestContext, budget = 6000) {
-  const starts: Array<{ text: string; streamId?: string }> = [];
-  const updates: Array<{ text: string; messageId: string; finalize?: boolean; error?: boolean }> = [];
+  const starts: Array<{ text: string; streamId?: string; activity?: TurnActivity }> = [];
+  const updates: Array<{ text: string; messageId: string; finalize?: boolean; error?: boolean; activity?: TurnActivity }> = [];
   const client = createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", resumableProgress: true,
     turnStatusHeader: "available", resultPageBytes: budget }, {
     async sendText() { throw Error("must not use fallback"); },
@@ -34,12 +37,14 @@ test("status remains first above concrete commentary/tools; body text never dete
   const f = fixture(t);
   await f.stream.progress("已完成一个步骤，但原任务继续");
   assert.ok(f.starts[0].text.startsWith(turnStatusHeading("running")));
+  assert.equal(f.starts[0].activity, "running");
   await f.stream.progress("✅ 检查通过"); await f.stream.answer("已完成（尚未收到原生完成事件）"); await f.stream.flush();
   assert.ok(f.updates.at(-1)!.text.startsWith(turnStatusHeading("running")));
   assert.equal(f.updates.at(-1)!.finalize, undefined);
   for (const status of ["waiting-input", "waiting-approval", "unconfirmed", "recovering"] as TurnActivity[]) {
     await f.stream.setActivity(status); await f.stream.flush();
     assert.ok(f.updates.at(-1)!.text.startsWith(turnStatusHeading(status)));
+    assert.equal(f.updates.at(-1)!.activity, status);
     assert.equal(f.stream.checkpoint().finished, false);
   }
   await f.restart(); await f.stream.synchronize();
@@ -49,7 +54,68 @@ test("status remains first above concrete commentary/tools; body text never dete
   await f.stream.finalize("真实最终结果");
   assert.ok(f.updates.at(-1)!.text.startsWith(turnStatusHeading("completed")));
   assert.equal(f.updates.at(-1)!.finalize, true);
+  assert.equal(f.updates.at(-1)!.activity, undefined);
   assert.equal(f.stream.checkpoint().terminal!.text, "真实最终结果");
+});
+
+test("compact progress view uses normal text, bounded history and a plain native-cursor anchor", () => {
+  const text = renderTurnProgressCard({ activity: "running", elapsed: "2 分钟", current: "正在检查最新改动",
+    recent: ["旧记录", "较早记录", "❌ 工具操作失败", "已通过静态检查"],
+    tools: { completed: 3, failed: 1 }, answerPreview: "" });
+  assert.ok(text.startsWith("**进行中** · 已用时 2 分钟"));
+  assert.doesNotMatch(text, /^#{1,6} |🔵|🟡|🟠/mu);
+  assert.doesNotMatch(text, /旧记录/);
+  assert.match(text, /工具操作失败/);
+  assert.equal((text.match(/\/stop/g) ?? []).length, 1);
+  assert.ok(text.endsWith("任务仍在执行"));
+  assert.ok(text.lastIndexOf("```") < text.lastIndexOf("任务仍在执行"));
+  for (const outcome of ["running", "completed", "failed", "interrupted", "continued", "detached"] as const) {
+    assert.doesNotMatch(turnStatusHeading(outcome), /^#|🔵|✅|❌/u);
+  }
+});
+
+test("compact results preserve the legacy reserve and partially acknowledged page boundaries", async t => {
+  const reserve = Buffer.byteLength("## ⏸️ 已停止同步（任务未停止）\n\n---\n\n");
+  assert.equal(TURN_STATUS_BYTES, reserve);
+  const body = "连续的中文结果。\n".repeat(220);
+  const pages = resultPages(body, 1300, reserve);
+  assert.ok(pages.length > 1);
+  const f = fixture(t, 1300);
+  const stream = new ChannelTurnTextStream(f.client, "room", { save() {}, restore: {
+    messageId: "old-page-1", startedAt: 1, progressEntries: [], thought: "", answerPreview: "", finished: false,
+    statusHeader: true, activity: "running", resultPageBytes: 1300, resultPresentation: "card",
+    terminal: { text: body, error: false }, terminalPages: pages.map((_, i) => ({ messageId: `old-page-${i + 1}`, delivered: i === 0 }))
+  } });
+  t.after(() => stream.suspend());
+  assert.equal(await stream.finalize(body), true);
+  assert.equal(f.starts.length, 0);
+  assert.deepEqual(f.updates.map(update => update.text.slice((turnStatusHeading("completed") + "\n\n").length)), pages.slice(1).map(page => page.text));
+  assert.ok(f.updates.every(update => Buffer.byteLength(update.text) <= 1300));
+});
+
+test("an incomplete code preview cannot swallow the stop control or native-cursor anchor", () => {
+  const text = renderTurnProgressCard({ activity: "running", elapsed: "1 秒", current: "公开进展",
+    recent: [], tools: { completed: 0, failed: 0 }, answerPreview: "```ts\n" + "const data = 1;\n".repeat(100) });
+  const tokens = Lexer.lex(text);
+  assert.equal(tokens.filter(token => token.type === "code").length, 2);
+  assert.equal(tokens.at(-1)?.type, "paragraph");
+  assert.equal(tokens.at(-1)?.raw, "任务仍在执行");
+  assert.match(text, /回复预览（尚未完成）/);
+});
+
+test("restored waiting cards keep trusted activity separate from body claims and heartbeat", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_800_000_000_000 });
+  const f = fixture(t);
+  await f.stream.progress("正文声称已完成，但尚无原生回执");
+  await f.stream.setActivity("waiting-input"); await f.stream.flush();
+  await f.restart(); await f.stream.synchronize();
+  assert.equal(f.updates.at(-1)!.activity, "waiting-input");
+  t.mock.timers.tick(30_000); await f.stream.flush();
+  assert.equal(f.updates.at(-1)!.activity, "waiting-input");
+  assert.equal(f.updates.at(-1)!.finalize, undefined);
+  await f.stream.progress("已接收回答，继续执行"); await f.stream.flush();
+  assert.equal(f.updates.at(-1)!.activity, "running");
+  assert.equal(f.starts.length, 1);
 });
 
 test("a state observation alone creates no placeholder; final pages and @ merging preserve status and budget", async t => {

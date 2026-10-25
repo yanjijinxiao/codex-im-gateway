@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { turnStatusHeading } from "./turn-status.js";
+import type { TurnActivity } from "./turn-status.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
@@ -61,29 +62,32 @@ export type DingTalkAICardTarget =
   | { readonly type: "group"; readonly conversationId: string }
   | { readonly type: "user"; readonly staffId: string };
 
+type DingTalkCardActivity = { activity?: TurnActivity };
+export type DingTalkAICardCreateInput = DingTalkCardActivity & {
+  accessToken: string;
+  cardTemplateId: string;
+  contentKey: string;
+  outTrackId: string;
+  robotCode: string;
+  target: DingTalkAICardTarget;
+  atUserIds?: Record<string, string>;
+  text: string;
+  lifecycleId?: string;
+  onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
+};
+export type DingTalkAICardUpdateInput = DingTalkCardActivity & {
+  accessToken: string;
+  contentKey: string;
+  outTrackId: string;
+  text: string;
+  finalize: boolean;
+  error: boolean;
+};
 export type DingTalkAICardClient = {
-  create(input: {
-    accessToken: string;
-    cardTemplateId: string;
-    contentKey: string;
-    outTrackId: string;
-    robotCode: string;
-    target: DingTalkAICardTarget;
-    atUserIds?: Record<string, string>;
-    text: string;
-    lifecycleId?: string;
-    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
-  }): Promise<void>;
+  create(input: DingTalkAICardCreateInput): Promise<void>;
   /** Reuses a created outTrackId; never calls createCard. */
   deliver?(input: { accessToken: string; outTrackId: string; robotCode: string; target: DingTalkAICardTarget; atUserIds?: Record<string, string> }): Promise<void>;
-  update(input: {
-    accessToken: string;
-    contentKey: string;
-    outTrackId: string;
-    text: string;
-    finalize: boolean;
-    error: boolean;
-  }): Promise<void>;
+  update(input: DingTalkAICardUpdateInput): Promise<void>;
 };
 
 export type DingTalkEmotionClient = {
@@ -378,12 +382,13 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         publish("create-pending");
         await this.cardClient.create({ accessToken, cardTemplateId: this.account.cardTemplateId!, contentKey: this.account.cardContentKey?.trim() || "content",
           outTrackId: instanceId, robotCode: target.robotCode, target: providerTarget, text: input.text,
+          ...(input.activity ? { activity: input.activity } : {}),
           onStage: stage => { if (stage === "delivery-pending") operation = "deliver"; publish(stage); } });
         publish("delivered");
       }
       operation = "update";
       await this.cardClient.update({ accessToken, contentKey: this.account.cardContentKey?.trim() || "content", outTrackId: instanceId,
-        text: input.text, finalize: false, error: false });
+        text: input.text, finalize: false, error: false, ...(input.activity ? { activity: input.activity } : {}) });
       return { messageId: instanceId };
     } catch (error) {
       const failure = cardStreamFailure(error, operation);
@@ -404,6 +409,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     text: string;
     finalize?: boolean;
     error?: boolean;
+    activity?: TurnActivity;
   }): Promise<void> {
     if (!this.account.cardTemplateId) throw new Error("钉钉 AI Card 模板未配置");
     try {
@@ -413,7 +419,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         outTrackId: input.messageId,
         text: input.text,
         finalize: input.finalize ?? false,
-        error: input.error ?? false
+        error: input.error ?? false,
+        ...(input.activity ? { activity: input.activity } : {})
       });
     } catch (error) { throw dingTalkProgressError(error, input.messageId); }
   }
@@ -741,18 +748,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     this.sleep = requestOrOptions.sleep ?? delayMilliseconds;
   }
 
-  async create(input: {
-    accessToken: string;
-    cardTemplateId: string;
-    contentKey: string;
-    outTrackId: string;
-    robotCode: string;
-    target: DingTalkAICardTarget;
-    atUserIds?: Record<string, string>;
-    text: string;
-    lifecycleId?: string;
-    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
-  }): Promise<void> {
+  async create(input: DingTalkAICardCreateInput): Promise<void> {
     const mentionParameters = dingTalkCardAtParameters(input.target, input.atUserIds);
     const suppliedLifecycleId = input.lifecycleId?.trim();
     const lifecycle = { id: suppliedLifecycleId || input.outTrackId, owned: !suppliedLifecycleId };
@@ -798,14 +794,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     });
   }
 
-  async update(input: {
-    accessToken: string;
-    contentKey: string;
-    outTrackId: string;
-    text: string;
-    finalize: boolean;
-    error: boolean;
-  }): Promise<void> {
+  async update(input: DingTalkAICardUpdateInput): Promise<void> {
     const lifecycle = this.cardLifecycles.get(input.outTrackId)
       ?? { id: input.outTrackId, owned: true };
     this.cardLifecycles.set(input.outTrackId, lifecycle);
@@ -823,21 +812,21 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     }
   }
 
-  private async updateWithRetry(input: {
-    accessToken: string;
-    contentKey: string;
-    outTrackId: string;
-    text: string;
-    finalize: boolean;
-    error: boolean;
-  }, lifecycleId: string): Promise<void> {
+  private async updateWithRetry(input: DingTalkAICardUpdateInput, lifecycleId: string): Promise<void> {
     const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
-    if (firstUpdate) {
-      await this.updateCardState(lifecycleId, input, content, "2", false);
-      this.inputingCards.add(input.outTrackId);
+    if (!input.finalize && !nativeDingTalkLoading(input)) {
+      // Select the static body without finalizing the logical task or its
+      // stream. A later running frame reselects input mode on this SAME card.
+      await this.updateCardState(lifecycleId, input, content, "3", true);
+      this.inputingCards.delete(input.outTrackId);
+      return;
     }
+    // Full snapshots remain the compatibility path. During execution, stream
+    // LAST so the native cursor is not immediately replaced by a static write.
+    if (firstUpdate || !input.finalize) await this.updateCardState(lifecycleId, input, content, "2", !firstUpdate);
+    this.inputingCards.add(input.outTrackId);
     const streamBody = dingTalkCardStreamingUpdateBody({
       outTrackId: input.outTrackId,
       contentKey: input.contentKey,
@@ -856,12 +845,6 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     if (input.finalize) {
       await this.updateCardState(lifecycleId, input, content, "3", true);
       this.inputingCards.delete(input.outTrackId);
-    } else if (!firstUpdate) {
-      // Some DingTalk tenants acknowledge /card/streaming without pushing the
-      // new value to clients. Force the same full snapshot through the card
-      // instance endpoint, which is the path that reliably renders the first
-      // frame in those tenants.
-      await this.updateCardState(lifecycleId, input, content, "2", true);
     }
   }
 
@@ -971,17 +954,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     }));
   }
 
-  async create(input: {
-    accessToken: string;
-    cardTemplateId: string;
-    contentKey: string;
-    outTrackId: string;
-    robotCode: string;
-    target: DingTalkAICardTarget;
-    atUserIds?: Record<string, string>;
-    text: string;
-    onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
-  }): Promise<void> {
+  async create(input: DingTalkAICardCreateInput): Promise<void> {
     const mentionParameters = dingTalkCardAtParameters(input.target, input.atUserIds);
     let operation: "create" | "deliver" = "create";
     try {
@@ -1042,14 +1015,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       assertDingTalkCardMutationSucceeded("deliver", deliverResponse);
   }
 
-  async update(input: {
-    accessToken: string;
-    contentKey: string;
-    outTrackId: string;
-    text: string;
-    finalize: boolean;
-    error: boolean;
-  }): Promise<void> {
+  async update(input: DingTalkAICardUpdateInput): Promise<void> {
     const previous = this.updateChains.get(input.outTrackId) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
@@ -1064,21 +1030,17 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     }
   }
 
-  private async updateWithRetry(input: {
-    accessToken: string;
-    contentKey: string;
-    outTrackId: string;
-    text: string;
-    finalize: boolean;
-    error: boolean;
-  }): Promise<void> {
+  private async updateWithRetry(input: DingTalkAICardUpdateInput): Promise<void> {
     const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
-    if (firstUpdate) {
-      await this.updateCardStateWithRetry(input, content, "2", false);
-      this.inputingCards.add(input.outTrackId);
+    if (!input.finalize && !nativeDingTalkLoading(input)) {
+      await this.updateCardStateWithRetry(input, content, "3", true);
+      this.inputingCards.delete(input.outTrackId);
+      return;
     }
+    if (firstUpdate || !input.finalize) await this.updateCardStateWithRetry(input, content, "2", !firstUpdate);
+    this.inputingCards.add(input.outTrackId);
     const guid = this.streamGuids.next();
     let lastError: unknown;
     for (const [attempt, retryDelay] of this.retryDelaysMs.entries()) {
@@ -1105,8 +1067,6 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
         if (input.finalize) {
           await this.updateCardStateWithRetry(input, content, "3", true);
           this.inputingCards.delete(input.outTrackId);
-        } else if (!firstUpdate) {
-          await this.updateCardStateWithRetry(input, content, "2", true);
         }
         return;
       } catch (error) {
@@ -1200,12 +1160,17 @@ function visibleDingTalkTerminalContent(input: { text: string; finalize: boolean
   return normalizeDingTalkCardContent(text);
 }
 
-function initialDingTalkCardData(input: { contentKey: string; text: string }): Record<string, string> {
+/** Legacy non-task stream callers retain their existing input presentation. */
+function nativeDingTalkLoading(input: DingTalkCardActivity): boolean {
+  return input.activity === undefined || input.activity === "running" || input.activity === "recovering";
+}
+
+function initialDingTalkCardData(input: { contentKey: string; text: string } & DingTalkCardActivity): Record<string, string> {
   const text = normalizeDingTalkCardContent(input.text);
   if (!text.trim()) throw new Error("DingTalk card initial content must not be empty");
   if (text.length > 50_000) throw new Error("DingTalk card payload requires pagination");
   // Publish a populated first frame, not an empty template awaiting a second request.
-  return dingTalkCardStateParamMap({ contentKey: input.contentKey, text, flowStatus: "2" });
+  return dingTalkCardStateParamMap({ contentKey: input.contentKey, text, flowStatus: nativeDingTalkLoading(input) ? "2" : "3" });
 }
 
 export function dingTalkCardStateParamMap(input: {

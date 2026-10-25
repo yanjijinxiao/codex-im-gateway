@@ -3,6 +3,7 @@ import type { ChannelActionCard } from "./action-card.js";
 import type { ChannelTaskCard } from "./task-card.js";
 import type { ChannelTableLayout } from "./table.js";
 import type { ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
+import type { TurnActivity } from "./turn-status.js";
 
 export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
@@ -42,6 +43,8 @@ export type ChannelTextClient = {
     text: string;
     finalize?: boolean;
     error?: boolean;
+    /** Trusted task activity; adapters must not infer loading from body text. */
+    activity?: TurnActivity;
   }): Promise<void>;
   sendImage?(input: { toUserId: string; path: string }): Promise<{ messageId: string }>;
   sendActionCard?(input: ChannelActionCardInput): Promise<ChannelReceipt>;
