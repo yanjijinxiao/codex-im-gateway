@@ -823,9 +823,10 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
       this.inputingCards.delete(input.outTrackId);
       return;
     }
-    // Full snapshots remain the compatibility path. During execution, stream
-    // LAST so the native cursor is not immediately replaced by a static write.
-    if (firstUpdate || !input.finalize) await this.updateCardState(lifecycleId, input, content, "2", !firstUpdate);
+    // One writer owns the active body. Re-entering input mode patches only
+    // template controls, never the content key already owned by streaming.
+    // Rewriting both resets native Markdown widgets (notably fenced commands).
+    if (firstUpdate) await this.updateCardState(lifecycleId, input, content, "2", true, true);
     this.inputingCards.add(input.outTrackId);
     const streamBody = dingTalkCardStreamingUpdateBody({
       outTrackId: input.outTrackId,
@@ -853,12 +854,13 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
     input: { accessToken: string; contentKey: string; outTrackId: string },
     content: string,
     flowStatus: "2" | "3" | "5",
-    updateByKey: boolean
+    updateByKey: boolean,
+    modeOnly = false
   ): Promise<void> {
     await this.mutateWithRetry(lifecycleId, "state", "/v1.0/card/instances", input.accessToken, {
       outTrackId: input.outTrackId,
       cardData: {
-        cardParamMap: dingTalkCardStateParamMap({
+        cardParamMap: modeOnly ? dingTalkCardInputModeParamMap(input.contentKey) : dingTalkCardStateParamMap({
           contentKey: input.contentKey,
           text: content,
           flowStatus
@@ -1039,7 +1041,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       this.inputingCards.delete(input.outTrackId);
       return;
     }
-    if (firstUpdate || !input.finalize) await this.updateCardStateWithRetry(input, content, "2", !firstUpdate);
+    if (firstUpdate) await this.updateCardStateWithRetry(input, content, "2", true, true);
     this.inputingCards.add(input.outTrackId);
     const guid = this.streamGuids.next();
     let lastError: unknown;
@@ -1091,7 +1093,8 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
     },
     content: string,
     flowStatus: "2" | "3" | "5",
-    updateByKey: boolean
+    updateByKey: boolean,
+    modeOnly = false
   ): Promise<void> {
     let lastError: unknown;
     for (const [attempt, retryDelay] of this.retryDelaysMs.entries()) {
@@ -1099,7 +1102,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
       const request = new DingTalk.card_1_0.UpdateCardRequest({
         outTrackId: input.outTrackId,
         cardData: new DingTalk.card_1_0.UpdateCardRequestCardData({
-          cardParamMap: dingTalkCardStateParamMap({
+          cardParamMap: modeOnly ? dingTalkCardInputModeParamMap(input.contentKey) : dingTalkCardStateParamMap({
             contentKey: input.contentKey,
             text: content,
             flowStatus
@@ -1185,6 +1188,12 @@ export function dingTalkCardStateParamMap(input: {
     sys_full_json_obj: JSON.stringify({ order: [input.contentKey] }),
     config: JSON.stringify({ autoLayout: true })
   };
+}
+
+/** Input-mode control plane. No body means no second Markdown body writer. */
+function dingTalkCardInputModeParamMap(contentKey: string): Record<string, string> {
+  const { [contentKey]: _body, ...mode } = dingTalkCardStateParamMap({ contentKey, text: "", flowStatus: "2" });
+  return mode;
 }
 
 export function dingTalkCardStreamingUpdateBody(input: {

@@ -86,7 +86,11 @@ for (const transport of ["HTTPS", "SDK"] as const) {
     const source = "1. **第一段**\n\n   解释\n\n2. **第二段**\n\n   - 明细";
     const contents: string[] = [];
     let creates = 0, deliveries = 0;
-    const snapshot = (body: any) => { contents.push(body.cardData.cardParamMap.content); };
+    let modePatches = 0;
+    const snapshot = (body: any) => {
+      if (Object.hasOwn(body.cardData.cardParamMap, "content")) contents.push(body.cardData.cardParamMap.content);
+      else modePatches++;
+    };
     const client = transport === "HTTPS" ? new DingTalkHttpsAICardClient(async (url, init) => {
       const body = JSON.parse(String(init?.body));
       const deliver = String(url).endsWith("/deliver");
@@ -107,7 +111,7 @@ for (const transport of ["HTTPS", "SDK"] as const) {
     await client.update({ ...input, finalize: true, error: false });
     assert.equal(creates, 1);
     assert.equal(deliveries, 1);
-    assert.equal(contents.length, 5);
+    assert.equal(contents.length, 4); assert.equal(modePatches, 1);
     assert.ok(contents.every(content => content === normalizeDingTalkCardContent(source)));
     assert.ok(contents.every(content => content.includes("**2.** **第二段**")));
   });

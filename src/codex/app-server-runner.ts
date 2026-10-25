@@ -489,7 +489,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   async inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState> {
-    const membership = this.sessionMembership(true);
+    // Read membership when the response arrives, not before an IPC wait that
+    // can overlap moving the chat out of its project.
+    const membership = (state: CodexThreadState) => this.sessionMembership(true)(state);
     await this.ensureConnected();
     try {
       let response: Record<string, unknown>;

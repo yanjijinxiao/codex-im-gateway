@@ -9,12 +9,17 @@ import type { CodexThreadState } from "./backend.js";
  */
 export function desktopSessionMembership(codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), hostId = "local", legacyWorkspaceFallback = false): (state: CodexThreadState) => CodexThreadState {
   let state: Record<string, unknown> = {};
+  let available = false;
+  let current = false;
   for(const filename of [".codex-global-state.json", ".codex-global-state.json.bak"]) {
     try {
       const parsed: unknown = JSON.parse(fs.readFileSync(path.join(codexHome, filename), "utf8"));
       if(!record(parsed))
         continue;
       state = parsed;
+      available = record(parsed["thread-project-assignments"]) || record(parsed["sidebar-project-thread-orders"])
+        || Array.isArray(parsed["projectless-thread-ids"]);
+      current = filename === ".codex-global-state.json";
       break;
     }
     catch { /* Atomic replacement or Desktop not installed; native data remains authoritative. */ }
@@ -69,18 +74,22 @@ export function desktopSessionMembership(codexHome = process.env.CODEX_HOME ?? p
   }
   const hints = record(state["thread-workspace-root-hints"]) ? state["thread-workspace-root-hints"] : {};
   return (thread) => {
-    if (membership.has(thread.threadId)) return { ...thread, projectId: membership.get(thread.threadId) };
-    if (!legacyWorkspaceFallback || thread.projectId) return thread;
+    if (membership.has(thread.threadId)) return { ...thread, projectId: membership.get(thread.threadId),
+      projectMembership: current ? membership.get(thread.threadId) ? "assigned" : "none" : "unknown" };
+    if (thread.projectId) return { ...thread, projectMembership: thread.projectMembership ?? "assigned" };
+    const unassigned = { ...thread, projectMembership: available && current ? "none" as const : "unknown" as const };
+    if (!legacyWorkspaceFallback) return unassigned;
     const hint = hints[thread.threadId];
     const cwd = typeof hint === "string" ? hint : thread.cwd;
-    if (!cwd) return thread;
+    if (!cwd) return unassigned;
     // Same boundary-aware root matching used by Desktop's project groups.
     // Ambiguous roots do not invent a membership; the longest unique root wins.
     const matches = roots.filter(({ root }) => cwd === root || cwd.startsWith(`${root.replace(/[\\/]+$/, "")}/`))
       .sort((a, b) => b.root.length - a.root.length);
     const longest = matches[0];
     const ids = new Set(matches.filter(m => m.root.length === longest?.root.length).map(m => m.projectId));
-    return ids.size === 1 ? { ...thread, projectId: longest.projectId } : thread;
+    // Legacy grouping is useful in a catalog but is never access authority.
+    return ids.size === 1 ? { ...thread, projectId: longest.projectId, projectMembership: "unknown" } : unassigned;
   };
 }
 function record(value: unknown): value is Record<string, unknown> {

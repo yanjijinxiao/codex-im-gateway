@@ -141,7 +141,7 @@ export type BridgeServiceOptions = {
   ideApprovals?: IDEApprovalService;
   /** Captured from the actual running adapter account, not mutable UI state. */
   ideProviderId?: string;
-  ideEntry?: (session: ManagedSession) => string | undefined;
+  ideEntry?: (session: ManagedSession) => string | undefined | Promise<string | undefined>;
   deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
@@ -511,7 +511,7 @@ export class BridgeService {
     switch (command.name) {
       case "ide": {
         const session = this.executionSession(message.senderId);
-        const url = session && this.options.ideEntry?.(session);
+        const url = session && await this.options.ideEntry?.(session);
         await this.reply(message.senderId, url ? `${ideEntryLink(url)}\n登录后打开，不会启动新的 Codex 任务。`
           : "当前没有可用的 Web IDE 入口。请先绑定有项目的 session，并在 Gateway 网页端启用对应主机的 Web IDE。");
         return;
@@ -2382,8 +2382,14 @@ export class BridgeService {
         }
         const bound = stillBound();
         let finalText = parsed.visibleText.trim() || "处理完成。";
-        try { finalText = withIDEEntry(finalText, this.options.ideEntry?.(session)); } catch { /* IDE is optional. */ }
         const journaled = bound && result.turnId && this.options.deliverTurnResult;
+        // The journal owns decoration when present; standalone delivery uses
+        // the same presentation policy, never a second enrichment pass.
+        if (!journaled) {
+          let url: string | undefined;
+          try { url = await this.options.ideEntry?.(session); } catch { /* IDE is optional. */ }
+          finalText = withIDEEntry(finalText, url);
+        }
         const streamed = journaled
           ? await this.options.deliverTurnResult!(session, result.turnId!, finalText)
           : bound && replyStream ? await replyStream.finalize(finalText) : false;

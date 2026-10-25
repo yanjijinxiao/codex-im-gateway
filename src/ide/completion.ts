@@ -10,6 +10,17 @@ export function ideEntryLink(url: string): string {
 
 /** Presentation-only enrichment. Never alters the model history or submission. */
 export function withIDEEntry(text: string, url?: string): string {
+  // This standalone label is Gateway-owned, including legacy model-authored
+  // footers. Reconcile it semantically, not by comparing two session URLs.
+  let fence: string | undefined;
+  text = text.split("\n").filter(line => {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker) { if (!fence) fence = marker; else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined; return true; }
+    if (fence) return true;
+    const match = /^\s*\[打开项目 Web IDE\]\((https?:\/\/\S+)\)\s*$/.exec(line);
+    if (!match) return true;
+    try { return !/^\/workspace\/[^/]+\/?$/.test(new URL(match[1]).pathname); } catch { return true; }
+  }).join("\n").trimEnd();
   if (!url) return text;
   const link = ideEntryLink(url);
   if (text.includes(url) || text.includes(link)) return text;

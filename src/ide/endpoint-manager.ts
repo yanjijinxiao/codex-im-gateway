@@ -127,6 +127,7 @@ export class IDEEndpointManager {
     };
     record.context = {
       configStore: this.manager.configStore, config: () => record.config, resolve,
+      refresh: async id => { resolve(id); await this.manager.refresh(id); return resolve(id); },
       authorizationFile: () => spec.localDirect ? path.join(path.dirname(this.manager.authorizationFile()), "authorization-local-direct.json")
         : hostId ? path.join(path.dirname(this.manager.authorizationFile()), `authorization-${hostKey(hostId)}.json`) : this.manager.authorizationFile(),
       canonicalForTrust: id => { resolve(id); return this.manager.canonicalForTrust(id); },

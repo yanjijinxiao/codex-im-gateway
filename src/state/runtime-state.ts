@@ -883,6 +883,30 @@ export class RuntimeStateStore {
     return structuredClone(session);
   }
 
+  /** One native thread can have many IM edges. Membership changes update every
+   * edge on that host atomically, without detaching chats or touching execution. */
+  reconcileThreadProject(threadId: string, hostId: string, projectId: string | undefined, cwd?: string): void {
+    if (projectId && (this.mutableProject(projectId).hostId ?? "local") !== hostId) throw new Error("项目主机不一致");
+    let changed = false;
+    for (const session of this.state.sessions) {
+      if (session.threadId !== threadId || session.mode === "qa"
+        || (session.hostId ?? this.getProject(session.projectId ?? "")?.hostId ?? "local") !== hostId) continue;
+      const bound = this.getBoundSession(session.senderId)?.id === session.id;
+      const workspace = cwd && path.isAbsolute(cwd) ? cwd : session.workspace;
+      if (session.projectId === projectId && session.workspace === workspace
+        && (projectId ? session.projectBinding !== "none" : session.projectBinding === "none")) continue;
+      session.hostId = hostId; session.workspace = workspace;
+      if (projectId) { session.projectId = projectId; delete session.projectBinding; }
+      else { delete session.projectId; session.projectBinding = "none"; }
+      if (bound) {
+        if (projectId) this.state.activeProjectIds[session.senderId] = projectId;
+        else delete this.state.activeProjectIds[session.senderId];
+      }
+      changed = true;
+    }
+    if (changed) this.save();
+  }
+
   /** Selecting a Taskboard thread is a binding change, not a retargeted old session. */
   bindProjectThread(senderId: string, projectId: string, threadId: string, title: string): ManagedSession {
     const project = this.mutableProject(projectId);

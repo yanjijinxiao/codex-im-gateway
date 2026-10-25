@@ -31,6 +31,30 @@ test("Desktop membership joins exact host/thread IDs, not shared cwd; explicit m
   fs.unlinkSync(path.join(home, ".codex-global-state.json.bak"));
   assert.equal(desktopSessionMembership(home)(thread("member", "native")).projectId, "native");
 });
+
+test("membership evidence separates explicit absence, unknown/backup data and cwd-only catalog grouping", t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-membership-evidence-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const file = path.join(home, ".codex-global-state.json");
+  const thread: CodexThreadState = { threadId: "thread", cwd: "/project", persistence: "active", runtimeStatus: "idle", activeFlags: [] };
+  assert.equal(desktopSessionMembership(home)(thread).projectMembership, "unknown");
+  fs.writeFileSync(file, "{}");
+  assert.equal(desktopSessionMembership(home)(thread).projectMembership, "unknown");
+  const state = { "local-projects": { p: { id: "p", rootPaths: ["/project"] } }, "thread-project-assignments": {} as Record<string, unknown> };
+  fs.writeFileSync(file, JSON.stringify(state));
+  assert.equal(desktopSessionMembership(home)(thread).projectMembership, "none");
+  const legacy = desktopSessionMembership(home, "local", true)(thread);
+  assert.equal(legacy.projectId, "p"); assert.equal(legacy.projectMembership, "unknown");
+  state["thread-project-assignments"].thread = { projectId: null };
+  fs.writeFileSync(file, JSON.stringify(state));
+  assert.equal(desktopSessionMembership(home, "local", true)(thread).projectMembership, "none");
+  state["thread-project-assignments"].thread = { projectId: "p" };
+  fs.writeFileSync(file, JSON.stringify(state));
+  assert.equal(desktopSessionMembership(home)(thread).projectMembership, "assigned");
+  fs.renameSync(file, file + ".bak");
+  const backup = desktopSessionMembership(home)(thread);
+  assert.equal(backup.projectId, "p"); assert.equal(backup.projectMembership, "unknown", "backup metadata is display-only, never fresh access authority");
+});
 test("App backend applies membership before filtering/limit across all native pages, and inspect agrees", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-native-pages-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));

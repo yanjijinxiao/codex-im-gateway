@@ -13,7 +13,7 @@ import type { IDEApprovalCopyPort } from "./approval-service.js";
 import { IDE_APPROVAL_CHOICES, ideConfirmationCommand } from "./approval-presentation.js";
 
 type BrowserSession = IDEBrowserSession;
-export type IDEAccessContext = Pick<WorkspaceIDEManager, "configStore" | "config" | "resolve" | "authorizationFile" | "canonicalForTrust" | "open" | "endpoint" | "resume" | "close" | "onStop" | "accessAvailable">;
+export type IDEAccessContext = Pick<WorkspaceIDEManager, "configStore" | "config" | "resolve" | "refresh" | "authorizationFile" | "canonicalForTrust" | "open" | "endpoint" | "resume" | "close" | "onStop" | "accessAvailable">;
 const COOKIE = "cig_ide_";
 const escape = (text: string) => text.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 
@@ -76,7 +76,7 @@ export class IDEAccessServer {
     } catch (error) { this.error = error instanceof Error ? error.message : "IDE HTTPS 证书无法读取"; throw error; }
     server.on("connection", socket => { this.sockets.add(socket); socket.once("close", () => this.sockets.delete(socket)); });
     server.on("upgrade", (req, socket, head) => {
-      try { this.upgrade(req, socket, head); } catch { socket.destroy(); }
+      void this.upgrade(req, socket, head).catch(() => socket.destroy());
     });
     server.requestTimeout = 30_000; server.headersTimeout = 15_000; server.maxHeadersCount = 100; server.maxConnections = 256;
     const listenError = "IDE 访问入口启动失败；请检查端口占用及所选 VPN/IP 是否仍在线。";
@@ -104,6 +104,7 @@ export class IDEAccessServer {
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
       const scope = this.scope(entryId);
+      await this.manager.refresh(entryId);
       if (expectedScope !== undefined && scope !== expectedScope) throw new Error("项目目录已改变，请重新核对完整目录后授权");
       const directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未签发授权");
@@ -121,6 +122,7 @@ export class IDEAccessServer {
   async approveAccess(requestId: string, entryId: string, trustWorkspace = false, beforeCommit?: () => void): Promise<void> {
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
+      await this.manager.refresh(entryId);
       this.assertEntry(entryId); const scope = this.scope(entryId), directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未批准授权");
       if (decision.invalidated) throw new Error("项目授权配置已改变，未批准授权");
@@ -188,7 +190,7 @@ export class IDEAccessServer {
     if (!this.validHost(req)) { res.writeHead(403).end(); return; }
     const url = new URL(req.url ?? "/", this.manager.config().publicOrigin);
     const entryId = /^\/(?:workspace|open|ide|logout)\/([a-f0-9]{32})(?:\/|$)/.exec(url.pathname)?.[1] ?? "";
-    if (entryId) { try { this.manager.resolve(entryId); } catch { res.writeHead(404).end(); return; } }
+    if (entryId) { try { await this.manager.refresh(entryId); } catch { res.writeHead(404).end(); return; } }
     const session = this.authenticate(req, entryId), method = req.method ?? "GET";
     const copyPanel = /^\/approval\/([a-f0-9]{32})$/.exec(url.pathname);
     if (copyPanel) {
@@ -213,7 +215,7 @@ export class IDEAccessServer {
       const allowed = authority && [this.managementOrigin, `http://localhost:${authority.port}`];
       if (!allowed || !allowed.includes(req.headers.origin)) { res.writeHead(403).end(); return; }
       const form = new URLSearchParams(await readBody(req)), id = form.get("entryId") ?? "";
-      try { this.manager.resolve(id); } catch { res.writeHead(404).end(); return; }
+      try { await this.manager.refresh(id); } catch { res.writeHead(404).end(); return; }
       this.assertEntry(id);
       const access = this.authorization.consume(form.get("token") ?? "", id, this.scope(id));
       if (!access) { this.page(res, 401, "授权已失效", "请从 Gateway 管理页重新打开；授权只能使用一次。"); return; }
@@ -318,9 +320,10 @@ export class IDEAccessServer {
     for (const key of Object.keys(headers)) if (["cookie", "authorization", "proxy-authorization", "forwarded"].includes(key) || key.startsWith("x-forwarded-") || key.startsWith("x-codex-")) delete headers[key];
     return headers;
   }
-  private upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+  private async upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
     const url = new URL(req.url ?? "/", this.manager.config().publicOrigin), match = /^\/ide\/([a-f0-9]{32})(\/.*)$/.exec(url.pathname);
     if (!match) { socket.destroy(); return; }
+    try { await this.manager.refresh(match[1]); } catch { socket.destroy(); return; }
     const session = this.authenticate(req, match[1]);
     if (!this.validHost(req) || !this.validOrigin(req) || !session) { socket.destroy(); return; }
     const endpoint = this.manager.endpoint(match[1], session.trustWorkspace === true); if (!endpoint) { socket.destroy(); return; }
@@ -341,8 +344,9 @@ export class IDEAccessServer {
   }
   private track(socket: Duplex, session: BrowserSession, instanceId: string): void {
     const previous = this.connections.get(socket); if (previous) clearTimeout(previous.timer);
-    const verify = () => {
+    const verify = async () => {
       try {
+        await this.manager.refresh(session.entryId);
         if (!this.authorization.active(session) || session.scope !== this.scope(session.entryId)) { socket.destroy(); return; }
         const entry = this.connections.get(socket); if (!entry) return;
         entry.timer = setTimeout(verify, Math.max(1, Math.min(30_000, session.expiresAt - Date.now()))); entry.timer.unref();

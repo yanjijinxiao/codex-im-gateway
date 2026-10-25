@@ -12,7 +12,7 @@ import { runtimeChanges } from "./reconfiguration.js";
 export type IDEWorkspace = { owner: string; sessionId: string; hostId: string; workspace: string; projectName: string;
   projectId?: string; nativeThreadId?: string; rootPaths?: readonly string[] };
 export type IDECanonicalWorkspace = { workspace: string; rootPaths?: readonly string[] };
-type Reference = { accountId: string; sessionId: string };
+type Reference = { accountId: string; sessionId: string; identity?: string; sessionIds?: string[] };
 type Instance = { id: string; hostId: string; workspace: string; status: "starting" | "running" | "error" | "stopped";
   error?: string; launch?: IDELaunch; lastUsedAt: number; trustWorkspace?: boolean; profile?: IDEProfileStatus;
   rootPaths?: readonly string[]; workspaceFile?: string };
@@ -46,7 +46,9 @@ export class WorkspaceIDEManager {
       const references = readJsonFile<Record<string, Reference>>(this.referencePath, {});
       if (!references || Array.isArray(references) || typeof references !== "object"
         || Object.entries(references).some(([id, value]) => !/^[a-f0-9]{32}$/.test(id)
-          || !value || typeof value.accountId !== "string" || typeof value.sessionId !== "string")) throw new Error("Invalid IDE references");
+          || !value || typeof value.accountId !== "string" || typeof value.sessionId !== "string"
+          || value.identity !== undefined && !/^[a-f0-9]{32}$/.test(value.identity)
+          || value.sessionIds !== undefined && (!Array.isArray(value.sessionIds) || value.sessionIds.some(id => typeof id !== "string")))) throw new Error("Invalid IDE references");
       this.references = references;
     }
     catch { this.references = {}; this.referenceError = true; }
@@ -62,16 +64,62 @@ export class WorkspaceIDEManager {
       : config.routing === "per-host" && target.hostId !== "local" ? config.hosts.find(h => h.hostId === target.hostId)?.access?.publicOrigin : config.publicOrigin;
     if (!origin) return;
     if (this.referenceError) throw new Error("IDE 入口记录无法读取，请检查专用状态文件；未覆盖旧记录");
-    const id = digest([accountId, sessionId]);
-    if (!this.references[id]) { this.references[id] = { accountId, sessionId }; writeJsonFile(this.referencePath, this.references); }
+    // Project/worktree identity is stable across IM edges and native threads.
+    // Roots are an authorization scope, not URL identity: expanding them keeps
+    // the link but requires a fresh grant. Legacy references remain readable.
+    const identity = target.projectId ? this.entryIdentity(accountId, target) : undefined;
+    const id = identity ?? digest([accountId, sessionId]);
+    const reference = this.references[id];
+    if (!reference) {
+      this.references[id] = { accountId, sessionId, ...(identity ? { identity, sessionIds: [sessionId] } : {}) };
+      writeJsonFile(this.referencePath, this.references);
+    } else if (identity && !reference.sessionIds?.includes(sessionId)) {
+      reference.sessionIds = [...new Set([reference.sessionId, ...(reference.sessionIds ?? []), sessionId])];
+      writeJsonFile(this.referencePath, this.references);
+    }
     return { id, url: `${new URL(origin).origin}/workspace/${id}` };
+  }
+  async freshEntry(accountId: string, sessionId: string): Promise<{ id: string; url: string } | undefined> {
+    if (!this.configStore.config().enabled) return;
+    if (this.options.refresh && !await this.options.refresh(accountId, sessionId)) return;
+    return this.entry(accountId, sessionId);
+  }
+  private entryIdentity(accountId: string, target: IDEWorkspace): string {
+    return digest(["project-entry-v1", accountId, target.owner, target.hostId, target.projectId, target.workspace]);
+  }
+  private referenceTarget(id: string): { reference: Reference; sessionId: string; target: IDEWorkspace } {
+    if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("IDE 入口不存在");
+    const reference = this.references[id];
+    if (reference) for (const sessionId of new Set([reference.sessionId, ...(reference.sessionIds ?? [])])) {
+      const target = this.options.resolve(reference.accountId, sessionId);
+      if (target && (!reference.identity || this.entryIdentity(reference.accountId, target) === reference.identity)) {
+        // Pin legacy references on their first validated use. Keep their old
+        // authorization shape, but never follow a later session/project move.
+        if (!reference.identity && target.projectId) {
+          reference.identity = this.entryIdentity(reference.accountId, target);
+          writeJsonFile(this.referencePath, this.references);
+        }
+        return { reference, sessionId, target };
+      }
+    }
+    throw new Error("项目或 session 已移除，IDE 入口失效");
+  }
+  /** Validate through the same native boundary as link creation and startup.
+   * Unknown observations fail closed and do not rewrite stored membership. */
+  async refresh(id: string): Promise<IDEWorkspace> {
+    const { reference, sessionId } = this.referenceTarget(id);
+    const current = this.options.refresh ? await this.options.refresh(reference.accountId, sessionId) : this.resolve(id);
+    if (!current) throw new Error("项目关系无法确认，IDE 入口失效");
+    if (reference.identity && this.entryIdentity(reference.accountId, current) !== reference.identity) throw new Error("项目上下文已改变，IDE 入口失效");
+    const latest = this.resolve(id);
+    return reference.identity === id ? latest : current;
   }
   accountForEntry(id: string): string { this.resolve(id); return this.references[id].accountId; }
   authorizationScope(id: string): string { return crypto.createHash("sha256").update(JSON.stringify(this.resolve(id))).digest("hex"); }
   resolve(id: string): IDEWorkspace {
-    if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("IDE 入口不存在");
-    const reference = this.references[id];
-    const target = reference && this.options.resolve(reference.accountId, reference.sessionId);
+    const { reference, target: resolved } = this.referenceTarget(id);
+    // Authorization must not depend on which surviving IM alias was selected.
+    const target = reference.identity === id ? { ...resolved, sessionId: id, nativeThreadId: undefined } : resolved;
     if (!target || !path.posix.isAbsolute(target.workspace) || /[\r\n\0]/.test(target.workspace)) throw new Error("项目或 session 已移除，IDE 入口失效");
     if (target.rootPaths && (!Array.isArray(target.rootPaths) || target.rootPaths.length < 2 || target.rootPaths.length > 32
       || !target.rootPaths.includes(target.workspace) || new Set(target.rootPaths).size !== target.rootPaths.length
@@ -98,8 +146,8 @@ export class WorkspaceIDEManager {
     return { workspace, rootPaths };
   }
   async canonicalForTrust(id: string): Promise<IDECanonicalWorkspace> {
-    const base = this.resolve(id), expected = digest(base), reference = this.references[id];
-    const current = this.options.refresh ? await this.options.refresh(reference.accountId, reference.sessionId) : base;
+    const base = this.resolve(id), expected = digest(base);
+    const current = await this.refresh(id);
     if (!current || digest(current) !== expected || digest(this.resolve(id)) !== expected) throw new Error("项目目录已改变，请同步 session 后重新授权");
     const directory = await this.canonical(base);
     if (digest(this.resolve(id)) !== expected) throw new Error("项目已改变，未授权目录");
@@ -107,7 +155,7 @@ export class WorkspaceIDEManager {
   }
   async start(id: string, prepare = false, trustWorkspace = false, trustedDirectory?: string, trustedRootPaths?: readonly string[]): Promise<IDEInstanceStatus> {
     if (this.closing) throw new Error("IDE 正在停止或重新配置，请稍后重试");
-    const base = this.resolve(id), reference = this.references[id], generation = this.generation;
+    const base = this.resolve(id), generation = this.generation;
     const hostGeneration = this.hostGenerations.get(base.hostId) ?? 0;
     const initial = this.host(base);
     const check = () => {
@@ -118,7 +166,7 @@ export class WorkspaceIDEManager {
         throw new Error("IDE 配置已改变，已取消启动，请刷新后重试");
     };
     check();
-    const target = this.options.refresh ? await this.options.refresh(reference.accountId, reference.sessionId) : base;
+    const target = await this.refresh(id);
     check();
     if (!target || target.hostId !== base.hostId || target.owner !== base.owner || digest(base) !== digest(this.resolve(id))) throw new Error("项目上下文已改变，未启动 IDE");
     const { config, host } = this.host(target);

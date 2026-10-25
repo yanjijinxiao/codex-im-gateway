@@ -61,7 +61,8 @@ type FollowState = {
   presentationInputBaseline?: string[];
 };
 type Options = {
-  decorateFinal?: (sub: ThreadSubscription, text: string) => string;
+  decorateFinal?: (sub: ThreadSubscription, text: string) => string | Promise<string>;
+  onThreadState?: (sub: ThreadSubscription, state: CodexThreadState) => void;
   onCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   holdsCapacityStart?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   turnAudience?: TurnAudienceJournal;
@@ -429,6 +430,7 @@ export class ThreadEventHub {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);
     state.runtime = snapshot.state;
+    this.options.onThreadState?.(sub, snapshot.state);
     if (snapshot.state.activeTurnId && this.options.holdsCapacityStart?.({ hostId: sub.hostId,
       threadId: sub.threadId, turnId: snapshot.state.activeTurnId })) return;
     state.observedAt = new Date().toISOString();
@@ -881,8 +883,11 @@ export class ThreadEventHub {
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
     const visible = visibleText(text).trim() || "任务已结束。";
     let clean = visible;
-    try { clean = this.options.decorateFinal?.(sub, visible) ?? visible; }
+    try { clean = await this.options.decorateFinal?.(sub, visible) ?? visible; }
     catch { /* Optional IDE metadata must never prevent result delivery. */ }
+    // Optional native context reads can outlive a detach, a replacement turn,
+    // or another completion delivery. Never publish into that newer binding.
+    if (!this.isLive(sub) || state.turnId !== turnId || state.completed.includes(turnId)) return;
     state.terminalPending ??= { turnId, text: clean, fallbackSent: false, outcome: recovery.outcome };
     this.save();
     const stream = this.stream(sub);

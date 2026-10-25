@@ -27,6 +27,7 @@ import { ChannelTurnTextStream } from "../src/channels/progress.js";
 import { ChannelProgressError } from "../src/channels/errors.js";
 import { PinnedNetworkLifecycleTransport } from "../src/channels/network-family.js";
 import { DingTalkCardRouting } from "../src/channels/dingtalk-card-routing.js";
+import { renderTurnProgressCard } from "../src/channels/turn-progress-card.js";
 function cardRouting() { const routes = new DingTalkCardRouting("fake"); routes.remember("cid-test", "2", "staff-123", "fake"); return routes; }
 
 test("DingTalk streaming updates replace the full card content and preserve finalize state", () => {
@@ -129,7 +130,6 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
     { url: "https://api.dingtalk.com/v1.0/card/instances/deliver", method: "POST" },
     { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
-    { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/streaming", method: "PUT" },
     { url: "https://api.dingtalk.com/v1.0/card/instances", method: "PUT" }
@@ -148,14 +148,12 @@ test("DingTalk production card transport matches the HTTPS REST lifecycle", asyn
     openSpaceId: "dtv1.card//IM_GROUP.conversation-id",
     imGroupOpenDeliverModel: { robotCode: "robot-code" }
   });
-  assert.equal((calls[2]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, "阶段一<br>继续");
+  assert.equal((calls[2]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, undefined, "input mode must not rewrite the streaming body");
   assert.equal(calls[3]?.body.key, "msgContent");
   assert.equal(calls[3]?.body.content, "阶段一<br>继续");
-  assert.equal((calls[4]?.body.cardData as { cardParamMap?: Record<string, string> }).cardParamMap?.msgContent, "阶段二");
-  assert.deepEqual(calls[4]?.body.cardUpdateOptions, { updateCardDataByKey: true });
-  assert.equal(calls[5]?.body.content, "阶段二");
-  assert.equal(calls[6]?.body.isFinalize, true);
-  assert.deepEqual(calls[7]?.body.cardUpdateOptions, { updateCardDataByKey: true });
+  assert.equal(calls[4]?.body.content, "阶段二");
+  assert.equal(calls[5]?.body.isFinalize, true);
+  assert.deepEqual(calls[6]?.body.cardUpdateOptions, { updateCardDataByKey: true });
 });
 
 test("DingTalk rejects HTTP 200 card responses whose business result failed", () => {
@@ -308,7 +306,7 @@ test("DingTalk SDK publishes the same nonempty first frame and complete snapshot
   await client.update({ ...base, text: "第一帧" });
   await client.update({ ...base, text: "第二帧" });
   await client.update({ ...base, text: "完成", finalize: true });
-  assert.deepEqual(states, [{ text: "第一帧", keyed: false }, { text: "第二帧", keyed: true }, { text: "完成", keyed: true }]);
+  assert.deepEqual(states, [{ text: undefined, keyed: true }, { text: "完成", keyed: true }]);
 });
 
 test("DingTalk session webhook requires errcode zero before creating a local receipt", async () => {
@@ -353,6 +351,33 @@ test("DingTalk card state snapshots use the configured content key", () => {
 });
 
 for (const mode of ["https", "sdk"] as const) {
+  test(`DingTalk ${mode} sends the stop widget through one active-body writer across progress, heartbeat and recovery`, async () => {
+    const writes: Array<{ kind: string; body: any }> = [];
+    const client = mode === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
+      writes.push({ kind: String(url).endsWith("/streaming") ? "stream" : "state", body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ success: true, result: true }), { status: 200 });
+    }, [0], async () => {}) : new DingTalkSdkAICardClient({
+      async updateCardWithOptions(body) { writes.push({ kind: "state", body }); return { statusCode: 200, body: { success: true, result: true } }; },
+      async streamingUpdateWithOptions(body) { writes.push({ kind: "stream", body }); return { statusCode: 200, body: { success: true, result: true } }; }
+    } as never, [0], async () => {});
+    const base = { accessToken: "fixture", contentKey: "msgContent", outTrackId: "restored-card", finalize: false, error: false };
+    for (const activity of ["running", "running", "waiting-input", "recovering", "running"] as const) {
+      const text = renderTurnProgressCard({ activity, elapsed: "1 秒", current: "当前会话由 Codex Desktop 持有，已转交桌面端继续执行。",
+        recent: [], tools: { completed: 0, failed: 0 }, answerPreview: "" });
+      const before = writes.length;
+      await client.update({ ...base, activity, text });
+      const updates = writes.slice(before);
+      const bodies = updates.map(w => w.kind === "stream" ? w.body.content : w.body.cardData.cardParamMap.msgContent).filter(v => v !== undefined);
+      assert.equal(bodies.length, 1, "never send the same active Markdown block via both snapshot and stream");
+      assert.equal((bodies[0].match(/停止会中断当前任务/g) ?? []).length, 1);
+      assert.equal((bodies[0].match(/\/stop/g) ?? []).length, 1);
+      if (activity !== "waiting-input") {
+        assert.equal(updates.at(-1)!.kind, "stream"); assert.equal(updates.at(-1)!.body.isFull, true);
+        assert.equal(updates.at(-1)!.body.isFinalize, false);
+      }
+    }
+  });
+
   test(`DingTalk ${mode} keeps native loading last, hides it while waiting, and resumes the same card`, async () => {
     const calls: Array<{ kind: "state" | "stream"; body: any }> = [];
     const client = mode === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
@@ -373,9 +398,12 @@ for (const mode of ["https", "sdk"] as const) {
     for (const text of ["**进行中**", "已完成一个步骤，并非终态"]) {
       const before = calls.length;
       await client.update({ ...base, text, activity: "running" });
-      assert.deepEqual(calls.slice(before).map(call => call.kind), ["state", "stream"]);
+      assert.deepEqual(calls.slice(before).map(call => call.kind), before === 0 ? ["state", "stream"] : ["stream"]);
       assert.equal(calls.at(-1)!.body.isFinalize, false);
-      assert.equal(calls.at(-2)!.body.cardData.cardParamMap.flowStatus, "2");
+      if (before === 0) {
+        assert.equal(calls.at(-2)!.body.cardData.cardParamMap.flowStatus, "2");
+        assert.equal(calls.at(-2)!.body.cardData.cardParamMap.msgContent, undefined);
+      }
     }
     for (const activity of ["waiting-input", "waiting-approval", "unconfirmed"] as const) {
       const before = calls.length;
@@ -387,7 +415,7 @@ for (const mode of ["https", "sdk"] as const) {
     for (const activity of ["recovering", "running"] as const) {
       const before = calls.length;
       await client.update({ ...base, text: "恢复后继续", activity });
-      assert.deepEqual(calls.slice(before).map(call => call.kind), ["state", "stream"]);
+      assert.deepEqual(calls.slice(before).map(call => call.kind), activity === "recovering" ? ["state", "stream"] : ["stream"]);
       assert.equal(calls.at(-1)!.body.isFinalize, false);
     }
     await client.update({ ...base, text: "真实最终回执", activity: "running", finalize: true });
@@ -484,7 +512,7 @@ test("DingTalk serializes updates, uses ordered GUIDs, and retries a rejected bu
   assert.equal(calls[0]?.guid, calls[1]?.guid, "a retry must keep the same idempotency GUID");
   assert.ok((calls[2]?.guid ?? "") > (calls[1]?.guid ?? ""), "later updates must have ordered GUIDs");
   assert.deepEqual(states, [
-    { text: "进展一", flowStatus: "2", updateByKey: false },
+    { text: "", flowStatus: "2", updateByKey: true },
     { text: "最终内容", flowStatus: "3", updateByKey: true }
   ]);
 });
@@ -1426,7 +1454,7 @@ for (const transport of ["https", "sdk"] as const) {
     assert.equal(creations[0].userIdType, 1);
     const expected = "<a atId=staff-123>Tester</a>\n\n完成";
     assert.equal(creations[0].cardData.cardParamMap.content, expected);
-    assert.deepEqual(frames, [expected, expected, expected], "initial state, full streaming frame and completed state retain the same native anchor and body");
+    assert.deepEqual(frames, [undefined, expected, expected], "mode patch carries no body; stream and completed snapshot retain the same native anchor");
   });
 }
 
@@ -1470,7 +1498,7 @@ for (const transport of ["https", "sdk"] as const) {
       assert.deepEqual(calls.filter(item => item.operation === "stream").map(item => [item.body.outTrackId, item.body.content]),
         [[receipt.messageId, expected], ["original-segment", "phase summary"]]);
       assert.deepEqual(calls.filter(item => item.operation === "state" && item.body.outTrackId === receipt.messageId)
-        .map(item => item.body.cardData.cardParamMap.content), [expected, expected]);
+        .map(item => item.body.cardData.cardParamMap.content), [undefined, expected]);
       assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "stream", "state", "state", "stream", "state"]);
       const newFinal = calls.findIndex(item => item.operation === "state" && item.body.outTrackId === receipt.messageId && item.body.cardData.cardParamMap.flowStatus === "3");
       const oldFirst = calls.findIndex(item => item.body.outTrackId === "original-segment");

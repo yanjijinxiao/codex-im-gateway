@@ -348,7 +348,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
     if (method === "POST" && url.pathname === "/api/ide/entry") {
       const input = z.object({ accountId: z.string().min(1), sessionId: z.string().min(1) }).strict().parse(await readJsonBody(request));
-      const entry = ide.entry(input.accountId, input.sessionId);
+      const entry = await ide.freshEntry(input.accountId, input.sessionId);
       if (!entry) { sendJson(response, 409, { error: "当前 session 没有可用项目 IDE；请先启用对应主机。" }); return; }
       const target = ide.resolve(entry.id);
       sendJson(response, 200, { ...entry, ...(target.rootPaths ? { rootPaths: target.rootPaths, scope: ide.authorizationScope(entry.id) } : {}) }); return;

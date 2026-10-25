@@ -26,6 +26,7 @@ const BRIDGE_COPY_INSTRUCTIONS = [
   "Native form fields, dropdowns and action buttons should work directly; do not duplicate their labels or internal enum values as copyable answers. For a reply through IM, provide the complete valid command or answer, not an unusable bare internal value. Clearly label templates that require editing.",
   "Copying must not submit an answer, execute a command, grant permission or select an option. Do not ask the user to copy secrets into IM."
 ].join("\n");
+const BRIDGE_IDE_INSTRUCTIONS = "Gateway owns the automatic project Web IDE footer. Do not append an ‘打开项目 Web IDE’ footer or infer one from cwd, remembered URLs or another session. Explicitly requested links may be discussed normally.";
 const KNOWLEDGE_CONTEXT_START = "[codex-weixin-private-knowledge]";
 const KNOWLEDGE_CONTEXT_END = "[/codex-weixin-private-knowledge]";
 export type AttachmentSource = "WeChat" | "Web" | "DingTalk" | "Feishu" | "WeCom" | "IM";
@@ -64,7 +65,9 @@ export function buildPromptParts(
   }
   return {
     prompt: lines.join("\n\n").trim(),
-    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", attachmentSource), BRIDGE_COPY_INSTRUCTIONS, buildKnowledgeContext(knowledge, attachmentSource)].join("\n\n")
+    developerInstructions: [BRIDGE_ACTION_INSTRUCTIONS.replaceAll("WeChat", attachmentSource), BRIDGE_COPY_INSTRUCTIONS,
+      BRIDGE_IDE_INSTRUCTIONS,
+      buildKnowledgeContext(knowledge, attachmentSource)].join("\n\n")
   };
 }
 
@@ -123,6 +126,7 @@ export function parsePrompt(text: string): { text: string; attachments: PromptAt
   for (const instructions of [BRIDGE_COPY_INSTRUCTIONS, LEGACY_BRIDGE_COPY_INSTRUCTIONS]) {
     if (normalized.startsWith(instructions)) { normalized = normalized.slice(instructions.length).trim(); break; }
   }
+  if (normalized.startsWith(BRIDGE_IDE_INSTRUCTIONS)) normalized = normalized.slice(BRIDGE_IDE_INSTRUCTIONS.length).trim();
   normalized = normalized.replace(
     new RegExp(`^${escapeRegExp(KNOWLEDGE_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(KNOWLEDGE_CONTEXT_END)}\\s*`),
     ""

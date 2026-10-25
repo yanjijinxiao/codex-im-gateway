@@ -38,6 +38,8 @@ import type {
   CodexModelOption,
   CodexRuntimeInfo
 } from "../codex/backend.js";
+import type { CodexThreadState } from "../codex/backend.js";
+import { desktopSessionMembership } from "../codex/desktop-session-membership.js";
 import { assertCodexThreadRunnable } from "../codex/backend.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
@@ -289,6 +291,7 @@ export class AccountManager {
   private readonly codexSessionMonitorFactory: NonNullable<AccountManagerOptions["codexSessionMonitorFactory"]>;
   private readonly codexDesktopRequestMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopRequestMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
+  private readonly membershipReads = new Map<string, Promise<CodexThreadState>>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly threadEvents: ThreadEventHub;
   private readonly sessionControls: SessionControlJournal;
@@ -322,10 +325,13 @@ export class AccountManager {
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
-      decorateFinal: (sub, text) => {
+      decorateFinal: async (sub, text) => {
         const [accountId, sessionId] = JSON.parse(sub.key) as string[];
-        return withIDEEntry(text, this.ide.entry(accountId, sessionId)?.url);
+        let url: string | undefined;
+        try { url = (await this.ide.freshEntry(accountId, sessionId))?.url; } catch { /* Optional metadata fails closed. */ }
+        return withIDEEntry(text, url);
       },
+      onThreadState: (sub, state) => { this.observeThreadMembership(sub.hostId, state); },
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       turnAudience: this.turnAudience,
       subscriptions: () => this.threadSubscriptions(),
@@ -495,7 +501,7 @@ export class AccountManager {
     const service = this.bridgeFactory({
       ideApprovals: this.ideApprovals,
       ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
-      ideEntry: session => this.ide.entry(account.accountId, session.id)?.url,
+      ideEntry: async session => (await this.ide.freshEntry(account.accountId, session.id))?.url,
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
@@ -791,11 +797,23 @@ export class AccountManager {
    * supplies a path; independent/QA sessions cannot inherit a nearby project. */
   ideWorkspace(accountId: string, sessionId: string): IDEWorkspace | undefined {
     try {
-      const store = this.storeFor(accountId), session = store.getSession(sessionId);
+      const store = this.storeFor(accountId);
+      let session = store.getSession(sessionId);
       if (!session?.projectId || session.projectBinding === "none" || session.mode === "qa") return;
-      const project = store.getProject(session.projectId); if (!project) return;
+      let project = store.getProject(session.projectId); if (!project) return;
       const hostId = session.hostId ?? project.hostId ?? "local";
       if (hostId !== (project.hostId ?? "local") || (project.projectKind === "remote" && hostId === "local")) return;
+      // Cheap fresh Desktop membership check also protects already-issued local
+      // URLs and proxy requests. cwd is never supplied as membership evidence.
+      if (hostId === "local" && session.threadId && project.sourceProjectId && this.configProvider().codexBackend !== "exec") {
+        const state = desktopSessionMembership()( { threadId: session.threadId, persistence: "active", runtimeStatus: "unknown", activeFlags: [] });
+        if (!this.observeThreadMembership(hostId, state)) return;
+        // Stopped accounts have disk-backed ephemeral stores, not a shared
+        // running store. Re-read after reconciliation in either lifecycle.
+        session = this.storeFor(accountId).getSession(sessionId);
+        if (!session?.projectId || session.projectBinding === "none") return;
+        project = this.storeFor(accountId).getProject(session.projectId); if (!project) return;
+      }
       // Desktop can change project membership while Gateway is running. Read
       // its full root set, not just the thread cwd; never mix hosts or backends.
       const nativeProject = this.configProvider().codexBackend === "exec" ? undefined
@@ -814,20 +832,45 @@ export class AccountManager {
   }
 
   private async refreshIDEWorkspace(accountId: string, sessionId: string): Promise<IDEWorkspace | undefined> {
-    const target = this.ideWorkspace(accountId, sessionId); if (!target) return;
-    const store = this.storeFor(accountId), session = store.getSession(sessionId)!;
-    if (!session.threadId || this.configProvider().codexBackend === "exec") return target;
+    const store = this.storeFor(accountId), session = store.getSession(sessionId);
+    if (!session || session.mode === "qa") return;
+    const hostId = session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local";
+    if (!session.threadId || this.configProvider().codexBackend === "exec") return this.ideWorkspace(accountId, sessionId);
+    const state = await this.readMembership(session.threadId, hostId);
+    if (state.threadId !== session.threadId || state.internal || state.persistence !== "active" || !state.cwd
+      || !this.observeThreadMembership(hostId, state)) return;
+    return this.ideWorkspace(accountId, sessionId);
+  }
+
+  private readMembership(threadId: string, hostId: string): Promise<CodexThreadState> {
+    const key = JSON.stringify([hostId, threadId]), pending = this.membershipReads.get(key);
+    if (pending) return pending;
     let timer: NodeJS.Timeout | undefined;
-    try {
-      const state = await Promise.race([this.runnerFor().inspectThread(session.threadId, target.hostId),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("无法核对原生 session 目录，未启动 IDE")), 15_000); })]);
-      const project = store.getProject(session.projectId!);
-      if (state.internal || state.persistence === "missing" || !state.cwd
-        || (project?.sourceProjectId && state.projectId !== project.sourceProjectId)) throw new Error("原生 session 项目关系已改变，未启动 IDE");
-      return { ...target, workspace: state.cwd,
-        ...(target.rootPaths ? { rootPaths: target.rootPaths.includes(state.cwd) ? target.rootPaths
-          : target.rootPaths.map(root => root === target.workspace ? state.cwd! : root) } : {}) };
-    } finally { if (timer) clearTimeout(timer); }
+    const work = Promise.race([this.runnerFor().inspectThread(threadId, hostId),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("无法核对原生 session 目录，未启动 IDE")), 15_000); })])
+      .finally(() => { if (timer) clearTimeout(timer); if (this.membershipReads.get(key) === work) this.membershipReads.delete(key); });
+    this.membershipReads.set(key, work);
+    return work;
+  }
+
+  /** Membership is a host/thread fact, never an IM conversation property. Only
+   * explicit observations reconcile durable edges; unknown leaves them intact. */
+  private observeThreadMembership(hostId: string, state: CodexThreadState): boolean {
+    if (state.internal || state.persistence !== "active" || state.projectMembership === "unknown"
+      || !state.projectId && state.projectMembership !== "none") return false;
+    const native = state.projectId ? readCodexDesktopProjects().find(p => p.projectId === state.projectId && (p.hostId ?? "local") === hostId) : undefined;
+    for (const account of listAccounts(this.options.paths)) {
+      const store = this.storeFor(account.accountId);
+      const matching = store.listSessions().filter(s => s.threadId === state.threadId && s.mode !== "qa"
+        && (s.hostId ?? store.getProject(s.projectId ?? "")?.hostId ?? "local") === hostId);
+      if (!matching.length) continue;
+      let project = state.projectId ? store.listProjects().find(p => p.sourceProjectId === state.projectId && (p.hostId ?? "local") === hostId) : undefined;
+      if (state.projectId && !project && native?.available !== false && native) project = store.createProject(native.name, native.workspace,
+        { sourceProjectId: native.projectId, hostId, projectKind: native.projectKind, rootPaths: native.rootPaths });
+      if (state.projectId && !project) return false;
+      store.reconcileThreadProject(state.threadId, hostId, project?.id, state.cwd);
+    }
+    return true;
   }
 
   listProjects(accountId?: string): AccountProject[] {
