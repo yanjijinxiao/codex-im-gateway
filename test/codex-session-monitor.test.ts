@@ -181,6 +181,7 @@ test("reports only new Codex task completions from existing and new sessions", a
     taskTitle: "执行新任务",
     text: "Codex 任务已中断：interrupted",
     success: false,
+    outcome: "interrupted",
     completedAt: "2026-08-01T08:00:04.000Z"
   }, {
     sessionId: "session-existing",
@@ -189,6 +190,7 @@ test("reports only new Codex task completions from existing and new sessions", a
     taskTitle: "服务重启前已开始的任务",
     text: "修复完成",
     success: true,
+    outcome: "completed",
     completedAt: "2026-08-01T08:00:03.000Z"
   }]);
   assert.equal(taskChanges.some((task) =>

@@ -70,6 +70,8 @@ export type ChannelCapabilities = {
   readonly inbound: Readonly<Record<AttachmentKind, Capability>>;
   readonly outbound: Readonly<Record<AttachmentKind, Capability>>;
   readonly progress: Capability;
+  /** Trusted, persistent task-state heading above progress and result bodies. */
+  readonly turnStatusHeader?: Capability;
   readonly resumableProgress: boolean;
   readonly streamBootstrapRecovery?: Capability;
   readonly actions: Capability;

@@ -1,9 +1,10 @@
 import crypto from "node:crypto";
 import { ChannelTurnTextStream, type ChannelStreamCheckpoint } from "./progress.js";
 import type { ChannelTextClient } from "./types.js";
+import type { TurnActivity } from "./turn-status.js";
 
 export type TurnReplyStream = Pick<ChannelTurnTextStream, "supported" | "checkpoint" | "deliveryState" | "suspend"
-  | "flush" | "synchronize" | "progress" | "answer" | "finalize" | "fail" | "waitForBackend" | "waitForRecovery" | "reportTerminalFailure">;
+  | "flush" | "synchronize" | "progress" | "answer" | "finalize" | "fail" | "setActivity" | "waitForBackend" | "waitForRecovery" | "reportTerminalFailure">;
 type Persistence = NonNullable<ConstructorParameters<typeof ChannelTurnTextStream>[2]>;
 type Segment = NonNullable<ChannelStreamCheckpoint["segments"]>["previous"][number];
 type Boundary = { id: string; kind: "answer" | "steer" };
@@ -73,7 +74,7 @@ export class ChannelTurnPresentation implements TurnReplyStream {
       const hasCard = Boolean(checkpoint.messageId || checkpoint.creationAttempted || checkpoint.bootstrap);
       if (this.lastAnswer) this.answerPrefix = { length: this.lastAnswer.length, digest: digest(this.lastAnswer) };
       if (hasCard) {
-        checkpoint.terminal = { text: stageSummary(checkpoint, boundary.kind), error: false };
+        checkpoint.terminal = { text: stageSummary(checkpoint, boundary.kind), error: false, outcome: "continued" };
         const retired = { inputId: boundary.id, checkpoint, attempts: 0 };
         this.previous.push(retired);
         this.current = this.makeStream();
@@ -107,7 +108,7 @@ export class ChannelTurnPresentation implements TurnReplyStream {
       this.answerPrefix = undefined; this.lastAnswer = "";
       this.current = this.makeStream();
       if (!checkpoint.finished && !checkpoint.terminal && (checkpoint.messageId || checkpoint.creationAttempted || checkpoint.bootstrap)) {
-        checkpoint.terminal = { text: stageSummary(checkpoint, "next-turn"), error: false };
+        checkpoint.terminal = { text: stageSummary(checkpoint, "next-turn"), error: false, outcome: "continued" };
         const retired = { inputId: id, checkpoint, attempts: 0 };
         this.previous.push(retired); this.oldStreams.set(id, old);
         this.save();
@@ -134,7 +135,7 @@ export class ChannelTurnPresentation implements TurnReplyStream {
     this.save();
     const work = (async () => {
       try {
-        await old.finalize(segment.checkpoint.terminal!.text, false, { existingOnly: true, recoverBootstrap: force });
+        await old.finalize(segment.checkpoint.terminal!.text, false, { existingOnly: true, recoverBootstrap: force, outcome: "continued" });
       } catch { /* Keep only this summary pending; never fail the task/new card. */ }
       finally {
         await old.suspend().catch(() => undefined);
@@ -166,7 +167,8 @@ export class ChannelTurnPresentation implements TurnReplyStream {
   finalize(text: string, error = false, recovery: Parameters<ChannelTurnTextStream["finalize"]>[2] = {}): Promise<boolean> {
     return this.run(() => this.suspended ? Promise.resolve(false) : this.current.finalize(text, error, recovery));
   }
-  fail(text: string): Promise<boolean> { return this.finalize(text, true); }
+  fail(text: string, outcome: "failed" | "interrupted" = "failed"): Promise<boolean> { return this.finalize(text, true, { outcome }); }
+  setActivity(activity: TurnActivity): Promise<boolean> { return this.run(() => this.current.setActivity(activity)); }
   waitForBackend(text: string): Promise<boolean> { return this.run(() => this.current.waitForBackend(text)); }
   waitForRecovery(text: string): Promise<boolean> { return this.run(() => this.current.waitForRecovery(text)); }
   reportTerminalFailure(): Promise<boolean> { return this.run(() => this.current.reportTerminalFailure()); }

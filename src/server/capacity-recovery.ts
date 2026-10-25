@@ -23,7 +23,7 @@ type Options = {
   notice: (scope: CapacityFailure, text: string) => Promise<void>;
   accepted: (scope: CapacityFailure, turnId: string) => Promise<void>;
   progress: (scope: CapacityFailure, text: string) => Promise<void>;
-  terminal: (scope: CapacityFailure, text: string) => Promise<void>;
+  terminal: (scope: CapacityFailure, text: string, outcome?: "completed" | "failed" | "interrupted") => Promise<void>;
   handlers?: (scope: CapacityFailure) => Pick<CodexCapacityResumeInput, "onApproval" | "onUserInput" | "onUserInputResult">;
   delaysMs?: readonly number[];
   now?: () => number;
@@ -185,7 +185,7 @@ export class CapacityRecoveryCoordinator {
       if (this.cancelled(record) || generation !== this.generation) return;
       record.status = "finished"; this.save();
       executionFinished = true;
-      await this.options.terminal({ ...record, turnId: result.turnId! }, result.text);
+      await this.options.terminal({ ...record, turnId: result.turnId! }, result.text, "completed");
     } catch (error) {
       if (this.cancelled(record) || generation !== this.generation) return;
       if (executionFinished) {
@@ -204,7 +204,8 @@ export class CapacityRecoveryCoordinator {
       this.save();
       await this.options.terminal(record, error instanceof CodexTurnExecutionError
         ? `${record.attempts >= this.delays.length && error.failureCode === "model-capacity" ? `已达到 ${record.attempts} 次容量自动恢复上限。\n` : ""}${userFacingMessageHandlingError(error).replace(/^\[codex-im-gateway\]\s*/, "")}`
-        : "容量自动恢复未继续执行：会话状态、原生队列或执行者条件已变化，或当前接口不可用。未重发原问题、未切换执行者；请查看 /status。");
+        : "容量自动恢复未继续执行：会话状态、原生队列或执行者条件已变化，或当前接口不可用。未重发原问题、未切换执行者；请查看 /status。",
+        error instanceof CodexTurnExecutionError && error.status === "interrupted" ? "interrupted" : "failed");
     } finally { this.executing.delete(key); }
   }
 }

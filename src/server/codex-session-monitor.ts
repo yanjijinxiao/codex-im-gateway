@@ -15,6 +15,7 @@ export type CodexSessionCompletion = {
   taskTitle: string;
   text: string;
   success: boolean;
+  outcome?: "completed" | "failed" | "interrupted";
   failureCode?: CodexFailureCode;
   completedAt: string;
 };
@@ -339,6 +340,7 @@ export class CodexSessionCompletionMonitor {
       taskTitle: cursor.taskTitle || "Codex 客户端会话",
       text,
       success,
+      outcome: status,
       ...(failureCode ? { failureCode } : {}),
       completedAt: timestamp
     });
@@ -562,7 +564,7 @@ async function readInitialSessionContext(
             text: success && typeof tailPayload.last_agent_message === "string"
               ? tailPayload.last_agent_message : failureCode ? codexFailureSummary(failureCode) : "Codex 任务已停止或执行失败。",
             ...(failureCode ? { failureCode } : {}),
-            success, completedAt: eventTimestamp(tailEvent!)
+            success, outcome: tailPayload.type === "turn_aborted" ? "interrupted" : success ? "completed" : "failed", completedAt: eventTimestamp(tailEvent!)
           };
         }
       }

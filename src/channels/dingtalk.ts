@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { turnStatusHeading } from "./turn-status.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
@@ -188,6 +189,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       outbound: { ...NO_MEDIA, file: "available" },
       tableLayout: account.cardTemplateId ? "markdown" : "list",
       progress: account.cardTemplateId ? "available" : "not-configured",
+      turnStatusHeader: account.cardTemplateId ? "available" : "not-configured",
       resumableProgress: Boolean(account.cardTemplateId),
       streamBootstrapRecovery: !this.cardClient.deliver ? "not-implemented" : account.cardTemplateId ? "available" : "not-configured"
     }, this);
@@ -1193,7 +1195,8 @@ class DingTalkStreamSequence {
 }
 
 function visibleDingTalkTerminalContent(input: { text: string; finalize: boolean; error: boolean }): string {
-  const text = input.finalize && input.error ? `❌ **处理失败**\n\n${input.text}` : input.text;
+  const hasFailureHeading = ["failed", "interrupted"].some(status => input.text.startsWith(turnStatusHeading(status as "failed" | "interrupted")));
+  const text = input.finalize && input.error && !hasFailureHeading ? `❌ **处理失败**\n\n${input.text}` : input.text;
   return normalizeDingTalkCardContent(text);
 }
 

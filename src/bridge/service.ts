@@ -2352,7 +2352,7 @@ export class BridgeService {
               await replyStream?.progress(progressText);
             }
           } : {}),
-          onApproval: (request: CodexApprovalRequest) => this.approvals.request(message.senderId, request),
+          onApproval: (request: CodexApprovalRequest) => this.requestApproval(message.senderId, request),
           onUserInput: (request: import("../codex/backend.js").CodexUserInputRequest) => this.requestUserInput(message.senderId, request, this.sessionHostId(session)),
           onUserInputResult: (request: import("../codex/backend.js").CodexUserInputRequest, result: import("../codex/backend.js").CodexUserInputResult) =>
             this.reportUserInputResult(message.senderId, request, result, this.sessionHostId(session))
@@ -2389,7 +2389,7 @@ export class BridgeService {
           : bound && replyStream ? await replyStream.finalize(finalText) : false;
         let resultDelivered = Boolean(streamed);
         if (!bound) {
-          await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。");
+          await replyStream?.finalize("已切换或退出绑定；原任务结果可用 /history 查看。", false, { outcome: "detached" });
           await replyStream?.suspend();
         } else if (journaled) {
           // Shared delivery owns pending results and error notices. An
@@ -2438,7 +2438,8 @@ export class BridgeService {
         throw error;
       }
       let failureWasReported = !stillBound() || (await replyStream?.fail(
-        stripBridgeErrorPrefix(userFacingMessageHandlingError(error))
+        stripBridgeErrorPrefix(userFacingMessageHandlingError(error)),
+        error instanceof CodexTurnExecutionError && error.status === "interrupted" ? "interrupted" : "failed"
       ) ?? false);
       if (!failureWasReported && replyStream && (replyStream.supported || replyStream.checkpoint().terminalPages?.length)) {
         try { failureWasReported = await replyStream.reportTerminalFailure(); }
@@ -2856,7 +2857,12 @@ export class BridgeService {
     return this.access.listPairedSenderIds();
   }
 
-  requestApproval(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
+  async requestApproval(senderId: string, request: CodexApprovalRequest): Promise<CodexApprovalDecision> {
+    const session = this.executionSession(senderId);
+    const active = session && this.activePresentations.get(session.id);
+    if (active?.threadId === request.threadId && active.turnId === request.turnId) {
+      try { await active.stream.setActivity("waiting-approval"); } catch { /* Presentation cannot block approval. */ }
+    }
     return this.approvals.request(senderId, request);
   }
 
@@ -2864,10 +2870,15 @@ export class BridgeService {
     return this.approvals.reportResult(senderId, request, result);
   }
 
-  requestUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest, hostId?: string): Promise<import("../codex/backend.js").CodexUserInputAnswer | undefined> {
+  async requestUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest, hostId?: string): Promise<import("../codex/backend.js").CodexUserInputAnswer | undefined> {
     const native = { ...request, hostId: hostId ?? request.hostId ?? "local" };
     const session = this.executionSession(senderId);
     if (session?.threadId !== native.threadId || (this.sessionHostId(session) ?? "local") !== native.hostId) return Promise.resolve(undefined);
+    const active = this.activePresentations.get(session.id);
+    // Async questions allow execution to continue; they are not a blocked turn.
+    if (native.kind !== "async" && active?.hostId === native.hostId && active.threadId === native.threadId && active.turnId === native.turnId) {
+      try { await active.stream.setActivity("waiting-input"); } catch { /* Preserve native question delivery. */ }
+    }
     return this.userInputs.request(senderId, native);
   }
 

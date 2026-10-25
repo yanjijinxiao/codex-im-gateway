@@ -27,8 +27,10 @@ function tableHeader(text: string, offset: number): string {
 }
 
 /** Source slices concatenate exactly to the input; Markdown wrappers are display-only. */
-export function resultPages(text: string, maxBytes = DEFAULT_RESULT_PAGE_BYTES): ResultPage[] {
+export function resultPages(text: string, maxBytes = DEFAULT_RESULT_PAGE_BYTES, reservedBytes = 0): ResultPage[] {
   if (!Number.isInteger(maxBytes) || maxBytes < 1_024) throw new Error("Result page budget must be at least 1024 bytes");
+  if (!Number.isInteger(reservedBytes) || reservedBytes < 0 || reservedBytes >= maxBytes - 512) throw new Error("Invalid result presentation overhead");
+  maxBytes -= reservedBytes;
   if (Buffer.byteLength(text) <= maxBytes) return [{ text, source: text }];
   const chunks: Array<{ source: string; start: number; end: number }> = [];
   let start = 0;

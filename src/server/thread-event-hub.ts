@@ -5,6 +5,7 @@ import { codexRecoverySummary } from "../codex/turn-recovery.js";
 import type { ChannelTextClient } from "../channels/types.js";
 import type { ChannelStreamCheckpoint } from "../channels/progress.js";
 import { completedCardForMentions } from "../channels/completion-mentions.js";
+import type { TurnOutcome } from "../channels/turn-status.js";
 import { ChannelTurnPresentation, nextTurnCheckpoint } from "../channels/turn-presentation.js";
 import type { AcceptedPresentationInput } from "../bridge/input-presentation.js";
 import type { TurnAudienceJournal } from "../bridge/turn-audience.js";
@@ -51,9 +52,9 @@ type FollowState = {
   lastSyncedAt?: string;
   syncFailure?: FollowSyncFailure;
   presentation?: SessionFollowStatus["presentation"];
-  terminalPending?: { turnId: string; text: string; fallbackSent: boolean };
+  terminalPending?: { turnId: string; text: string; fallbackSent: boolean; outcome?: TurnOutcome };
   /** Failed previous turns own their payload/card; never share a new turn's slot. */
-  pendingTerminals?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
+  pendingTerminals?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint; outcome?: TurnOutcome }>;
   /** Legacy observation notices are not model answers or completion receipts. */
   observationNotices?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
   repairTurnId?: string;
@@ -233,7 +234,7 @@ export class ThreadEventHub {
       const state = this.states[key];
       const changed = sub && state && (sub.hostId !== state.hostId || sub.threadId !== state.threadId);
       if (!live.has(key) || changed) {
-        await stream.finalize(changed ? "已切换绑定的会话；原任务继续运行。" : "已停止跟随此会话；任务继续运行。");
+        await stream.finalize(changed ? "已切换绑定的会话；原任务继续运行。" : "已停止跟随此会话；任务继续运行。", false, { outcome: "detached" });
         await stream.suspend();
         this.streams.delete(key);
       } else if (sub?.progressEnabled === false) {
@@ -411,6 +412,8 @@ export class ThreadEventHub {
     state.syncStatus = status;
     state.syncFailure = failure;
     this.save();
+    // A failed read is not a failed task. Update only an already-owned card.
+    if (failure.code !== "presentation") void this.streams.get(sub.key)?.setActivity("unconfirmed").catch(report);
     const lastLog = this.errorLogTimes.get(sub.key) ?? 0;
     if (changed || Date.now() - lastLog > 60_000) {
       this.errorLogTimes.set(sub.key, Date.now());
@@ -454,7 +457,8 @@ export class ThreadEventHub {
     if (!sub.managed && currentTurn && state.turnId && state.turnId !== currentTurn.id && !state.terminalPending) {
       const previous = snapshot.turns.find(turn => turn.id === state.turnId && turn.status !== "inProgress");
       const text = previous?.messages.filter(message => message.role === "assistant" && message.kind !== "progress").map(message => message.text).join("\n\n");
-      if (text?.trim()) state.terminalPending = { turnId: state.turnId, text: visibleText(text).trim(), fallbackSent: false };
+      if (text?.trim() && previous && previous.status !== "inProgress") state.terminalPending = {
+        turnId: state.turnId, text: visibleText(text).trim(), fallbackSent: false, outcome: previous.status };
     }
     if (!sub.managed && currentTurn && state.turnId !== currentTurn.id) await this.selectTurn(sub, currentTurn.id, true);
     if (currentTurn?.id === state.turnId) {
@@ -475,9 +479,9 @@ export class ThreadEventHub {
       const repair = snapshot.turns.find(turn => turn.id === state.repairTurnId && turn.status !== "inProgress");
       const text = repair?.messages.filter(message => message.role === "assistant" && message.kind !== "progress")
         .map(message => message.text).join("\n\n");
-      if (repair && text?.trim()) {
-        if (repair.id === state.turnId) state.terminalPending = { turnId: repair.id, text: visibleText(text).trim(), fallbackSent: false };
-        else (state.pendingTerminals ??= {})[repair.id] = { text: visibleText(text).trim() };
+      if (repair && repair.status !== "inProgress" && text?.trim()) {
+        if (repair.id === state.turnId) state.terminalPending = { turnId: repair.id, text: visibleText(text).trim(), fallbackSent: false, outcome: repair.status };
+        else (state.pendingTerminals ??= {})[repair.id] = { text: visibleText(text).trim(), outcome: repair.status };
         delete state.repairTurnId;
         this.save();
       }
@@ -486,7 +490,7 @@ export class ThreadEventHub {
     if (!this.isLive(sub)) return;
     if (state.terminalPending) {
       await this.finish(sub, state.terminalPending.turnId, state.terminalPending.text, false,
-        { recoverBootstrap: force, confirmUncertainDelivery: options.confirmUncertainDelivery });
+        { recoverBootstrap: force, confirmUncertainDelivery: options.confirmUncertainDelivery, outcome: state.terminalPending.outcome });
     }
     const { turns } = snapshot;
     if (!state.initialized && ["active", "idle"].includes(snapshot.state.runtimeStatus)) {
@@ -542,8 +546,14 @@ export class ThreadEventHub {
         await this.finish(sub, turn.id, final || (turn.status === "failed" && failure?.turnId === turn.id
           ? `${codexFailureSummary(failure.code)}\n原生轮次已确认失败；Gateway 未重新执行任务或切换模型。`
           : turn.status === "completed" ? "任务已完成。" : "任务已停止或执行失败。"),
-          Boolean(state.turnId && state.completed.includes(state.turnId)));
+          Boolean(state.turnId && state.completed.includes(state.turnId)), { outcome: turn.status });
       }
+    }
+    if (currentTurn && currentTurn.id === state.turnId && !state.terminalPending && state.checkpoint && sub.progressEnabled !== false) {
+      const flags = snapshot.state.activeFlags;
+      await this.stream(sub).setActivity(flags.includes("waitingOnApproval") ? "waiting-approval"
+        : flags.includes("waitingOnUserInput") ? "waiting-input"
+        : snapshot.state.recovery?.threadId === sub.threadId && snapshot.state.recovery.turnId === currentTurn.id ? "recovering" : "running");
     }
     // Advance only from the native ordered/timestamped window, not from an
     // arbitrary unseen ID. Preserve the cursor even when old pages appear later.
@@ -590,11 +600,11 @@ export class ThreadEventHub {
         await this.deliver(sub, turnId, text);
       })));
   }
-  async completion(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
+  async completion(hostId: string, threadId: string, turnId: string, text: string, outcome: TurnOutcome = "completed"): Promise<void> {
     if (this.options.holdsCapacityStart?.({ hostId, threadId, turnId })) return;
     await Promise.all(this.options.subscriptions().filter((sub) =>
       sub.enabled !== false && sub.hostId === hostId && sub.threadId === threadId && !sub.managed)
-      .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text))));
+      .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text, false, { outcome }))));
   }
 
   /** An explicitly accepted empty continuation changes native identity only;
@@ -625,17 +635,17 @@ export class ThreadEventHub {
       })));
   }
 
-  async capacityTerminal(scope: { hostId: string; threadId: string; turnId: string }, text: string): Promise<void> {
+  async capacityTerminal(scope: { hostId: string; threadId: string; turnId: string }, text: string, outcome: TurnOutcome = "completed"): Promise<void> {
     await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
       && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
-        if (this.isLive(sub) && this.state(sub).turnId === scope.turnId) await this.finish(sub, scope.turnId, text);
+        if (this.isLive(sub) && this.state(sub).turnId === scope.turnId) await this.finish(sub, scope.turnId, text, false, { outcome });
       })));
   }
-  async recoverCompletion(hostId: string, threadId: string, turnId: string, text: string): Promise<void> {
+  async recoverCompletion(hostId: string, threadId: string, turnId: string, text: string, outcome: TurnOutcome = "completed"): Promise<void> {
     await Promise.all(this.options.subscriptions().filter((sub) => sub.enabled !== false
       && sub.hostId === hostId && sub.threadId === threadId && !sub.managed
       && this.states[sub.key]?.turnId === turnId)
-      .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text))));
+      .map((sub) => this.queue.run(sub.key, () => this.finish(sub, turnId, text, false, { outcome }))));
   }
   /** A confirmed native input splits presentation only. Never completes a turn. */
   async acceptedInput(input: AcceptedPresentationInput): Promise<void> {
@@ -730,6 +740,7 @@ export class ThreadEventHub {
     if (turnId && !state.completed.includes(turnId) && (pending || archiveCheckpoint && state.checkpoint?.terminal)) {
       (state.pendingTerminals ??= {})[turnId] = {
         text: pending?.text ?? state.checkpoint!.terminal!.text,
+        outcome: pending?.outcome ?? state.checkpoint?.terminal?.outcome,
         checkpoint: state.checkpoint
       };
     }
@@ -770,7 +781,8 @@ export class ThreadEventHub {
         }
       });
       try {
-        const delivered = await stream.finalize(pending.text, false, { recoverBootstrap: force, existingOnly: true });
+        const delivered = await stream.finalize(pending.text, pending.outcome === "failed" || pending.outcome === "interrupted",
+          { recoverBootstrap: force, existingOnly: true, outcome: pending.outcome });
         if (delivered && this.isLive(sub) && state.pendingTerminals?.[turnId] === pending) {
           delete state.pendingTerminals![turnId];
           state.completed = [...state.completed, turnId].slice(-200);
@@ -860,7 +872,7 @@ export class ThreadEventHub {
     this.save();
   }
   private async finish(sub: ThreadSubscription, turnId: string, text: string, allowSwitch = false,
-    recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean } = {}): Promise<void> {
+    recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; outcome?: TurnOutcome } = {}): Promise<void> {
     const current = this.currentSubscription(sub);
     if (!current) return;
     sub = current;
@@ -871,10 +883,11 @@ export class ThreadEventHub {
     let clean = visible;
     try { clean = this.options.decorateFinal?.(sub, visible) ?? visible; }
     catch { /* Optional IDE metadata must never prevent result delivery. */ }
-    state.terminalPending ??= { turnId, text: clean, fallbackSent: false };
+    state.terminalPending ??= { turnId, text: clean, fallbackSent: false, outcome: recovery.outcome };
     this.save();
     const stream = this.stream(sub);
-    if (!await stream.finalize(clean, false, recovery)) {
+    const outcome = state.terminalPending.outcome ?? recovery.outcome;
+    if (!await stream.finalize(clean, outcome === "failed" || outcome === "interrupted", { ...recovery, outcome })) {
       if (!state.terminalPending.fallbackSent) {
         if (stream.supported || stream.checkpoint().terminalPages?.length) {
           try { await stream.reportTerminalFailure(); }

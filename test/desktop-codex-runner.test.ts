@@ -128,6 +128,7 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
       taskTitle: "hello from DingTalk",
       text: "desktop reply",
       success: true,
+      outcome: "completed",
       completedAt: result.raw ? JSON.parse(result.raw).completedAt : ""
     })
   });

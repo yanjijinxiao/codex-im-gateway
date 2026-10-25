@@ -364,8 +364,8 @@ export class AccountManager {
           return route ? this.entries.get(route.accountId)?.service?.reportUserInputResult(route.recipientId, request, result, scope.hostId) : undefined;
         }
       }),
-      terminal: async (scope, text) => {
-        await this.threadEvents.capacityTerminal(scope, parseActionBlocks(text).visibleText.trim() || "处理完成。");
+      terminal: async (scope, text, outcome) => {
+        await this.threadEvents.capacityTerminal(scope, parseActionBlocks(text).visibleText.trim() || "处理完成。", outcome);
         const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), scope.turnId).destination;
         if (route) await this.entries.get(route.accountId)?.service?.applyRecoveredOutput(route.sessionId, text);
       }
@@ -1486,7 +1486,7 @@ export class AccountManager {
       onTaskChanged: (task) => this.updateExternalCodexTask(task),
       onActivity: (activity) => this.notifyExternalCodexActivity(activity),
       onRecoveredCompletion: (completion) => this.threadEvents.recoverCompletion(
-        "local", completion.sessionId, completion.turnId, completion.text
+        "local", completion.sessionId, completion.turnId, completion.text, completion.outcome ?? (completion.success ? "completed" : "failed")
       )
     });
     this.codexSessionMonitor.start();
@@ -1877,7 +1877,8 @@ export class AccountManager {
     const finalText = completion.success
       ? completion.text
       : `Codex 任务执行失败：${completion.text}`;
-    await this.threadEvents.completion("local", completion.sessionId, completion.turnId, finalText);
+    await this.threadEvents.completion("local", completion.sessionId, completion.turnId, finalText,
+      completion.outcome ?? (completion.success ? "completed" : "failed"));
   }
 
   private async sendProjectCompletion(

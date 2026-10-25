@@ -5,6 +5,7 @@ import { channelProgressError } from "./errors.js";
 import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import { copyBlock } from "./copyable.js";
+import { TURN_STATUS_BYTES, turnStatusHeading, withTurnStatus, type TurnActivity, type TurnOutcome } from "./turn-status.js";
 import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
 const MAX_RECOVERY_PROBES = 3;
@@ -27,7 +28,9 @@ export type ChannelStreamCheckpoint = {
   recoveryNotice?: string;
   toolActivity?: { completed: number; failed: number; active?: string; last?: string };
   /** Terminal delivery may be retried, but progress must never resume. */
-  terminal?: { text: string; error: boolean };
+  terminal?: { text: string; error: boolean; outcome?: TurnOutcome };
+  statusHeader?: true;
+  activity?: TurnActivity;
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
   terminalNoticeSent?: boolean;
   /** Pinned layout and acknowledged pages survive a restart/partial failure. */
@@ -55,7 +58,9 @@ export class ChannelTurnTextStream {
   private recoveryProbes = 0;
   private retryAt = 0;
   private suspended = false;
-  private terminal?: { text: string; error: boolean };
+  private terminal?: ChannelStreamCheckpoint["terminal"];
+  private readonly statusHeader: boolean;
+  private activity: TurnActivity = "running";
   private finalizing?: Promise<boolean>;
   private terminalBlocked = false;
   private terminalNoticeSent = false;
@@ -92,6 +97,8 @@ export class ChannelTurnTextStream {
     }
   ) {
     const saved = persistence?.restore;
+    // A pre-upgrade partially delivered result owns its exact page layout.
+    this.statusHeader = saved?.statusHeader ?? (!saved?.resultPageBytes && client.capabilities?.turnStatusHeader === "available");
     this.supported = saved?.resultPresentation === "native-text" ? false
       : saved?.resultPresentation === "card" || Boolean(saved?.messageId || saved?.bootstrap || saved?.creationAttempted) || (persistence?.progressEnabled !== false && (client.capabilities
         ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream)));
@@ -116,6 +123,7 @@ export class ChannelTurnTextStream {
       this.communicationNotice = saved.communicationNotice;
       this.recoveryNotice = saved.recoveryNotice;
       this.terminal = saved.terminal;
+      this.activity = saved.activity ?? "running";
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
       this.resultPageBytes = saved.resultPageBytes;
       this.resultPresentation = saved.resultPresentation;
@@ -131,6 +139,7 @@ export class ChannelTurnTextStream {
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
+      ...(this.statusHeader ? { statusHeader: true as const, activity: this.activity } : {}),
       toolActivity: { ...this.toolActivity },
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
@@ -187,6 +196,7 @@ export class ChannelTurnTextStream {
     if (!content) return false;
     this.communicationNotice = undefined;
     this.recoveryNotice = undefined;
+    this.activity = "running";
     const kind = progressKind(content);
     if (kind === "thought") {
       this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
@@ -218,6 +228,7 @@ export class ChannelTurnTextStream {
     if (!content) return false;
     this.communicationNotice = undefined;
     this.recoveryNotice = undefined;
+    this.activity = "running";
     this.answerPreview = boundedProgressText(content, 2_400);
     this.thought = "正在组织最终回复…";
     return this.publish(this.render());
@@ -234,7 +245,7 @@ export class ChannelTurnTextStream {
     return true;
   }
 
-  async finalize(text: string, error = false, recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; existingOnly?: boolean } = {}): Promise<boolean> {
+  async finalize(text: string, error = false, recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; existingOnly?: boolean; outcome?: TurnOutcome } = {}): Promise<boolean> {
     const content = text.trim();
     if (this.finished) return true;
     // A shutdown-detached writer must not poison the checkpoint that its
@@ -243,7 +254,7 @@ export class ChannelTurnTextStream {
     if (!content) return false;
     // Set the terminal guard before awaiting any in-flight operation. A failed
     // final frame retains its handle and terminal payload for later recovery.
-    this.terminal ??= { text: content, error };
+    this.terminal ??= { text: content, error, ...(recovery.outcome ? { outcome: recovery.outcome } : {}) };
     this.recoveryNotice = undefined;
     this.stopTimers();
     this.persistence?.save(this.checkpoint());
@@ -261,7 +272,9 @@ export class ChannelTurnTextStream {
     if (this.suspended || this.terminalBlocked) return false;
     this.resultPageBytes ??= this.client.capabilities?.resultPageBytes ?? DEFAULT_RESULT_PAGE_BYTES;
     this.resultPresentation ??= this.supported ? "card" : "native-text";
-    const pages = resultPages(this.terminal!.text, this.resultPageBytes);
+    const pages = resultPages(this.terminal!.text, this.resultPageBytes, this.statusHeader ? TURN_STATUS_BYTES : 0)
+      .map(page => this.statusHeader ? { ...page, text: withTurnStatus(page.text,
+        this.terminal!.outcome ?? (this.terminal!.error ? "failed" : "completed")) } : page);
     // Historical recovery may update acknowledged cards, but must not create
     // new notifications (including continuation pages or native text). Check
     // the complete layout before updating page 1 so partial recovery is quiet.
@@ -349,8 +362,19 @@ export class ChannelTurnTextStream {
     }
   }
 
-  async fail(text: string): Promise<boolean> {
-    return this.finalize(text, true);
+  async fail(text: string, outcome: "failed" | "interrupted" = "failed"): Promise<boolean> {
+    return this.finalize(text, true, { outcome });
+  }
+
+  /** Status-only observations may update an existing card, never create a placeholder. */
+  async setActivity(activity: TurnActivity): Promise<boolean> {
+    if (!this.statusHeader || this.finished || this.terminal || this.suspended || this.activity === activity) return false;
+    this.activity = activity;
+    if (activity !== "unconfirmed") this.communicationNotice = undefined;
+    if (activity !== "recovering") this.recoveryNotice = undefined;
+    this.persistence?.save(this.checkpoint());
+    if (!this.messageId && !this.creationAttempted) return false;
+    return this.publish(this.render());
   }
 
   /** A lost backend receipt cannot finish a provider stream or assert task failure. */
@@ -358,6 +382,7 @@ export class ChannelTurnTextStream {
     if (this.finished || this.terminal || this.suspended) return false;
     this.communicationNotice = text.trim();
     this.recoveryNotice = undefined;
+    this.activity = "unconfirmed";
     this.persistence?.save(this.checkpoint());
     if (!this.supported) {
       try { await this.sendPlainText(text); return true; } catch { return false; }
@@ -373,6 +398,7 @@ export class ChannelTurnTextStream {
     if (this.recoveryNotice === text.trim()) return true;
     this.recoveryNotice = text.trim();
     this.communicationNotice = undefined;
+    this.activity = "recovering";
     this.persistence?.save(this.checkpoint());
     if (!this.supported) {
       try { return await this.textProgress!.push(text); } catch { return false; }
@@ -467,7 +493,9 @@ export class ChannelTurnTextStream {
   private render(): string {
     const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
     const sections = [
-      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**" : current ? "**当前进展**" : "**任务执行中**",
+      ...(this.statusHeader ? [turnStatusHeading(this.communicationNotice ? "unconfirmed" : this.recoveryNotice ? "recovering" : this.activity), "---"] : []),
+      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**"
+        : current ? "**当前进展**" : this.statusHeader ? "**进展摘要**" : "**任务执行中**",
       this.communicationNotice || this.recoveryNotice || current || this.thought || "等待新的可展示进展。"
     ];
     // Keep an actual public reasoning summary available without replacing a
@@ -488,7 +516,7 @@ export class ChannelTurnTextStream {
     }
     sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
       : this.recoveryNotice ? "_保留本张进度卡；等待 Codex 后续进展或最终状态_"
-      : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)} · 长任务会持续执行_\n\n停止当前任务（会中断执行）：\n\n${copyBlock("/stop")}`);
+      : `_${this.statusHeader ? "本轮已用时" : "已运行"} ${formatTurnElapsed(Date.now() - this.startedAt)}${this.activity === "waiting-input" || this.activity === "waiting-approval" ? " · 等待你的操作" : " · 长任务会持续执行"}_\n\n停止当前任务（会中断执行）：\n\n${copyBlock("/stop")}`);
     return sections.join("\n\n");
   }
 
