@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+
+function selectedBody(map: Record<string, string>): string | undefined {
+  return map[JSON.parse(map.sys_full_json_obj).order[0]];
+}
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -293,7 +297,7 @@ test("DingTalk SDK publishes the same nonempty first frame and complete snapshot
       return { statusCode: 200, body: { success: true, result: [{ success: true }] } };
     },
     async updateCardWithOptions(request) {
-      states.push({ text: request.cardData.cardParamMap.msgContent, keyed: request.cardUpdateOptions?.updateCardDataByKey ?? false });
+      states.push({ text: selectedBody(request.cardData.cardParamMap), keyed: request.cardUpdateOptions?.updateCardDataByKey ?? false });
       return { statusCode: 200, body: { success: true, result: true } };
     },
     async streamingUpdateWithOptions() { return { statusCode: 200, body: { success: true, result: true } }; }
@@ -367,7 +371,7 @@ for (const mode of ["https", "sdk"] as const) {
       const before = writes.length;
       await client.update({ ...base, activity, text });
       const updates = writes.slice(before);
-      const bodies = updates.map(w => w.kind === "stream" ? w.body.content : w.body.cardData.cardParamMap.msgContent).filter(v => v !== undefined);
+      const bodies = updates.map(w => w.kind === "stream" ? w.body.content : selectedBody(w.body.cardData.cardParamMap)).filter(v => v !== undefined);
       assert.equal(bodies.length, 1, "never send the same active Markdown block via both snapshot and stream");
       assert.equal((bodies[0].match(/停止会中断当前任务/g) ?? []).length, 1);
       assert.equal((bodies[0].match(/\/stop/g) ?? []).length, 1);
@@ -410,7 +414,8 @@ for (const mode of ["https", "sdk"] as const) {
       await client.update({ ...base, text: "正文仍写着正在执行", activity });
       assert.deepEqual(calls.slice(before).map(call => call.kind), ["state"]);
       assert.equal(calls.at(-1)!.body.cardData.cardParamMap.flowStatus, "3");
-      assert.equal(calls.at(-1)!.body.cardData.cardParamMap.msgContent, "正文仍写着正在执行");
+      assert.equal(selectedBody(calls.at(-1)!.body.cardData.cardParamMap), "正文仍写着正在执行");
+      assert.deepEqual(JSON.parse(calls.at(-1)!.body.cardData.cardParamMap.sys_full_json_obj).order, ["staticMsgContent"]);
     }
     for (const activity of ["recovering", "running"] as const) {
       const before = calls.length;
@@ -453,7 +458,7 @@ for (const mode of ["https", "sdk"] as const) {
     assert.equal(streams.at(-1)?.isFinalize, true);
     assert.match(streams.at(-1)?.content ?? "", /处理失败.*失败说明/s);
     assert.equal(states.at(-1)?.flowStatus, "3");
-    assert.match(states.at(-1)?.msgContent ?? "", /处理失败.*失败说明/s);
+    assert.match(selectedBody(states.at(-1)!) ?? "", /处理失败.*失败说明/s);
   });
 }
 
@@ -466,7 +471,7 @@ test("DingTalk serializes updates, uses ordered GUIDs, and retries a rejected bu
     async deliverCardWithOptions() { return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
     async updateCardWithOptions(request) {
       states.push({
-        text: request.cardData?.cardParamMap?.content ?? "",
+        text: selectedBody(request.cardData.cardParamMap) ?? "",
         flowStatus: request.cardData?.cardParamMap?.flowStatus ?? "",
         updateByKey: request.cardUpdateOptions?.updateCardDataByKey ?? false
       });
@@ -1030,6 +1035,7 @@ test("DingTalk creates, delivers, streams, and finalizes an AI Card for a group 
     outTrackId: oneShot.messageId,
     robotCode: "ding-client",
     text: "最终答案",
+    finalize: true,
     target: { type: "group", conversationId: "conversation-123" },
     lifecycleId: "ding-message"
   });
@@ -1039,6 +1045,7 @@ test("DingTalk creates, delivers, streams, and finalizes an AI Card for a group 
     outTrackId: oneShot.messageId,
     text: "最终答案",
     finalize: true,
+    presentation: "static",
     error: false
   });
 
@@ -1337,11 +1344,11 @@ function noEmotionClient(): DingTalkEmotionClient {
   };
 }
 
-test("DingTalk completion @ uses native webhook recipients, with no AI Card recreation", async () => {
+test("unconfigured DingTalk @ uses native webhook recipients without inventing a card", async () => {
   let listener: ((message: DWClientDownStream) => void) | undefined;
   const sent: any[] = [], received: any[] = [];
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
-    clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
+    clientSecret: "fake", savedAt: "", enabled: true }, {
     apiTransport: new PinnedNetworkLifecycleTransport("ipv4", async (_family, _url, init) => {
       sent.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ errcode: 0, processQueryKey: "mention" }), { status: 200 });
     }), cardClient: { async create() { throw new Error("must not create card"); }, async update() {} },
@@ -1352,8 +1359,8 @@ test("DingTalk completion @ uses native webhook recipients, with no AI Card recr
   try {
     listener!(frame(robotMessage())); await ready.promise;
     assert.deepEqual(received[0].mention, { userId: "staff-123", name: "Tester" });
-    await adapter.client.sendMentionNotification({ toUserId: "conversation-123", text: "完成", mentions: [{ userId: "staff-123" }, { userId: "staff-456" }] });
-    assert.deepEqual(sent, [{ msgtype: "text", text: { content: "@staff-123 @staff-456\n完成" }, at: { atUserIds: ["staff-123", "staff-456"], isAtAll: false } }]);
+    await adapter.client.sendMentionNotification({ toUserId: "conversation-123", text: "回复命令：\n\n```text\n/answer Q38 --option 1\n```", mentions: [{ userId: "staff-123" }, { userId: "staff-456" }] });
+    assert.deepEqual(sent, [{ msgtype: "text", text: { content: "@staff-123 @staff-456\n回复命令：\n\n/answer Q38 --option 1" }, at: { atUserIds: ["staff-123", "staff-456"], isAtAll: false } }]);
   } finally { abort.abort(); await monitor; }
 });
 
@@ -1376,23 +1383,26 @@ test("DingTalk IDE approval keeps the real staff identity separate from group ro
   }
 });
 
-test("DingTalk question and native @ share one webhook message, not a second reminder", async () => {
+test("configured DingTalk questions and native @ share one static Markdown card even while the webhook is available", async () => {
   let listener: ((message: DWClientDownStream) => void) | undefined;
-  const writes: any[] = [];
+  const writes: any[] = [], cards: any[] = [], updates: any[] = [];
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake",
     clientSecret: "fake", cardTemplateId: "template", savedAt: "", enabled: true }, {
     webhookSender: async input => { writes.push(input); return { messageId: "question" }; },
-    cardClient: { async create() { throw new Error("no extra card"); }, async update() {} },
+    cardClient: { async create(input) { cards.push(input); }, async update(input) { updates.push(input); } },
     emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }), now: () => 1_800_000_000_000
   });
   const abort = new AbortController(), ready = Promise.withResolvers<void>();
   const monitor = adapter.monitor({ signal: abort.signal, async onMessage() { ready.resolve(); } });
   try {
     listener!(frame(robotMessage())); await ready.promise;
-    const question = createChoiceCard({ title: "Codex 问题 Q7", body: "项目在哪里？", fallbackText: "【Codex 问题 Q7】\n项目在哪里？\n/answer Q7 路径", choices: [] });
+    const question = createChoiceCard({ title: "Codex 问题 Q7", body: "项目在哪里？", fallbackText: "【Codex 问题 Q7】\n项目在哪里？", choices: [{ label: "继续", command: "answer", arg: "Q7 --option 1" }] });
     const receipt = await adapter.client.sendActionCard({ toUserId: "conversation-123", card: question, mentions: [{ userId: "staff-123" }] });
-    assert.equal(writes.length, 1); assert.equal(receipt.messageId, "question");
-    assert.deepEqual(writes[0].atUserIds, ["staff-123"]); assert.equal(writes[0].text, `@staff-123\n${question.fallbackText}`);
+    assert.equal(writes.length, 0); assert.equal(cards.length, 1); assert.equal(receipt.messageId, cards[0].outTrackId);
+    assert.deepEqual(cards[0].atUserIds, { "staff-123": "参与者" });
+    assert.equal(cards[0].text, `<a atId=staff-123>参与者</a>\n\n${question.fallbackText}`);
+    assert.match(cards[0].text, /```text\n\/answer Q7 --option 1\n```/);
+    assert.equal(cards[0].finalize, true); assert.equal(updates[0].presentation, "static");
   } finally { abort.abort(); await monitor; }
 });
 
@@ -1434,13 +1444,13 @@ for (const transport of ["https", "sdk"] as const) {
       const body = JSON.parse(String(init?.body));
       if (String(url).endsWith("/deliver")) deliveries.push(body);
       else if (init?.method === "POST") creations.push(body);
-      else frames.push(body.content ?? body.cardData.cardParamMap.content);
+      else frames.push(body.content ?? selectedBody(body.cardData.cardParamMap));
       return new Response(JSON.stringify({ success: true, result: init?.method === "PUT" ? true
         : String(url).endsWith("/deliver") ? [{ success: true }] : "instance" }), { status: 200 });
     }, [0], async () => {}) : new DingTalkSdkAICardClient({
       async createCardWithOptions(request: unknown) { creations.push(request); return { statusCode: 200, body: { success: true, result: "instance" } }; },
       async deliverCardWithOptions(request: unknown) { deliveries.push(request); return { statusCode: 200, body: { success: true, result: [{ success: true }] } }; },
-      async updateCardWithOptions(request: any) { frames.push(request.cardData.cardParamMap.content); return { statusCode: 200, body: { success: true, result: true } }; },
+      async updateCardWithOptions(request: any) { frames.push(selectedBody(request.cardData.cardParamMap)); return { statusCode: 200, body: { success: true, result: true } }; },
       async streamingUpdateWithOptions(request: any) { frames.push(request.content); return { statusCode: 200, body: { success: true, result: true } }; }
     } as never, [0], async () => {});
     const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake",
@@ -1453,8 +1463,9 @@ for (const transport of ["https", "sdk"] as const) {
     assert.deepEqual(creations[0].cardAtUserIds, ["staff-123"]);
     assert.equal(creations[0].userIdType, 1);
     const expected = "<a atId=staff-123>Tester</a>\n\n完成";
-    assert.equal(creations[0].cardData.cardParamMap.content, expected);
-    assert.deepEqual(frames, [undefined, expected, expected], "mode patch carries no body; stream and completed snapshot retain the same native anchor");
+    assert.equal(selectedBody(creations[0].cardData.cardParamMap), expected);
+    assert.equal(creations[0].cardData.cardParamMap.flowStatus, "3");
+    assert.deepEqual(frames, [expected], "static notifications never enter input mode or open a native stream");
   });
 }
 
@@ -1491,15 +1502,15 @@ for (const transport of ["https", "sdk"] as const) {
       const expected = "<a atId=staff-123>Tester</a> <a atId=staff-456>Other</a>\n\nfull result";
       assert.deepEqual(created.cardAtUserIds, ["staff-123", "staff-456"]);
       assert.equal(created.userIdType, 1);
-      assert.equal(created.cardData.cardParamMap.content, expected);
+      assert.equal(selectedBody(created.cardData.cardParamMap), expected);
       const delivery = calls.find(item => item.operation === "deliver")!.body;
       assert.equal(delivery.outTrackId, receipt.messageId); assert.equal(delivery.openSpaceId, "dtv1.card//IM_GROUP.conversation-123");
       assert.deepEqual(delivery.imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester", "staff-456": "Other" });
       assert.deepEqual(calls.filter(item => item.operation === "stream").map(item => [item.body.outTrackId, item.body.content]),
-        [[receipt.messageId, expected], ["original-segment", "phase summary"]]);
+        [["original-segment", "phase summary"]]);
       assert.deepEqual(calls.filter(item => item.operation === "state" && item.body.outTrackId === receipt.messageId)
-        .map(item => item.body.cardData.cardParamMap.content), [undefined, expected]);
-      assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "stream", "state", "state", "stream", "state"]);
+        .map(item => selectedBody(item.body.cardData.cardParamMap)), [expected]);
+      assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "state", "stream", "state"]);
       const newFinal = calls.findIndex(item => item.operation === "state" && item.body.outTrackId === receipt.messageId && item.body.cardData.cardParamMap.flowStatus === "3");
       const oldFirst = calls.findIndex(item => item.body.outTrackId === "original-segment");
       assert.ok(newFinal > 0 && oldFirst > newFinal, "never remove the old answer before the new final content is acknowledged");

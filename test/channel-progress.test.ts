@@ -8,6 +8,33 @@ import { summarizeProgress } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("legacy page layouts retain activity metadata and update waiting/running text on the same card", async t => {
+  const frames: any[] = [];
+  const client = createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available",
+    turnStatusHeader: "available", resumableProgress: true }, {
+    async sendText() { throw new Error("no duplicate notice"); },
+    async startTextStream() { throw new Error("must keep the restored card"); },
+    async updateTextStream(input) { frames.push(input); }
+  });
+  const stream = new ChannelTurnTextStream(client, "chat", { save() {}, restore: {
+    streamId: "old-stream", messageId: "old-card", startedAt: Date.now(), progressEntries: [],
+    thought: "仍在处理", answerPreview: "", finished: false, resultPageBytes: 1024
+  } });
+  t.after(() => stream.suspend());
+  await stream.synchronize();
+  assert.equal(frames.at(-1).activity, "running");
+  for (const activity of ["waiting-approval", "waiting-input", "running"] as const) {
+    await stream.setActivity(activity); await stream.flush();
+    assert.equal(frames.at(-1).messageId, "old-card");
+    assert.equal(frames.at(-1).activity, activity);
+    assert.match(frames.at(-1).text, activity === "waiting-approval" ? /等待审批/ : activity === "waiting-input" ? /等你回答/ : /进行中/);
+    assert.doesNotMatch(frames.at(-1).text, /^## /m);
+    assert.equal(stream.checkpoint().resultPageBytes, 1024);
+    assert.equal(stream.checkpoint().statusHeader, undefined, "do not change existing final-page boundaries");
+    assert.equal(stream.checkpoint().activity, activity);
+  }
+});
+
 test("quiet historical recovery never creates a card, native text or missing continuation pages", async t => {
   const io = transport();
   for (const messageId of [undefined, "original"]) {

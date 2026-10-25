@@ -12,6 +12,7 @@ import { applyDesktopStatePatches } from "../codex/desktop-state-patches.js";
 import {
   isAppServerApprovalMethod,
   parseAppServerApproval,
+  appServerApprovalResult,
   type AppServerApprovalMethod,
   type CodexApprovalDecision,
   type CodexApprovalRequest
@@ -34,6 +35,10 @@ export type CodexDesktopUserInput = {
   method: "item/tool/requestUserInput";
   request: CodexUserInputRequest;
 };
+export type CodexDesktopUnsupportedInteraction = {
+  hostId: string; threadId: string; turnId: string; requestId: string | number;
+  method: string;
+};
 type DesktopRequest = CodexDesktopApproval | CodexDesktopUserInput;
 
 export type CodexDesktopRequestMonitorOptions = {
@@ -47,6 +52,8 @@ export type CodexDesktopRequestMonitorOptions = {
   onUserInput?: (input: CodexDesktopUserInput) => Promise<CodexUserInputAnswer | undefined>;
   onUserInputResult?: (input: CodexDesktopUserInput, result: CodexUserInputResult) => Promise<void> | void;
   onObservedUserInputAnswers?: (receipts: NativeAsyncAnswerReceipt[]) => Promise<void> | void;
+  /** Neutral notice only: no unvalidated form, credential or challenge data. */
+  onUnsupportedInteraction?: (input: CodexDesktopUnsupportedInteraction) => Promise<void>;
 };
 
 type IpcMessage = Record<string, unknown>;
@@ -59,6 +66,7 @@ export class CodexDesktopRequestMonitor {
   private readonly reconnectDelayMs: number;
   private readonly followedThreads = new Map<string, DesktopFollowTarget>();
   private readonly handledRequests = new Set<string>();
+  private readonly unsupportedNotices = new Set<string>();
   private readonly activeRequests = new Map<string, DesktopRequest>();
   private readonly requestSnapshots = new Map<string, { requests: unknown[]; cwd?: string; turns?: unknown[];
     turnHistory?: unknown; threadRuntimeStatus?: unknown }>();
@@ -283,11 +291,27 @@ export class CodexDesktopRequestMonitor {
       const method = stringValue(envelope?.method);
       const requestId = requestIdValue(envelope?.id);
       const params = recordValue(envelope?.params);
-      if (requestId === undefined || !params) continue;
+      if (requestId === undefined || !params || envelope?.completed === true) continue;
       const parsedInput = method === "item/tool/requestUserInput" ? parseUserInputRequest(params) : undefined;
       const inputRequest = parsedInput ? { ...parsedInput, ...(envelope?.async === true ? { kind: "async" as const } : {}) } : undefined;
       const request = inputRequest ?? (isAppServerApprovalMethod(method) ? parseAppServerApproval(method, params) : undefined);
-      if (!request || request.threadId !== threadId) continue;
+      if (!request) {
+        if (method === "mcpServer/elicitation/request" && params.threadId === threadId) {
+          const turnId = stringValue(params.turnId);
+          const noticeKey = JSON.stringify([hostId, threadId, turnId, typeof requestId, requestId]);
+          if (turnId && !this.unsupportedNotices.has(noticeKey)) {
+            // Claim before sending: an ambiguous delivery must not produce a
+            // second notification on every follower patch/reconnect.
+            this.unsupportedNotices.add(noticeKey);
+            while (this.unsupportedNotices.size > 500) this.unsupportedNotices.delete(this.unsupportedNotices.values().next().value!);
+            void this.options.onUnsupportedInteraction?.({ hostId, threadId, turnId, requestId, method }).catch(() => {
+              console.warn("[codex-im-gateway] unsupported Desktop interaction notice unconfirmed");
+            });
+          }
+        }
+        continue;
+      }
+      if (request.threadId !== threadId) continue;
       const key = JSON.stringify([hostId, threadId, request.turnId, typeof requestId, requestId]);
       present.add(key);
       const normalized = inputRequest ? { ...inputRequest, requestId, hostId }
@@ -389,8 +413,13 @@ export class CodexDesktopRequestMonitor {
       ? "thread-follower-command-approval-decision"
       : approval.method === "item/fileChange/requestApproval"
         ? "thread-follower-file-approval-decision"
-        : "thread-follower-permissions-request-approval-response";
-    const params = approval.method === "item/permissions/requestApproval"
+        : approval.method === "mcpServer/elicitation/request"
+          ? "thread-follower-submit-mcp-server-elicitation-response"
+          : "thread-follower-permissions-request-approval-response";
+    const params = approval.method === "mcpServer/elicitation/request"
+      ? { conversationId: approval.request.threadId, requestId: approval.requestId,
+          response: appServerApprovalResult(approval.method, approval.request, decision) }
+      : approval.method === "item/permissions/requestApproval"
       ? {
           conversationId: approval.request.threadId,
           requestId: approval.requestId,

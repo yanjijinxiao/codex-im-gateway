@@ -532,14 +532,14 @@ test("declares experimentalApi before starting plan collaboration mode and manag
   assert.equal(await runner.getGoal(result.threadId), undefined);
 });
 
-test("routes command, file, and permission approvals to the active channel turn", async (t) => {
+test("routes command, file, permission and simple MCP approvals to the active channel turn", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
     requestTimeoutMs: 2_000
   });
   t.after(() => runner.close());
 
-  for (const kind of ["command", "file", "permissions"] as const) {
+  for (const kind of ["command", "file", "permissions", "mcp"] as const) {
     const requests: Array<{ kind: string; command?: string; reason?: string }> = [];
     const result = await runner.run({
       prompt: `approval:${kind}`,

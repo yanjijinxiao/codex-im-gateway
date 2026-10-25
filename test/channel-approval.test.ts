@@ -12,6 +12,18 @@ function request(): CodexApprovalRequest {
   return { kind: "command", threadId: "thread", turnId: "turn", itemId: "item", command: "echo test" };
 }
 
+test("MCP confirmation uses once-only choices with complete commands and no persistence option", async () => {
+  const notices: string[] = [];
+  const controller = new ChannelApprovalController(async (_sender, notice) => { notices.push(notice.text); });
+  const pending = controller.request("room", { kind: "mcp", threadId: "thread", turnId: "turn", itemId: "confirmation",
+    serverName: "browser-use", reason: "Allow download from https://example.com/photo.jpg?" });
+  assert.match(notices[0], /工具操作确认（仅本次）/);
+  assert.match(notices[0], /browser-use/); assert.match(notices[0], /example.com\/photo.jpg/);
+  assert.match(notices[0], /```text\n\/approve A1\n```/);
+  assert.doesNotMatch(notices[0], /Always allow|永久允许/);
+  controller.decide("room", "A1", "decline"); assert.equal(await pending, "decline");
+});
+
 test("approval decisions are conversation-scoped and report submission before backend confirmation", async () => {
   const notices: string[] = [];
   const approvals = new ChannelApprovalController(async (_sender, notice) => { notices.push(notice.text); });

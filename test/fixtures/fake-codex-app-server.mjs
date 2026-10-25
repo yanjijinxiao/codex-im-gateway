@@ -164,7 +164,7 @@ rl.on("line", (line) => {
     pendingApprovals.delete(message.id);
     const decision = approval.kind === "permissions"
       ? (Object.keys(message.result?.permissions ?? {}).length ? "accept" : "decline")
-      : message.result?.decision;
+      : approval.kind === "mcp" ? message.result?.action : message.result?.decision;
     const itemId = `item-${approval.turnId}`;
     send({
       method: "item/completed",
@@ -590,7 +590,7 @@ rl.on("line", (line) => {
     if (prompt === "delayed-turn-receipt") {
       setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 150);
     } else respond(message.id, { turn: completedTurn(turnId, "inProgress") });
-    if (["command", "file", "permissions"].includes(approvalKind)) {
+    if (["command", "file", "permissions", "mcp"].includes(approvalKind)) {
       const approvalId = `approval-${turnId}`;
       pendingApprovals.set(approvalId, {
         kind: approvalKind,
@@ -601,7 +601,7 @@ rl.on("line", (line) => {
         ? "item/commandExecution/requestApproval"
         : approvalKind === "file"
           ? "item/fileChange/requestApproval"
-          : "item/permissions/requestApproval";
+          : approvalKind === "mcp" ? "mcpServer/elicitation/request" : "item/permissions/requestApproval";
       send({
         id: approvalId,
         method,
@@ -614,7 +614,9 @@ rl.on("line", (line) => {
           command: approvalKind === "command" ? "touch approved.txt" : null,
           reason: `fixture ${approvalKind} approval`,
           grantRoot: approvalKind === "file" ? "/tmp/project" : null,
-          permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined
+          permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined,
+          ...(approvalKind === "mcp" ? { mode: "form", serverName: "browser", message: "fixture mcp approval",
+            requestedSchema: { type: "object", properties: {} } } : {})
         }
       });
       return;

@@ -31,7 +31,7 @@ export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
-import { dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
+import { dingTalkLoadingBody, dingTalkPlainText, dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
 import { dingTalkMentionCard, dingTalkCardAtParameters } from "./dingtalk-mentions.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import {
@@ -64,6 +64,8 @@ export type DingTalkAICardTarget =
 
 type DingTalkCardActivity = { activity?: TurnActivity };
 export type DingTalkAICardCreateInput = DingTalkCardActivity & {
+  /** One-shot replies/questions are static from their very first paint. */
+  finalize?: boolean;
   accessToken: string;
   cardTemplateId: string;
   contentKey: string;
@@ -76,6 +78,8 @@ export type DingTalkAICardCreateInput = DingTalkCardActivity & {
   onStage?: (stage: "created" | "delivery-pending" | "delivered") => void;
 };
 export type DingTalkAICardUpdateInput = DingTalkCardActivity & {
+  /** A one-shot card uses only the static component, never opens a stream. */
+  presentation?: "static";
   accessToken: string;
   contentKey: string;
   outTrackId: string;
@@ -264,6 +268,12 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       }
       return receipt;
     }
+    // @ is routing metadata, not a reason to discard the Markdown surface.
+    // Select this before any write; uncertain card sends never fall back.
+    if (this.account.cardTemplateId?.trim()) {
+      const card = dingTalkMentionCard(input.text, input.mentions);
+      return this.createTextCard(target, card.text, true, undefined, card.atUserIds);
+    }
     const reply = this.replyTargets.get(input.toUserId);
     // Select before any external write. Never switch transports after an ambiguous send.
     if (reply && (reply.expiresAt === undefined || reply.expiresAt > this.now())) {
@@ -319,7 +329,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     try {
       const result = await this.webhookSender({
         url: target.webhookUrl,
-        text: input.text,
+        text: dingTalkPlainText(input.text),
         accessToken,
         lifecycleId,
         ...(input.atUserIds ? { atUserIds: input.atUserIds } : {})
@@ -639,6 +649,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       robotCode: target.robotCode,
       ...(atUserIds ? { atUserIds } : {}),
       text,
+      finalize,
       target: target.conversationType === "2"
         ? { type: "group", conversationId: target.conversationId }
         : { type: "user", staffId: target.actorId },
@@ -647,7 +658,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         : {})
     });
     try {
-      await this.cardClient.update({ accessToken, contentKey, outTrackId, text, finalize, error: false });
+      await this.cardClient.update({ accessToken, contentKey, outTrackId, text, finalize, error: false,
+        ...(finalize ? { presentation: "static" as const } : {}) });
     } catch (error) {
       // Creation/delivery succeeded: retry this card, never create its replacement.
       throw dingTalkProgressError(error, outTrackId);
@@ -815,6 +827,11 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
   private async updateWithRetry(input: DingTalkAICardUpdateInput, lifecycleId: string): Promise<void> {
     const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
+    if (input.presentation === "static") {
+      if (!input.finalize) throw new Error("Static DingTalk card cannot represent active work");
+      await this.updateCardState(lifecycleId, input, content, "3", true);
+      this.inputingCards.delete(input.outTrackId); return;
+    }
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
     if (!input.finalize && !nativeDingTalkLoading(input)) {
       // Select the static body without finalizing the logical task or its
@@ -1035,6 +1052,11 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
   private async updateWithRetry(input: DingTalkAICardUpdateInput): Promise<void> {
     const content = visibleDingTalkTerminalContent(input);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
+    if (input.presentation === "static") {
+      if (!input.finalize) throw new Error("Static DingTalk card cannot represent active work");
+      await this.updateCardStateWithRetry(input, content, "3", true);
+      this.inputingCards.delete(input.outTrackId); return;
+    }
     const firstUpdate = !this.inputingCards.has(input.outTrackId);
     if (!input.finalize && !nativeDingTalkLoading(input)) {
       await this.updateCardStateWithRetry(input, content, "3", true);
@@ -1157,10 +1179,10 @@ class DingTalkStreamSequence {
   }
 }
 
-function visibleDingTalkTerminalContent(input: { text: string; finalize: boolean; error: boolean }): string {
+function visibleDingTalkTerminalContent(input: { text: string; finalize: boolean; error: boolean } & DingTalkCardActivity): string {
   const hasFailureHeading = ["failed", "interrupted"].some(status => input.text.startsWith(turnStatusHeading(status as "failed" | "interrupted")));
   const text = input.finalize && input.error && !hasFailureHeading ? `❌ **处理失败**\n\n${input.text}` : input.text;
-  return normalizeDingTalkCardContent(text);
+  return normalizeDingTalkCardContent(!input.finalize && nativeDingTalkLoading(input) ? dingTalkLoadingBody(text) : text);
 }
 
 /** Legacy non-task stream callers retain their existing input presentation. */
@@ -1168,12 +1190,12 @@ function nativeDingTalkLoading(input: DingTalkCardActivity): boolean {
   return input.activity === undefined || input.activity === "running" || input.activity === "recovering";
 }
 
-function initialDingTalkCardData(input: { contentKey: string; text: string } & DingTalkCardActivity): Record<string, string> {
-  const text = normalizeDingTalkCardContent(input.text);
+function initialDingTalkCardData(input: { contentKey: string; text: string; finalize?: boolean } & DingTalkCardActivity): Record<string, string> {
+  const text = normalizeDingTalkCardContent(!input.finalize && nativeDingTalkLoading(input) ? dingTalkLoadingBody(input.text) : input.text);
   if (!text.trim()) throw new Error("DingTalk card initial content must not be empty");
   if (text.length > 50_000) throw new Error("DingTalk card payload requires pagination");
   // Publish a populated first frame, not an empty template awaiting a second request.
-  return dingTalkCardStateParamMap({ contentKey: input.contentKey, text, flowStatus: nativeDingTalkLoading(input) ? "2" : "3" });
+  return dingTalkCardStateParamMap({ contentKey: input.contentKey, text, flowStatus: input.finalize || !nativeDingTalkLoading(input) ? "3" : "2" });
 }
 
 export function dingTalkCardStateParamMap(input: {
@@ -1183,9 +1205,9 @@ export function dingTalkCardStateParamMap(input: {
 }): Record<string, string> {
   return {
     flowStatus: input.flowStatus,
-    [input.contentKey]: input.text,
-    staticMsgContent: "",
-    sys_full_json_obj: JSON.stringify({ order: [input.contentKey] }),
+    [input.contentKey]: input.flowStatus === "2" ? input.text : "",
+    staticMsgContent: input.flowStatus === "2" ? "" : input.text,
+    sys_full_json_obj: JSON.stringify({ order: [input.flowStatus === "2" ? input.contentKey : "staticMsgContent"] }),
     config: JSON.stringify({ autoLayout: true })
   };
 }

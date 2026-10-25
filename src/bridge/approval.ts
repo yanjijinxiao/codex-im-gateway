@@ -109,7 +109,9 @@ function approvalNotice(id: string, request: CodexApprovalRequest, timeoutMs: nu
     ? ["类型：运行命令", request.command ? `命令：\n${limit(request.command)}` : undefined]
     : request.kind === "file"
       ? ["类型：修改文件", request.grantRoot ? `写入范围：${request.grantRoot}` : undefined]
-      : ["类型：申请额外权限", request.permissions ? `权限：${limit(JSON.stringify(request.permissions))}` : undefined];
+      : request.kind === "mcp"
+        ? ["类型：工具操作确认（仅本次）", request.serverName ? `来源：${request.serverName}` : undefined]
+        : ["类型：申请额外权限", request.permissions ? `权限：${limit(JSON.stringify(request.permissions))}` : undefined];
   const timeout = `${Math.max(1, Math.ceil(timeoutMs / 60_000))} 分钟内未处理将自动拒绝。`;
   const summary = [
     `【Codex 审批 ${id}】`,

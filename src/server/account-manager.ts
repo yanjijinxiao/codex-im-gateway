@@ -1600,6 +1600,15 @@ export class AccountManager {
       onUserInputResult: (input, result) => this.reportDesktopUserInputResult(input, result),
       onObservedUserInputAnswers: async receipts => {
         await Promise.all([...this.entries.values()].map(entry => entry.service?.observeNativeUserInputAnswers?.(receipts)));
+      },
+      onUnsupportedInteraction: async input => {
+        const binding = this.interactionBinding(input.threadId, input.turnId, input.hostId);
+        if (!binding) { await this.notifyInteractionRouteConflict(input.hostId, input.threadId, input.turnId); return; }
+        // Deliberately omit native payloads: these may contain an OAuth URL,
+        // verification challenge or credentials that must not enter an IM group.
+        const text = "当前任务正在等待工具或浏览器确认。此请求需要在 Codex Desktop 中处理，暂不能通过 IM 回答；Gateway 未代为批准，任务尚未完成。";
+        const sent = await binding.client.sendText({ toUserId: binding.recipientId, text, contextToken: binding.contextToken });
+        binding.onTextDelivered?.({ messageId: sent.messageId, text });
       }
     });
     this.codexDesktopRequestMonitor.start();

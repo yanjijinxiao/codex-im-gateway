@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { marked } from "marked";
-import { dingTalkVisibleOrdinals } from "../src/channels/dingtalk-markdown.js";
+import { dingTalkLoadingBody, dingTalkPlainText, dingTalkVisibleOrdinals } from "../src/channels/dingtalk-markdown.js";
 import { DingTalkHttpsAICardClient, DingTalkSdkAICardClient, normalizeDingTalkCardContent } from "../src/channels/dingtalk.js";
 import { resultPages } from "../src/channels/result-pages.js";
 
@@ -88,7 +88,8 @@ for (const transport of ["HTTPS", "SDK"] as const) {
     let creates = 0, deliveries = 0;
     let modePatches = 0;
     const snapshot = (body: any) => {
-      if (Object.hasOwn(body.cardData.cardParamMap, "content")) contents.push(body.cardData.cardParamMap.content);
+      const map = body.cardData.cardParamMap, key = JSON.parse(map.sys_full_json_obj).order[0];
+      if (Object.hasOwn(map, key)) contents.push(map[key]);
       else modePatches++;
     };
     const client = transport === "HTTPS" ? new DingTalkHttpsAICardClient(async (url, init) => {
@@ -112,7 +113,28 @@ for (const transport of ["HTTPS", "SDK"] as const) {
     assert.equal(creates, 1);
     assert.equal(deliveries, 1);
     assert.equal(contents.length, 4); assert.equal(modePatches, 1);
-    assert.ok(contents.every(content => content === normalizeDingTalkCardContent(source)));
+    assert.deepEqual(contents, [source, source, source, source].map((text, i) => normalizeDingTalkCardContent(i < 2 ? dingTalkLoadingBody(text) : text)));
     assert.ok(contents.every(content => content.includes("**2.** **第二段**")));
   });
 }
+
+test("plain DingTalk fallback preserves exact reply values without leaking fenced-code syntax", () => {
+  const commands = ["/answer Q38 --option 1", "/skip Q38", '/answer Q38 a`b **literal** <tag> \\ path', "多行\n第二行"];
+  for (const command of commands) {
+    const fence = command.includes("`") ? "````" : "```";
+    const source = `选择说明\n\n${fence}text\n${command}\n${fence}\n\n下一项`;
+    assert.equal(dingTalkPlainText(source), `选择说明\n\n${command}\n\n下一项`);
+  }
+  assert.equal(dingTalkPlainText("~~~text\n/ide access 123456789abc\n~~~"), "/ide access 123456789abc");
+  assert.equal(dingTalkPlainText("普通参考：路径 /repo 和 ID Q38"), "普通参考：路径 /repo 和 ID Q38");
+});
+
+test("all active Markdown block endings have a normal cursor anchor without changing the copied command", () => {
+  for (const body of ["```text\n/stop\n```", "```text\n/stop", "> 引用", "- 列表", "| 列 | 值 |\n| --- | --- |\n| a | b |", "## 标题"]) {
+    const result = dingTalkLoadingBody(body);
+    assert.ok(result.endsWith("\n\n正在处理…"));
+    assert.equal(dingTalkLoadingBody(result), result);
+    if (body.includes("/stop")) assert.match(result, /```text\n\/stop\n```\n\n正在处理…$/);
+  }
+  assert.equal(dingTalkLoadingBody("任务仍在执行"), "任务仍在执行");
+});

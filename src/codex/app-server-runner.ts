@@ -1668,6 +1668,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const request = parseAppServerApproval(method, message.params ?? {});
       const handler = request ? this.approvalHandlersByThread.get(request.threadId) : undefined;
       if (!request || !handler) {
+        if (method === "mcpServer/elicitation/request") {
+          this.send({ id, result: { action: "cancel", content: null, _meta: null } });
+          return;
+        }
         const fallback = request ?? {
           kind: "command" as const,
           threadId: "",
@@ -1699,9 +1703,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         return;
       case "item/tool/requestUserInput":
         this.handleUserInputRequest(id, message.params ?? {});
-        return;
-      case "mcpServer/elicitation/request":
-        this.send({ id, result: { action: "cancel", content: null, _meta: null } });
         return;
       case "item/tool/call":
         this.handleDynamicToolRequest(id, message.params ?? {});

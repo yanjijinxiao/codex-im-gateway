@@ -5,7 +5,7 @@ import { channelProgressError } from "./errors.js";
 import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import { copyBlock } from "./copyable.js";
-import { TURN_STATUS_BYTES, withTurnStatus, type TurnActivity, type TurnOutcome } from "./turn-status.js";
+import { TURN_STATUS_BYTES, turnStatusHeading, withTurnStatus, type TurnActivity, type TurnOutcome } from "./turn-status.js";
 import { renderTurnProgressCard } from "./turn-progress-card.js";
 import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
@@ -61,6 +61,9 @@ export class ChannelTurnTextStream {
   private suspended = false;
   private terminal?: ChannelStreamCheckpoint["terminal"];
   private readonly statusHeader: boolean;
+  /** Native loading is a transport capability, not a Markdown layout choice.
+   * Restored pre-header page plans must still receive trusted activity. */
+  private readonly activityMetadata: boolean;
   private activity: TurnActivity = "running";
   private finalizing?: Promise<boolean>;
   private terminalBlocked = false;
@@ -101,6 +104,7 @@ export class ChannelTurnTextStream {
     const saved = persistence?.restore;
     // A pre-upgrade partially delivered result owns its exact page layout.
     this.statusHeader = saved?.statusHeader ?? (!saved?.resultPageBytes && client.capabilities?.turnStatusHeader === "available");
+    this.activityMetadata = this.statusHeader || client.capabilities?.turnStatusHeader === "available";
     this.supported = saved?.resultPresentation === "native-text" ? false
       : saved?.resultPresentation === "card" || Boolean(saved?.messageId || saved?.bootstrap || saved?.creationAttempted) || (persistence?.progressEnabled !== false && (client.capabilities
         ? client.capabilities.progress === "available" : Boolean(client.startTextStream && client.updateTextStream)));
@@ -141,7 +145,8 @@ export class ChannelTurnTextStream {
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
-      ...(this.statusHeader ? { statusHeader: true as const, activity: this.activity } : {}),
+      ...(this.statusHeader ? { statusHeader: true as const } : {}),
+      ...(this.activityMetadata ? { activity: this.activity } : {}),
       toolActivity: { ...this.toolActivity },
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
@@ -183,7 +188,7 @@ export class ChannelTurnTextStream {
     this.phase = "active";
     this.retryAt = 0;
     this.latestText = this.render();
-    this.latestActivity = this.statusHeader ? this.visibleActivity() : undefined;
+    this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
     if (this.messageId) {
       this.startHeartbeat();
       await this.updateNow();
@@ -240,7 +245,7 @@ export class ChannelTurnTextStream {
   private async publish(content: string): Promise<boolean> {
     if (!this.supported || this.finished || this.terminal || this.suspended || !content) return false;
     this.latestText = content;
-    this.latestActivity = this.statusHeader ? this.visibleActivity() : undefined;
+    this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
     if (this.phase === "unavailable" || Date.now() < this.retryAt) return false;
     if (this.opening) return this.opening;
     if (!this.messageId) return this.openNow();
@@ -373,7 +378,7 @@ export class ChannelTurnTextStream {
 
   /** Status-only observations may update an existing card, never create a placeholder. */
   async setActivity(activity: TurnActivity): Promise<boolean> {
-    if (!this.statusHeader || this.finished || this.terminal || this.suspended || this.activity === activity) return false;
+    if (!this.activityMetadata || this.finished || this.terminal || this.suspended || this.activity === activity) return false;
     this.activity = activity;
     if (activity !== "unconfirmed") this.communicationNotice = undefined;
     if (activity !== "recovering") this.recoveryNotice = undefined;
@@ -450,6 +455,7 @@ export class ChannelTurnTextStream {
     if (this.updating) return this.chain;
     this.updating = true;
     let attemptedText = "";
+    let attemptedActivity: TurnActivity | undefined;
     this.chain = this.chain.catch(() => undefined).then(async () => {
       if (!this.canUpdate() || !this.messageId || Date.now() < this.retryAt) return;
       // Read the latest snapshot only when this operation actually runs.
@@ -457,6 +463,7 @@ export class ChannelTurnTextStream {
       attemptedText = text;
       try {
         const activity = this.latestActivity;
+        attemptedActivity = activity;
         await this.client.updateTextStream!({ toUserId: this.toUserId, messageId: this.messageId, text,
           ...(activity ? { activity } : {}) });
         this.recovered();
@@ -464,7 +471,7 @@ export class ChannelTurnTextStream {
     });
     try { await this.chain; } finally {
       this.updating = false;
-      if (attemptedText && this.latestText !== attemptedText && this.canUpdate()) this.scheduleUpdate();
+      if (attemptedText && (this.latestText !== attemptedText || this.latestActivity !== attemptedActivity) && this.canUpdate()) this.scheduleUpdate();
     }
   }
 
@@ -483,7 +490,7 @@ export class ChannelTurnTextStream {
     this.heartbeatTimer = setInterval(() => {
       if (!this.canUpdate() || !this.messageId || this.phase === "backoff") return;
       this.latestText = this.render();
-      this.latestActivity = this.statusHeader ? this.visibleActivity() : undefined;
+      this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
       this.scheduleUpdate();
     }, 30_000);
     this.heartbeatTimer.unref?.();
@@ -507,7 +514,8 @@ export class ChannelTurnTextStream {
       recent: this.progressEntries.filter(entry => entry !== current), tools: this.toolActivity,
       answerPreview: this.answerPreview, notice: this.communicationNotice || this.recoveryNotice });
     const sections = [
-      this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**"
+      this.activityMetadata ? turnStatusHeading(this.visibleActivity())
+        : this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**"
         : current ? "**当前进展**" : "**任务执行中**",
       this.communicationNotice || this.recoveryNotice || current || this.thought || "等待新的可展示进展。"
     ];
@@ -530,6 +538,7 @@ export class ChannelTurnTextStream {
     sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
       : this.recoveryNotice ? "_保留本张进度卡；等待 Codex 后续进展或最终状态_"
       : `_已运行 ${formatTurnElapsed(Date.now() - this.startedAt)}${this.activity === "waiting-input" || this.activity === "waiting-approval" ? " · 等待你的操作" : " · 长任务会持续执行"}_\n\n停止当前任务（会中断执行）：\n\n${copyBlock("/stop")}`);
+    if (this.activityMetadata) sections.push(turnStatusHeading(this.visibleActivity()));
     return sections.join("\n\n");
   }
 
@@ -621,7 +630,7 @@ export class ChannelTurnTextStream {
       this.retryTimer = undefined;
       if (!this.canUpdate()) return;
       this.latestText = this.render();
-      this.latestActivity = this.statusHeader ? this.visibleActivity() : undefined;
+      this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
       if (this.messageId) void this.updateNow();
       else void this.openNow();
     }, delay);

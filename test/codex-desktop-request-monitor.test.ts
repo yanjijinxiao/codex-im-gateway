@@ -58,7 +58,8 @@ async function fixture(t: test.TestContext, options: Partial<CodexDesktopRequest
     params: { conversationId: "thread", hostId, change } });
   const snapshot = (state: unknown, hostId = "local") => send({ type: "snapshot", conversationState: state }, hostId);
   const patches = (patches: unknown[], hostId = "local") => send({ type: "patches", patches }, hostId);
-  const writes = () => messages.filter(m => ["thread-follower-submit-user-input", "thread-follower-steer-turn"].includes(m.method));
+  const writes = () => messages.filter(m => ["thread-follower-submit-user-input", "thread-follower-steer-turn",
+    "thread-follower-submit-mcp-server-elicitation-response"].includes(m.method));
   const respond = (result: unknown, includeMethod = true) => { const m = writes().at(-1)!;
     frame(peer, { type: "response", ...(includeMethod ? { method: m.method } : {}), requestId: m.requestId, resultType: "success", result }); };
   return { monitor, peer, messages, inputs, results, snapshot, patches, writes, respond };
@@ -68,6 +69,43 @@ const native = { id: 42, method: "item/tool/requestUserInput", params: {
   threadId: "thread", turnId: "turn", itemId: "item", autoResolutionMs: null,
   questions: [{ id: "native-question", header: "问题", question: "目录在哪？" }]
 } };
+
+test("Desktop browser confirmation waits for a human decision and a native receipt", async t => {
+  let approve!: (value: "accept" | "decline") => void;
+  const results: string[] = [];
+  const f = await fixture(t, { onApproval: async request => {
+    assert.equal(request.method, "mcpServer/elicitation/request");
+    assert.equal(request.request.kind, "mcp");
+    return new Promise(resolve => { approve = resolve; });
+  }, onResult: async (_request, result) => { results.push(result); } });
+  const request = { id: 99, method: "mcpServer/elicitation/request", params: {
+    threadId: "thread", turnId: "turn", serverName: "browser", mode: "form", message: "Allow download?",
+    requestedSchema: { type: "object", properties: {} }, _meta: { persist: { key: "must-not-grant" } }
+  } };
+  f.snapshot({ requests: [request] }); await waitFor(() => Boolean(approve));
+  assert.equal(f.writes().length, 0, "merely observing an approval never grants it");
+  approve("accept"); await waitFor(() => f.writes().length === 1);
+  assert.deepEqual(f.writes()[0].params, { conversationId: "thread", requestId: 99,
+    response: { action: "accept", content: {}, _meta: null } });
+  assert.deepEqual(results, []);
+  f.respond({ ok: true }); await waitFor(() => results.length === 1);
+  assert.deepEqual(results, ["confirmed"]);
+  f.snapshot({ requests: [{ ...request, completed: true }] });
+  await new Promise(resolve => setTimeout(resolve, 10)); assert.equal(f.writes().length, 1);
+});
+
+test("unsupported native confirmations produce one neutral notice without exposing or answering the payload", async t => {
+  const notices: unknown[] = [];
+  const f = await fixture(t, { onUnsupportedInteraction: async value => { notices.push(value); } });
+  const request = { id: "auth", method: "mcpServer/elicitation/request", params: {
+    threadId: "thread", turnId: "turn", serverName: "browser", mode: "openai/userVerification", challenge: "private-value"
+  } };
+  f.snapshot({ requests: [request] }); await waitFor(() => notices.length === 1);
+  f.snapshot({ requests: [request] }); f.patches([{ op: "add", path: ["cwd"], value: "/project" }]);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(notices, [{ hostId: "local", threadId: "thread", turnId: "turn", requestId: "auth", method: request.method }]);
+  assert.equal(f.writes().length, 0);
+});
 const asyncTurn = { turnId: "turn", status: "inProgress", items: [{ type: "agentMessage", id: "call",
   questions: [{ title: "farming 在哪里？" }] }] };
 function asyncState(canonical = false) {

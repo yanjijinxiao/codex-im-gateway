@@ -1,4 +1,30 @@
 import { Lexer, type Token, type Tokens } from "marked";
+import { closeMarkdownFence } from "./result-pages.js";
+
+/** The client's native cursor must end in a normal paragraph, never inside a
+ * code/list/table block. Display-only: the stored task/command is unchanged. */
+export function dingTalkLoadingBody(source: string): string {
+  const last = Lexer.lex(source, { gfm: true }).filter(token => token.type !== "space").at(-1);
+  return last && !["paragraph", "text"].includes(last.type) ? `${closeMarkdownFence(source).trimEnd()}\n\n正在处理…` : source;
+}
+
+/** Plain webhook transport has no Markdown renderer. Remove only code-block
+ * wrappers, never rewrite the literal reply/command inside them. */
+export function dingTalkPlainText(source: string): string {
+  let result = "", cursor = 0;
+  for (const token of Lexer.lex(source, { gfm: true })) {
+    const offset = source.indexOf(token.raw, cursor);
+    if (offset < 0 || !token.raw) continue;
+    let replacement = token.raw;
+    if (token.type === "code" && /^ {0,3}(?:`{3,}|~{3,})/.test(token.raw))
+      replacement = (token as Tokens.Code).text + trailingNewlines(token.raw);
+    else if (token.type === "blockquote")
+      replacement = dingTalkPlainText((token as Tokens.Blockquote).text).split("\n").map(line => `> ${line}`).join("\n") + trailingNewlines(token.raw);
+    result += source.slice(cursor, offset) + replacement;
+    cursor = offset + token.raw.length;
+  }
+  return result + source.slice(cursor);
+}
 
 /**
  * The AI Card template can render list bodies without their native ordered-list

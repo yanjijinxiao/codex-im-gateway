@@ -63,6 +63,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   let approvalResultHandler: ((approval: CodexDesktopApproval, result: ApprovalDeliveryResult) => Promise<void> | void) | undefined;
   let questionHandler: CodexDesktopRequestMonitorOptions["onUserInput"];
   let questionResultHandler: CodexDesktopRequestMonitorOptions["onUserInputResult"];
+  let unsupportedInteractionHandler: CodexDesktopRequestMonitorOptions["onUnsupportedInteraction"];
   const channelQuestions: Array<{ accountId: string; senderId: string; request: CodexDesktopUserInput["request"] }> = [];
   const questionResults: Array<{ senderId: string; result: string }> = [];
   const recoveredQuestions = new Set<string>();
@@ -191,6 +192,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
       approvalResultHandler = handlers.onResult;
       questionHandler = handlers.onUserInput;
       questionResultHandler = handlers.onUserInputResult;
+      unsupportedInteractionHandler = handlers.onUnsupportedInteraction;
       return {
         start() {},
         stop() {},
@@ -247,6 +249,9 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     },
     async emitQuestionResult(input: CodexDesktopUserInput, result: "confirmed" | "withdrawn" | "failed") {
       await questionResultHandler?.(input, result);
+    },
+    async emitUnsupportedInteraction(input: Parameters<NonNullable<typeof unsupportedInteractionHandler>>[0]) {
+      assert.ok(unsupportedInteractionHandler); await unsupportedInteractionHandler(input);
     },
     channelQuestions, questionResults, recoveredQuestions,
     currentlyFollowed,
@@ -890,6 +895,18 @@ test("routes questions and native receipts to the unique originating IM, never a
   assert.match(f.bridges.get("account-one")!.userInputFilePath!, /account-one\/user-input.json$/);
   await f.emitQuestionResult(input, "confirmed"); await f.emitQuestionResult(input, "failed");
   assert.deepEqual(f.questionResults, [{ senderId: "bound-room", result: "confirmed" }]);
+  await f.manager.stopAll();
+});
+
+test("unsupported Desktop interaction notices use the exact binding without inventing approval choices", async t => {
+  const f = setup(t); seedApprovalBinding(f.paths, "account-one", "bound-room", { project: true });
+  await f.manager.startAll();
+  await f.emitUnsupportedInteraction({ hostId: "local", threadId: "bound-approval-thread", turnId: "approval-turn",
+    requestId: "auth", method: "mcpServer/elicitation/request" });
+  const notice = f.sent.filter(item => item.text.includes("暂不能通过 IM 回答"));
+  assert.equal(notice.length, 1); assert.equal(notice[0].toUserId, "bound-room");
+  assert.doesNotMatch(notice[0].text, /\/approve|\/answer/);
+  assert.equal(f.channelApprovals.length, 0); assert.equal(f.channelQuestions.length, 0);
   await f.manager.stopAll();
 });
 
