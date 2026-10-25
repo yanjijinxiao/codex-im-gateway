@@ -21,7 +21,7 @@ function fixture(api: (...args: any[]) => Promise<unknown> = async () => ({})) {
   const ui = context.window.gatewayIDE;
   const panel = { innerHTML: "", querySelector: node, querySelectorAll: () => [node("confirm"), node("cancel")] };
   const button = { dataset: { ideApprove: request.id, ideEntry: request.entryId, ideTrust: "true" }, closest: () => panel };
-  const data = { accessRequests: [request], installations: [], authorization: { sessionTtlDays: 15 } };
+  const data = { accessRequests: [request], installations: [], authorization: { sessionTtlDays: 90 } };
   return { ui, panel, button, data, node, context };
 }
 
@@ -33,7 +33,7 @@ test("approval uses a visible exact-request confirmation and polling preserves i
     assert.deepEqual(JSON.parse(JSON.stringify(options.body)), { requestId: request.id, entryId: request.entryId, trustWorkspace: true });
     calls++; await gate;
   });
-  ui.renderActivity(data); assert.equal(node("#ideSessionDuration").textContent, "15 天");
+  ui.renderActivity(data); assert.equal(node("#ideSessionDuration").textContent, "90 天");
   assert.match(node("#ideAccessRequests").innerHTML, /&lt;project&gt;/);
   node("#ideAccessRequests").innerHTML = "retained node identity";
   ui.renderActivity(data); assert.equal(node("#ideAccessRequests").innerHTML, "retained node identity");
@@ -52,7 +52,7 @@ test("owner registration UI escapes identity data and polling preserves inputs w
     accounts: [{ accountId: "<account>", channel: "dingtalk", providerId: "client" }] };
   ui.renderActivity({ ...data, approvers });
   assert.match(node("#ideApprovers").innerHTML, /&lt;owner&gt;/); assert.doesNotMatch(node("#ideApprovers").innerHTML, /<owner>/);
-  assert.match(node("#ideApprovers").innerHTML, /移除审批资格/);
+  assert.match(node("#ideApprovers").innerHTML, /移除兼容资格/);
   node("#ideApproverActor").value = "draft-owner"; node("#ideApproverAccount").innerHTML = "stable select";
   ui.renderActivity({ ...data, approvers }); assert.equal(node("#ideApproverActor").value, "draft-owner");
   assert.equal(node("#ideApproverAccount").innerHTML, "stable select");

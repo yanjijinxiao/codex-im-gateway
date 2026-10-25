@@ -1115,14 +1115,14 @@ async function handleAccountAction(event) {
         throw new Error("授权对象信息不完整，请刷新页面并重新发送消息后再试。");
       }
       const scope = userScope
-        ? "仅允许此用户在当前渠道使用 Codex，不会授权同一聊天中的其他人。"
-        : "允许此会话中的所有成员使用 Codex。如果是群聊，其他群成员也将获得访问权限。";
+        ? "允许此用户在当前渠道使用 Codex，并通过 /ide 为本人浏览器配对，获得本账号项目的代码编辑和终端权限；不会获得 Gateway 管理权限，也不会授权同一聊天中的其他人。"
+        : "允许此会话中的所有成员通过 IM 使用 Codex。如果是群聊，其他群成员也将获得 IM 访问权限；不授予个人 Web IDE 配对资格。";
       if (!window.confirm(`${userScope ? "允许此用户" : "允许整个会话"}？\n渠道：${accountDisplayName(accountId)}\n用户 Actor ID：${actorId}\n来源 Conversation ID：${conversationId || "未获取"}\n\n${scope}`)) return;
       await api(`/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(senderId)}/allow`, { method: "POST" });
       toast(userScope ? `已允许用户 ${actorId}。请回聊天重新发送消息。` : `已允许整个会话 ${conversationId}。请回聊天重新发送消息。`);
     }
     if (action === "revoke-all" && account) {
-      if (!window.confirm(`撤销“${accountDisplayName(accountId)}”的全部用户及会话授权？撤销后需要重新允许才能继续使用。`)) return;
+      if (!window.confirm(`撤销“${accountDisplayName(accountId)}”的全部用户及会话授权？同时撤销由这些个人准入签发的 IDE 登录，断开对应终端连接。旧版未记录个人来源的浏览器授权和独立兼容身份不受影响；必要时在 Web IDE 页面另行撤销。继续？`)) return;
       await Promise.all(account.pairedSenderIds.map((senderId) => api(
         `/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(senderId)}/remove`,
         { method: "POST" }

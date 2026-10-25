@@ -345,7 +345,7 @@ export class BridgeService {
       this.options.stateStore.rememberContextToken(replyTargetId, scopedMessage.contextToken);
     }
 
-    // Dedicated owner authority, before chat ACL/session gating. Source actor
+    // Dedicated personal authority, before chat ACL/session gating. Source actor
     // and provider-confirmed conversation kind must never be rewritten to a room.
     const control = parseCommand(message.text);
     if (control && isIDEApprovalCommand(control.name, control.arg)) {

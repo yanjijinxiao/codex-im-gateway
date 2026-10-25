@@ -140,7 +140,8 @@ test("conversation authorization explicitly warns of other members and sends the
   const h = harness();
   await h.allow("conversation");
   assert.match(h.confirmations[0], /允许整个会话/);
-  assert.match(h.confirmations[0], /其他群成员也将获得访问权限/);
+  assert.match(h.confirmations[0], /其他群成员也将获得 IM 访问权限/);
+  assert.match(h.confirmations[0], /不授予个人 Web IDE 配对资格/);
   assert.deepEqual(h.requests, [{ url: `/api/accounts/${fixture.accountId}/senders/${encodeURIComponent(fixture.lastActiveSenderId)}/allow`, options: { method: "POST" } }]);
 });
 

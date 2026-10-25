@@ -315,6 +315,9 @@ export class AccountManager {
 
   constructor(private readonly options: AccountManagerOptions) {
     this.ideApprovals = new IDEApprovalService({ root: options.paths.root,
+      // Exact actor lookup only. Never use requireAccess(actor, conversation):
+      // its group-wide ACL is intentionally insufficient for browser pairing.
+      allowedPersonal: principal => this.storeFor(principal.accountId).listPairedSenderIds().includes(principal.actorId),
       accounts: () => listAccounts(options.paths).map(account => ({ accountId: account.accountId, channel: accountChannel(account),
         providerId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId })) });
     this.ide = new WorkspaceIDEManager({ root: options.paths.root, resolve: (accountId, sessionId) => this.ideWorkspace(accountId, sessionId),
@@ -1414,6 +1417,7 @@ export class AccountManager {
   }
 
   removeSender(accountId: string, senderId: string): void {
+    this.ideApprovals.revokePersonalAccess(loadAccount(this.options.paths, accountId).accountId, senderId);
     const entry = this.entries.get(loadAccount(this.options.paths, accountId).accountId);
     if (entry?.service) {
       entry.service.removeSender(senderId);

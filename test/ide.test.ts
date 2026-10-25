@@ -122,13 +122,15 @@ test("external first hop silently rechecks Strict cookies without approval UI, g
   assert.equal(transport.launches.length, 1);
 });
 
-test("separate browser authentication guards HTTP/WS, strips credentials, denies foreign origins and revokes sockets", async t => {
+for (const source of ["local", "personal"] as const) test(`${source} browser authentication guards HTTP/WS, strips credentials, denies foreign origins and revokes sockets`, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-access-")), transport = new FakeTransport();
   const manager = new WorkspaceIDEManager({ root, transport, resolve: () => ({ owner: "owner", sessionId: "s", workspace: "/project", hostId: "local", projectName: "<project>" }),
     refresh: async () => ({ owner: "owner", sessionId: "s", workspace: "/actual/worktree", hostId: "local", projectName: "<project>" }) });
   const port = await freePort(), origin = `http://127.0.0.1:${port}`;
   manager.configStore.save(config(manager.configStore, port));
   const access = new IDEAccessServer(manager); await access.reload();
+  let personalAllowed = true;
+  access.setAccessAuthority({ isSubjectAllowed: () => personalAllowed });
   const managementOrigin = "http://127.0.0.1:18788"; access.setManagementOrigin(managementOrigin);
   t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const entry = manager.entry("account", "s")!;
@@ -138,21 +140,31 @@ test("separate browser authentication guards HTTP/WS, strips credentials, denies
   assert.match(anon.headers.get("content-security-policy")!,new RegExp(`script-src 'nonce-${nonce.replace(/[+]/g,"\\+")}'`));
   assert.match(waitingPage,/data-ide-wait/);assert.match(waitingPage,/data-copy-button/);assert.match(waitingPage,/window\.location\.reload/);
   const primary=waitingPage.split("<details")[0];
-  assert.match(primary,/当前浏览器尚未授权，不代表管理员登记丢失/);
+  assert.match(primary,/当前浏览器尚未授权，不代表个人准入丢失/);
   assert.doesNotMatch(primary,/请先.*登记|首次.*登记|尚未登记管理员/);
-  assert.match(primary,/申请有效期为 5 分钟/);assert.match(primary,/访问授权有效期为 15 天/);
-  assert.match(primary,/管理员登记独立持久保存/);
+  assert.match(primary,/申请有效期为 5 分钟/);assert.match(primary,/访问授权有效期为 90 天/);
+  assert.match(primary,/Gateway 重启保留，不自动延期/);
+  assert.match(primary,/撤销个人准入.*重新允许也不会恢复旧登录/);
   assert.match(waitingPage,/<details data-ide-registration-help><summary>首次使用/);
   assert.doesNotMatch(waitingPage,/<details[^>]*\bopen\b/);
   assert.equal(anon.headers.get("referrer-policy"), "strict-origin-when-cross-origin", "native browser POST must retain a verifiable Origin");
-  const grant = await access.grant(entry.id);
-  const login = (originHeader: string) => fetch(`${origin}/authorize`, { method: "POST", headers: { Origin: originHeader }, redirect: "manual",
-    body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
-  assert.equal((await login("https://evil.invalid")).status, 403);
-  const logged = await login(managementOrigin); assert.equal(logged.status, 303);
-  assert.equal((await login(managementOrigin)).status, 401, "grant cannot be replayed");
+  let logged: Response;
+  if (source === "local") {
+    const grant = await access.grant(entry.id);
+    const login = (originHeader: string) => fetch(`${origin}/authorize`, { method: "POST", headers: { Origin: originHeader }, redirect: "manual",
+      body: new URLSearchParams({ token: grant.token, entryId: entry.id }) });
+    assert.equal((await login("https://evil.invalid")).status, 403);
+    logged = await login(managementOrigin); assert.equal(logged.status, 303);
+    assert.equal((await login(managementOrigin)).status, 401, "grant cannot be replayed");
+  } else {
+    const request = access.pendingAccess()[0];
+    await access.approveAccess(request.id, entry.id, false, undefined, {
+      principal: { accountId: "account", channel: "dingtalk", providerId: "bot", actorId: "alice" }, basis: "im-personal", epoch: 0 });
+    logged = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: anon.headers.get("set-cookie")!.split(";")[0] }, redirect: "manual" });
+    assert.equal(logged.status, 303);
+  }
   const cookie = logged.headers.get("set-cookie")!.split(";")[0]; assert.match(logged.headers.get("set-cookie")!, /HttpOnly; SameSite=Strict/);
-  assert.match(logged.headers.get("set-cookie")!, /Max-Age=1296000/);
+  assert.match(logged.headers.get("set-cookie")!, /Max-Age=7776000/);
   const landing = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } }); const html = await landing.text();
   assert.match(html, /&lt;project&gt;/); const csrf = /name="csrf" value="([^"]+)"/.exec(html)![1];
   assert.equal((await fetch(`${origin}/open/${entry.id}`, { method: "POST", headers: { Cookie: cookie, Origin: origin }, body: "csrf=wrong" })).status, 403);
@@ -167,7 +179,9 @@ test("separate browser authentication guards HTTP/WS, strips credentials, denies
     const request = http.request(`${origin}/ide/${entry.id}/socket`, { headers: { Cookie: cookie, Origin: origin, Connection: "Upgrade", Upgrade: "websocket" } });
     request.on("upgrade", (_res, socket) => resolve(socket)); request.on("error", reject); request.end();
   });
-  const closed = new Promise<void>(resolve => ws.once("close", () => resolve())); access.revoke(); await closed;
+  const closed = new Promise<void>(resolve => ws.once("close", () => resolve()));
+  if (source === "personal") { personalAllowed = false; access.reconcileAccess(); } else access.revoke();
+  await closed;
   assert.equal((await fetch(`${origin}/ide/${entry.id}/file`, { headers: { Cookie: cookie }, redirect: "manual" })).status, 303);
 });
 
@@ -181,7 +195,7 @@ test("management entry API is mutation-protected and never trusts a client path 
   assert.equal((await fetch(`${server.url}/api/ide/entry`, { method: "POST", headers, body: JSON.stringify({ accountId: "account", sessionId: "s", workspace: "/etc" }) })).status, 400);
   assert.equal((await fetch(`${server.url}/api/ide/entry`, { method: "POST", headers, body: JSON.stringify({ accountId: "account", sessionId: "s" }) })).status, 409);
   const data = await (await fetch(`${server.url}/api/ide`)).json(); assert.equal(data.config.enabled, false); assert.equal(data.passwordHash, undefined);
-  assert.equal(data.authorization.sessionTtlDays, 15);
+  assert.equal(data.authorization.sessionTtlDays, 90);
 });
 
 test("browser cookie survives access-server restart and trusted workbench cannot switch root", async t => {

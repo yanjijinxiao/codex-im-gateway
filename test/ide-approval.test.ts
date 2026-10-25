@@ -14,12 +14,65 @@ import { WorkspaceIDEManager } from "../src/ide/manager.js";
 import { startLocalHttpServer } from "../src/server/http-server.js";
 
 const owner: IDEApprover = { accountId: "account", channel: "dingtalk", providerId: "client", actorId: "owner" };
+
+test("exact personal admission enables pairing in DM or group without creating an approver, IM task, or binding", async t => {
+  const f = fixture(t), b = bridgeFixture(t, f); f.allow();
+  assert.equal(f.service.registrationStatus(owner), "allowed");
+  await b.send("/ide identity", "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已获 Gateway 个人准入/); assert.doesNotMatch(b.texts.at(-1)!, /首次|请.*登记/);
+  await b.send("/ide auth 123456", "owner", "group", "group");
+  const command = b.cards.at(-1)!.actionGroups[0][0].value.arg;
+  await b.send(`/ide ${command}`, "owner", "group", "group");
+  assert.match(b.texts.at(-1)!, /已批准/); assert.equal(f.decisions.length, 1);
+  assert.deepEqual(f.service.list(), []); assert.deepEqual(b.mutations, []); assert.equal(b.store.listSessions().length, 0);
+});
+
+test("a room allowance and a different account's human allowance never confer personal IDE admission", async t => {
+  const f = fixture(t), b = bridgeFixture(t, f); f.allow("group"); f.allow("stranger", "other");
+  await b.send("/ide auth 123456", "stranger", "group", "group");
+  assert.match(b.texts.at(-1)!, /不是 IDE/); assert.equal(b.cards.length, 0); assert.equal(f.decisions.length, 0);
+  assert.equal(f.service.registrationStatus({ ...owner, actorId: "stranger" }), "unregistered");
+  assert.doesNotMatch(b.texts.join(""), /exact\/project/);
+});
+
+test("personal grant provenance survives restart and a durable revocation epoch fences in-flight and re-allowed identities", async t => {
+  const f = fixture(t); f.allow(); let release!: () => void;
+  const gate = new Promise<void>(r => release = r); let captured: unknown, calls = 0;
+  f.service.attach({ pendingAccess: () => f.requests, async approveAccess(_id, _entry, _trust, guard, subject) {
+    captured = subject; await gate; guard?.(); calls++;
+  }, rejectAccess() {} });
+  const offered = f.service.offer("request", "entry")!;
+  const pending = f.service.decide(owner, offered.shortCode, "trust");
+  assert.deepEqual(captured, { principal: owner, basis: "im-personal", epoch: 0 });
+  assert.equal(new IDEApprovalService(f.options).isSubjectAllowed(captured as never), true);
+  f.service.revokePersonalAccess("account", "owner");
+  // Re-allowing (even without an intervening request) cannot revive epoch 0.
+  f.allow(); release(); await assert.rejects(pending, /个人准入/); assert.equal(calls, 0);
+  assert.equal(f.service.isSubjectAllowed(captured as never), false);
+  assert.equal(new IDEApprovalService(f.options).isSubjectAllowed(captured as never), false);
+  assert.equal(fs.statSync(path.join(f.root, "ide/access-revisions.json")).mode & 0o777, 0o600);
+});
+
+test("personal admission does not depend on the legacy list, but unreadable revocation state fails closed without overwriting", t => {
+  const f = fixture(t); f.allow();
+  fs.mkdirSync(path.join(f.root, "ide"), { recursive: true }); fs.writeFileSync(path.join(f.root, "ide/approvers.json"), "broken legacy");
+  const service = new IDEApprovalService(f.options);
+  assert.equal(service.registrationStatus(owner), "allowed");
+  fs.writeFileSync(path.join(f.root, "ide/access-revisions.json"), "broken revocations");
+  const broken = new IDEApprovalService(f.options);
+  assert.equal(broken.registrationStatus(owner), "unavailable");
+  assert.throws(() => broken.preview(owner, "123456"), /撤销记录/);
+  assert.throws(() => broken.revokePersonalAccess("account", "owner"), /撤销记录/);
+  assert.equal(fs.readFileSync(path.join(f.root, "ide/access-revisions.json"), "utf8"), "broken revocations");
+});
 function fixture(t: test.TestContext) {
   const root = fs.mkdtempSync("/private/tmp/cig-approval-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let now = 1000;
   const accounts = [{ accountId: "account", channel: "dingtalk", providerId: "client" }, { accountId: "other", channel: "dingtalk", providerId: "client-other" }];
-  const options = { root, accounts: () => accounts, now: () => now };
+  const allowed = new Set<string>();
+  const options = { root, accounts: () => accounts, now: () => now,
+    allowedPersonal: (p: IDEApprover) => allowed.has(JSON.stringify([p.accountId, p.actorId])) };
   const service = new IDEApprovalService(options);
   const requests: IDEApprovalRequest[] = [{ id: "request", entryId: "entry", code: "123456", expiresAt: now + 300_000,
     accountId: "account", hostId: "remote:test", projectName: "project", workspace: "/exact/project", scope: "scope", approved: false }];
@@ -27,7 +80,8 @@ function fixture(t: test.TestContext) {
   service.attach({ pendingAccess: () => requests.filter(r => !r.approved),
     approveAccess: async (id, entryId, trust, guard) => { guard?.(); const r = requests.find(r => r.id === id)!; r.approved = true; decisions.push({ id, entryId, trust }); },
     rejectAccess: (id, entryId) => { decisions.push({ id, entryId, deny: true }); requests.splice(requests.findIndex(r => r.id === id), 1); } });
-  return { root, service, accounts, options, requests, decisions, tick: (ms: number) => now += ms };
+  return { root, service, accounts, options, requests, decisions, allowed,
+    allow: (actorId = "owner", accountId = "account") => allowed.add(JSON.stringify([accountId, actorId])), tick: (ms: number) => now += ms };
 }
 
 test("IDE approvers persist independently of chat ACL, bind provider/account/actor, and fail closed on corruption", t => {
@@ -37,9 +91,9 @@ test("IDE approvers persist independently of chat ACL, bind provider/account/act
   assert.deepEqual(new IDEApprovalService(f.options).list(), [owner]);
   assert.equal(fs.statSync(path.join(f.root, "ide/approvers.json")).mode & 0o777, 0o600);
   assert.throws(() => f.service.preview({ ...owner, actorId: "room" }, "123456"), /不是 IDE/);
-  assert.throws(() => f.service.preview({ ...owner, accountId: "other" }, "123456"), /不是 IDE/);
+  assert.throws(() => f.service.preview({ ...owner, accountId: "other" }, "123456"), /已改变/);
   f.accounts[0].providerId = "replaced-bot";
-  assert.throws(() => f.service.preview(owner, "123456"), /不是 IDE/);
+  assert.throws(() => f.service.preview(owner, "123456"), /已改变/);
   assert.throws(() => f.service.principal("account", "dingtalk", "owner", "client"), /已改变/);
   assert.throws(() => f.service.preview(f.service.principal("account", "dingtalk", "owner", "replaced-bot"), "123456"), /不是 IDE/);
   const file = path.join(f.root, "ide/approvers.json"); fs.writeFileSync(file, "malformed");
@@ -79,7 +133,7 @@ test("owner removal, endpoint detach, native changes and concurrent confirmation
     approveAccess: async (_id, _entry, _trust, guard) => { await gate; guard?.(); calls++; }, rejectAccess() {} });
   const preview = f.service.preview(owner, "123456"), pending = f.service.decide(owner, preview.token, "trust");
   await assert.rejects(f.service.decide(owner, preview.token, "trust"), /正在处理/);
-  f.service.setOwner(owner, true); release(); await assert.rejects(pending, /不是 IDE/); assert.equal(calls, 0);
+  f.service.setOwner(owner, true); release(); await assert.rejects(pending, /个人准入|已改变/); assert.equal(calls, 0);
   f.service.setOwner(owner); const next = f.service.preview(owner, "123456");
   f.requests[0].scope = "new-native-thread";
   await assert.rejects(f.service.decide(owner, next.token, "trust"), /已改变/);
@@ -123,7 +177,7 @@ test("unbound private approval uses original human and provider DM metadata befo
   assert.equal([...b.cards[0].fallbackText.matchAll(/```text\n\/ide (trust|access|deny) [a-f0-9]{12}\n```/g)].length,3,"short commands keep the permission choice visible before the identifier");
   const action = b.cards[0].actionGroups[0][0].value;
   assert.ok(parseChannelActionValue(action)); assert.equal(action.command, "ide");
-  await b.send(`/ide ${action.arg}`); assert.match(b.texts.at(-1)!, /15 天/);
+  await b.send(`/ide ${action.arg}`); assert.match(b.texts.at(-1)!, /90 天/);
   assert.deepEqual(f.decisions, [{ id: "request", entryId: "entry", trust: true }]);
   assert.deepEqual(b.mutations, []); assert.equal(JSON.stringify(b.store.snapshot), before);
 });
@@ -267,16 +321,17 @@ async function freePort() {
   const s = net.createServer(); await new Promise<void>(r => s.listen(0, "127.0.0.1", r));
   const port = (s.address() as net.AddressInfo).port; await new Promise<void>(r => s.close(() => r())); return port;
 }
-test("real HTTP browser pairing + token-protected owner setup + private IM confirmation persists browser access across restart", async t => {
+for (const admission of ["legacy", "personal"] as const) test(`real HTTP browser pairing + token-protected ${admission} setup + private IM confirmation persists browser access across restart`, async t => {
   const fetch = (input: string, init: RequestInit = {}) => globalThis.fetch(input, { ...init, headers: { Connection: "close", ...init.headers } });
   const f = fixture(t), b = bridgeFixture(t, f), port = await freePort();
   // Real wall clock, because IDE browser authorization is independently clocked.
-  const approvals = new IDEApprovalService({ root: f.root, accounts: f.options.accounts });
+  const approvals = new IDEApprovalService({ root: f.root, accounts: f.options.accounts, allowedPersonal: f.options.allowedPersonal });
   const ide = new WorkspaceIDEManager({ root: f.root, resolve: (_account, sessionId) => ({ owner: "owner", sessionId,
     hostId: "local", projectName: "real-browser <script>globalThis.bad=1</script>", workspace: f.root }), transport: { canonicalDirectory: async () => f.root,
       async launch() { throw new Error("pairing does not launch a task or editor"); } } });
   ide.configStore.save({ ...ide.config(), enabled: true, port, publicOrigin: `http://127.0.0.1:${port}`, hosts: [{ hostId: "local", enabled: true, binary: "code-server" }] });
-  const manager = { ide, ideApprovals: approvals, listProjects: () => [] } as never;
+  const manager = { ide, ideApprovals: approvals, listProjects: () => [], allowSender: () => f.allow(),
+    removeSender: () => { approvals.revokePersonalAccess("account", "owner"); f.allowed.delete(JSON.stringify(["account", "owner"])); } } as never;
   let http = await startLocalHttpServer({ paths: resolveStatePaths(f.root), port: 0, accountManager: manager });
   t.after(() => http.close()); const entry = ide.entry("account", "session")!;
   const copyJS=await fetch(http.url+"/copyable.js"),copyCSS=await fetch(http.url+"/copyable.css");
@@ -288,7 +343,12 @@ test("real HTTP browser pairing + token-protected owner setup + private IM confi
   assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers: { "Content-Type": "application/json" }, body })).status, 403);
   const headers = { "Content-Type": "application/json", "x-codex-im-gateway-token": http.requestToken, Origin: http.url };
   assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers: { ...headers, Origin: "https://foreign.test" }, body })).status, 403);
-  assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers, body })).status, 200);
+  if (admission === "legacy") assert.equal((await fetch(http.url + "/api/ide/approvers", { method: "POST", headers, body })).status, 200);
+  else {
+    assert.equal((await fetch(http.url + "/api/accounts/account/senders/owner/allow", { method: "POST" })).status, 403);
+    assert.equal((await fetch(http.url + "/api/accounts/account/senders/owner/allow", { method: "POST", headers })).status, 200);
+    assert.deepEqual(approvals.list(), []);
+  }
   // Run the same real bridge with the authority attached to the HTTP endpoints.
   const unitDetach = f.service.attach({ pendingAccess: () => [], async approveAccess() {}, rejectAccess() {} }); unitDetach();
   const { ideApprovalCommand } = await import("../src/bridge/ide-approval.js");
@@ -320,7 +380,16 @@ test("real HTTP browser pairing + token-protected owner setup + private IM confi
   await http.close();
   http = await startLocalHttpServer({ paths: resolveStatePaths(f.root), port: 0, accountManager: manager });
   const restored = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: sessionCookie } }); assert.match(await restored.text(), /已授权并信任当前目录/);
-  assert.deepEqual(new IDEApprovalService({ root: f.root, accounts: f.options.accounts }).list(), [owner]); assert.deepEqual(b.mutations, []);
+  assert.deepEqual(new IDEApprovalService({ root: f.root, accounts: f.options.accounts }).list(), admission === "legacy" ? [owner] : []); assert.deepEqual(b.mutations, []);
+  if (admission === "personal") {
+    const headers = { "x-codex-im-gateway-token": http.requestToken, Origin: http.url };
+    assert.equal((await fetch(http.url + "/api/accounts/account/senders/owner/remove", { method: "POST", headers })).status, 200);
+    const revoked = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: sessionCookie }, redirect: "manual" });
+    assert.match(await revoked.text(), /等待 Gateway 授权/);
+    assert.equal((await fetch(http.url + "/api/accounts/account/senders/owner/allow", { method: "POST", headers })).status, 200);
+    const reallowed = await fetch(entry.url + "?auth_check=1", { headers: { Cookie: sessionCookie }, redirect: "manual" });
+    assert.match(await reallowed.text(), /等待 Gateway 授权/);
+  }
 });
 
 for (const choice of ["trust", "access", "deny"] as const) test(`single-command ${choice} uses a stable browser snapshot and requires a registered owner, not a pairing code`, async t => {
@@ -360,7 +429,7 @@ for (const change of ["directory", "owner", "provider", "expiry", "port"] as con
   if(change==="provider")f.accounts[0].providerId="different-bot";
   if(change==="expiry")f.tick(300_001);
   if(change==="port")detach();
-  release();await assert.rejects(pending,/已改变|不是 IDE/);assert.equal(calls,0);
+  release();await assert.rejects(pending,/已改变|个人准入/);assert.equal(calls,0);
 });
 
 test("two browser offers keep exact request IDs separate and a restart cannot revive copied commands", async t => {
@@ -410,7 +479,7 @@ for (const conversationKind of ["direct", "group"] as const) for (const choice o
   if(choice==="deny"){assert.equal(original.status,200);assert.match(await original.text(),/等待 Gateway/);assert.doesNotMatch(original.headers.get("set-cookie")??"",/cig_ide_/);}
   else {
     assert.equal(original.status,303);const cookie=original.headers.get("set-cookie")!.split(";")[0];
-    assert.match(original.headers.get("set-cookie")!,/Max-Age=1296000/);
+    assert.match(original.headers.get("set-cookie")!,/Max-Age=7776000/);
     const granted=await fetch(entry.url + "?auth_check=1",{headers:{Cookie:cookie}});assert.match(await granted.text(),choice==="trust"?/已授权并信任当前目录/:/本次仅批准访问/);
     assert.match(await(await fetch(entry.url + "?auth_check=1")).text(),/等待 Gateway/,"copied URL does not authenticate a different browser");
   }

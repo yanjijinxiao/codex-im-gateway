@@ -2,29 +2,33 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { idePrincipalSchema, ideAccessSubjectSchema, type IDEAccessSubject } from "./access-subject.js";
 
-const identifier = z.string().trim().min(1).max(300).regex(/^[^\s\x00-\x1f\x7f]+$/);
-export const ideApproverSchema = z.object({ accountId: identifier,
-  channel: z.enum(["dingtalk", "feishu", "wecom", "weixin"]), providerId: identifier, actorId: identifier }).strict();
+export const ideApproverSchema = idePrincipalSchema;
 export type IDEApprover = z.infer<typeof ideApproverSchema>;
 export type IDEApprovalRequest = { id: string; entryId: string; code: string; expiresAt: number; approved: boolean;
   accountId: string; hostId: string; projectName: string; workspace: string; rootPaths?: readonly string[]; scope: string; url?: string };
 export type IDEApprovalCopyPort = Pick<IDEApprovalService, "copyPreview" | "offer">;
 export type IDEApprovalPort = {
   pendingAccess(): IDEApprovalRequest[];
-  approveAccess(requestId: string, entryId: string, trustWorkspace: boolean, beforeCommit?: () => void): Promise<void>;
+  approveAccess(requestId: string, entryId: string, trustWorkspace: boolean, beforeCommit?: () => void, subject?: IDEAccessSubject): Promise<void>;
   rejectAccess(requestId: string, entryId: string): void;
+  reconcileAccess?(): void;
 };
 type Decision = { request: IDEApprovalRequest; revision: number; pending: boolean };
-type Confirmation = Decision & { principal: string; owner: IDEApprover; shortCode: string };
+type Confirmation = Decision & { principal: string; owner: IDEApprover; subject: IDEAccessSubject; shortCode: string };
 type Offer = Decision & { account: { accountId: string; channel: string; providerId: string } };
 const key = (principal: IDEApprover) => JSON.stringify([principal.accountId, principal.channel, principal.providerId, principal.actorId]);
 const fingerprint = (request: IDEApprovalRequest) => JSON.stringify(request);
 
-/** One authority for owner decisions, independent of chat ACLs, session roles,
- * model output and transports. A decision never contains a browser credential. */
+/** Reuses exact personal IM admission, never conversation ACLs or session roles.
+ * Legacy approvers remain compatible, but do not grant management API access.
+ * A decision never contains a browser credential. */
 export class IDEApprovalService {
   private readonly file: string;
+  private readonly revisionsFile: string;
+  private readonly epochs = new Map<string, IDEAccessSubject>();
+  private revisionsError?: string;
   private owners: IDEApprover[] = [];
   private revision = 0;
   private port?: IDEApprovalPort;
@@ -33,8 +37,21 @@ export class IDEApprovalService {
   private readonly attempts = new Map<string, { count: number; until: number }>();
   private readonly decisions = new Map<string, { count: number; until: number }>();
   error?: string;
-  constructor(private readonly options: { root: string; accounts: () => { accountId: string; channel: string; providerId: string }[]; now?: () => number }) {
+  constructor(private readonly options: { root: string; accounts: () => { accountId: string; channel: string; providerId: string }[];
+    allowedPersonal?: (principal: IDEApprover) => boolean; now?: () => number }) {
     this.file = path.join(options.root, "ide", "approvers.json");
+    this.revisionsFile = path.join(options.root, "ide", "access-revisions.json");
+    try {
+      const data = z.object({ version: z.literal(1), revisions: z.array(ideAccessSubjectSchema).max(10_000) }).strict()
+        .parse(JSON.parse(fs.readFileSync(this.revisionsFile, "utf8")));
+      for (const subject of data.revisions) {
+        const id = this.subjectKey(subject.principal, subject.basis);
+        if (this.epochs.has(id)) throw new Error("duplicate revision");
+        this.epochs.set(id, subject);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.revisionsError = "IDE 个人撤销记录无法读取；个人配对已关闭，原文件未覆盖，请在本机检查。";
+    }
     try {
       const data = z.object({ version: z.literal(1), owners: z.array(ideApproverSchema).max(50) }).strict()
         .parse(JSON.parse(fs.readFileSync(this.file, "utf8")));
@@ -44,6 +61,7 @@ export class IDEApprovalService {
     }
   }
   private now() { return (this.options.now ?? Date.now)(); }
+  get personalAccessError() { return this.revisionsError; }
   attach(port: IDEApprovalPort): () => void {
     this.port = port; this.confirmations.clear(); this.offers.clear();
     return () => { if (this.port === port) { this.port = undefined; this.confirmations.clear(); this.offers.clear(); } };
@@ -53,19 +71,50 @@ export class IDEApprovalService {
   private validAccount(principal: IDEApprover) {
     return this.accounts().some(a => a.accountId === principal.accountId && a.channel === principal.channel && a.providerId === principal.providerId);
   }
+  private subjectKey(principal: IDEApprover, basis: IDEAccessSubject["basis"]) { return JSON.stringify([key(principal), basis]); }
+  private epoch(principal: IDEApprover, basis: IDEAccessSubject["basis"]) { return this.epochs.get(this.subjectKey(principal, basis))?.epoch ?? 0; }
+  private subject(principal: IDEApprover): IDEAccessSubject {
+    if (this.revisionsError) throw new Error(this.revisionsError);
+    if (!this.validAccount(principal)) throw new Error("渠道账号已改变，请重新核对个人身份");
+    const basis = this.options.allowedPersonal?.(principal) ? "im-personal"
+      : !this.error && this.owners.some(p => key(p) === key(principal)) ? "legacy-approver" : undefined;
+    if (!basis) throw new Error("当前个人账号不是 IDE 可用身份。请在本机 Gateway 的聊天授权中「允许此用户」；允许整个群和 session 角色不能代替个人授权。");
+    return { principal: { ...principal }, basis, epoch: this.epoch(principal, basis) };
+  }
+  isSubjectAllowed(subject: IDEAccessSubject): boolean {
+    try {
+      const parsed = ideAccessSubjectSchema.parse(subject), { principal, basis, epoch } = parsed;
+      return !this.revisionsError && this.validAccount(principal) && epoch === this.epoch(principal, basis)
+        && (basis === "im-personal" ? this.options.allowedPersonal?.(principal) === true
+          : !this.error && this.owners.some(p => key(p) === key(principal)));
+    } catch { return false; }
+  }
+  /** Write the revocation fence BEFORE the IM allowlist is changed. Even an
+   * offline endpoint or a later re-allow cannot resurrect prior credentials. */
+  revokePersonalAccess(accountId: string, actorId: string): void {
+    for (const account of this.accounts().filter(a => a.accountId === accountId))
+      this.advanceEpoch(ideApproverSchema.parse({ ...account, actorId }), "im-personal");
+  }
+  private advanceEpoch(principal: IDEApprover, basis: IDEAccessSubject["basis"]): void {
+    if (this.revisionsError) throw new Error(this.revisionsError);
+    const next = new Map(this.epochs), subject = { principal, basis, epoch: this.epoch(principal, basis) + 1 };
+    next.set(this.subjectKey(principal, basis), subject);
+    if (next.size > 10_000) throw new Error("IDE 撤销记录达到上限，请在本机检查；未修改准入授权");
+    this.write(this.revisionsFile, { version: 1, revisions: [...next.values()] });
+    this.epochs.clear(); for (const [id, value] of next) this.epochs.set(id, value);
+    this.confirmations.clear(); this.port?.reconcileAccess?.();
+  }
   /** Reports only the verified caller's own status; never enumerates owners or grants access. */
-  registrationStatus(principal: IDEApprover): "registered" | "unregistered" | "unavailable" {
-    if (this.error || !this.validAccount(principal)) return "unavailable";
+  registrationStatus(principal: IDEApprover): "allowed" | "registered" | "unregistered" | "unavailable" {
+    if (this.revisionsError || !this.validAccount(principal)) return "unavailable";
+    try { if (this.options.allowedPersonal?.(principal)) return "allowed"; } catch { return "unavailable"; }
+    if (this.error) return "unavailable";
     return this.owners.some(p => key(p) === key(principal)) ? "registered" : "unregistered";
   }
   principal(accountId: string, channel: string, actorId: string, providerId: string): IDEApprover {
     const account = this.accounts().find(a => a.accountId === accountId && a.channel === channel && a.providerId === providerId);
     if (!account) throw new Error("此渠道账号已改变，请重新在本机核对 IDE 管理员身份");
     return ideApproverSchema.parse({ ...account, actorId });
-  }
-  private assertOwner(principal: IDEApprover) {
-    if (this.error || !this.validAccount(principal) || !this.owners.some(p => key(p) === key(principal)))
-      throw new Error("当前个人账号不是 IDE 授权管理员。请先在本机 Gateway 的 Web IDE 页登记；群白名单和 session 权限不授予 IDE 审批权限。");
   }
   setOwner(input: IDEApprover, remove = false): void {
     if (this.error) throw new Error(this.error);
@@ -74,12 +123,16 @@ export class IDEApprovalService {
     const owners = this.owners.filter(p => key(p) !== key(principal));
     if (!remove) owners.push(principal);
     if (owners.length > 50) throw new Error("IDE 授权管理员数量达到上限");
-    const directory = path.dirname(this.file); fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const temporary = `${this.file}.${crypto.randomBytes(8).toString("hex")}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({ version: 1, owners }), { mode: 0o600, flag: "wx" });
-    try { fs.renameSync(temporary, this.file); } catch (error) { fs.unlinkSync(temporary); throw error; }
+    if (remove) this.advanceEpoch(principal, "legacy-approver");
+    this.write(this.file, { version: 1, owners });
     this.owners = owners; this.revision++; this.confirmations.clear(); this.offers.clear();
     this.audit(remove ? "owner-removed" : "owner-added", principal);
+  }
+  private write(file: string, value: unknown) {
+    const directory = path.dirname(file); fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700);
+    const temporary = `${file}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+    try { fs.renameSync(temporary, file); } catch (error) { fs.unlinkSync(temporary); throw error; }
   }
   /** Local mutation-token protected API and IM share this commit boundary. */
   async approveLocal(requestId: string, entryId: string, trustWorkspace: boolean) {
@@ -103,7 +156,7 @@ export class IDEApprovalService {
    * Polling retains the same offer and can never rebind it to changed metadata. */
   offer(requestId: string, entryId: string): { shortCode: string; request: IDEApprovalRequest } | undefined {
     this.prune();
-    if (this.error || !this.port) return;
+    if (this.revisionsError || !this.port) return;
     const matches = this.port.pendingAccess().filter(r => r.id === requestId && r.entryId === entryId && !r.approved && r.expiresAt > this.now());
     if (matches.length !== 1) return;
     const request = { ...matches[0] }, accounts = this.accounts().filter(a => a.accountId === request.accountId);
@@ -120,7 +173,7 @@ export class IDEApprovalService {
     return { shortCode, request: { ...request } };
   }
   preview(principal: IDEApprover, code: string): { token: string; shortCode: string; request: IDEApprovalRequest } {
-    this.assertOwner(principal); this.prune();
+    const subject = this.subject(principal); this.prune();
     if (!/^\d{6}$/.test(code)) throw new Error("用法：/ide auth 六位识别码");
     const identity = key(principal), attempt = this.attempts.get(identity) ?? { count: 0, until: this.now() + 60_000 };
     if (++attempt.count > 10) throw new Error("查找申请过于频繁，请一分钟后重试");
@@ -132,7 +185,7 @@ export class IDEApprovalService {
     if (this.confirmations.size >= 100) throw new Error("待确认的 IDE 审批过多，请稍后重试");
     const token = crypto.randomBytes(16).toString("hex");
     const shortCode = this.shortCode();
-    this.confirmations.set(token, { principal: identity, owner: { ...principal }, shortCode, request, revision: this.revision, pending: false });
+    this.confirmations.set(token, { principal: identity, owner: { ...principal }, subject, shortCode, request, revision: this.revision, pending: false });
     return { token, shortCode, request };
   }
   /** Read-only presentation capability, not browser authorization. The 128-bit
@@ -142,18 +195,18 @@ export class IDEApprovalService {
     const item = /^[a-f0-9]{32}$/.test(token) ? this.confirmations.get(token) : undefined;
     if (!item || item.pending || item.revision !== this.revision) return;
     try {
-      this.assertOwner(item.owner);
+      if (!this.isSubjectAllowed(item.subject)) return;
       if (!this.requirePort().pendingAccess().some(r => fingerprint(r) === fingerprint(item.request))) return;
       return { shortCode: item.shortCode, request: { ...item.request } };
     } catch { return; }
   }
   async decide(principal: IDEApprover, token: string, choice: "trust" | "access" | "deny"): Promise<void> {
-    this.assertOwner(principal); this.prune();
+    const subject = this.subject(principal); this.prune();
     if (!["trust", "access", "deny"].includes(choice)) throw new Error("无效的 IDE 审批选项，未批准浏览器。");
     const identity = key(principal), attempt = this.decisions.get(identity) ?? { count: 0, until: this.now() + 60_000 };
     this.decisions.set(identity, attempt);
     if (++attempt.count > 20) throw new Error("确认尝试过于频繁，请一分钟后重试；未批准浏览器。");
-    // Browser offers require an explicitly registered owner of the captured
+    // Browser offers require an explicitly admitted person of the captured
     // provider/account. Legacy previews additionally bind the original actor.
     // Neither uses a public pairing code or an implicit "latest request".
     const offered = this.offers.get(token);
@@ -166,7 +219,8 @@ export class IDEApprovalService {
       throw new Error("此确认已失效、正在处理或不属于当前个人账号；请回原浏览器复制当前命令，或重新发送 /ide auth 识别码。");
     decision.pending = true;
     const guard = () => {
-      this.assertOwner(principal);
+      if (!this.isSubjectAllowed(subject) || (confirmation && !this.isSubjectAllowed(confirmation.subject)))
+        throw new Error("个人准入已撤销或改变，未批准浏览器。请在本机核对个人授权。");
       if (this.port !== port || this.revision !== decision.revision || store.get(token) !== decision
         || decision.request.expiresAt <= this.now()
         || !port.pendingAccess().some(r => fingerprint(r) === fingerprint(decision.request)))
@@ -175,7 +229,7 @@ export class IDEApprovalService {
     try {
       guard();
       if (choice === "deny") port.rejectAccess(decision.request.id, decision.request.entryId);
-      else await port.approveAccess(decision.request.id, decision.request.entryId, choice === "trust", guard);
+      else await port.approveAccess(decision.request.id, decision.request.entryId, choice === "trust", guard, subject);
       this.audit(choice === "deny" ? "denied" : "approved", principal, { entryId: decision.request.entryId, trustWorkspace: choice === "trust" });
     } finally { store.delete(token); }
   }

@@ -1062,6 +1062,33 @@ test("isolates senders and managed sessions by account", async (t) => {
   await manager.stopAccount("account-two");
 });
 
+test("Web UI personal admission is IDE authority for running and stopped accounts; removal fences old grants across restart and re-allow", async t => {
+  const { manager, root } = setup(t);
+  const person = manager.ideApprovals.principal("account-one", "weixin", "alice", "account-one");
+  assert.equal(manager.ideApprovals.registrationStatus(person), "unregistered");
+  manager.allowSender("account-one", "alice");
+  manager.allowSender("account-two", "bob");
+  assert.equal(manager.ideApprovals.registrationStatus(person), "allowed");
+  assert.equal(manager.ideApprovals.registrationStatus({ ...person, actorId: "bob" }), "unregistered");
+  const old = { principal: person, basis: "im-personal" as const, epoch: 0 };
+  assert.equal(manager.ideApprovals.isSubjectAllowed(old), true);
+  await manager.startAccount("account-one", false);
+  assert.equal(manager.ideApprovals.registrationStatus(person), "allowed");
+  manager.removeSender("account-one", "alice");
+  assert.equal(manager.ideApprovals.registrationStatus(person), "unregistered");
+  manager.allowSender("account-one", "alice");
+  assert.equal(manager.ideApprovals.isSubjectAllowed(old), false);
+  assert.equal(manager.ideApprovals.isSubjectAllowed({ ...old, epoch: 1 }), true);
+  await manager.stopAccount("account-one");
+  assert.equal(manager.ideApprovals.registrationStatus(person), "allowed");
+  const restarted = setup(t, { root }).manager;
+  assert.equal(restarted.ideApprovals.registrationStatus(person), "allowed");
+  assert.equal(restarted.ideApprovals.isSubjectAllowed(old), false);
+  assert.deepEqual(restarted.ideApprovals.list(), [], "no duplicated IDE allowlist is created");
+  manager.removeSender("account-one", "alice");
+  assert.equal(manager.ideApprovals.registrationStatus(person), "unregistered");
+});
+
 test("isolates managed projects by WeChat account", (t) => {
   const { manager, root } = setup(t);
   const one = manager.createProject("account-one", "账号一项目", path.join(root, "one"));

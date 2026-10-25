@@ -10,6 +10,7 @@ import type { IDEConfig } from "./config.js";
 import { IDETLSManager, loadIDETLS, localIDEAddresses } from "./tls.js";
 import { copyField, COPY_SCRIPT, COPY_STYLE } from "./copy-controls.js";
 import type { IDEApprovalCopyPort } from "./approval-service.js";
+import type { IDEAccessAuthority, IDEAccessSubject } from "./access-subject.js";
 import { IDE_APPROVAL_CHOICES, ideConfirmationCommand } from "./approval-presentation.js";
 
 type BrowserSession = IDEBrowserSession;
@@ -31,11 +32,13 @@ export class IDEAccessServer {
   private readonly decisions = new Set<{ entryId: string; invalidated: boolean }>();
   private managementOrigin?: string;
   private approvalCopies?: IDEApprovalCopyPort;
+  private accessAuthority?: IDEAccessAuthority;
   private transition: Promise<void> = Promise.resolve();
   error?: string;
   constructor(private readonly manager: IDEAccessContext) {
     this.tls = new IDETLSManager(path.join(path.dirname(manager.configStore.filePath), "tls"));
-    try { this.authorization = new IDEAuthorization(Date.now, manager.authorizationFile(), new URL(manager.config().publicOrigin).origin); }
+    try { this.authorization = new IDEAuthorization(Date.now, manager.authorizationFile(), new URL(manager.config().publicOrigin).origin,
+      subject => this.accessAuthority?.isSubjectAllowed(subject) === true); }
     catch { this.authorization = new IDEAuthorization(); this.authorizationError = "IDE 授权记录无法读取；访问已拒绝，原文件未改动。"; }
     manager.accessAvailable = false;
     manager.onStop = id => { for (const [socket, entry] of this.connections) if (entry.instanceId === id) socket.destroy(); };
@@ -99,6 +102,11 @@ export class IDEAccessServer {
   port(): number | undefined { const address = this.server?.address(); return address && typeof address !== "string" ? address.port : undefined; }
   setManagementOrigin(origin: string): void { this.managementOrigin = origin; }
   setApprovalCopies(port: IDEApprovalCopyPort | undefined): void { this.approvalCopies = port; }
+  setAccessAuthority(authority: IDEAccessAuthority): void { this.accessAuthority = authority; }
+  reconcileAccess(): void {
+    try { this.authorization.reconcileAccess(); }
+    finally { for (const [socket, { session }] of this.connections) if (!this.authorization.active(session)) socket.destroy(); }
+  }
   async grant(entryId: string, trustWorkspace = false, expectedScope?: string): Promise<{ action: string; entryId: string; token: string }> {
     this.assertEntry(entryId);
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
@@ -119,7 +127,7 @@ export class IDEAccessServer {
       catch { return []; }
     });
   }
-  async approveAccess(requestId: string, entryId: string, trustWorkspace = false, beforeCommit?: () => void): Promise<void> {
+  async approveAccess(requestId: string, entryId: string, trustWorkspace = false, beforeCommit?: () => void, subject?: IDEAccessSubject): Promise<void> {
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
       await this.manager.refresh(entryId);
@@ -127,7 +135,7 @@ export class IDEAccessServer {
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未批准授权");
       if (decision.invalidated) throw new Error("项目授权配置已改变，未批准授权");
       beforeCommit?.();
-      this.authorization.approve(requestId, entryId, scope, trustWorkspace, directory?.workspace, directory?.rootPaths);
+      this.authorization.approve(requestId, entryId, scope, trustWorkspace, directory?.workspace, directory?.rootPaths, subject);
     } finally { this.decisions.delete(decision); }
   }
   rejectAccess(requestId: string, entryId: string): void {
@@ -205,8 +213,8 @@ export class IDEAccessServer {
       }
       try { this.assertEntry(preview.request.entryId); } catch { res.writeHead(410).end(); return; }
       const r = preview.request;
-      this.page(res, 200, "二次确认 · 复制命令", "核对项目后，复制一种选择，回到刚才已登记的机器人私聊或群聊发送。此页只复制，不批准浏览器；转发本页不能取得审批资格。",
-        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}</p>${workspaceScopeHtml(r)}<p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 15 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), { purpose: "reply", rows: 2 })}</section>`).join("")}`); return;
+      this.page(res, 200, "二次确认 · 复制命令", "核对项目后，复制一种选择，由已获个人准入的本人在对应机器人私聊或群聊发送。此页只复制，不批准浏览器；转发本页不能取得配对资格。",
+        `<p>浏览器识别码：<strong>${escape(r.code)}</strong><br>项目：${escape(r.projectName)}<br>主机：${escape(r.hostId)}</p>${workspaceScopeHtml(r)}<p>IDE 具备运行用户的开发权限，不是文件系统沙箱。仅批准你本人发起的申请；批准后授权 ${IDE_SESSION_DAYS} 天，可撤销。申请截止时间：<time datetime="${new Date(r.expiresAt).toISOString()}">${escape(new Date(r.expiresAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))}（北京时间）</time>。申请到期后命令不可再用，本页不会自动刷新打断复制。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(preview.shortCode, c.choice), { purpose: "reply", rows: 2 })}</section>`).join("")}`); return;
     }
     // A one-use grant is posted from the local Gateway UI, never placed in a
     // URL or forwarded to code-server. No other cross-origin mutation is allowed.
@@ -255,8 +263,8 @@ export class IDEAccessServer {
         const choiceControls = offer
           ? `<p>项目：<strong>${escape(offer.request.projectName)}</strong><br>主机：${escape(offer.request.hostId)}</p>${workspaceScopeHtml(offer.request)}<p>IDE 允许项目编辑和终端访问，具备运行用户的开发权限，不是文件系统沙箱。请选择一种权限，复制对应命令并在本人的机器人私聊或群聊发送一次；不会再要求第二条确认命令。</p>${IDE_APPROVAL_CHOICES.map(c => `<section><h2>${escape(c.label)}</h2><p>${escape(c.detail)}</p>${copyField(`「${c.label}」命令`, ideConfirmationCommand(offer.shortCode, c.choice), { purpose: "reply", rows: 2 })}</section>`).join("")}`
           : `${workspaceScopeHtml(this.manager.resolve(id))}<p>一次确认命令暂未就绪，可使用兼容流程在机器人私聊或群聊核对申请。</p>${copyField("兼容流程：先核对申请", `/ide auth ${pending.request.code}`, { purpose: "reply" })}`;
-        this.page(res, 200, "等待 Gateway 授权", "当前浏览器尚未授权，不代表管理员登记丢失。核对下方项目、主机、目录和权限，再复制所选命令发给对应机器人。无需 Web IDE 密码。",
-          `<section data-ide-wait>${choiceControls}<p>浏览器识别码（仅核对用，无需单独发送）：<strong>${escape(pending.request.code)}</strong></p></section><p>只批准你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天。管理员登记独立持久保存，不因 Gateway 重启失效，也不受这两个期限影响。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何登记审批管理员</summary><p>仅未登记的个人身份需要首次设置；已登记者无需重复操作。本页尚未验证你的钉钉身份，不判断你是否已登记。请在机器人私聊或群聊发送下方命令，查看本人真实登记状态。</p>${copyField("查询本人登记状态的命令", "/ide identity", { purpose: "reply" })}<p>命令确认未登记时，再到运行 Gateway 的电脑管理页「Web IDE → 授权管理员」登记个人 ID，不要填写群 ID。群白名单和 session 权限不等于 IDE 审批资格。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}/#ide">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
+        this.page(res, 200, "等待 Gateway 授权", "当前浏览器尚未授权，不代表个人准入丢失。已在 Gateway 获准的个人无需额外登记 IDE 管理员；核对下方项目、主机、目录和权限，再复制所选命令发给对应机器人。无需 Web IDE 密码。",
+          `<section data-ide-wait>${choiceControls}<p>浏览器识别码（仅核对用，无需单独发送）：<strong>${escape(pending.request.code)}</strong></p></section><p>只配对你本人发起的申请。复制不会发送命令或批准访问；剪贴板受限时，可长按短命令复制或直接输入。</p><p>本次浏览器申请有效期为 5 分钟；批准后，浏览器访问授权有效期为 ${IDE_SESSION_DAYS} 天，Gateway 重启保留，不自动延期。撤销个人准入会使由该资格签发的浏览器授权失效，重新允许也不会恢复旧登录。</p><p>批准后本页会自动继续；复制操作期间暂缓刷新。</p><a href="/workspace/${id}">批准后继续</a><details data-ide-registration-help><summary>首次使用：如何核对个人准入</summary><p>本页尚未验证你的 IM 身份。请在对应机器人私聊或群聊发送下方命令，查看本人资格；已获个人准入者无需重复设置。</p>${copyField("查询本人准入状态的命令", "/ide identity", { purpose: "reply" })}<p>未获准时，请管理员在运行 Gateway 的电脑管理页聊天授权中「允许此用户」，不要仅允许整个群。群白名单和 session 角色不授予个人 IDE 资格；旧版独立登记的身份仍兼容。</p>${this.managementOrigin && local ? `<p><a href="${escape(this.managementOrigin)}">打开本机 Gateway 管理页（仅运行 Gateway 的电脑）</a></p>` : ""}</details>`); return;
       }
       const endpoint = this.manager.endpoint(id, session.trustWorkspace === true);
       if (endpoint) { this.redirect(res, editorDestination(id, endpoint)); return; }
@@ -272,6 +280,7 @@ export class IDEAccessServer {
     if (method === "POST" && open && session) {
       const form = new URLSearchParams(await readBody(req));
       if (form.get("csrf") !== session.csrf) { res.writeHead(403).end(); return; }
+      if (!this.authorization.active(session)) { res.writeHead(401).end(); return; }
       let instance;
       try { instance = await this.manager.open(open[1], session.trustWorkspace === true, session.trustedDirectory, session.trustedRootPaths); }
       catch (error) {

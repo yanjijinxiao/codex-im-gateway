@@ -1,5 +1,5 @@
 window.gatewayIDE = (() => {
-  let current, busy = false, opening = false, approval, requests = [], requestMarkup = "", instanceMarkup = "", endpointMarkup = "", sessionDuration = "15 天";
+  let current, busy = false, opening = false, approval, requests = [], requestMarkup = "", instanceMarkup = "", endpointMarkup = "", sessionDuration = "以服务端显示为准";
   const receipts = new Map();
   let approverMarkup = "", approverAccountsMarkup = "", approverBusy = false;
   const $ = selector => document.querySelector(selector);
@@ -29,6 +29,7 @@ window.gatewayIDE = (() => {
     finally { busy = false; button.disabled = false; $("#ideSave").disabled = false; fields.forEach(field => { field.disabled = false; }); }
   }
   function renderActivity(data) {
+    if (data.authorization?.error) message(data.authorization.error, true);
     if (current) current.instances = data.instances || [];
     if (data.approvers) renderApprovers(data.approvers);
     const labels = { checking: "检查主机", "remote-download": "远程下载官方包", "gateway-download": "Gateway 兜底下载", transferring: "SSH 传输", verifying: "校验并安装", ready: "已就绪", error: "失败，可重试" };
@@ -50,20 +51,20 @@ window.gatewayIDE = (() => {
       if ([...(data.accounts || [])].some(account => JSON.stringify(account) === value)) select.value = value;
     }
     const markup = data.error ? `<p class="ide-error">${escapeHtml(data.error)}</p>` : data.owners?.length ? data.owners.map(owner =>
-      `<article class="ide-instance"><div><strong>${escapeHtml(owner.accountId)} · ${escapeHtml(owner.channel)}</strong><p>个人 ID：<code>${escapeHtml(owner.actorId)}</code></p></div><button type="button" class="button button-secondary" data-ide-approver-remove="${escapeAttr(JSON.stringify(owner))}">移除审批资格</button></article>`).join("") : "<p>尚未登记管理员。跨设备审批尚不可用；本机网页审批不受影响。</p>";
+      `<article class="ide-instance"><div><strong>${escapeHtml(owner.accountId)} · ${escapeHtml(owner.channel)}</strong><p>个人 ID：<code>${escapeHtml(owner.actorId)}</code></p></div><button type="button" class="button button-secondary" data-ide-approver-remove="${escapeAttr(JSON.stringify(owner))}">移除兼容资格</button></article>`).join("") : "<p>没有旧版独立登记。已获 Gateway 个人准入者可直接配对，不需要在此添加。</p>";
     if (!approverBusy && markup !== approverMarkup) { approverMarkup = markup; $("#ideApprovers").innerHTML = markup; }
     $("#ideApproverAdd").disabled = approverBusy || Boolean(data.error) || !data.accounts?.length;
   }
   async function saveApprover(principal, remove = false) {
     if (approverBusy) return;
-    if (!window.confirm(remove ? `移除 ${principal.actorId} 的 IDE 审批资格？待确认审批立即失效，已有浏览器授权不自动撤销。`
+    if (!window.confirm(remove ? `移除 ${principal.actorId} 的 IDE 兼容资格？待确认操作及由此资格新签发且记录来源的登录立即失效；未记录来源的旧版授权需另行撤销。个人 IM 准入不受影响。`
       : `请确认这是你本人的个人 ID：${principal.actorId}\n渠道账号：${principal.accountId} · ${principal.channel}\n该身份将可批准本账号项目的浏览器访问及开发终端权限。不要添加群 ID 或陌生人。继续登记？`)) return;
     approverBusy = true; $("#ideApproverAdd").disabled = true;
     const status = $("#ideApproverStatus"); status.textContent = "正在保存审批资格…";
     try {
       const result = await api("/api/ide/approvers", { method: "POST", body: { principal, remove } });
       if (current?.approvers) current.approvers.owners = result.owners;
-      status.textContent = remove ? "已移除审批资格，待确认审批已失效；如需撤销已签发访问，请另行撤销浏览器授权。" : "已登记并持久保存。其他设备打开 IDE 后，由本人复制授权页所选命令，在对应机器人钉钉私聊或群聊发送一次。无需聊天绑定 session，群白名单不能代替个人审批资格。";
+      status.textContent = remove ? "已移除兼容资格，待确认操作和由此资格新签发的登录失效；未记录来源的旧版授权需另行撤销。" : "已兼容登记并持久保存。其他设备打开 IDE 后，由本人发送授权页所选命令配对。已获个人准入者无需此登记；群白名单不能代替个人资格。";
       status.classList.remove("ide-error");
     } catch (error) { status.textContent = `未保存：${error.message}。原审批配置未改变，请检查后重试。`; status.classList.add("ide-error"); }
     finally { approverBusy = false; if (current?.approvers) renderApprovers(current.approvers); else $("#ideApproverAdd").disabled = false; }

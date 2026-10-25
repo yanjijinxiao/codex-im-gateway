@@ -6,6 +6,7 @@ import { IDETLSManager, loadIDETLS, localIDEAddresses } from "./tls.js";
 import type { WorkspaceIDEManager } from "./manager.js";
 import { RemoteIDEIngress, type IDEIngressIO, type IDEIngressState } from "./remote-ingress.js";
 import type { IDEApprovalCopyPort } from "./approval-service.js";
+import type { IDEAccessAuthority, IDEAccessSubject } from "./access-subject.js";
 import { entrances, publicationKey, runtimeChanges, type IDEEntrance } from "./reconfiguration.js";
 
 export type IDEEndpointStatus = { hostId: string; publicOrigin: string; shared?: boolean; localDirect?: boolean; state: "starting" | "ready" | "error" | "connecting" | "reconnecting";
@@ -22,6 +23,7 @@ export class IDEEndpointManager {
   private transition: Promise<void> = Promise.resolve();
   private managementOrigin?: string;
   private approvalCopies?: IDEApprovalCopyPort;
+  private accessAuthority?: IDEAccessAuthority;
   error?: string;
   constructor(private readonly manager: WorkspaceIDEManager, private readonly options: { ingressIO?: IDEIngressIO; ingressTiming?: { retryMs: number; probeMs: number };
     localAddresses?: typeof localIDEAddresses } = {}) {
@@ -136,6 +138,7 @@ export class IDEEndpointManager {
       resume: () => this.manager.resume(), close: async () => {}
     };
     record.server = new IDEAccessServer(record.context);
+    if (this.accessAuthority) record.server.setAccessAuthority(this.accessAuthority);
     record.server.setApprovalCopies(this.approvalCopies);
     if (this.managementOrigin) record.server.setManagementOrigin(this.managementOrigin);
     this.endpoints.set(spec.key, record);
@@ -181,6 +184,15 @@ export class IDEEndpointManager {
     this.approvalCopies = port;
     for (const endpoint of this.endpoints.values()) endpoint.server.setApprovalCopies(port);
   }
+  setAccessAuthority(authority: IDEAccessAuthority): void {
+    this.accessAuthority = authority;
+    for (const endpoint of this.endpoints.values()) endpoint.server.setAccessAuthority(authority);
+  }
+  reconcileAccess(): void {
+    const errors: unknown[] = [];
+    for (const endpoint of this.endpoints.values()) try { endpoint.server.reconcileAccess(); } catch (error) { errors.push(error); }
+    if (errors.length) throw new AggregateError(errors, "部分 IDE 授权撤销记录写入失败；访问已拒绝，请重试");
+  }
   private serverFor(id: string): IDEAccessServer {
     const target = this.manager.resolve(id), config = this.manager.config();
     const endpoint = this.endpoints.get(publicationKey(config, target.hostId));
@@ -193,7 +205,7 @@ export class IDEEndpointManager {
     if (matches.length !== 1) throw new Error("浏览器申请已失效或不唯一，请刷新后重新申请");
     return matches[0].server;
   }
-  async approveAccess(requestId: string, id: string, trustWorkspace = false, beforeCommit?: () => void) { return this.requestServer(requestId, id).approveAccess(requestId, id, trustWorkspace, beforeCommit); }
+  async approveAccess(requestId: string, id: string, trustWorkspace = false, beforeCommit?: () => void, subject?: IDEAccessSubject) { return this.requestServer(requestId, id).approveAccess(requestId, id, trustWorkspace, beforeCommit, subject); }
   rejectAccess(requestId: string, id: string) { this.requestServer(requestId, id).rejectAccess(requestId, id); }
   pendingAccess() {
     return [...this.endpoints.values()].flatMap(e => e.server.pendingAccess()).flatMap(request => {

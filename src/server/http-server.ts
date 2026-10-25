@@ -201,6 +201,7 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
   const ideAccess = options.accountManager.ide ? new IDEEndpointManager(options.accountManager.ide) : undefined;
   const detachApprovals = ideAccess && options.accountManager.ideApprovals?.attach(ideAccess);
   ideAccess?.setApprovalCopies(options.accountManager.ideApprovals);
+  if (options.accountManager.ideApprovals) ideAccess?.setAccessAuthority(options.accountManager.ideApprovals);
   if (ideAccess && options.accountManager.ide.config().port === (options.port ?? 8787)) ideAccess.error = "IDE 端口不能与 Gateway 管理端口相同。";
   else await ideAccess?.reload(false).catch(() => console.warn("[codex-im-gateway] IDE listener unavailable; management and IM remain available"));
   const requestToken = crypto.randomBytes(24).toString("base64url");
@@ -292,7 +293,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
         approvers: context.accountManager.ideApprovals ? { owners: context.accountManager.ideApprovals.list(),
           accounts: context.accountManager.ideApprovals.accounts(), error: context.accountManager.ideApprovals.error } : undefined,
         networkAddresses: localIDEAddresses(), certificate: context.ideAccess?.certificate(), endpoints: context.ideAccess?.statuses() ?? [],
-        authorization: { sessionTtlDays: IDE_SESSION_DAYS },
+        authorization: { sessionTtlDays: IDE_SESSION_DAYS, ...(context.accountManager.ideApprovals?.personalAccessError
+          ? { error: context.accountManager.ideApprovals.personalAccessError } : {}) },
         running: context.ideAccess?.running() ?? false, error: ide.configStore.error ?? context.ideAccess?.error,
         instances: ide.list(), installations: ide.installer.list(), extensionChoices: IDE_EXTENSIONS,
         hosts: [...new Set(["local", ...context.accountManager.listProjects().map(p => p.hostId ?? "local")])] }); return;

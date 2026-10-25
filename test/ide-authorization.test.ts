@@ -3,7 +3,47 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { IDEAuthorization } from "../src/ide/authorization.js";
+import { IDEAuthorization, IDE_SESSION_DAYS } from "../src/ide/authorization.js";
+import type { IDEAccessSubject } from "../src/ide/access-subject.js";
+
+test("IM provenance persists, is private, and is checked for exchange, HTTP authentication, active connections and restart", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-personal-auth-")), file = path.join(root, "auth.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const subject: IDEAccessSubject = { principal: { accountId: "account", channel: "dingtalk", providerId: "bot", actorId: "alice" }, basis: "im-personal", epoch: 0 };
+  let allowed = true;
+  const create = () => new IDEAuthorization(Date.now, file, "origin", s => allowed && s.principal.actorId === "alice");
+  const auth = create(), pending = auth.request("a"), second = auth.request("a");
+  auth.approve(pending.request.id, "a", "a", false, undefined, undefined, subject);
+  auth.approve(second.request.id, "a", "a", false, undefined, undefined, subject);
+  const browser = auth.exchangeRequest(pending.request.id, pending.proof, "a")!;
+  const local = auth.consume(auth.grant("a"), "a")!;
+  assert.deepEqual(browser.session.subject, subject);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2, "old binaries must reject the personal-policy format, not ignore provenance");
+  assert.equal(JSON.stringify(auth.pending()).includes("alice"), false);
+  assert.ok(create().authenticate(browser.token, "a"));
+  assert.equal(new IDEAuthorization(Date.now, file, "origin").authenticate(browser.token, "a"), undefined, "missing policy cannot authorize a tagged grant");
+  assert.equal(fs.readFileSync(file, "utf8").includes(browser.token), false);
+  allowed = false;
+  assert.equal(auth.active(browser.session), false);
+  assert.equal(auth.authenticate(browser.token, "a"), undefined);
+  assert.equal(auth.exchangeRequest(second.request.id, second.proof, "a"), undefined);
+  assert.equal(create().authenticate(browser.token, "a"), undefined);
+  assert.ok(auth.authenticate(local.token, "a"), "legacy/local authorizations without provenance are preserved, not guessed or rebound");
+  auth.reconcileAccess(); allowed = true;
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version, 2, "never downgrade after removing the last tagged session");
+  assert.equal(create().authenticate(browser.token, "a"), undefined, "durable revocation cannot be undone by a later allow");
+  assert.ok(create().authenticate(local.token, "a"));
+});
+
+test("malformed principal provenance in durable grants fails closed without rewriting the file", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-invalid-subject-")), file = path.join(root, "auth.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const auth = new IDEAuthorization(Date.now, file, "origin"); auth.consume(auth.grant("a"), "a");
+  const data = JSON.parse(fs.readFileSync(file, "utf8")); data.sessions[0].session.subject = { basis: "group", principal: {} };
+  fs.writeFileSync(file, JSON.stringify(data)); const original = fs.readFileSync(file);
+  assert.throws(() => new IDEAuthorization(Date.now, file, "origin"), /授权记录无效/);
+  assert.deepEqual(fs.readFileSync(file), original);
+});
 
 test("Gateway grants are one-use, project scoped, expiring and revocable", () => {
   let now = 1000; const auth = new IDEAuthorization(() => now);
@@ -16,7 +56,8 @@ test("Gateway grants are one-use, project scoped, expiring and revocable", () =>
   const stale = auth.grant("a"); now += 60_001; assert.equal(auth.consume(stale, "a"), undefined);
   auth.revoke(); assert.equal(auth.active(granted.session), false);
   const next = auth.consume(auth.grant("a"), "a")!;
-  assert.equal(next.session.expiresAt - now, 15 * 24 * 60 * 60_000);
+  assert.equal(IDE_SESSION_DAYS, 90);
+  assert.equal(next.session.expiresAt - now, 90 * 24 * 60 * 60_000);
   now += 8 * 60 * 60_000; assert.ok(auth.authenticate(next.token, "a"));
   now = next.session.expiresAt;
   assert.equal(auth.authenticate(next.token, "a"), undefined);
@@ -62,6 +103,45 @@ test("approved browser access and exact trust survive restart without extending 
   assert.equal(new IDEAuthorization(() => now, file, "https://other.example.com").authenticate(grant.token, "entry", "scope"), undefined);
   now = grant.session.expiresAt;
   assert.equal(new IDEAuthorization(() => now, file, "https://ide.example.com").authenticate(grant.token, "entry", "scope"), undefined);
+});
+
+test("90-day grants survive repeated restarts past day 15 without rotating the token or extending expiry", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-90-day-auth-")), file = path.join(root, "authorization.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const day = 24 * 60 * 60_000, start = 1_800_000_000_000;
+  let now = start;
+  const create = () => new IDEAuthorization(() => now, file, "https://ide.example.com");
+  const auth = create(), browser = auth.consume(auth.grant("project", "scope", true, "/project"), "project", "scope")!;
+  const original = fs.readFileSync(file);
+  for (const elapsed of [1, 16, 30, 60, 89]) {
+    now = start + elapsed * day;
+    const restored = create().authenticate(browser.token, "project", "scope")!;
+    assert.ok(restored); assert.equal(restored.expiresAt, start + 90 * day);
+    assert.equal(restored.trustWorkspace, true); assert.equal(restored.trustedDirectory, "/project");
+    assert.deepEqual(fs.readFileSync(file), original, "ordinary restart must not clear or renew persisted grants");
+  }
+  now = start + 90 * day;
+  assert.equal(create().authenticate(browser.token, "project", "scope"), undefined);
+});
+
+test("a lifetime-policy increase preserves existing 15-day authorizations and their original expiry", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-old-15-day-auth-")), file = path.join(root, "authorization.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const day = 24 * 60 * 60_000, start = 1_800_000_000_000;
+  let now = start;
+  const auth = new IDEAuthorization(() => now, file, "https://ide.example.com");
+  const browser = auth.consume(auth.grant("old", "scope"), "old", "scope")!;
+  const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+  legacy.sessions[0].session.expiresAt = start + 15 * day;
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  const original = fs.readFileSync(file);
+  now = start + day;
+  const upgraded = new IDEAuthorization(() => now, file, "https://ide.example.com");
+  assert.equal(upgraded.authenticate(browser.token, "old", "scope")!.expiresAt, start + 15 * day);
+  assert.deepEqual(fs.readFileSync(file), original);
+  const newer = upgraded.consume(upgraded.grant("new", "other"), "new", "other")!;
+  assert.equal(newer.session.expiresAt, now + 90 * day);
+  assert.equal(upgraded.authenticate(browser.token, "old", "scope")!.expiresAt, start + 15 * day);
 });
 
 test("logout and explicit revocation persist; malformed records are not overwritten", t => {
