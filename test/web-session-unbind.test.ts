@@ -32,6 +32,18 @@ test("web list distinguishes exact IM conversation/native IDs and keeps unbind s
   assert.match(html, /data-session-action="unbind"[^>]+data-session-id="other-record" disabled/);
   assert.match(html, /data-session-action="delete"/);
   assert.doesNotMatch(html, /微信当前/);
+  assert.match(html, /历史关联 · 非当前绑定/);
+  assert.doesNotMatch(html, /已连接 Codex/);
+});
+
+test("archived bindings cannot claim a live connection in their footer", () => {
+  const session={...selected,binding:{...selected.binding,nativeUnavailable:true}};
+  const state={sessions:[session],projects:[],accounts:[],selectedAccountId:session.accountId,selectedSessionKey:session.id};
+  const els={sessionListCount:{},sessionAccountTabs:{},sessionsList:{innerHTML:""}};
+  const context=vm.createContext({state,els,selectedSession:()=>session,sessionKey:(s:any)=>s.id,accountDisplayName:()=>"DingTalk",escapeAttr:String,escapeHtml:String,relativeTime:()=>"now",renderChatPanel(){},drawIcons(){}});
+  vm.runInContext(`${renderExpiry}\n${render}\nrenderSessions();`,context);
+  assert.match(els.sessionsList.innerHTML,/已归档或不可用 · 交互暂停/);
+  assert.doesNotMatch(els.sessionsList.innerHTML,/已连接 Codex|已关联 Codex session/);
 });
 
 for (const confirm of [false, true]) {

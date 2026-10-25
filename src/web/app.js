@@ -668,7 +668,10 @@ function renderSessions() {
         ${session.binding?.deliveryRoute === "unconfirmed" ? `<span class="session-binding-id">投递身份待确认：在此 IM 对话向机器人发消息后自动补齐</span>` : ""}
         ${renderBindingExpiry(session)}
         <span class="session-workspace" title="${escapeAttr(session.workspace)}">${escapeHtml(session.workspace)}</span>
-        <span class="session-thread${session.responding ? " is-responding" : ""}">${session.responding ? "对方正在输入…" : session.threadId ? "已连接 Codex" : "等待首条消息"}</span>
+        <span class="session-thread${session.responding ? " is-responding" : ""}">${session.binding?.nativeUnavailable ? "已归档或不可用 · 交互暂停"
+          : !session.binding?.bound && session.threadId ? "历史关联 · 非当前绑定"
+          : session.binding?.deliveryRoute === "unconfirmed" ? "投递身份待确认"
+          : session.responding ? "正在处理此会话的请求…" : session.threadId ? "已关联 Codex session" : "等待首条消息"}</span>
       </button>
       <div class="session-actions">
         ${session.binding?.bound && session.threadId && session.follow !== false && !session.binding.nativeUnavailable ? `<button class="button button-secondary" type="button" data-session-action="primary" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding.interaction?.current || session.binding.deliveryRoute === "unconfirmed" ? "disabled" : ""}>设为提问入口</button>` : ""}
