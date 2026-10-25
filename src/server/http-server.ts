@@ -829,6 +829,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/app.js": { name: "app.js", type: "text/javascript; charset=utf-8" },
     "/account-mode-settings.js": { name: "account-mode-settings.js", type: "text/javascript; charset=utf-8" },
     "/binding-expiry.js": { name: "binding-expiry.js", type: "text/javascript; charset=utf-8" },
+    "/bindings.js": { name: "bindings.js", type: "text/javascript; charset=utf-8" },
     "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
     "/ide.js": { name: "ide.js", type: "text/javascript; charset=utf-8" },
     "/copyable.js": { name: "copyable.js", type: "text/javascript; charset=utf-8" },

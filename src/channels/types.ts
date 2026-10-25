@@ -9,6 +9,8 @@ export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
 export type ChannelTextInput = { toUserId: string; text: string; contextToken?: string };
 export type ChannelMention = { userId: string; name?: string };
+/** Provider-confirmed public conversation metadata, never inferred from IDs or session titles. */
+export type ChannelConversationIdentity = { kind: "direct" | "group"; name?: string };
 /** Trusted application intent, not part of model-authored card content. */
 export type ChannelActionCardInput = { toUserId: string; card: ChannelActionCard; contextToken?: string;
   mentions?: readonly ChannelMention[] };
@@ -21,6 +23,7 @@ export type ChannelMentionInput = ChannelTextInput & {
 };
 
 export type ChannelTextClient = {
+  conversationIdentity?(recipientId: string): ChannelConversationIdentity | undefined;
   /** Pure routing preflight; no provider calls and no guessed recipient type. */
   deliveryRouteStatus?(recipientId: string): "available" | "unconfirmed";
   /** Legacy transport boundary. Production consumers receive a ChannelClient. */

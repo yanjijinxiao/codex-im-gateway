@@ -134,6 +134,7 @@ type DingTalkRobotMessage = Omit<RobotMessage, "msgtype" | "text"> & {
   readonly msgtype: string;
   readonly text?: { readonly content?: unknown };
   readonly content?: unknown;
+  readonly conversationTitle?: string;
 };
 
 type ReplyTarget = {
@@ -216,6 +217,11 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
   }
   deliveryRouteStatus(recipientId: string): "available" | "unconfirmed" {
     try { this.cardTarget(recipientId); return "available"; } catch { return "unconfirmed"; }
+  }
+  conversationIdentity(recipientId: string) {
+    const route = this.cardRouting.get(recipientId);
+    return route ? { kind: route.type === "group" ? "group" as const : "direct" as const,
+      ...(route.name ? { name: route.name } : {}) } : undefined;
   }
 
   async sendMedia(input: ChannelMediaInput): Promise<{ messageId: string }> {
@@ -473,7 +479,8 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       };
       this.replyTargets.set(conversationId, replyTarget);
       this.replyTargets.set(actorId, replyTarget);
-      this.cardRouting.remember(conversationId, body.conversationType, body.senderStaffId?.trim(), replyTarget.robotCode);
+      this.cardRouting.remember(conversationId, body.conversationType, body.senderStaffId?.trim(), replyTarget.robotCode,
+        { conversationName: body.conversationTitle, actorName: body.senderNick });
       const message: ChannelMessage = {
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,

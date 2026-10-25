@@ -68,6 +68,7 @@ const WEBHOOK_PROVIDER_PRESENTATION = {
   }
 };
 let streamingRenderFrame = 0;
+let bindingOverview;
 
 const els = {};
 
@@ -123,6 +124,9 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 function bindEvents() {
+  bindingOverview = window.createBindingOverview({ snapshot: () => state, escapeHtml, escapeAttr,
+    accountName: accountDisplayName, showView, sessionAction: handleSessionAction,
+    refresh: () => refreshData(true), drawIcons });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => closeDialog(button.dataset.closeDialog)));
   document.querySelector("#addAccountButton").addEventListener("click", openChannelDialog);
@@ -409,6 +413,7 @@ async function refreshData(notify) {
     renderMetrics();
     renderAccounts();
     renderSessions();
+    bindingOverview?.render();
     renderTaskboardStatus();
     window.renderKnowledgeBasesPage?.();
     if (!taskboardEditing) renderTaskboardWorkbench();
@@ -437,6 +442,7 @@ function renderAll() {
   renderMetrics();
   renderAccounts();
   renderSessions();
+  bindingOverview?.render();
   renderTaskboardWorkbench();
   window.renderKnowledgeBasesPage?.();
   renderSettings();
@@ -503,6 +509,10 @@ function renderAccounts() {
           <button class="icon-button is-danger" type="button" data-account-action="remove" data-account-id="${escapeAttr(account.accountId)}" title="移除账号" aria-label="移除账号"><i data-lucide="trash-2"></i></button>
         </div>
       </div>
+      <div class="account-binding-entry">
+        <span><strong>对话绑定</strong><small>钉钉 / IM 对话与 Codex session 的对应关系</small></span>
+        <button class="button button-secondary" type="button" data-binding-link data-account-id="${escapeAttr(account.accountId)}"><i data-lucide="git-compare-arrows"></i>查看绑定</button>
+      </div>
       <details class="account-identifiers" data-account-id="${escapeAttr(account.accountId)}"${expandedAccountIds.has(account.accountId) ? " open" : ""}>
         <summary>
           <span class="account-identifiers-title"><i data-lucide="fingerprint"></i><strong>渠道 ID</strong><small>${channelMeta.label}</small></span>
@@ -526,15 +536,18 @@ function renderAccountProjects(account, projects) {
       const notificationsEnabled = project.notifications?.some((target) => target.enabled === true) === true;
       const notificationTitle = notificationsEnabled ? "任务完成通知已开启" : "任务完成通知未开启";
       const runningTasks = project.runningTasks || [];
-      const boundSessions = project.boundSessions || [];
+      const records = (state.sessions || []).filter(session => session.accountId === project.accountId && session.projectId === project.id);
+      const boundSessions = records.filter(session => session.binding?.bound === true);
+      const historicalCount = records.length - boundSessions.length;
       return `<li class="account-project-row${notificationsEnabled ? " has-notifications" : ""}">
         <span class="account-project-icon" aria-hidden="true"><i data-lucide="folder"></i></span>
         <span class="account-project-copy">
           <span class="account-project-title-line"><strong title="${escapeAttr(project.name)}">${escapeHtml(project.name)}</strong>${notificationsEnabled ? `<span class="project-notification-status"><i data-lucide="bell-ring"></i>通知已开启</span>` : ""}</span>
           <small title="${escapeAttr(project.workspace)}">${escapeHtml(project.workspace)}</small>
           ${runningTasks.length ? `<span class="account-project-running-tasks">${runningTasks.map((task) => `<span class="account-project-running-task" title="${escapeAttr(task.title)}"><i data-lucide="loader-circle"></i><b>${escapeHtml(task.title)}</b><em>${task.source === "codex" ? "Codex Desktop" : "消息渠道"}</em></span>`).join("")}</span>` : ""}
-          <span class="account-project-bound-heading"><i data-lucide="messages-square"></i>已绑定会话 ${project.sessionCount || 0}</span>
-          ${boundSessions.length ? `<span class="account-project-bound-sessions">${boundSessions.map((session) => `<span class="account-project-bound-session${session.active ? " is-active" : ""}" title="${escapeAttr(session.title)}"><i data-lucide="message-square"></i><b>${escapeHtml(session.title)}</b>${session.active ? "<em>当前</em>" : ""}</span>`).join("")}</span>` : `<span class="account-project-no-session">尚未绑定会话</span>`}
+          <span class="account-project-bound-heading"><i data-lucide="messages-square"></i>当前绑定 ${boundSessions.length}${historicalCount ? ` · 历史关联 ${historicalCount}` : ""}</span>
+          ${boundSessions.length ? `<span class="account-project-bound-sessions">${boundSessions.slice(0, 10).map((session) => `<button type="button" class="account-project-bound-session is-active" data-binding-link data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}" title="查看此项目的对话绑定"><i data-lucide="message-square"></i><b>${escapeHtml(session.title)}</b></button>`).join("")}</span>` : `<span class="account-project-no-session">当前没有有效绑定</span>`}
+          <button class="account-project-binding-link" type="button" data-binding-link data-account-id="${escapeAttr(project.accountId)}" data-project-id="${escapeAttr(project.id)}">查看项目绑定 <i data-lucide="arrow-up-right"></i></button>
         </span>
         <span class="account-project-task-count${runningTasks.length ? " is-running" : ""}">${runningTasks.length} 个运行中</span>
         <span class="account-project-actions">
@@ -1267,6 +1280,14 @@ async function handleSessionAction(event) {
   const sessionId = button.dataset.sessionId;
   const session = state.sessions.find((item) => item.accountId === accountId && item.id === sessionId);
   if (!session) return;
+  if (action === "inspect") {
+    state.selectedAccountId = session.accountId;
+    if (session.projectId) state.collapsedProjectKeys.delete(`${session.accountId}\n${session.projectId}`);
+    showView("sessions");
+    selectSession(session);
+    renderSessions();
+    return;
+  }
   if (action === "open") return selectSession(session);
   if (action === "rename") return openRenameSessionDialog(session);
   if (action === "expiry") return openBindingExpiryDialog(session);
@@ -2303,7 +2324,8 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "taskboard", "knowledge", "ide", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "bindings", "taskboard", "knowledge", "ide", "settings"].includes(name) ? name : "accounts";
+  if (valid === "bindings") bindingOverview?.render();
   if (valid === "ide") void window.gatewayIDE?.refresh();
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const visible = panel.dataset.viewPanel === valid;

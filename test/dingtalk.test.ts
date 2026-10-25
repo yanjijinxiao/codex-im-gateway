@@ -1344,6 +1344,20 @@ function noEmotionClient(): DingTalkEmotionClient {
   };
 }
 
+test("DingTalk callback exposes group title as public display identity without confusing it with the sender", async () => {
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake", savedAt: "", enabled: true }, {
+    emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }) });
+  const abort = new AbortController(), ready = Promise.withResolvers<void>();
+  const monitor = adapter.monitor({ signal: abort.signal, async onMessage() { ready.resolve(); } });
+  try {
+    listener!(frame({ ...robotMessage(), conversationTitle: "诊断群", senderNick: "张三" }));
+    await ready.promise;
+    assert.deepEqual(adapter.client.conversationIdentity("conversation-123"), { kind: "group", name: "诊断群" });
+    assert.deepEqual(adapter.client.conversationIdentity("staff-123"), { kind: "direct", name: "张三" });
+  } finally { abort.abort(); await monitor; }
+});
+
 test("unconfigured DingTalk @ uses native webhook recipients without inventing a card", async () => {
   let listener: ((message: DWClientDownStream) => void) | undefined;
   const sent: any[] = [], received: any[] = [];

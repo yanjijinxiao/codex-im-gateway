@@ -147,6 +147,7 @@ export type AccountSession = ManagedSession & {
   active: boolean;
   responding: boolean;
   binding: SessionBindingTarget & { bound: boolean; expiry?: BindingExpiry;
+    conversation?: import("../channels/types.js").ChannelConversationIdentity;
     interaction?: InteractionRouteStatus; deliveryRoute?: "available" | "unconfirmed"; nativeUnavailable?: boolean };
 };
 
@@ -1450,12 +1451,14 @@ export class AccountManager {
 
   private sessionSummary(accountId: string, session: ManagedSession, active: boolean): AccountSession {
     const expiry = this.storeFor(accountId).getBindingExpiry(session.senderId, this.configProvider().bindingIdleDays);
+    const conversation = this.entries.get(accountId)?.client?.conversationIdentity?.(session.senderId);
     return {
       ...session,
       accountId,
       active,
       responding: this.isSessionResponding(accountId, session.id),
       binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active,
+        ...(conversation ? { conversation } : {}),
         ...(active && session.threadId ? { interaction: this.getSessionInteractionRoute(accountId, session.id),
           deliveryRoute: this.entries.get(accountId)?.client?.deliveryRouteStatus?.(session.senderId),
           nativeUnavailable: ["archived", "missing"].includes(this.threadEvents.status(JSON.stringify([accountId, session.id])).runtime?.persistence ?? "") } : {}),

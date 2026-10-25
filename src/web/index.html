@@ -14,6 +14,7 @@
   <script defer src="/vendor/purify.min.js"></script>
   <script defer src="/account-mode-settings.js"></script>
   <script defer src="/binding-expiry.js"></script>
+  <script defer src="/bindings.js"></script>
   <script defer src="/app.js"></script>
   <script defer src="/knowledge-bases.js"></script>
   <script defer src="/ide.js"></script>
@@ -32,6 +33,7 @@
       <nav class="view-tabs" aria-label="管理视图">
         <button class="tab is-active" type="button" data-view="accounts" aria-current="page">消息渠道</button>
         <button class="tab" type="button" data-view="sessions">会话</button>
+        <button class="tab" type="button" data-view="bindings">对话绑定</button>
         <button class="tab" type="button" data-view="taskboard">任务面板</button>
         <button class="tab" type="button" data-view="knowledge">知识库</button>
         <button class="tab" type="button" data-view="ide">Web IDE</button>
@@ -154,6 +156,21 @@
           </form>
         </section>
       </div>
+    </section>
+
+    <section class="view bindings-view" id="bindingsView" data-view-panel="bindings" hidden>
+      <div class="section-heading">
+        <div><p class="eyebrow">CONVERSATION BINDINGS</p><h1 tabindex="-1">对话绑定</h1></div>
+        <button class="button button-secondary" id="refreshBindingsButton" type="button"><i data-lucide="refresh-cw"></i>刷新绑定</button>
+      </div>
+      <p class="binding-intro">查看哪个钉钉群或私聊连接了哪个 Codex session。解绑只解除对应关系，不删除 session、不停止任务。</p>
+      <div class="binding-filters" role="search" aria-label="筛选对话绑定">
+        <label><span>消息渠道</span><select id="bindingAccountFilter"><option value="">全部消息渠道</option></select></label>
+        <label><span>项目</span><select id="bindingProjectFilter"><option value="">全部项目</option></select></label>
+        <label class="binding-search"><span>查找对话或 session</span><input id="bindingSearch" type="search" placeholder="群名、session 名称或 ID"></label>
+      </div>
+      <p class="binding-count" id="bindingCount" role="status"></p>
+      <div id="bindingsList" class="binding-list"></div>
     </section>
 
     <section class="view taskboard-view" id="taskboardView" data-view-panel="taskboard" hidden>

@@ -101,6 +101,56 @@ h1 { margin: 0; font-size: 30px; line-height: 1.15; font-weight: 750; }
 h2 { margin: 0; font-size: 19px; line-height: 1.3; }
 
 .account-list { display: grid; gap: 12px; }
+.account-binding-entry { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 20px; border-top: 1px solid var(--line); background: #f4f8f5; }
+.account-binding-entry > span { display: grid; gap: 4px; }
+.account-binding-entry strong { font-size: 13px; }
+.account-binding-entry small { color: var(--ink-soft); font-size: 11px; line-height: 1.5; }
+.account-project-binding-link { display: inline-flex; align-items: center; gap: 3px; margin-top: 7px; padding: 0; border: 0; background: transparent; color: var(--green-dark); font-size: 11px; font-weight: 650; }
+.account-project-binding-link svg { width: 13px; height: 13px; }
+.binding-intro { color: var(--ink-soft); font-size: 13px; line-height: 1.7; margin: -8px 0 24px; }
+.binding-filters { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(160px, 1fr) minmax(200px, 1.5fr); gap: 16px; }
+.binding-filters label { min-width: 0; display: grid; gap: 7px; color: var(--ink-soft); font-size: 12px; }
+.binding-filters input, .binding-filters select { width: 100%; min-width: 0; min-height: 40px; border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; color: var(--ink); background: var(--surface); }
+.binding-count { color: var(--ink-soft); font-size: 12px; margin: 24px 0 10px; }
+.binding-list { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.binding-table-head, .binding-row { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.2fr) minmax(0, 1fr) 130px; gap: 24px; padding: 18px 20px; }
+.binding-table-head { background: var(--surface-muted); color: var(--ink-soft); font-size: 11px; font-weight: 650; }
+.binding-row + .binding-row { border-top: 1px solid var(--line); }
+.binding-row > div { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; min-width: 0; }
+.binding-row strong { font-size: 14px; font-weight: 650; line-height: 1.5; overflow-wrap: anywhere; }
+.binding-kind, .binding-meta { color: var(--ink-soft); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.binding-id { color: var(--ink-soft); font: 11px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
+.binding-status { font-size: 12px; line-height: 1.5; }
+.binding-status small { color: var(--ink-soft); font-size: 11px; }
+.binding-badge { display: inline-block; border-radius: 4px; padding: 4px 7px; font-size: 11px; font-weight: 650; }
+.binding-badge.is-current { color: var(--green-dark); background: var(--green-soft); }
+.binding-badge.is-warning { color: #835006; background: var(--amber-soft); }
+.binding-badge.is-history { color: var(--ink-soft); background: var(--surface-muted); }
+.binding-actions .button { width: 100%; min-height: 34px; padding-inline: 8px; font-size: 11px; }
+.binding-column-label { display: none; }
+.binding-empty { color: var(--ink-soft); padding: 20px; font-size: 13px; line-height: 1.7; }
+.binding-history { border-top: 1px solid var(--line); }
+.binding-history summary { cursor: pointer; padding: 18px 20px; color: var(--ink-soft); font-size: 13px; }
+.binding-history summary span { margin-left: 14px; font-size: 11px; }
+.binding-history[open] summary { border-bottom: 1px solid var(--line); }
+@media (max-width: 900px) {
+  .view-tabs { overflow-x: auto; }
+  .tab { flex: 1 0 auto; }
+  .binding-table-head { display: none; }
+  .binding-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  .binding-column-label { display: block; color: var(--ink-soft); font-size: 11px; }
+  .binding-row .binding-actions { flex-direction: row; flex-wrap: wrap; align-self: end; }
+  .binding-actions .button { width: auto; }
+}
+@media (max-width: 640px) {
+  .binding-filters { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+  .binding-search { grid-column: 1 / -1; }
+  .binding-row { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 18px 16px; }
+  .binding-history summary span { display: block; margin: 6px 0 0; }
+  .account-binding-entry { padding: 14px 16px; }
+  .account-binding-entry small { max-width: 180px; }
+  .binding-actions .button { min-height: 40px; }
+}
 .account-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
 .account-main { min-height: 98px; padding: 20px; display: grid; grid-template-columns: minmax(220px, 1.3fr) minmax(112px, .6fr) minmax(72px, .4fr) minmax(180px, .8fr) auto; align-items: center; gap: 22px; }
 .account-identity { min-width: 0; display: flex; align-items: center; gap: 14px; }
@@ -762,3 +812,7 @@ input[aria-invalid="true"] { border-color: #d6908d; outline-color: rgb(200 64 61
 .binding-expiry-form input:disabled { color: var(--ink-soft); background: var(--canvas, #f4f6f4); cursor: not-allowed; }
 #bindingExpiryTarget { white-space: pre-wrap; overflow-wrap: anywhere; }
 #bindingExpiryError { color: #b42318; }
+@media (max-width: 900px) {
+  .view-tabs { overflow-x: auto; }
+  .view-tabs .tab { flex: 0 0 auto; min-width: 72px; }
+}

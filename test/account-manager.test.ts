@@ -19,9 +19,11 @@ import { defaultConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { listRetainedAccounts, loadAccount, saveAccount } from "../src/weixin/accounts.js";
+import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 
-function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object; root?: string } = {}) {
+function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object; root?: string;
+  adapterFactory?: ConstructorParameters<typeof AccountManager>[0]["adapterFactory"] } = {}) {
   const root = options.root ?? fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root);
@@ -103,6 +105,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
   };
   const manager = new AccountManager({
     paths,
+    adapterFactory: options.adapterFactory,
     configProvider: () => ({ ...defaultConfig(root), taskboardEnabled: Boolean(options.taskboardClient) }),
     taskboardClientFactory: () => options.taskboardClient as never,
     llmWiki: options.llmWiki as never,
@@ -1195,6 +1198,25 @@ test("includes the project's bound sessions and active marker in project summari
     hasThread: false,
     updatedAt: session.updatedAt
   }]);
+});
+
+test("session binding projection adds only provider-confirmed conversation identity and preserves historical edges", async t => {
+  const { manager, root } = setup(t, { adapterFactory: () => ({
+    client: createChannelClient("dingtalk", TEXT_CAPABILITIES, {
+      async sendText() { return { messageId: "sent" }; },
+      conversationIdentity(id) { return id === "known-group" ? { kind: "group", name: "真实群名" } : undefined; }
+    }),
+    async monitor({ signal }) { await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true })); }
+  }) });
+  await manager.startAccount("account-one"); t.after(() => manager.stopAll());
+  const old = manager.createSession("account-one", "known-group", root, "not-a-group-name");
+  const current = manager.createSession("account-one", "known-group", root, "new-record");
+  const unknown = manager.createSession("account-one", "unknown-cid", root, "never-use-as-a-group-name");
+  const sessions = manager.listSessions();
+  assert.deepEqual(sessions.find(s => s.id === old.id)?.binding.conversation, { kind: "group", name: "真实群名" });
+  assert.equal(sessions.find(s => s.id === old.id)?.binding.bound, false);
+  assert.equal(sessions.find(s => s.id === current.id)?.binding.bound, true);
+  assert.equal(sessions.find(s => s.id === unknown.id)?.binding.conversation, undefined);
 });
 
 test("rejects projects outside the configured workspace allowlist", (t) => {

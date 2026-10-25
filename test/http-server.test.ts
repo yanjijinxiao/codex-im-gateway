@@ -22,6 +22,18 @@ test("Codex status probe reuses the runner command resolver", async () => {
   });
 });
 
+test("binding overview ships as a protected local UI using the existing session projection", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-binding-overview-api-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {} as never });
+  t.after(() => server.close());
+  const asset = await fetch(`${server.url}/bindings.js`);
+  assert.equal(asset.status, 200); assert.match(await asset.text(), /window.createBindingOverview/);
+  const html = await (await fetch(server.url)).text();
+  assert.match(html, /data-view="bindings">对话绑定/);
+  assert.ok(html.indexOf('src="/bindings.js"') < html.indexOf('src="/app.js"'));
+});
+
 test("interaction primary API uses existing local mutation protection and the shared routing port", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-interaction-primary-api-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
