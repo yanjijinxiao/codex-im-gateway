@@ -21,6 +21,8 @@ export type ChannelMentionInput = ChannelTextInput & {
 };
 
 export type ChannelTextClient = {
+  /** Pure routing preflight; no provider calls and no guessed recipient type. */
+  deliveryRouteStatus?(recipientId: string): "available" | "unconfirmed";
   /** Legacy transport boundary. Production consumers receive a ChannelClient. */
   capabilities?: ChannelCapabilities;
   /** Can update an existing stream using only its persisted message ID. */

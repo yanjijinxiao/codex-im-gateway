@@ -145,6 +145,8 @@ test("public routes survive restart without persisting webhooks, text or access 
 
 test("unknown routing causes no create mutation and does not guess a group from CID", async () => {
   const io = provider(); const stream = new ChannelTurnTextStream(io.adapter(false).client, "cid-private");
+  assert.equal(io.adapter(false).client.deliveryRouteStatus("cid-private"),"unconfirmed");
+  assert.equal(io.adapter().client.deliveryRouteStatus("cid-private"),"available");
   await stream.progress("开始"); assert.equal(io.calls.length, 0);
   assert.equal(stream.checkpoint().bootstrap?.stage, "create-rejected");
   assert.equal(stream.checkpoint().bootstrap?.failure?.code, "RouteUnconfirmed");

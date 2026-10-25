@@ -434,6 +434,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { sessions: context.accountManager.listSessions() });
     return;
   }
+  if (method === "GET" && url.pathname === "/api/interaction-health") {
+    sendJson(response, 200, context.accountManager.interactionHealth()); return;
+  }
   if (method === "GET" && url.pathname === "/api/codex-projects") {
     sendJson(response, 200, { projects: await readCodexProjects(context) });
     return;

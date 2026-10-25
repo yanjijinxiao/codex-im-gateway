@@ -57,3 +57,12 @@ for (const confirm of [false, true]) {
     }
   });
 }
+
+test("web primary action changes only the interaction entry, not session activation or execution", async () => {
+  const calls: string[] = [];
+  const button = { dataset: { sessionAction:"primary",accountId:selected.accountId,sessionId:selected.id },disabled:false };
+  const context=vm.createContext({state:{sessions:[selected]},toast(){},async api(url:string){calls.push(url);},async refreshData(){} });
+  vm.runInContext(handle,context); await context.handleSessionAction({target:{closest:()=>button}});
+  assert.deepEqual(calls,["/api/sessions/one%2Faccount/managed-record/interaction-primary"]);
+  assert.equal(button.disabled,false);
+});

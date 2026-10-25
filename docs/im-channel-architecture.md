@@ -217,7 +217,7 @@ Desktop 明确的 `systemError` 是运行时事实，Router 不能以私有 App 
 
 问题、审批与进度是不同的领域事件。`CodexDesktopRequestMonitor` 复用一条本机 follower 连接收集待处理交互；旧审批监听器名称只作兼容导出。共享应用层的 `InteractionRoutingJournal` 在 `runtime/interaction-routing.json` 原子保存 host + thread 的主交互目标、host + thread + turn 的原生交互归属（权限 0600，仅标识符，不存问题、答案或凭证）。进度跟随依然可多绑定；原生问题/审批只由一个对话回答。
 
-路由优先级为原轮次归属、持久化主交互目标、唯一启用绑定。成功接收的 IM 轮次保存原始来源；未显式选择主对话时也建立后续 App 轮次的默认目标。`/follow primary` 仅允许 controller 将当前启用绑定设为主对话；明确的主对话不会被其他跟随轮询或新 IM 来源覆盖。管理 API 的 `GET/POST /api/sessions/:accountId/:sessionId/interaction-primary` 使用同一个应用层端口，POST 沿用本机 Origin/token 校验。`/follow` 显示路由健康与配置指引，不启动任务、不改变其他跟随绑定。
+路由优先级为原轮次归属、持久化主交互目标、唯一启用绑定。成功接收的 IM 轮次保存原始来源；未显式选择主对话时也建立后续 App 轮次的默认目标。`/follow primary` 仅允许 controller 将当前启用绑定设为主对话；有效的显式主对话不会被跟随轮询或新 IM 来源覆盖。绑定切换、解绑、重置及启动恢复时，以 RuntimeStateStore 的当前绑定投影校验主入口；失效入口保留墓碑，不改投旧轮次。只有新近原生接收的 IM 来源或明确设置入口才能建立替代默认。临时渠道重连不是解绑，不撤销入口。管理 API 的 `GET/POST /api/sessions/:accountId/:sessionId/interaction-primary` 使用同一个应用层端口，POST 沿用本机 Origin/token 校验。管理页提供“设为提问入口”按钮，并分别显示绑定、入口及投递身份；`GET /api/interaction-health` 提供同一投影与脱敏的不支持交互记录。归档 session 保留绑定但暂停交互，跟随低频复查，不自动反归档或重启任务。
 
 无法唯一路由时，协调层向同 host/thread 的当前启用绑定发送中性的配置提示（不含原生题目、选项或敏感正文），指引控制者设置 `/follow primary`。提示优先使用纯文本，不新建进度卡；现有路由日志按精确绑定与冲突类别先持久认领发送尝试，未知回执或重启不自动重发。原生监听器保留仍待处理的交互，默认每 30 秒最多发起一次同 scope 的只读快照刷新；主目标或绑定变化会提前请求刷新。必须由新完整原生快照确认同一问题仍待答，才重新路由；旧缓存和补丁不授权重投。问题撤回、取消跟随、IPC 断开和服务停止会清理探测；已经尝试提交的答案或审批决定仍按原回执处理，不因路由恢复而重发。这不是 Gateway 执行队列，也不会代答、steer 或创建任务。
 
@@ -236,7 +236,9 @@ Q 问题与最终答复共用 `TurnAudienceJournal.mentions` 的整轮可信参�
 
 同一组 native 问题首次发现时冻结名单，随 Q 记录保存；答完第一题或重启不重新选择后续题目的名单。`sendActionCard` 的独立结构化 `mentions` 参数与 `actionCardMentions` 能力门控授权提醒，不从模型正文/引用生成 @。钉钉配置 AI 模板后，不论临时 webhook 是否有效，都使用已确认群路由，在**同一张静态问题卡**中携带 Markdown 正文、创建白名单和投放名单；真正的无模板纯文本通道才降级移除围栏包装。飞书使用[卡片原生 at 标签](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot?lang=zh-CN)，保留原按钮/表单。长问题仅第一页提醒；名单超过单批上限时，首批与完整问题同发，后续批次仅发指向同一 Q 编号的短通知，不复制问题正文或截掉超出的人。问题卡及 @ 共用既有发送前持久认领，未知回执不换通道补发；分批后仍保留原问题卡 ID 供确认更新。确认/失效更新不携带 mentions，不重复提醒，不影响原生答案回传、任务状态或最终结果通知。
 
-工具/浏览器的 `mcpServer/elicitation/request` 在原生适配层统一分类，而不是由钉钉渠道猜测。严格的空对象 `form` 确认映射到既有单次审批控制器，Desktop 回传 `thread-follower-submit-mcp-server-elicitation-response`，App Server 回复原请求；只返回本次 `action/content`，绝不提交 persist/always-allow 元数据。复杂输入、URL/OAuth、身份验证、未知 schema 或无法完整展示的请求不被扁平化成批准按钮。Desktop 监听器只输出不含原始载荷的中性提示，按唯一 host/thread/turn 绑定告知回 Desktop 处理，不向群转发 challenge 或收集凭据。未知投递不重复提醒，未收到原生确认不宣称审批生效。没有安全映射或处理器的私有 App Server 请求保留取消策略。
+工具/浏览器的 `mcpServer/elicitation/request` 在原生适配层统一分类，而不是由钉钉渠道猜测。空对象 `form` / `openai/form` 确认映射到既有单次审批控制器；非敏感的有界 primitive 表单经共享 `elicitation.ts` 映射到问题控制器，保留 string/number/integer/boolean、枚举及范围约束，回复前校验，返回原字段名与 JSON 类型。未知 schema 约束不会被忽略，必填项跳过将拒绝整次表单。Desktop 回传 `thread-follower-submit-mcp-server-elicitation-response`，App Server 回复原请求，均等待原生确认；绝不提交 persist/always-allow 元数据。没有 turnId 的 MCP 请求使用独立的 thread/request 交互作用域，不猜测执行轮次。
+
+URL/认证与不支持请求也必须有可见状态，而非“一律回 Desktop”或静默跳过。可审查的无凭证 HTTPS 导航链接可在 IM 打开；含 query/fragment、challenge 或凭据的链接不发布到群，只提示从原工具安全入口完成认证，不收集密码/验证码，不把打开链接当作认证成功。未知原生交互输出脱敏通知并持久化诊断；时间、attestation、token refresh 等协议服务不伪装成人类问题。App Server 无映射时保留请求，不自动取消。配置冲突通知使用可持久化的渠道投递面，独立记录尝试/送达/未确认；中性通知退避重试最多三次，绝不自动重发原生回答或审批决定。绑定失效会收口旧待回答记录，未知原生提交保留“未确认”，不伪造拒绝或确认。
 
 异步答案确认有两种可信证据：关联原请求并返回同一轮次的 RPC 回执，或原生 canonical turn 中已接收的结构化答案。Desktop 适配器只向共享控制器输出 host/thread/turn/question ID 与答案摘要，不转交原始快照或答案正文。提交前持久保存精确问题及答案的比较摘要；原题、原轮次、正文摘要和当前有效绑定全部匹配后，才可只读恢复 `unconfirmed → confirmed`，包括重启后的恢复。待接受 steer、其他题目/轮次、引用文本、不同答案或未提交的答案都不能作为成功证据。已确认状态不会被迟到的超时或撤回覆盖，未知提交仍不重发；确认通知按结果去重。
 

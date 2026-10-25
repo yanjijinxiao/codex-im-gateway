@@ -5,6 +5,7 @@ import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { parseUserInputRequest } from "./user-input.js";
+import { parseMcpForm, mcpFormResponse, safeElicitationUrl, type McpForm } from "./elicitation.js";
 import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
 import { codexFailureCode, lastCodexTurnFailure, type CodexFailureCode } from "./turn-failure.js";
@@ -1665,11 +1666,22 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const id = message.id as JsonRpcId;
     if (isAppServerApprovalMethod(message.method)) {
       const method = message.method;
-      const request = parseAppServerApproval(method, message.params ?? {});
+      const params = message.params ?? {};
+      const threadId = typeof params.threadId === "string" ? params.threadId : "";
+      const scoped = method === "mcpServer/elicitation/request"
+        ? { ...params, turnId: params.turnId ?? this.activeTurns.get(threadId) ?? `mcp-thread-scope:${typeof id}:${id}` } : params;
+      const form = method === "mcpServer/elicitation/request" ? parseMcpForm(scoped) : undefined;
+      if (form) { this.handleUserInputRequest(id, {}, form); return; }
+      const request = parseAppServerApproval(method, scoped);
       const handler = request ? this.approvalHandlersByThread.get(request.threadId) : undefined;
       if (!request || !handler) {
         if (method === "mcpServer/elicitation/request") {
-          this.send({ id, result: { action: "cancel", content: null, _meta: null } });
+          const turnId = typeof scoped.turnId === "string" ? scoped.turnId : this.activeTurns.get(threadId);
+          const url = safeElicitationUrl(params);
+          if (threadId && turnId) this.emitProgress(turnKey(threadId, turnId), url
+            ? `当前工具需要在浏览器完成验证：${url}。打开页面不等于已批准或完成验证。`
+            : "当前工具有尚未适配或需要安全认证的交互，未自动批准、未收集密码或验证码。请求保持待处理，请从原工具提供的安全页面处理。");
+          console.warn("[codex-im-gateway] MCP interaction unsupported; native request retained, no payload logged");
           return;
         }
         const fallback = request ?? {
@@ -1711,6 +1723,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         this.send({ id, result: { currentTimeAt: Math.floor(Date.now() / 1_000) } });
         return;
       default:
+        if (typeof message.params?.threadId === "string") {
+          const turnId = this.activeTurns.get(message.params.threadId);
+          if (turnId) this.emitProgress(turnKey(message.params.threadId, turnId), "当前任务遇到未支持的原生交互；已记录脱敏诊断，未代答或批准。");
+        }
         this.send({
           id,
           error: { code: -32601, message: `Unsupported app-server request: ${message.method ?? "unknown"}` }
@@ -1745,8 +1761,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }));
   }
 
-  private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>): void {
-    const parsed = parseUserInputRequest(params);
+  private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>, form?: McpForm): void {
+    const parsed = form?.request ?? parseUserInputRequest(params);
     const request = parsed ? { ...parsed, requestId: id } : undefined;
     const handler = request ? this.userInputHandlersByThread.get(request.threadId) : undefined;
     if (!request || !handler) {
@@ -1760,7 +1776,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     Promise.resolve(handler(request)).then(answers => {
       if (answers === undefined || this.userInputRequests.get(key) !== pending) return;
       pending.submitted = true;
-      this.send({ id, result: { answers } });
+      this.send({ id, result: form ? mcpFormResponse(form, answers) : { answers } });
     }).catch(() => this.resolveUserInput(key, "failed"));
   }
 

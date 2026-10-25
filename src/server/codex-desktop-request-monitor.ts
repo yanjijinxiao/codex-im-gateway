@@ -8,6 +8,7 @@ import { parseUserInputRequest } from "../codex/user-input.js";
 import { desktopAsyncUserInputs, asyncUserInputReply, asyncAnswerDigest, desktopAsyncAnswerReceipts, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
 import { IpcFrameDecoder, IpcFrameSizeError } from "../codex/ipc-frames.js";
 import { applyDesktopStatePatches } from "../codex/desktop-state-patches.js";
+import { parseMcpForm, mcpFormResponse, safeElicitationUrl, type McpForm } from "../codex/elicitation.js";
 
 import {
   isAppServerApprovalMethod,
@@ -34,10 +35,14 @@ export type CodexDesktopUserInput = {
   requestId: string | number;
   method: "item/tool/requestUserInput";
   request: CodexUserInputRequest;
+  /** Native method/response stay separate from the IM question projection. */
+  mcpForm?: McpForm;
 };
 export type CodexDesktopUnsupportedInteraction = {
   hostId: string; threadId: string; turnId: string; requestId: string | number;
   method: string;
+  reason?: "authentication" | "schema-unsupported" | "request-unsupported";
+  safeUrl?: string;
 };
 type DesktopRequest = CodexDesktopApproval | CodexDesktopUserInput;
 
@@ -53,7 +58,7 @@ export type CodexDesktopRequestMonitorOptions = {
   onUserInputResult?: (input: CodexDesktopUserInput, result: CodexUserInputResult) => Promise<void> | void;
   onObservedUserInputAnswers?: (receipts: NativeAsyncAnswerReceipt[]) => Promise<void> | void;
   /** Neutral notice only: no unvalidated form, credential or challenge data. */
-  onUnsupportedInteraction?: (input: CodexDesktopUnsupportedInteraction) => Promise<void>;
+  onUnsupportedInteraction?: (input: CodexDesktopUnsupportedInteraction) => Promise<boolean | void>;
 };
 
 type IpcMessage = Record<string, unknown>;
@@ -66,7 +71,7 @@ export class CodexDesktopRequestMonitor {
   private readonly reconnectDelayMs: number;
   private readonly followedThreads = new Map<string, DesktopFollowTarget>();
   private readonly handledRequests = new Set<string>();
-  private readonly unsupportedNotices = new Set<string>();
+  private readonly unsupportedNotices = new Map<string, { delivered: boolean; retryAt: number }>();
   private readonly activeRequests = new Map<string, DesktopRequest>();
   private readonly requestSnapshots = new Map<string, { requests: unknown[]; cwd?: string; turns?: unknown[];
     turnHistory?: unknown; threadRuntimeStatus?: unknown }>();
@@ -292,21 +297,27 @@ export class CodexDesktopRequestMonitor {
       const requestId = requestIdValue(envelope?.id);
       const params = recordValue(envelope?.params);
       if (requestId === undefined || !params || envelope?.completed === true) continue;
-      const parsedInput = method === "item/tool/requestUserInput" ? parseUserInputRequest(params) : undefined;
+      const scopedParams = method === "mcpServer/elicitation/request" && params.threadId === threadId
+        ? { ...params, turnId: params.turnId ?? `mcp-thread-scope:${typeof requestId}:${requestId}` } : params;
+      const form = method === "mcpServer/elicitation/request" ? parseMcpForm(scopedParams) : undefined;
+      const parsedInput = form?.request ?? (method === "item/tool/requestUserInput" ? parseUserInputRequest(params) : undefined);
       const inputRequest = parsedInput ? { ...parsedInput, ...(envelope?.async === true ? { kind: "async" as const } : {}) } : undefined;
-      const request = inputRequest ?? (isAppServerApprovalMethod(method) ? parseAppServerApproval(method, params) : undefined);
+      const request = inputRequest ?? (isAppServerApprovalMethod(method) ? parseAppServerApproval(method, scopedParams) : undefined);
       if (!request) {
-        if (method === "mcpServer/elicitation/request" && params.threadId === threadId) {
-          const turnId = stringValue(params.turnId);
+        if (method && !["currentTime/read", "attestation/generate", "account/chatgptAuthTokens/refresh", "item/tool/call"].includes(method)
+          && (params.threadId === undefined || params.threadId === threadId)) {
+          const turnId = stringValue(params.turnId) ?? `native-thread-scope:${typeof requestId}:${requestId}`;
           const noticeKey = JSON.stringify([hostId, threadId, turnId, typeof requestId, requestId]);
-          if (turnId && !this.unsupportedNotices.has(noticeKey)) {
-            // Claim before sending: an ambiguous delivery must not produce a
-            // second notification on every follower patch/reconnect.
-            this.unsupportedNotices.add(noticeKey);
-            while (this.unsupportedNotices.size > 500) this.unsupportedNotices.delete(this.unsupportedNotices.values().next().value!);
-            void this.options.onUnsupportedInteraction?.({ hostId, threadId, turnId, requestId, method }).catch(() => {
-              console.warn("[codex-im-gateway] unsupported Desktop interaction notice unconfirmed");
-            });
+          const notice = this.unsupportedNotices.get(noticeKey);
+          if (!notice?.delivered && (!notice || notice.retryAt <= Date.now())) {
+            this.unsupportedNotices.set(noticeKey, { delivered: false, retryAt: Date.now() + 60_000 });
+            while (this.unsupportedNotices.size > 500) this.unsupportedNotices.delete(this.unsupportedNotices.keys().next().value!);
+            const url = safeElicitationUrl(params);
+            void this.options.onUnsupportedInteraction?.({ hostId, threadId, turnId, requestId, method,
+              ...(params.mode === "url" ? { reason: "authentication" as const, ...(url ? { safeUrl: url } : {}) }
+                : params.mode === "form" || params.mode === "openai/form" ? { reason: "schema-unsupported" as const } : {}) })
+              .then(delivered => { if (delivered !== false) this.unsupportedNotices.set(noticeKey, { delivered: true, retryAt: 0 }); })
+              .catch(() => { console.warn("[codex-im-gateway] unsupported Desktop interaction notice unconfirmed; retry pending"); });
           }
         }
         continue;
@@ -317,13 +328,13 @@ export class CodexDesktopRequestMonitor {
       const normalized = inputRequest ? { ...inputRequest, requestId, hostId }
         : { ...request, ...((request as CodexApprovalRequest).cwd || !cwd ? {} : { cwd }) };
       const previous = this.activeRequests.get(key);
-      if (previous && previous.method === method && JSON.stringify(previous.request) === JSON.stringify(normalized)) {
+      if (previous && previous.method === (form ? "item/tool/requestUserInput" : method) && JSON.stringify(previous.request) === JSON.stringify(normalized)) {
         if (fresh && this.retryReady.has(key)) this.dispatch(key, previous);
         continue;
       }
       if (previous) this.withdraw(key, previous);
       const approval: DesktopRequest = inputRequest
-        ? { hostId, requestId, method: "item/tool/requestUserInput", request: { ...inputRequest, requestId, hostId } }
+        ? { hostId, requestId, method: "item/tool/requestUserInput", request: { ...inputRequest, requestId, hostId }, ...(form ? { mcpForm: form } : {}) }
         : { hostId, requestId, method: method as AppServerApprovalMethod, request: normalized as CodexApprovalRequest };
       this.activeRequests.set(key, approval);
       this.dispatch(key, approval);
@@ -372,7 +383,12 @@ export class CodexDesktopRequestMonitor {
       }
       this.handledRequests.add(key);
       try {
-        if (approval.request.kind === "async") {
+        if (approval.mcpForm) {
+          await this.submitDecision("thread-follower-submit-mcp-server-elicitation-response", {
+            conversationId: approval.request.threadId, requestId: approval.requestId,
+            response: mcpFormResponse(approval.mcpForm, answers)
+          }, undefined, undefined, approval.hostId);
+        } else if (approval.request.kind === "async") {
           // Same structured question-reply envelope as the Desktop UI. This
           // endpoint cannot start a task. Legacy IPC v1 does NOT enforce a
           // caller's expectedTurnId, so check the native identity before sending

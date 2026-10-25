@@ -57,6 +57,7 @@ export function createChannelClient(channel: ChannelClient["channel"], capabilit
     && resultPages(input.completedCard.text, caps.resultPageBytes).length === 1
     && (driver.canCombineCompletionMentionCard?.(input) ?? true);
   return {
+    deliveryRouteStatus: recipientId => driver.deliveryRouteStatus?.(recipientId) ?? "available",
     channel, capabilities: caps, resumableTextStream: caps.resumableProgress, sendText, canCombineCompletionMentionCard,
     async sendMentionNotification(input) {
       requireFeature("mentions", caps.mentions ?? "unsupported");

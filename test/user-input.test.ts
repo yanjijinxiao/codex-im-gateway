@@ -73,6 +73,27 @@ test("literal numeric answer is not silently interpreted as an option", async t 
   assert.deepEqual(await selected, { "native-question": { answers: ["目录"] } });
 });
 
+test("typed form answers are validated while the same question remains actionable", async t => {
+  const f = fixture(t); const pending = f.controller.request("room", { ...request,
+    questions: [{ ...request.questions[0], valueSchema: { type: "integer", minimum: 1, maximum: 5 } }] });
+  assert.match(f.controller.answer("room", "Q1 99"), /未提交/);
+  assert.match(f.controller.answer("room", "Q1 1.2"), /未提交/);
+  f.controller.answer("room", "Q1 3");
+  assert.deepEqual(await pending, { "native-question": { answers: ["3"] } });
+});
+
+test("restart reconciles orphan questions without replaying an unknown native submission", async t => {
+  let valid = true; const f = fixture(t, { validate: () => valid });
+  const pending = f.controller.request("room", request); f.controller.close(); await pending;
+  const saved = JSON.parse(fs.readFileSync(f.filePath,"utf8"));
+  saved.records.push({ ...saved.records[0], id: "Q2", key: "unknown", status: "unconfirmed" });
+  fs.writeFileSync(f.filePath,JSON.stringify(saved)); valid = false;
+  const restored = f.create(); restored.suspendInvalidBindings();
+  const records = JSON.parse(fs.readFileSync(f.filePath,"utf8")).records;
+  assert.equal(records[0].status,"withdrawn"); assert.equal(records[1].status,"unconfirmed");
+  assert.ok(records.every((r: any) => r.bindingDetached)); assert.equal(f.cards.length,1);
+});
+
 test("wrong conversation or switched binding cannot answer or skip a question", async t => {
   let bound = true;
   const f = fixture(t, { validate: () => bound });

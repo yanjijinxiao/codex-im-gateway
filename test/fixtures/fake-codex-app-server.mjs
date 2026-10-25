@@ -164,7 +164,13 @@ rl.on("line", (line) => {
     pendingApprovals.delete(message.id);
     const decision = approval.kind === "permissions"
       ? (Object.keys(message.result?.permissions ?? {}).length ? "accept" : "decline")
-      : approval.kind === "mcp" ? message.result?.action : message.result?.decision;
+      : approval.kind.startsWith("mcp") ? message.result?.action : message.result?.decision;
+    if (approval.kind === "mcp-form") {
+      if (message.result?.content?.count !== 2 || message.result?.content?.enabled !== false) {
+        fail(message.id, "MCP form must preserve native number/boolean types"); return;
+      }
+      send({ method: "serverRequest/resolved", params: { threadId: approval.threadId, requestId: message.id } });
+    }
     const itemId = `item-${approval.turnId}`;
     send({
       method: "item/completed",
@@ -590,7 +596,7 @@ rl.on("line", (line) => {
     if (prompt === "delayed-turn-receipt") {
       setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 150);
     } else respond(message.id, { turn: completedTurn(turnId, "inProgress") });
-    if (["command", "file", "permissions", "mcp"].includes(approvalKind)) {
+    if (["command", "file", "permissions", "mcp", "mcp-form"].includes(approvalKind)) {
       const approvalId = `approval-${turnId}`;
       pendingApprovals.set(approvalId, {
         kind: approvalKind,
@@ -601,7 +607,7 @@ rl.on("line", (line) => {
         ? "item/commandExecution/requestApproval"
         : approvalKind === "file"
           ? "item/fileChange/requestApproval"
-          : approvalKind === "mcp" ? "mcpServer/elicitation/request" : "item/permissions/requestApproval";
+          : approvalKind.startsWith("mcp") ? "mcpServer/elicitation/request" : "item/permissions/requestApproval";
       send({
         id: approvalId,
         method,
@@ -616,7 +622,9 @@ rl.on("line", (line) => {
           grantRoot: approvalKind === "file" ? "/tmp/project" : null,
           permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined,
           ...(approvalKind === "mcp" ? { mode: "form", serverName: "browser", message: "fixture mcp approval",
-            requestedSchema: { type: "object", properties: {} } } : {})
+            requestedSchema: { type: "object", properties: {} } } : {}),
+          ...(approvalKind === "mcp-form" ? { mode: "openai/form", serverName: "tool", message: "fixture form",
+            requestedSchema: { type: "object", properties: { count: { type: "integer", minimum: 1, maximum: 5 }, enabled: { type: "boolean" } }, required: ["count", "enabled"] } } : {})
         }
       });
       return;

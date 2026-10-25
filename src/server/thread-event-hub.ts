@@ -191,6 +191,7 @@ export class ThreadEventHub {
     const state = this.states[key];
     const matching = sub && state && sub.hostId === state.hostId && sub.threadId === state.threadId ? state : undefined;
     let status: SessionFollowStatus["status"] = sub?.enabled === false || !sub ? "disabled" : matching?.syncStatus ?? "pending";
+    if (sub?.enabled !== false && matching?.runtime?.persistence === "archived") status = "suspended";
     if (status === "synced" && matching?.lastSyncedAt
       && Date.now() - Date.parse(matching.lastSyncedAt) > 60_000) status = "stale";
     const pending = (matching?.terminalPending ? 1 : 0) + Object.keys(matching?.pendingTerminals ?? {}).length
@@ -255,6 +256,9 @@ export class ThreadEventHub {
     const snapshots = new Map<string, Promise<CodexThreadSnapshot>>();
     await Promise.all(subscriptions.map(async (sub) => {
       if (!sub.threadId || typeof this.options.backend().readThreadSnapshot !== "function") return;
+      const prior = this.states[sub.key];
+      if (prior?.hostId === sub.hostId && prior.threadId === sub.threadId && prior.runtime?.persistence === "archived"
+        && prior.lastAttemptAt && Date.now() - Date.parse(prior.lastAttemptAt) < 5 * 60_000) return;
       const manual = this.manualSyncs.get(sub.key);
       if (manual) { await manual; return; }
       const key = JSON.stringify([sub.hostId, sub.threadId]);
@@ -416,7 +420,7 @@ export class ThreadEventHub {
     // A failed read is not a failed task. Update only an already-owned card.
     if (failure.code !== "presentation") void this.streams.get(sub.key)?.setActivity("unconfirmed").catch(report);
     const lastLog = this.errorLogTimes.get(sub.key) ?? 0;
-    if (changed || Date.now() - lastLog > 60_000) {
+    if (changed || Date.now() - lastLog > (state.runtime?.persistence === "archived" ? 5 * 60_000 : 60_000)) {
       this.errorLogTimes.set(sub.key, Date.now());
       console.warn(`[codex-im-gateway] thread follow sync ${JSON.stringify({
         timestamp: new Date().toISOString(), hostId: sub.hostId, threadId: sub.threadId,

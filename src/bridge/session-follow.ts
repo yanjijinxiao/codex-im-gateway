@@ -18,7 +18,7 @@ export type FollowSyncFailure = {
 };
 
 export type SessionFollowStatus = {
-  status: "disabled" | "pending" | "syncing" | "synced" | "stale" | "unconfirmed" | "failed";
+  status: "disabled" | "suspended" | "pending" | "syncing" | "synced" | "stale" | "unconfirmed" | "failed";
   lastAttemptAt?: string;
   lastSyncedAt?: string;
   snapshotAt?: string;
@@ -43,7 +43,7 @@ export function followSyncFailure(error: unknown): FollowSyncFailure {
 
 export function formatFollowStatus(state: SessionFollowStatus): string[] {
   const labels: Record<SessionFollowStatus["status"], string> = {
-    disabled: "已关闭", pending: "等待首次同步", syncing: "正在同步", synced: "同步成功",
+    disabled: "已关闭", suspended: "会话已归档，跟随暂停（绑定保留）", pending: "等待首次同步", syncing: "正在同步", synced: "同步成功",
     stale: "同步已过期", unconfirmed: "状态未确认", failed: "同步失败"
   };
   const time = (value: string) => new Date(value).toLocaleString("zh-CN", { hour12: false });

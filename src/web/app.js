@@ -663,11 +663,15 @@ function renderSessions() {
         <span class="session-binding-id">对话：${escapeHtml(session.senderId)}</span>
         <span class="session-binding-id">主机：${escapeHtml(session.binding?.hostId || session.hostId || "local")}</span>
         <span class="session-binding-id">Session：${escapeHtml(session.threadId || "尚未创建 Codex session")}</span>
+        ${session.binding?.nativeUnavailable ? `<span class="session-binding-id">原生会话已归档或不存在，交互暂停；绑定记录保留</span>`
+          : session.binding?.interaction ? `<span class="session-binding-id">提问入口：${session.binding.interaction.current ? "当前对话" : session.binding.interaction.destination ? "其他跟随对话" : "未确定或原入口失效"}</span>` : ""}
+        ${session.binding?.deliveryRoute === "unconfirmed" ? `<span class="session-binding-id">投递身份待确认：在此 IM 对话向机器人发消息后自动补齐</span>` : ""}
         ${renderBindingExpiry(session)}
         <span class="session-workspace" title="${escapeAttr(session.workspace)}">${escapeHtml(session.workspace)}</span>
         <span class="session-thread${session.responding ? " is-responding" : ""}">${session.responding ? "对方正在输入…" : session.threadId ? "已连接 Codex" : "等待首条消息"}</span>
       </button>
       <div class="session-actions">
+        ${session.binding?.bound && session.threadId && session.follow !== false && !session.binding.nativeUnavailable ? `<button class="button button-secondary" type="button" data-session-action="primary" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding.interaction?.current || session.binding.deliveryRoute === "unconfirmed" ? "disabled" : ""}>设为提问入口</button>` : ""}
         <button class="icon-button" type="button" data-session-action="activate" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.active ? "disabled" : ""} title="绑定到此记录的 IM 对话" aria-label="绑定到此记录的 IM 对话"><i data-lucide="circle-play"></i></button>
         <button class="button button-secondary session-unbind" type="button" data-session-action="unbind" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding?.bound ? "" : "disabled"} title="仅解除此 IM 对话的绑定，不删除或停止 Codex session"><i data-lucide="unlink"></i><span>解绑</span></button>
         <button class="icon-button" type="button" data-session-action="expiry" data-account-id="${escapeAttr(session.accountId)}" data-session-id="${escapeAttr(session.id)}" ${session.binding?.bound ? "" : "disabled"} title="自动解绑期限" aria-label="设置此 IM 对话的自动解绑期限"><i data-lucide="timer"></i></button>
@@ -1265,6 +1269,10 @@ async function handleSessionAction(event) {
   if (action === "expiry") return openBindingExpiryDialog(session);
   try {
     button.disabled = true;
+    if (action === "primary") {
+      await api(`/api/sessions/${encodeURIComponent(accountId)}/${encodeURIComponent(sessionId)}/interaction-primary`, { method: "POST" });
+      toast("已设置后续提问入口；已投递的问题仍归原对话，其他跟随不变。");
+    }
     if (action === "unbind") {
       const binding = session.binding;
       if (!binding?.bound) return;

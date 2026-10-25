@@ -214,6 +214,9 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
     return this.sendWebhookText(input);
   }
+  deliveryRouteStatus(recipientId: string): "available" | "unconfirmed" {
+    try { this.cardTarget(recipientId); return "available"; } catch { return "unconfirmed"; }
+  }
 
   async sendMedia(input: ChannelMediaInput): Promise<{ messageId: string }> {
     if (input.kind !== "file") throw new ChannelCapabilityError("dingtalk", `outbound.${input.kind}`, "not-implemented");

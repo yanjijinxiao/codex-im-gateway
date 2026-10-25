@@ -576,6 +576,15 @@ test("declines an app-server approval when the channel rejects it", async (t) =>
   assert.equal(result.text, "approval:command:decline");
 });
 
+test("App Server and Desktop share the typed MCP form mapping and native resolution receipts", async t => {
+  const runner = new AppServerCodexRunner({ codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"), requestTimeoutMs: 2000 });
+  t.after(() => runner.close()); const receipts: string[] = [];
+  const result = await runner.run({ prompt: "approval:mcp-form", cwd: "/tmp/project", onApproval: () => { throw Error("not an approval"); },
+    onUserInput: async request => { assert.equal(request.questions[0].valueSchema?.type, "integer"); return { count: { answers: ["2"] }, enabled: { answers: ["false"] } }; },
+    onUserInputResult: (_request, result) => { receipts.push(result); } });
+  assert.equal(result.text, "approval:mcp-form:accept"); assert.deepEqual(receipts, ["confirmed"]);
+});
+
 test("interrupts the active V2 turn with both threadId and turnId", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

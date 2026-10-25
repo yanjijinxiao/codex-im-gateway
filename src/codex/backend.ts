@@ -249,6 +249,7 @@ export type CodexDynamicToolCall = {
 export type CodexDynamicToolHandler = (call: CodexDynamicToolCall) => Promise<string>;
 
 export type CodexUserInputQuestion = {
+  valueSchema?: import("./elicitation.js").ElicitationField;
   header: string;
   id: string;
   question: string;

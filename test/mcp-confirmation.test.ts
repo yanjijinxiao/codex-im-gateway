@@ -13,13 +13,13 @@ test("empty MCP confirmation has an explicit once-only approval result, not pers
   assert.equal(request.serverName, "browser-use");
   assert.deepEqual(appServerApprovalResult(method, request, "accept"), { action: "accept", content: {}, _meta: null });
   assert.deepEqual(appServerApprovalResult(method, request, "decline"), { action: "decline", content: null, _meta: null });
+  assert.equal(parseAppServerApproval(method, { ...confirmation, mode: "openai/form" })?.kind, "mcp");
 });
 
 test("MCP input forms, security challenges and unsupported schema constraints never become approve buttons", () => {
   for (const override of [
     { mode: "url", url: "https://example.com/auth?secret=do-not-forward" },
     { mode: "openai/userVerification", challenge: "do-not-forward" },
-    { mode: "openai/form" },
     { requestedSchema: { type: "object", properties: { password: { type: "string" } } } },
     { requestedSchema: { type: "object", properties: {}, required: ["approved"] } },
     { requestedSchema: { type: "object", properties: {}, minProperties: 1 } },

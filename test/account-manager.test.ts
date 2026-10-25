@@ -855,6 +855,23 @@ test("selecting a primary cannot reactivate a switched binding or disable anothe
   await f.manager.stopAll();
 });
 
+test("reset reconciles a stale primary and only a newly accepted IM origin can replace it", async t => {
+  const f = setup(t), one = seedApprovalBinding(f.paths,"account-one","one-room");
+  const two = seedApprovalBinding(f.paths,"account-two","two-room");
+  await f.manager.startAll(); f.manager.setSessionInteractionPrimary("account-one",one.id);
+  f.manager.resetSession("account-one",one.id);
+  assert.equal(f.manager.getSessionInteractionRoute("account-two",two.id).status,"unavailable");
+  const disk = JSON.parse(fs.readFileSync(path.join(f.paths.runtimeDir,"interaction-routing.json"),"utf8"));
+  assert.equal(Object.values(disk.primary).some((x: any) => x.inactive),true);
+  f.setRunHandler(async input => {
+    await (input.onTurnStarted as (r: {threadId:string;turnId:string})=>void)({threadId:"bound-approval-thread",turnId:"new-origin"});
+    return {raw:"",text:"done",threadId:"bound-approval-thread",turnId:"new-origin"};
+  });
+  await f.manager.continueSession("account-two",two.id,"new input");
+  assert.equal(f.manager.getSessionInteractionRoute("account-two",two.id).current,true);
+  await f.manager.stopAll();
+});
+
 test("an already persisted question destination is not changed by a new primary", async t => {
   const f = setup(t); seedApprovalBinding(f.paths, "account-one", "one-room");
   const two = seedApprovalBinding(f.paths, "account-two", "two-room");

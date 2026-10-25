@@ -16,8 +16,11 @@ export type SessionInteractionPort = {
   status(session: ManagedSession): InteractionRouteStatus;
   setPrimary(session: ManagedSession): InteractionRouteStatus;
 };
-type Journal = { version: 1; primary: Record<string, { destination: InteractionDestination; explicit: boolean }>;
-  origins: Record<string, InteractionDestination>; routeNotices?: Record<string, number> };
+type NoticeReceipt = { state: "sending" | "delivered" | "unconfirmed"; attempts: number; at: number };
+type Journal = { version: 1; primary: Record<string, { destination: InteractionDestination; explicit: boolean; inactive?: boolean }>;
+  origins: Record<string, InteractionDestination>; routeNotices?: Record<string, number | NoticeReceipt>;
+  unsupported?: Array<{ hostId: string; threadId: string; turnId: string; requestId: string | number;
+    method: string; reason: string; delivered: boolean; at: number }> };
 const scope = (hostId: string, threadId: string) => JSON.stringify([hostId, threadId]);
 const turnScope = (hostId: string, threadId: string, turnId: string) => JSON.stringify([hostId, threadId, turnId]);
 const same = (a: InteractionDestination, b: InteractionDestination) =>
@@ -37,6 +40,18 @@ export class InteractionRoutingJournal {
     this.state.primary[scope(destination.hostId, destination.threadId)] = { destination: { ...destination }, explicit: true };
     this.save();
   }
+  /** Reconcile only configured accounts, never transport availability. A
+   * reconnect must not revoke ownership. Keep invalid owners as tombstones so
+   * an outstanding request can never drift to another chat. */
+  reconcileBindings(bindings: readonly InteractionDestination[], accountIds: readonly string[]): void {
+    let changed = false;
+    for (const primary of Object.values(this.state.primary)) {
+      if (!accountIds.includes(primary.destination.accountId)) continue;
+      const inactive = !bindings.some(binding => same(binding, primary.destination));
+      if (inactive !== Boolean(primary.inactive)) { primary.inactive = inactive; changed = true; }
+    }
+    if (changed) this.save();
+  }
   rememberTurn(destination: InteractionDestination, turnId: string): void {
     this.retainTurn(destination, turnId, true);
   }
@@ -53,7 +68,7 @@ export class InteractionRoutingJournal {
     // future App turns, not an already-delivered question or approval.
     this.state.origins[key] ??= { ...destination };
     const primaryKey = scope(destination.hostId, destination.threadId);
-    if (!this.state.primary[primaryKey] || promoteDefault && !this.state.primary[primaryKey].explicit) {
+    if (!this.state.primary[primaryKey] || promoteDefault && (!this.state.primary[primaryKey].explicit || this.state.primary[primaryKey].inactive)) {
       this.state.primary[primaryKey] = { destination: { ...destination }, explicit: false };
     }
     while (Object.keys(this.state.origins).length > 2_000) delete this.state.origins[Object.keys(this.state.origins)[0]];
@@ -74,17 +89,37 @@ export class InteractionRoutingJournal {
     return count === 1 ? { status: "unique", bindingCount: count, current: false, destination: { ...candidates[0] } }
       : { status: count ? "ambiguous" : "unavailable", bindingCount: count, current: false };
   }
-  /** Claim before sending: an unknown notification receipt must not cause spam. */
+  /** Bounded retries concern neutral configuration notices, NEVER questions,
+   * answers or approval decisions. Legacy claims had no delivery receipt. */
   claimRouteNotice(destination: InteractionDestination, status: "ambiguous" | "unavailable"): boolean {
     const key = JSON.stringify([destination.accountId, destination.sessionId, destination.recipientId,
       destination.hostId, destination.threadId, status]);
     const notices = this.state.routeNotices ??= {};
-    if (Object.hasOwn(notices, key)) return false;
-    notices[key] = Date.now();
+    const prior = notices[key], now = Date.now();
+    if (typeof prior === "object" && (prior.state === "delivered" || prior.attempts >= 3
+      || now - prior.at < 60_000)) return false;
+    notices[key] = { state: "sending", attempts: typeof prior === "object" ? prior.attempts + 1 : 1, at: now };
     while (Object.keys(notices).length > 1_000) delete notices[Object.keys(notices)[0]];
     this.save();
     return true;
   }
+  reportRouteNotice(destination: InteractionDestination, status: "ambiguous" | "unavailable", delivered: boolean): void {
+    const key = JSON.stringify([destination.accountId, destination.sessionId, destination.recipientId,
+      destination.hostId, destination.threadId, status]);
+    const receipt = this.state.routeNotices?.[key];
+    if (receipt && typeof receipt === "object") { receipt.state = delivered ? "delivered" : "unconfirmed"; this.save(); }
+  }
+  recordUnsupported(input: { hostId: string; threadId: string; turnId: string; requestId: string | number; method: string; reason?: string }, delivered = false): void {
+    const records = this.state.unsupported ??= [];
+    const existing = records.find(r => r.hostId === input.hostId && r.threadId === input.threadId
+      && r.turnId === input.turnId && r.requestId === input.requestId);
+    if (existing) { existing.delivered ||= delivered; existing.at = Date.now(); }
+    else records.push({ hostId: input.hostId, threadId: input.threadId, turnId: input.turnId, requestId: input.requestId,
+      method: /^[A-Za-z0-9_\/-]{1,120}$/.test(input.method) ? input.method : "unknown",
+      reason: ["authentication", "schema-unsupported"].includes(input.reason ?? "") ? input.reason! : "request-unsupported", delivered, at: Date.now() });
+    this.state.unsupported = records.slice(-200); this.save();
+  }
+  diagnostics(): NonNullable<Journal["unsupported"]> { return structuredClone(this.state.unsupported ?? []); }
   private save(): void {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     const temporary = `${this.filePath}.${process.pid}.tmp`;

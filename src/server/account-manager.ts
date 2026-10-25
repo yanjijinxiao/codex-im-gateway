@@ -146,7 +146,8 @@ export type AccountSession = ManagedSession & {
   accountId: string;
   active: boolean;
   responding: boolean;
-  binding: SessionBindingTarget & { bound: boolean; expiry?: BindingExpiry };
+  binding: SessionBindingTarget & { bound: boolean; expiry?: BindingExpiry;
+    interaction?: InteractionRouteStatus; deliveryRoute?: "available" | "unconfirmed"; nativeUnavailable?: boolean };
 };
 
 export type AccountProject = ManagedProject & {
@@ -689,6 +690,8 @@ export class AccountManager {
       });
     }
     this.entries.delete(account.accountId);
+    this.interactionRouting.reconcileBindings([], [account.accountId]);
+    this.refreshDesktopRequestSubscriptions();
   }
 
   updateAccount(accountId: string, patch: AccountSettingsPatch): AccountSummary {
@@ -1101,6 +1104,12 @@ export class AccountManager {
     const session = requireSession(this.storeFor(accountId), sessionId);
     if (!session.threadId || !this.threadSubscriptions().some(binding => binding.enabled
       && binding.key === JSON.stringify([accountId, sessionId]))) throw new Error("请选择当前启用跟随的会话绑定，再设置主交互对话。");
+    if (["archived", "missing"].includes(this.threadEvents.status(JSON.stringify([accountId, sessionId])).runtime?.persistence ?? "")) {
+      throw new Error("原生会话已归档或不存在，不能设为提问入口；绑定记录仍保留。");
+    }
+    if (this.entries.get(accountId)?.client?.deliveryRouteStatus?.(session.senderId) === "unconfirmed") {
+      throw new Error("此 IM 对话的投递身份尚未核验，请先在该对话向机器人发送消息，再设为提问入口。");
+    }
     this.interactionRouting.setPrimary(this.interactionDestination(accountId, session));
     this.refreshDesktopRequestSubscriptions();
     return this.getSessionInteractionRoute(accountId, sessionId);
@@ -1447,6 +1456,9 @@ export class AccountManager {
       active,
       responding: this.isSessionResponding(accountId, session.id),
       binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active,
+        ...(active && session.threadId ? { interaction: this.getSessionInteractionRoute(accountId, session.id),
+          deliveryRoute: this.entries.get(accountId)?.client?.deliveryRouteStatus?.(session.senderId),
+          nativeUnavailable: ["archived", "missing"].includes(this.threadEvents.status(JSON.stringify([accountId, session.id])).runtime?.persistence ?? "") } : {}),
         ...((active || expiry?.endedSessionId === session.id) ? { expiry } : {}) }
     };
   }
@@ -1592,7 +1604,8 @@ export class AccountManager {
 
   private ensureCodexDesktopRequestMonitor(): void {
     if (this.configProvider().codexBackend === "exec") return;
-    if (this.codexDesktopRequestMonitor || !this.hasManagedProjects()) return;
+    if (this.codexDesktopRequestMonitor || !this.hasManagedProjects()
+      && !this.threadSubscriptions().some(binding => binding.enabled && binding.threadId)) return;
     this.codexDesktopRequestMonitor = this.codexDesktopRequestMonitorFactory({
       onApproval: (approval) => this.handleDesktopApproval(approval),
       onResult: (approval, result) => this.reportDesktopApprovalResult(approval, result),
@@ -1602,13 +1615,18 @@ export class AccountManager {
         await Promise.all([...this.entries.values()].map(entry => entry.service?.observeNativeUserInputAnswers?.(receipts)));
       },
       onUnsupportedInteraction: async input => {
+        this.interactionRouting.recordUnsupported(input);
         const binding = this.interactionBinding(input.threadId, input.turnId, input.hostId);
-        if (!binding) { await this.notifyInteractionRouteConflict(input.hostId, input.threadId, input.turnId); return; }
+        if (!binding) { await this.notifyInteractionRouteConflict(input.hostId, input.threadId, input.turnId); return false; }
         // Deliberately omit native payloads: these may contain an OAuth URL,
         // verification challenge or credentials that must not enter an IM group.
-        const text = "当前任务正在等待工具或浏览器确认。此请求需要在 Codex Desktop 中处理，暂不能通过 IM 回答；Gateway 未代为批准，任务尚未完成。";
+        const text = input.reason === "authentication"
+          ? `当前任务等待安全认证。${input.safeUrl ? `可在浏览器打开认证页面：${input.safeUrl}` : "原请求包含认证链接或验证信息，未将它发布到群聊；请从原工具提供的安全页面完成验证。"} 不需要把密码或验证码发到 IM；打开页面不等于批准或完成认证。`
+          : "当前任务有待处理的原生交互，但该请求格式暂不能通过 IM 回答。Gateway 未代为批准，任务尚未完成；已记录脱敏的不支持类型，不能将它当作普通聊天忽略。";
         const sent = await binding.client.sendText({ toUserId: binding.recipientId, text, contextToken: binding.contextToken });
         binding.onTextDelivered?.({ messageId: sent.messageId, text });
+        this.interactionRouting.recordUnsupported(input, true);
+        return true;
       }
     });
     this.codexDesktopRequestMonitor.start();
@@ -1617,6 +1635,10 @@ export class AccountManager {
 
   private refreshDesktopRequestSubscriptions(): void {
     for (const entry of this.entries.values()) entry.service?.reconcileUserInputs?.();
+    const configured = [...this.entries].flatMap(([accountId, entry]) => (loadAccount(this.options.paths, accountId).enabled === false ? [] : entry.store?.listSessions()
+      .filter(session => entry.store!.getBoundSession(session.senderId)?.id === session.id && session.follow !== false && session.threadId)
+      .map(session => this.interactionDestination(accountId, session)) ?? []));
+    this.interactionRouting.reconcileBindings(configured, [...this.entries].filter(([, entry]) => entry.store).map(([id]) => id));
     const monitor = this.codexDesktopRequestMonitor;
     if (!monitor) return;
     const threadIds = this.threadSubscriptions()
@@ -1630,6 +1652,12 @@ export class AccountManager {
       }
     }
     monitor.setFollowedThreads(threadIds);
+  }
+  interactionHealth() {
+    const bindings = this.listSessions().filter(session => session.active).map(session => ({
+      accountId: session.accountId, sessionId: session.id, title: session.title, binding: session.binding
+    }));
+    return { bindings, unsupported: this.interactionRouting.diagnostics() };
   }
 
   private hasLocalThreadBinding(threadId: string): boolean {
@@ -1647,7 +1675,8 @@ export class AccountManager {
   }
 
   private interactionDestinations(): InteractionDestination[] {
-    return this.threadSubscriptions().filter(binding => binding.enabled).map(binding => {
+    return this.threadSubscriptions().filter(binding => binding.enabled
+      && !["archived", "missing"].includes(this.threadEvents.status(binding.key).runtime?.persistence ?? "")).map(binding => {
       const [accountId, sessionId] = JSON.parse(binding.key) as [string, string];
       return { accountId, sessionId, recipientId: binding.recipientId, hostId: binding.hostId, threadId: binding.threadId };
     });
@@ -1699,17 +1728,18 @@ export class AccountManager {
       if (!this.threadSubscriptions().some(current => current.enabled && current.key === binding.key
         && current.hostId === hostId && current.threadId === threadId && current.recipientId === binding.recipientId)) return;
       const text = status.status === "ambiguous"
-        ? "当前绑定的 Codex 会话有待处理交互，但多个对话跟随且未确定主交互对话，题目未投递。请控制者在希望接收题目的对话发送 /follow primary；仍待回答的问题会重新核对后投递。未代答、未启动或停止任务。"
-        : "当前绑定的 Codex 会话有待处理交互，但原交互目标不可用，未转发题目或改投其他对话。请在 Codex App 处理原问题；控制者可用 /follow primary 设置后续轮次的主交互对话。";
+        ? "当前绑定的 Codex 会话有待处理交互，但多个对话跟随且未确定主交互对话，题目未投递。控制者可在希望接收题目的对话设置主入口；仍待回答的问题会重新核对后投递。未代答、未启动或停止任务。\n\n```text\n/follow primary\n```"
+        : "当前绑定的 Codex 会话有待处理交互，但原交互目标已解绑或切换，题目尚未投递，未改投其他对话。控制者可在目标对话设置主交互；只有仍有效且尚未归属其他对话的请求才会恢复投递。\n\n```text\n/follow primary\n```";
       try {
         // This is a neutral configuration notice, never a broadcast of the
         // native question/choices. Prefer plain text, not another progress card.
-        const send = binding.client.sendProgressText
-          ?? (binding.client.capabilities?.progress !== "available" ? binding.client.sendText : undefined);
-        if (!send) throw new Error("Plain interaction notice is unavailable");
-        const sent = await send.call(binding.client, { toUserId: binding.recipientId, text, contextToken: binding.contextToken });
+        const sent = await binding.client.sendText({ toUserId: binding.recipientId, text, contextToken: binding.contextToken });
+        this.interactionRouting.reportRouteNotice(destination, status.status as "ambiguous" | "unavailable", true);
         binding.onTextDelivered?.({ messageId: sent.messageId, text });
-      } catch { console.warn("[codex-im-gateway] interaction route notice unconfirmed; not automatically resent"); }
+      } catch {
+        this.interactionRouting.reportRouteNotice(destination, status.status as "ambiguous" | "unavailable", false);
+        console.warn("[codex-im-gateway] interaction route notice unconfirmed; bounded neutral-notice retry pending");
+      }
     }));
   }
 

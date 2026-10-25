@@ -106,6 +106,29 @@ test("unsupported native confirmations produce one neutral notice without exposi
   assert.deepEqual(notices, [{ hostId: "local", threadId: "thread", turnId: "turn", requestId: "auth", method: request.method }]);
   assert.equal(f.writes().length, 0);
 });
+
+test("Desktop typed MCP forms return exact JSON only after IM answers and native acknowledgement", async t => {
+  const f = await fixture(t, { onUserInput: async input => {
+    assert.ok(input.mcpForm); return { count: { answers: ["2"] }, enabled: { answers: ["false"] } };
+  } });
+  f.snapshot({ requests: [{ id: "form", method: "mcpServer/elicitation/request", params: {
+    threadId: "thread", serverName: "tool", mode: "openai/form", message: "Settings",
+    requestedSchema: { type: "object", properties: { count: { type: "integer", minimum: 1 }, enabled: { type: "boolean" } }, required: ["count", "enabled"] }
+  } }] });
+  await waitFor(() => f.writes().length === 1);
+  assert.deepEqual(f.writes()[0].params, { conversationId: "thread", requestId: "form",
+    response: { action: "accept", content: { count: 2, enabled: false }, _meta: null } });
+  assert.deepEqual(f.results, []); f.respond({ ok: true }); await waitFor(() => f.results.includes("confirmed"));
+});
+
+test("unknown native human requests notify IM without leaking their payload; protocol requests do not", async t => {
+  const notices: any[] = []; const f = await fixture(t, { onUnsupportedInteraction: async n => { notices.push(n); } });
+  f.snapshot({ requests: [{ id: "x", method: "future/interaction", params: { secret: "PRIVATE" } },
+    { id: "clock", method: "currentTime/read", params: {} }] });
+  await waitFor(() => notices.length === 1);
+  assert.equal(notices[0].method, "future/interaction"); assert.doesNotMatch(JSON.stringify(notices), /PRIVATE/);
+  assert.equal(f.writes().length, 0);
+});
 const asyncTurn = { turnId: "turn", status: "inProgress", items: [{ type: "agentMessage", id: "call",
   questions: [{ title: "farming 在哪里？" }] }] };
 function asyncState(canonical = false) {

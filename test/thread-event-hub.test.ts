@@ -85,6 +85,7 @@ for (const unavailable of ["archived", "missing", "systemError", "absent-history
     await hub.activity("local", "thread", "turn", "正常进展");
     const count = writes.length;
     await hub.refresh(); await hub.synchronize("binding");
+    if (unavailable === "archived") assert.equal(hub.status("binding").status,"suspended");
     assert.equal(writes.length, count);
     assert.equal(hub.status("binding").resultDelivery?.pending, 0);
     assert.equal(hub.status("binding").resultDelivery?.lastDeliveredTurnId, undefined);

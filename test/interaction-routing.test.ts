@@ -57,10 +57,36 @@ test("a late interaction from an older turn cannot replace the latest accepted d
 test("neutral route-conflict notices are claimed once per exact binding across restarts", t => {
   const f = fixture(t);
   assert.equal(f.journal.claimRouteNotice(first, "ambiguous"), true);
+  f.journal.reportRouteNotice(first, "ambiguous", true);
   assert.equal(f.restart().claimRouteNotice(first, "ambiguous"), false);
   assert.equal(f.restart().claimRouteNotice(second, "ambiguous"), true);
   assert.equal(f.restart().claimRouteNotice({ ...first, hostId: "remote" }, "ambiguous"), true);
   assert.equal(f.restart().claimRouteNotice(first, "unavailable"), true);
   const saved = fs.readFileSync(f.filePath, "utf8");
   assert.doesNotMatch(saved, /question|answer|token/i);
+});
+
+test("binding reconciliation tombstones a stale primary; only a newly accepted IM turn establishes its replacement", t => {
+  const f = fixture(t); f.journal.setPrimary(first); f.journal.rememberTurn(first, "old");
+  f.journal.reconcileBindings([second], ["one", "two"]);
+  assert.equal(f.restart().resolve("local", "thread", [second], "future").status, "unavailable");
+  f.journal.rememberTurn(second, "new");
+  assert.deepEqual(f.restart().resolve("local", "thread", [second], "future").destination, second);
+  assert.equal(f.restart().resolve("local", "thread", [second], "old").status, "unavailable");
+});
+
+test("reconnecting another account cannot invalidate an unavailable account primary", t => {
+  const f = fixture(t); f.journal.setPrimary(first);
+  f.journal.reconcileBindings([second], ["two"]);
+  f.journal.rememberTurn(second, "new");
+  assert.deepEqual(f.restart().resolve("local", "thread", [first, second], "future").destination, first);
+});
+
+test("legacy notice claims are upgraded to receipt tracking, not permanent successful delivery", t => {
+  const f = fixture(t);
+  const key = JSON.stringify([first.accountId,first.sessionId,first.recipientId,first.hostId,first.threadId,"unavailable"]);
+  fs.writeFileSync(f.filePath, JSON.stringify({ version: 1, primary: {}, origins: {}, routeNotices: { [key]: 1 } }));
+  const restored = f.restart(); assert.equal(restored.claimRouteNotice(first,"unavailable"),true);
+  restored.reportRouteNotice(first,"unavailable",false);
+  assert.equal(f.restart().claimRouteNotice(first,"unavailable"),false,"backoff prevents snapshot spam");
 });

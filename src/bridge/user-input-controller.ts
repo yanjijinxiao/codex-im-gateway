@@ -7,6 +7,7 @@ import { copyBlock } from "../channels/copyable.js";
 import type { ChannelMention, ChannelReceipt } from "../channels/types.js";
 import { isDirectedMentionId } from "../channels/mentions.js";
 import { asyncAnswerDigest, type NativeAsyncAnswerReceipt } from "../codex/async-user-input.js";
+import { elicitationValue } from "../codex/elicitation.js";
 import { ChannelPartialDeliveryError, channelProgressError } from "../channels/errors.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import type { TurnParticipantOrigin } from "./turn-audience.js";
@@ -24,6 +25,7 @@ type QuestionRecord = {
   origin?: TurnParticipantOrigin;
   /** Frozen turn participants, distinct from the eventual answer author. */
   mentions?: ChannelMention[];
+  bindingDetached?: boolean;
 };
 type Waiter = { resolve: (answer: string | undefined) => void; timer?: NodeJS.Timeout };
 const MAX_RESOLUTION_CARD_ATTEMPTS = 3;
@@ -101,6 +103,11 @@ export class ChannelUserInputController {
         this.state.records.push(record); this.save();
       }
       record.kind ??= request.kind;
+      // Called only for a currently observed native request. Restoring the
+      // exact edge may reattach its unsent waiter, never replay an answer.
+      if (record.status === "withdrawn" && record.bindingDetached && this.matchesBinding(senderId, record)) {
+        record.status = "pending"; delete record.bindingDetached; this.save();
+      }
       if (!["pending", "answered"].includes(record.status)) return undefined;
       if (record.status === "pending") {
         if (!this.matchesBinding(senderId, record)) return undefined;
@@ -133,6 +140,10 @@ export class ChannelUserInputController {
     const selected = /^--option\s+(\d+)$/i.exec(raw);
     const answer = selected ? record.question.options?.[Number(selected[1]) - 1]?.label : raw;
     if (!answer || answer.length > 2_000) return selected ? "选项不存在，请使用问题中的选项编号。" : "回答不能为空，且不能超过 2000 字符。";
+    if (record.question.valueSchema) {
+      try { elicitationValue(record.question.valueSchema, answer); }
+      catch (error) { return `${error instanceof Error ? error.message : "表单值无效"}；未提交，请重新回答当前问题。`; }
+    }
     this.settle(record, answer, origin);
     return `已记录问题 ${record.id} 的回答；是否生效以 Codex 接收回执为准。`;
   }
@@ -210,6 +221,7 @@ export class ChannelUserInputController {
         continue;
       }
       if (result === "suspended") { this.release(record.id); this.releaseAudience(record.id); continue; }
+      if (result === "withdrawn") delete record.bindingDetached;
       if (result === "confirmed") record.presentation ??= {
         id: `answer:${crypto.createHash("sha256").update(record.requestKey).digest("hex")}`,
         kind: "answer", hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, acceptedAt: Date.now(),
@@ -328,8 +340,18 @@ export class ChannelUserInputController {
   }
   suspendInvalidBindings(): void {
     if (!this.options.validate) return;
-    for (const record of this.state.records) if (this.waiters.has(record.id)
-      && !this.options.validate(record.senderId, record)) this.release(record.id);
+    let changed = false;
+    for (const record of this.state.records) if (!this.options.validate(record.senderId, record)
+      && !record.bindingDetached && ["pending", "answered", "submitting", "unconfirmed"].includes(record.status)) {
+      record.bindingDetached = true; changed = true;
+    }
+    for (const record of this.state.records) if (!this.options.validate(record.senderId, record)
+      && ["pending", "answered"].includes(record.status)) {
+      record.status = "withdrawn"; delete record.answer; this.release(record.id); changed = true;
+    }
+    // Preserve unknown native submissions as unknown; never resend or falsely
+    // label them rejected just because the IM binding changed.
+    if (changed) this.save();
     for (const record of this.state.records) if (!this.options.validate(record.senderId, record)) this.releaseAudience(record.id);
     this.scheduleResolutionRetry();
   }

@@ -48,7 +48,7 @@ export function parseAppServerApproval(
     const schema = recordValue(params.requestedSchema), properties = recordValue(schema?.properties);
     const meta = recordValue(params._meta);
     const serverName = stringValue(params.serverName), message = stringValue(params.message);
-    if (params.mode !== "form" || !serverName || serverName.length > 200 || !message || message.length > 1_200
+    if (!["form", "openai/form"].includes(String(params.mode)) || !serverName || serverName.length > 200 || !message || message.length > 1_200
       || params._meta !== undefined && params._meta !== null && !meta || !schema || schema.type !== "object"
       || !properties || Object.keys(properties).length !== 0
       || (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.length !== 0))
@@ -64,6 +64,8 @@ export function parseAppServerApproval(
   const reason = stringValue(params.reason);
   const grantRoot = stringValue(params.grantRoot);
   const permissions = recordValue(params.permissions);
+  if (params.availableDecisions !== undefined && (!Array.isArray(params.availableDecisions)
+    || !params.availableDecisions.includes("accept") || !params.availableDecisions.includes("decline"))) return undefined;
   return {
     kind: method === "item/commandExecution/requestApproval"
       ? "command"
