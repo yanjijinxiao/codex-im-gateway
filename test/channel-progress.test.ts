@@ -8,6 +8,26 @@ import { summarizeProgress } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("presentation correction waits for old progress frames and never claims a native outcome", async t => {
+  let release!: () => void;
+  const frames: Array<{ text: string; finalize?: boolean }> = [];
+  let checkpoint: ReturnType<ChannelTurnTextStream["checkpoint"]> | undefined;
+  const stream = new ChannelTurnTextStream({ resumableTextStream: true,
+    async sendText() { throw Error("no new message"); }, async startTextStream() { throw Error("no new card"); },
+    async updateTextStream(input) { frames.push(input); if (!input.finalize) await new Promise<void>(resolve => { release = resolve; }); }
+  }, "chat", { restore: { streamId: "known", messageId: "known-card", startedAt: 1, progressEntries: [], thought: "", answerPreview: "", finished: false },
+    save(value) { checkpoint = value; } });
+  t.after(() => stream.suspend());
+  const update = stream.synchronize();
+  while (!release) await settle();
+  const correction = stream.invalidatePresentation("该卡来自已经结束的历史记录，本次没有启动任务。");
+  await settle(); assert.equal(frames.length, 1);
+  release(); await update; assert.equal(await correction, true);
+  assert.equal(frames.length, 2); assert.equal(frames[1].finalize, true); assert.match(frames[1].text, /状态已纠正/);
+  assert.equal(checkpoint?.terminal, undefined); assert.equal(checkpoint?.presentationCorrection?.delivered, true);
+  await stream.progress("late old progress"); assert.equal(frames.length, 2);
+});
+
 test("legacy page layouts retain activity metadata and update waiting/running text on the same card", async t => {
   const frames: any[] = [];
   const client = createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available",

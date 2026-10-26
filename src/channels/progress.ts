@@ -27,6 +27,8 @@ export type ChannelStreamCheckpoint = {
   communicationNotice?: string;
   /** Native execution recovery, independent of transport/delivery retry. */
   recoveryNotice?: string;
+  /** Correction of an invalid progress projection, never a native outcome. */
+  presentationCorrection?: { text: string; delivered: boolean };
   toolActivity?: { completed: number; failed: number; active?: string; last?: string };
   /** Terminal delivery may be retried, but progress must never resume. */
   terminal?: { text: string; error: boolean; outcome?: TurnOutcome };
@@ -60,6 +62,7 @@ export class ChannelTurnTextStream {
   private retryAt = 0;
   private suspended = false;
   private terminal?: ChannelStreamCheckpoint["terminal"];
+  private presentationCorrection?: ChannelStreamCheckpoint["presentationCorrection"];
   private readonly statusHeader: boolean;
   /** Native loading is a transport capability, not a Markdown layout choice.
    * Restored pre-header page plans must still receive trusted activity. */
@@ -132,6 +135,7 @@ export class ChannelTurnTextStream {
       this.finished = saved.finished;
       this.communicationNotice = saved.communicationNotice;
       this.recoveryNotice = saved.recoveryNotice;
+      this.presentationCorrection = saved.presentationCorrection;
       this.terminal = saved.terminal;
       this.activity = saved.activity ?? "running";
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
@@ -149,6 +153,7 @@ export class ChannelTurnTextStream {
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
+      ...(this.presentationCorrection ? { presentationCorrection: { ...this.presentationCorrection } } : {}),
       ...(this.statusHeader ? { statusHeader: true as const } : {}),
       ...(this.activityMetadata ? { activity: this.activity } : {}),
       toolActivity: { ...this.toolActivity },
@@ -379,6 +384,28 @@ export class ChannelTurnTextStream {
 
   async fail(text: string, outcome: "failed" | "interrupted" = "failed"): Promise<boolean> {
     return this.finalize(text, true, { outcome });
+  }
+
+  /** Correct a proved-invalid existing card, without making a native terminal
+   * receipt, creating another card, or offering execution controls. */
+  async invalidatePresentation(text: string): Promise<boolean> {
+    if (this.suspended || this.terminal || !this.messageId || !this.client.updateTextStream
+      || this.finished && !this.presentationCorrection) return false;
+    this.presentationCorrection ??= { text: `状态已纠正\n\n${text}`, delivered: false };
+    if (this.presentationCorrection.delivered) return true;
+    this.finished = true;
+    this.stopTimers();
+    this.persistence?.save(this.checkpoint());
+    try {
+      await this.opening;
+      await this.chain.catch(() => undefined);
+      if (this.suspended) return false;
+      await this.client.updateTextStream({ toUserId: this.toUserId, messageId: this.messageId,
+        text: this.presentationCorrection.text, finalize: true });
+      this.presentationCorrection.delivered = true;
+      this.persistence?.save(this.checkpoint());
+      return true;
+    } catch { return false; }
   }
 
   /** Status-only observations may update an existing card, never create a placeholder. */

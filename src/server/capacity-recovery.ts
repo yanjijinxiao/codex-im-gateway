@@ -25,6 +25,7 @@ type Options = {
   eligible: (scope: CapacityFailure) => boolean;
   notice: (scope: CapacityFailure, text: string) => Promise<void>;
   accepted: (scope: CapacityFailure, turnId: string) => Promise<void>;
+  retireProjection?: (scope: CapacityFailure, text: string) => Promise<void>;
   progress: (scope: CapacityFailure, text: string) => Promise<void>;
   terminal: (scope: CapacityFailure, text: string, outcome?: "completed" | "failed" | "interrupted") => Promise<void>;
   handlers?: (scope: CapacityFailure) => Pick<CodexCapacityResumeInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult">;
@@ -75,12 +76,9 @@ export class CapacityRecoveryCoordinator {
     }
     this.reconcileUncertain();
     for (const record of Object.values(this.records)) {
-      void (async () => {
-        for (let i = 1; i < record.turns.length; i++) {
-          await this.options.accepted({ ...record, turnId: record.turns[i - 1] }, record.turns[i]);
-        }
-        if (record.status === "uncertain") this.announce(record, "重启前的自动恢复接收或执行结果尚未确认。保留原卡并只读核对，不重复提交；可用 /status、/history 查看。");
-      })().catch(() => console.warn("[codex-im-gateway] capacity recovery projection pending"));
+      // A saved historical acceptance is not a new native start receipt.
+      // Terminal records must never replay accepted() and reopen old cards.
+      if (["finished", "cancelled"].includes(record.status)) void this.retireEndedProjection(record);
       if (record.status === "waiting") this.schedule(record);
     }
   }
@@ -225,6 +223,15 @@ export class CapacityRecoveryCoordinator {
       const snapshot = await this.snapshot(record), accepted = this.acceptedTurn(record, snapshot);
       if (this.stopped || generation !== this.generation || this.records[key] !== record || this.checking.has(key)
         || this.executing.has(key) || record.status !== "uncertain") return;
+      if (this.options.backend().backendInfo(record.hostId).id === record.backend
+        && snapshot.state.persistence === "active" && snapshot.state.runtimeStatus === "active"
+        && record.acceptedTurnId && accepted?.id === record.acceptedTurnId && accepted.status === "inProgress"
+        && snapshot.state.activeTurnId === accepted.id && snapshot.turns.at(-1)?.id === accepted.id) {
+        const parent = record.turns[record.turns.indexOf(accepted.id) - 1];
+        if (parent) void this.options.accepted({ ...record, turnId: parent }, accepted.id)
+          .catch(() => console.warn("[codex-im-gateway] active capacity projection pending"));
+        return;
+      }
       const reason = this.options.backend().backendInfo(record.hostId).id !== record.backend ? "backend-changed"
         : snapshot.state.persistence !== "active" ? "persistence-unconfirmed"
           : !["idle", "systemError"].includes(snapshot.state.runtimeStatus) || snapshot.state.activeFlags.length || snapshot.state.pendingTurnWithoutId ? "runtime-unconfirmed"
@@ -242,6 +249,22 @@ export class CapacityRecoveryCoordinator {
     } finally {
       if (this.settling.get(key) === token) this.settling.delete(key);
     }
+  }
+  private async retireEndedProjection(record: RecordState): Promise<void> {
+    if (!this.options.retireProjection || !record.acceptedTurnId) return;
+    const generation = this.generation, key = keyOf(record);
+    try {
+      const snapshot = await this.snapshot(record), accepted = this.acceptedTurn(record, snapshot);
+      if (this.stopped || generation !== this.generation || this.records[key] !== record
+        || this.options.backend().backendInfo(record.hostId).id !== record.backend
+        || !["finished", "cancelled"].includes(record.status) || snapshot.state.runtimeStatus === "active") return;
+      const archived = ["archived", "missing"].includes(snapshot.state.persistence);
+      if (!archived && !(snapshot.state.persistence === "active" && ["idle", "systemError"].includes(snapshot.state.runtimeStatus)
+        && !snapshot.state.activeFlags.length && !snapshot.state.pendingTurnWithoutId && this.terminal(accepted))) return;
+      await this.options.retireProjection({ ...record, turnId: record.acceptedTurnId }, archived
+        ? "这张恢复进度卡显示有误：它来自已结束的历史记录，原会话已归档或不存在。本次没有启动新的任务；误显示的加载状态已关闭。"
+        : "这张恢复进度卡显示有误：它来自已经结束的历史轮次。本次没有启动新的任务；误显示的加载状态已关闭。");
+    } catch { /* Missing proof cannot authorize any card creation or execution. */ }
   }
   private reconciliationDiagnostic(record: RecordState, status: "closed" | "protected", reason?: string, detail?: { elapsedMs: number; errorType: string }): void {
     console.info(`[codex-im-gateway] capacity reconciliation ${JSON.stringify({ timestamp: new Date().toISOString(),

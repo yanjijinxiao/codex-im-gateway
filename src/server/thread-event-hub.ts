@@ -680,6 +680,22 @@ export class ThreadEventHub {
       })));
   }
 
+  /** Presentation-only repair for historical capacity cards accidentally
+   * reopened by an older startup projector. Native outcome/binding stay intact. */
+  async retireCapacityProjection(scope: { hostId: string; threadId: string; turnId: string }, text: string): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
+      && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
+        if (!this.isLive(sub)) return;
+        const state = this.state(sub), checkpoint = state.checkpoint;
+        if (state.turnId !== scope.turnId || state.checkpointTurnId !== scope.turnId || !checkpoint?.messageId
+          || checkpoint.terminal || checkpoint.finished && !checkpoint.presentationCorrection
+          || !checkpoint.presentationCorrection && (!state.historyBoundary?.turnId || state.historyBoundary.turnId === scope.turnId
+            || !state.completed.includes(state.historyBoundary.turnId) || state.pendingTerminals?.[scope.turnId])) return;
+        state.sequence++; this.save();
+        await this.stream(sub).invalidatePresentation(text);
+      })));
+  }
+
   async capacityTerminal(scope: { hostId: string; threadId: string; turnId: string }, text: string, outcome: TurnOutcome = "completed"): Promise<void> {
     await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false
       && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {

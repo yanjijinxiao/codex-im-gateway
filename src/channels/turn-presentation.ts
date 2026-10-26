@@ -168,6 +168,7 @@ export class ChannelTurnPresentation implements TurnReplyStream {
     return this.run(() => this.suspended ? Promise.resolve(false) : this.current.finalize(text, error, recovery));
   }
   fail(text: string, outcome: "failed" | "interrupted" = "failed"): Promise<boolean> { return this.finalize(text, true, { outcome }); }
+  invalidatePresentation(text: string): Promise<boolean> { return this.run(() => this.current.invalidatePresentation(text)); }
   setActivity(activity: TurnActivity): Promise<boolean> { return this.run(() => this.current.setActivity(activity)); }
   waitForBackend(text: string): Promise<boolean> { return this.run(() => this.current.waitForBackend(text)); }
   waitForRecovery(text: string): Promise<boolean> { return this.run(() => this.current.waitForRecovery(text)); }

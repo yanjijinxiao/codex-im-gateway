@@ -367,6 +367,7 @@ export class AccountManager {
         && (session.hostId ?? entry.store?.getProject(session.projectId ?? "")?.hostId ?? "local") === scope.hostId
         && entry.store?.getBoundSession(session.senderId)?.id === session.id)),
       notice: (scope, text) => this.threadEvents.capacityNotice(scope, text),
+      retireProjection: (scope, text) => this.threadEvents.retireCapacityProjection(scope, text),
       accepted: (scope, turnId) => {
         this.interactionRouting.inheritTurn(scope.hostId, scope.threadId, scope.turnId, turnId);
         return this.threadEvents.capacityAccepted(scope, turnId);
