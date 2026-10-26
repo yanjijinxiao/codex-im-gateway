@@ -23,6 +23,14 @@ const checkpoint = (): ChannelStreamCheckpoint => ({ streamId: "current-segment"
     checkpoint: { streamId: "old", messageId: "old-card", startedAt: 1, progressEntries: [], thought: "", answerPreview: "", finished: true } }] } });
 const scope: TurnAudienceScope = { bindingKey: "binding", conversationId: "group", hostId: "local", threadId: "thread", turnId: "turn" };
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+for (const outcome of ["failed", "interrupted", "detached", "continued"] as const) test(`archived progress retains the actual ${outcome} outcome without success copy`, () => {
+  const c = checkpoint(); c.terminal = { text: "上游报告所选模型当前容量不足。", error: outcome === "failed", outcome };
+  const card = completedCardForMentions(c)!;
+  assert.doesNotMatch(card.summary, /完整结果与参与者|本轮处理已结束/);
+  assert.match(card.summary, outcome === "failed" ? /本轮执行失败/ : outcome === "detached" ? /已退出当前绑定/ : outcome === "continued" ? /已转入后续卡片/ : /本轮已停止/);
+  if (outcome === "failed") assert.match(card.summary, /模型当前容量不足/);
+  assert.equal(card.text, c.terminal.text);
+});
 function journal(t: test.TestContext) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-completion-mentions-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { readJsonFile, writeJsonFile } from "../state/json-store.js";
-import { CodexTurnExecutionError, type CodexBridgeBackend, type CodexCapacityResumeInput } from "../codex/backend.js";
+import { assertCapacityResume, CodexTurnExecutionError, type CodexThreadSnapshot, type CodexBridgeBackend, type CodexCapacityResumeInput } from "../codex/backend.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { codexRecoverySummary } from "../codex/turn-recovery.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
@@ -15,6 +15,9 @@ type RecordState = CapacityFailure & {
   clientId?: string;
   acceptedTurnId?: string;
   cancelFuture?: boolean;
+  retiredTurns?: string[];
+  closedBy?: { turnId: string; status: string; at: number };
+  previousClosure?: { turnId: string; status: string; at: number };
 };
 type Options = {
   filePath: string;
@@ -27,6 +30,7 @@ type Options = {
   handlers?: (scope: CapacityFailure) => Pick<CodexCapacityResumeInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult">;
   delaysMs?: readonly number[];
   now?: () => number;
+  reconcileTimeoutMs?: number;
 };
 const keyOf = (scope: CapacityFailure) => JSON.stringify([scope.hostId, scope.threadId]);
 
@@ -37,6 +41,7 @@ export class CapacityRecoveryCoordinator {
   private readonly records: Record<string, RecordState>;
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly executing = new Set<string>();
+  private readonly checking = new Map<string, { previous: RecordState; scopes: Map<string, CapacityFailure> }>();
   private readonly delays: readonly number[];
   private readonly now: () => number;
   private stopped = false;
@@ -64,6 +69,7 @@ export class CapacityRecoveryCoordinator {
           await this.options.accepted({ ...record, turnId: record.turns[i - 1] }, record.turns[i]);
         }
         if (record.status === "uncertain") this.announce(record, "重启前的自动恢复接收或执行结果尚未确认。保留原卡并只读核对，不重复提交；可用 /status、/history 查看。");
+        if (record.status === "uncertain") await this.settleKnownCompletion(record);
       })().catch(() => console.warn("[codex-im-gateway] capacity recovery projection pending"));
       if (record.status === "waiting") this.schedule(record);
     }
@@ -77,20 +83,23 @@ export class CapacityRecoveryCoordinator {
     this.save();
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.checking.clear();
   }
   holdsStart(scope: CapacityFailure): boolean {
+    if (this.checking.get(keyOf(scope))?.scopes.has(scope.turnId)) return true;
     const record = this.records[keyOf(scope)];
     return Boolean(record && (record.status === "submitting" || record.acceptedTurnId === scope.turnId
       && record.turnId !== scope.turnId && record.status === "running"
       || record.turnId === scope.turnId && (record.status === "waiting" || record.status === "uncertain" && !record.acceptedTurnId)));
   }
   hasPending(threadId: string, hostId: string): boolean {
-    const record = this.records[keyOf({ threadId, hostId, turnId: "" })];
-    return Boolean(record && !["finished", "cancelled"].includes(record.status));
+    const key = keyOf({ threadId, hostId, turnId: "" }), record = this.records[key];
+    return this.checking.has(key) || Boolean(record && !["finished", "cancelled"].includes(record.status));
   }
-  private cancelled(record: RecordState): boolean { return this.stopped || record.status === "cancelled"; }
+  private cancelled(record: RecordState): boolean { return this.stopped || this.records[keyOf(record)] !== record || record.status === "cancelled"; }
   cancel(threadId: string, hostId = "local"): void {
     const key = keyOf({ threadId, hostId, turnId: "" });
+    this.checking.delete(key);
     const record = this.records[key];
     if (!record || record.status === "finished" || record.status === "cancelled") return;
     if (record.acceptedTurnId && (record.status === "running" || record.status === "uncertain")) {
@@ -111,6 +120,9 @@ export class CapacityRecoveryCoordinator {
     const backend = this.options.backend(), backendId = backend.backendInfo(scope.hostId).id;
     if (backendId === "exec" || !backend.resumeAfterCapacity) return false;
     const key = keyOf(scope), previous = this.records[key];
+    if (previous?.retiredTurns?.includes(scope.turnId)) return true;
+    const checking = this.checking.get(key);
+    if (checking) { checking.scopes.set(scope.turnId, { ...scope }); return true; }
     if (previous?.backend === backendId && previous.turns.includes(scope.turnId)) {
       if (previous.turnId !== scope.turnId) return true; // Superseded native failure, never a final result.
       if (previous.status === "finished" || previous.status === "cancelled") return false;
@@ -122,12 +134,94 @@ export class CapacityRecoveryCoordinator {
       }
       return true;
     }
-    if (previous && ["submitting", "running", "uncertain"].includes(previous.status)) return false;
-    if (previous) this.cancel(scope.threadId, scope.hostId);
+    if ((previous && ["submitting", "running"].includes(previous.status)) || this.executing.has(key)) return false;
+    if (previous) {
+      const check = { previous, scopes: new Map([[scope.turnId, { ...scope }]]) };
+      this.checking.set(key, check);
+      this.announce(scope, "所选模型容量不足，正在只读核对旧恢复轮次与当前失败轮次；尚未提交新的恢复任务。");
+      void this.reconcile(key, check).catch(() => console.warn("[codex-im-gateway] capacity reconciliation presentation pending"));
+      return true;
+    }
+    return this.begin(scope, backendId);
+  }
+
+  private begin(scope: CapacityFailure, backendId: string, previous?: RecordState): boolean {
+    const key = keyOf(scope), timer = this.timers.get(key);
+    if (timer) clearTimeout(timer);
+    this.timers.delete(key);
     const record: RecordState = { ...scope, backend: backendId, turns: [scope.turnId], attempts: 0,
-      status: "waiting", nextAt: this.now() };
+      status: "waiting", nextAt: this.now(), ...(previous ? {
+        retiredTurns: [...new Set([...(previous.retiredTurns ?? []), ...previous.turns])].slice(-2000),
+        ...(previous.closedBy ? { previousClosure: previous.closedBy } : {})
+      } : {}) };
     this.records[key] = record;
     return this.defer(record);
+  }
+
+  private async snapshot(record: CapacityFailure): Promise<CodexThreadSnapshot> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const snapshot = await Promise.race([this.options.backend().readThreadSnapshot(record.threadId, record.hostId),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error("Capacity reconciliation timed out")), this.options.reconcileTimeoutMs ?? 5000); })]);
+      if (snapshot.state.threadId !== record.threadId || snapshot.state.internal) throw Error("Capacity observation identity mismatch");
+      return snapshot;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+  private acceptedTurn(record: RecordState, snapshot: CodexThreadSnapshot) {
+    const matches = record.acceptedTurnId
+      ? snapshot.turns.filter(turn => turn.id === record.acceptedTurnId)
+      : record.clientId ? snapshot.turns.filter(turn => turn.messages.some(message => message.role === "user" && message.clientUserMessageId === record.clientId)) : [];
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+  private terminal(turn: CodexThreadSnapshot["turns"][number] | undefined): boolean {
+    return Boolean(turn && ["completed", "failed", "interrupted"].includes(turn.status));
+  }
+  /** A restart may retire a proved-ended chain, but cannot discover a new
+   * failure from history and authorize execution by itself. */
+  private async settleKnownCompletion(record: RecordState): Promise<void> {
+    const generation = this.generation, key = keyOf(record);
+    try {
+      const snapshot = await this.snapshot(record), accepted = this.acceptedTurn(record, snapshot);
+      if (this.stopped || generation !== this.generation || this.records[key] !== record || this.checking.has(key)
+        || this.options.backend().backendInfo(record.hostId).id !== record.backend
+        || this.executing.has(key) || record.status !== "uncertain" || snapshot.state.persistence !== "active"
+        || !["idle", "systemError"].includes(snapshot.state.runtimeStatus) || snapshot.state.activeFlags.length || snapshot.state.pendingTurnWithoutId
+        || !this.terminal(accepted)) return;
+      if (!record.cancelFuture && snapshot.turns.at(-1)?.id === accepted!.id && snapshot.state.lastTurnFailure?.turnId === accepted!.id
+        && snapshot.state.lastTurnFailure.code === "model-capacity") return;
+      record.status = "finished"; record.closedBy = { turnId: accepted!.id, status: accepted!.status, at: this.now() }; this.save();
+    } catch { /* Unknown acceptance remains protected; no execution replay. */ }
+  }
+  private async reconcile(key: string, check: { previous: RecordState; scopes: Map<string, CapacityFailure> }): Promise<void> {
+    const generation = this.generation, previous = check.previous;
+    const current = () => !this.stopped && generation === this.generation && this.checking.get(key) === check
+      && this.records[key] === previous && !this.executing.has(key);
+    let scope = [...check.scopes.values()].at(-1)!;
+    try {
+      const snapshot = await this.snapshot(scope);
+      if (!current()) return;
+      const tail = snapshot.turns.at(-1), candidate = tail && check.scopes.get(tail.id);
+      if (!candidate) throw Error("Observed capacity failure is no longer the current tail");
+      scope = candidate;
+      assertCapacityResume(snapshot, scope.turnId);
+      if (snapshot.turns.some(turn => turn.status === "inProgress")) throw Error("Native history still contains an active turn");
+      if (!this.options.eligible(scope) || this.options.backend().backendInfo(scope.hostId).id !== previous.backend) throw Error("Capacity route changed");
+      if (previous.status === "uncertain") {
+        const accepted = this.acceptedTurn(previous, snapshot);
+        if (!this.terminal(accepted) || snapshot.turns.indexOf(accepted!) >= snapshot.turns.length - 1) throw Error("Old native acceptance is still uncertain");
+        previous.closedBy = { turnId: accepted!.id, status: accepted!.status, at: this.now() };
+      }
+      this.checking.delete(key);
+      this.begin(scope, previous.backend, previous);
+    } catch {
+      if (!current()) return;
+      this.checking.delete(key);
+      // A stale offered failure must not consume an already-authorized older
+      // waiting plan. Its backend still rechecks the exact tail before writing.
+      if (previous.status === "waiting" && this.options.eligible(previous)
+        && this.options.backend().backendInfo(previous.hostId).id === previous.backend) this.schedule(previous);
+      await this.options.terminal(scope, "上游报告所选模型当前容量不足。当前失败轮次或旧恢复的结束状态尚未核对清楚，未安排自动恢复；保留原记录，未重复提交任务。可用 /status、/history 查看。", "failed");
+    } finally { if (this.checking.get(key) === check) this.checking.delete(key); }
   }
 
   private defer(record: RecordState): boolean {
@@ -155,7 +249,7 @@ export class CapacityRecoveryCoordinator {
   }
   private async attempt(record: RecordState): Promise<void> {
     const key = keyOf(record);
-    if (record.status !== "waiting" || this.executing.has(key)) return;
+    if (record.status !== "waiting" || this.executing.has(key) || this.checking.has(key)) return;
     this.executing.add(key);
     const generation = this.generation;
     let accepted: string | undefined;
@@ -171,7 +265,7 @@ export class CapacityRecoveryCoordinator {
           this.current(record);
         },
         onTurnStarted: async event => {
-          if (generation !== this.generation) throw new Error("Recovery lifecycle changed after receipt");
+          if (generation !== this.generation || this.records[key] !== record) throw new Error("Recovery lifecycle changed after receipt");
           accepted = event.turnId;
           record.acceptedTurnId = event.turnId; record.turns.push(event.turnId);
           if (record.status !== "cancelled") record.status = "running";
@@ -179,8 +273,8 @@ export class CapacityRecoveryCoordinator {
           await this.options.accepted(record, event.turnId);
           record.turnId = event.turnId; this.save();
         },
-        onProgress: text => generation === this.generation ? this.options.progress(record, text) : undefined,
-        onRecovery: event => generation === this.generation ? this.options.notice(record, codexRecoverySummary(event)) : undefined
+        onProgress: text => generation === this.generation && this.records[key] === record ? this.options.progress(record, text) : undefined,
+        onRecovery: event => generation === this.generation && this.records[key] === record ? this.options.notice(record, codexRecoverySummary(event)) : undefined
       });
       if (this.cancelled(record) || generation !== this.generation) return;
       record.status = "finished"; this.save();
