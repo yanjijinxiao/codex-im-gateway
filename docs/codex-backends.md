@@ -17,6 +17,21 @@ CodexExecRunner      AppServerCodexRunner
           Desktop relay only for an owned writer
 ```
 
+## Scoped approvals share one authority
+
+`src/codex/approval.ts` normalizes native requests into explicit choices with exact native response payloads. Both the CLI **App Server backend** and the Desktop follower adapter use this model; channel cards, complete IM reply commands and Web UI → **待审批** project the same live controller. CLI `exec --json` has no interactive response transport and remains explicitly unsupported; it never borrows another backend or disables approval checks.
+
+- Command and file requests can offer once/session decisions. `availableDecisions`, when present, restricts the choices. Command rules retain the complete native argument prefix; network rules retain the offered host and allow/deny action.
+- Extra-permission responses retain the requested permission object and native `turn`/`session` scope. They do not acquire arbitrary persistent grants.
+- Empty MCP confirmation forms are once-only unless their native metadata explicitly declares `codex_approval_kind: mcp_tool_call` and a `persist` array containing `session` or `always`. Only those declared scopes are then offered and returned as `_meta.persist`; unknown persistence declarations remain unsupported. Computer Use treats accept without `_meta.persist` as session scope, so these forms must not display a misleading approve-once alternative. The installed implementation advertises session/always capabilities per target app. The native tool owns permission storage and revocation; prompt text and server names cannot invent persistence.
+- Nonempty forms, OAuth/verification challenges and unsupported interactions retain their existing typed or secure flow; they are never flattened into an always-allow button.
+
+Approval identity includes the execution host, native connection and typed native request ID. For MCP, a subsequently filled-in `turnId` is correlation, not a new request. Repeated pending snapshots do not create a second card. Choices are snapshotted before display; Web decisions include the account, original conversation, approval ID and scope version. IM/Web races, stale versions and unsupported choices cannot consume a different request. Receipts return to the original route even if the primary binding changes.
+
+Selecting a choice records **unconfirmed**, not success. Desktop requires a matching successful IPC receipt; App Server requires `serverRequest/resolved` after submission. Transport loss or turn completion without a receipt cannot claim persistence and never retries a possibly accepted decision. Per-account `runtime/<account>/approvals.json` is an atomic, private audit of choice/receipt/identity hashes only: it stores neither tool arguments nor a reusable permission rule, and restarting Gateway never replays approval history. Native Codex/MCP remains the sole grant authority. Existing Web IDE browser grants are separate and are not reset or extended by this feature.
+
+Protocol reference: [App Server approvals](https://learn.chatgpt.com/docs/app-server#approvals), [Computer Use permissions](https://learn.chatgpt.com/docs/computer-use#permissions-and-approvals). The native response mapping was checked against installed CLI 0.164.0 and Desktop bundled CLI 0.164.0-alpha.11.1; Desktop/Computer Use persistence is an observed native capability rather than a universal promise for every MCP server.
+
 ## Native execution recovery is not delivery retry
 
 The backend normalizes native errors into a closed vocabulary (`CodexFailureCode`), including current camelCase and legacy PascalCase codes. Model capacity (`serverOverloaded` / "model is at capacity") is distinct from rate limits, exhausted usage, authentication and safety refusal. Provider `additionalDetails`, stack traces and arbitrary error bodies are never copied into IM notices.

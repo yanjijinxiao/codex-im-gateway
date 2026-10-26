@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseMcpForm, mcpFormResponse, elicitationValue, safeElicitationUrl } from "../src/codex/elicitation.js";
-import { parseAppServerApproval } from "../src/codex/approval.js";
+import { parseAppServerApproval, appServerApprovalResult } from "../src/codex/approval.js";
 
 const params = { threadId: "thread", turnId: "turn", serverName: "tool", mode: "form", message: "Choose output settings",
   requestedSchema: { type: "object", properties: { title: { type: "string", minLength: 2, maxLength: 20 },
@@ -39,5 +39,8 @@ test("only non-credential HTTPS navigation URLs enter an IM notice", () => {
 });
 test("approval adapter cannot grant a decision absent from the native allowed set", () => {
   const value = { threadId: "thread", turnId: "turn", itemId: "item", availableDecisions: ["acceptForSession", "decline"] };
-  assert.equal(parseAppServerApproval("item/commandExecution/requestApproval", value), undefined);
+  const request = parseAppServerApproval("item/commandExecution/requestApproval", value)!;
+  assert.deepEqual(request.options?.map(o => o.id), ["session", "decline"]);
+  assert.throws(() => appServerApprovalResult("item/commandExecution/requestApproval", request, "accept"));
+  assert.deepEqual(appServerApprovalResult("item/commandExecution/requestApproval", request, "session"), { decision: "acceptForSession" });
 });

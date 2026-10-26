@@ -169,8 +169,12 @@ rl.on("line", (line) => {
       if (message.result?.content?.count !== 2 || message.result?.content?.enabled !== false) {
         fail(message.id, "MCP form must preserve native number/boolean types"); return;
       }
-      send({ method: "serverRequest/resolved", params: { threadId: approval.threadId, requestId: message.id } });
     }
+    if (approval.kind === "mcp-persist" && (message.result?._meta?.persist !== "always"
+      || message.result?.action !== "accept" || Object.keys(message.result?.content ?? {}).length)) {
+      throw new Error("Persistence response must match the native MCP scope exactly");
+    }
+    send({ method: "serverRequest/resolved", params: { threadId: approval.threadId, requestId: message.id } });
     const itemId = `item-${approval.turnId}`;
     send({
       method: "item/completed",
@@ -596,7 +600,7 @@ rl.on("line", (line) => {
     if (prompt === "delayed-turn-receipt") {
       setTimeout(() => respond(message.id, { turn: completedTurn(turnId, "inProgress") }), 150);
     } else respond(message.id, { turn: completedTurn(turnId, "inProgress") });
-    if (["command", "file", "permissions", "mcp", "mcp-form"].includes(approvalKind)) {
+    if (["command", "file", "permissions", "mcp", "mcp-form", "mcp-persist"].includes(approvalKind)) {
       const approvalId = `approval-${turnId}`;
       pendingApprovals.set(approvalId, {
         kind: approvalKind,
@@ -608,7 +612,7 @@ rl.on("line", (line) => {
         : approvalKind === "file"
           ? "item/fileChange/requestApproval"
           : approvalKind.startsWith("mcp") ? "mcpServer/elicitation/request" : "item/permissions/requestApproval";
-      send({
+      const approvalRequest = {
         id: approvalId,
         method,
         params: {
@@ -621,12 +625,16 @@ rl.on("line", (line) => {
           reason: `fixture ${approvalKind} approval`,
           grantRoot: approvalKind === "file" ? "/tmp/project" : null,
           permissions: approvalKind === "permissions" ? { network: { enabled: true } } : undefined,
-          ...(approvalKind === "mcp" ? { mode: "form", serverName: "browser", message: "fixture mcp approval",
+          ...(approvalKind === "mcp" || approvalKind === "mcp-persist" ? { mode: "form", serverName: "browser", message: "fixture mcp approval",
             requestedSchema: { type: "object", properties: {} } } : {}),
+          ...(approvalKind === "mcp-persist" ? { _meta: { codex_approval_kind: "mcp_tool_call", persist: ["session", "always"],
+            connector_name: "Computer Use", tool_params: { app: "mock.app" } } } : {}),
           ...(approvalKind === "mcp-form" ? { mode: "openai/form", serverName: "tool", message: "fixture form",
             requestedSchema: { type: "object", properties: { count: { type: "integer", minimum: 1, maximum: 5 }, enabled: { type: "boolean" } }, required: ["count", "enabled"] } } : {})
         }
-      });
+      };
+      send(approvalRequest);
+      if (approvalKind === "mcp-persist") send(approvalRequest);
       return;
     }
     if (prompt === "hold") {

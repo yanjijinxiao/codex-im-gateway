@@ -6,7 +6,7 @@ import test from "node:test";
 import { ChannelApprovalController } from "../src/bridge/approval.js";
 import type { CodexApprovalRequest } from "../src/codex/approval.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
-import { resolveStatePaths } from "../src/state/paths.js";
+import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 
 function request(): CodexApprovalRequest {
   return { kind: "command", threadId: "thread", turnId: "turn", itemId: "item", command: "echo test" };
@@ -17,7 +17,7 @@ test("MCP confirmation uses once-only choices with complete commands and no pers
   const controller = new ChannelApprovalController(async (_sender, notice) => { notices.push(notice.text); });
   const pending = controller.request("room", { kind: "mcp", threadId: "thread", turnId: "turn", itemId: "confirmation",
     serverName: "browser-use", reason: "Allow download from https://example.com/photo.jpg?" });
-  assert.match(notices[0], /工具操作确认（仅本次）/);
+  assert.match(notices[0], /工具操作确认/);
   assert.match(notices[0], /browser-use/); assert.match(notices[0], /example.com\/photo.jpg/);
   assert.match(notices[0], /```text\n\/approve A1\n```/);
   assert.doesNotMatch(notices[0], /Always allow|永久允许/);
@@ -82,4 +82,8 @@ test("approval IDs continue across service restarts instead of reusing old notic
   assert.equal(first.allocateApprovalId(), "A1");
   const restarted = new RuntimeStateStore(paths);
   assert.equal(restarted.allocateApprovalId(), "A2");
+  const one = new RuntimeStateStore(accountStatePaths(paths, "one"));
+  const two = new RuntimeStateStore(accountStatePaths(paths, "two"));
+  assert.notEqual(one.approvalJournalPath, two.approvalJournalPath);
+  assert.equal(one.approvalJournalPath, path.join(paths.runtimeDir, "one", "approvals.json"));
 });

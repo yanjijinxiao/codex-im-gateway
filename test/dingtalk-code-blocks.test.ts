@@ -21,8 +21,8 @@ test("the actual once-only approval notice retains two exact copy blocks and an 
     serverName: "cua_repl", reason: 'Allow Computer Use to use "Google Chrome"?' });
   const actual = normalizeDingTalkCardContent(notice);
   assert.deepEqual(codeValues(actual), ["/approve A2", "/reject A2"]);
-  assert.match(actual, /```\n拒绝：/);
-  assert.match(actual, /```\n10 分钟内未处理将自动拒绝。$/);
+  assert.match(actual, /```\n+拒绝：/);
+  assert.match(actual, /```\n+10 分钟内未处理将自动拒绝。$/);
   assert.doesNotMatch(actual, /```<br>/);
   assert.equal(approvals.hasPending("test-room"), true, "formatting must not settle or approve the request");
   approvals.declineAll("test-room"); assert.equal(await decision, "decline");

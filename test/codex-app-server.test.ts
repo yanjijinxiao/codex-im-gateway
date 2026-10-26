@@ -559,6 +559,33 @@ test("routes command, file, permission and simple MCP approvals to the active ch
   }
 });
 
+test("CLI app-server deduplicates native MCP identity and confirms the exact persistent decision", async t => {
+  const runner = new AppServerCodexRunner({ codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"), requestTimeoutMs: 2000 });
+  t.after(() => runner.close());
+  let calls = 0;
+  const receipts: string[] = [];
+  const result = await runner.run({ prompt: "approval:mcp-persist", cwd: "/tmp/project", threadId: "thread-persist",
+    onApproval: request => {
+      calls++; assert.equal(request.hostId, "local"); assert.match(request.nativeKey!, /app-server/);
+      assert.deepEqual(request.options?.map(o => o.id), ["session", "always", "decline"]);
+      return "always";
+    }, onApprovalResult: (_request, result) => { receipts.push(result); } });
+  assert.equal(result.text, "approval:mcp-persist:accept");
+  assert.equal(calls, 1); assert.deepEqual(receipts, ["confirmed"]);
+});
+
+test("CLI app-server preserves command, file and extra-permission session decisions", async t => {
+  const runner = new AppServerCodexRunner({ codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"), requestTimeoutMs: 2000 });
+  t.after(() => runner.close());
+  for (const kind of ["command", "file", "permissions"]) {
+    const receipts: string[] = [];
+    const result = await runner.run({ prompt: `approval:${kind}`, cwd: "/tmp/project", threadId: `session-${kind}`,
+      onApproval: () => "session", onApprovalResult: (_request, result) => { receipts.push(result); } });
+    assert.equal(result.text, `approval:${kind}:${kind === "permissions" ? "accept" : "acceptForSession"}`);
+    assert.deepEqual(receipts, ["confirmed"]);
+  }
+});
+
 test("declines an app-server approval when the channel rejects it", async (t) => {
   const runner = new AppServerCodexRunner({
     codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),

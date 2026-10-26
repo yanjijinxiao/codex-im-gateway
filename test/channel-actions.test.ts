@@ -472,7 +472,7 @@ test("Bridge renders approval decisions as buttons on interactive channels", asy
   for (let attempt = 0; attempt < 20 && cards.length === 0; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert.deepEqual(cards[0].actionGroups.flatMap((group) => group.map((action) => action.label)), ["批准", "拒绝"]);
+  assert.deepEqual(cards[0].actionGroups.flatMap((group) => group.map((action) => action.label)), ["允许一次", "拒绝"]);
   assert.deepEqual(cards[0].actionGroups.flatMap((group) => group.map((action) => action.value)), [
     { version: 1, command: "approve", arg: "A1" },
     { version: 1, command: "reject", arg: "A1" }

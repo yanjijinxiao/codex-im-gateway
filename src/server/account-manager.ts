@@ -285,6 +285,7 @@ export class AccountManager {
   readonly ideApprovals: IDEApprovalService;
   private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
   private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
+  private readonly sessionApprovalRoutes = new WeakMap<CodexApprovalRequest, { service: BridgeService; recipientId: string }>();
   private readonly interactionRouting: InteractionRoutingJournal;
   private readonly unresolvedInteractions = new Set<string>();
   private readonly entries = new Map<string, RuntimeEntry>();
@@ -377,6 +378,7 @@ export class AccountManager {
           const session = route && this.entries.get(route.accountId)?.store?.getSession(route.sessionId);
           return route && session ? this.requestSessionApproval(route.accountId, session, request) : Promise.resolve("decline" as const);
         },
+        onApprovalResult: (request, result) => this.reportSessionApprovalResult(request, result),
         onUserInput: request => {
           const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), request.turnId).destination;
           return route ? this.entries.get(route.accountId)?.service?.requestUserInput(route.recipientId, request, scope.hostId)
@@ -1357,6 +1359,7 @@ export class AccountManager {
         model: session.model ?? config.model,
         effort: session.effort ?? config.effort,
         onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
+        onApprovalResult: (request, result) => this.reportSessionApprovalResult(request, result),
         onUserInput: request => this.entries.get(accountId)?.service?.requestUserInput(session.senderId, request, session.hostId) ?? Promise.resolve(undefined),
         onUserInputResult: (request, result) => this.entries.get(accountId)?.service?.reportUserInputResult(session.senderId, request, result, session.hostId),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
@@ -1700,6 +1703,16 @@ export class AccountManager {
     return { bindings, unsupported: this.interactionRouting.diagnostics() };
   }
 
+  listApprovals() {
+    return [...this.entries].flatMap(([accountId, entry]) => entry.status === "running"
+      ? (entry.service?.listApprovals() ?? []).map(request => ({ ...request, accountId })) : []);
+  }
+  decideApproval(accountId: string, recipientId: string, id: string, choice: string, version: string) {
+    const entry = this.entries.get(accountId);
+    if (!entry?.service || entry.status !== "running") throw new Error("审批所属渠道当前未运行");
+    return entry.service.decideApproval(recipientId, id, choice, version);
+  }
+
   private hasLocalThreadBinding(threadId: string): boolean {
     return listAccounts(this.options.paths).some(account => {
       const store = this.storeFor(account.accountId);
@@ -1865,7 +1878,14 @@ export class AccountManager {
   ): Promise<CodexApprovalDecision> {
     const entry = this.entries.get(accountId);
     if (!entry?.service || (entry.status !== "running" && entry.status !== "starting")) return Promise.resolve("decline");
+    this.sessionApprovalRoutes.set(request, { service: entry.service, recipientId: session.senderId });
     return entry.service.requestApproval(session.senderId, request);
+  }
+
+  private reportSessionApprovalResult(request: CodexApprovalRequest, result: ApprovalDeliveryResult) {
+    const route = this.sessionApprovalRoutes.get(request);
+    this.sessionApprovalRoutes.delete(request);
+    return route?.service.reportApprovalResult(route.recipientId, request, result);
   }
 
   private projectApprovalTarget(project: ManagedProject): { service: BridgeService; recipientId: string } | undefined {

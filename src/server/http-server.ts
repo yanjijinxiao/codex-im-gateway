@@ -21,6 +21,7 @@ import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
 import { selectLocalDirectory } from "./directory-picker.js";
 import { SessionBindingConflictError } from "../state/runtime-state.js";
+import { ApprovalDecisionConflictError } from "../bridge/approval.js";
 import { IDEEndpointManager } from "../ide/endpoint-manager.js";
 import { IDE_EXTENSIONS, ideConfigSchema } from "../ide/config.js";
 import { localIDEAddresses } from "../ide/tls.js";
@@ -437,6 +438,15 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (method === "GET" && url.pathname === "/api/interaction-health") {
     sendJson(response, 200, context.accountManager.interactionHealth()); return;
   }
+  if (method === "GET" && url.pathname === "/api/approvals") {
+    sendJson(response, 200, { approvals: context.accountManager.listApprovals() }); return;
+  }
+  if (method === "POST" && url.pathname === "/api/approvals/decision") {
+    const body = z.object({ accountId: z.string().min(1).max(300), recipientId: z.string().min(1).max(500),
+      id: z.string().regex(/^A[1-9]\d*$/), choice: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+      version: z.string().regex(/^[a-f0-9]{64}$/) }).strict().parse(await readJsonBody(request));
+    sendJson(response, 200, { message: context.accountManager.decideApproval(body.accountId, body.recipientId, body.id, body.choice, body.version) }); return;
+  }
   if (method === "GET" && url.pathname === "/api/codex-projects") {
     sendJson(response, 200, { projects: await readCodexProjects(context) });
     return;
@@ -830,6 +840,7 @@ function serveStatic(response: ServerResponse, pathname: string): void {
     "/account-mode-settings.js": { name: "account-mode-settings.js", type: "text/javascript; charset=utf-8" },
     "/binding-expiry.js": { name: "binding-expiry.js", type: "text/javascript; charset=utf-8" },
     "/bindings.js": { name: "bindings.js", type: "text/javascript; charset=utf-8" },
+    "/approvals.js": { name: "approvals.js", type: "text/javascript; charset=utf-8" },
     "/knowledge-bases.js": { name: "knowledge-bases.js", type: "text/javascript; charset=utf-8" },
     "/ide.js": { name: "ide.js", type: "text/javascript; charset=utf-8" },
     "/copyable.js": { name: "copyable.js", type: "text/javascript; charset=utf-8" },
@@ -970,7 +981,7 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function errorStatus(error: unknown, message: string): number {
-  if (error instanceof SessionBindingConflictError) return 409;
+  if (error instanceof SessionBindingConflictError || error instanceof ApprovalDecisionConflictError) return 409;
   if (error instanceof z.ZodError) return 400;
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;

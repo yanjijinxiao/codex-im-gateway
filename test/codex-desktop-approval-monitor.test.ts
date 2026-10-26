@@ -118,7 +118,12 @@ test("forwards a followed Codex Desktop approval to the channel and returns its 
     decisionRequests,
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("approval decision timeout")), 2_000))
   ]);
-  assert.deepEqual(approvals, [{
+  for (const approval of approvals) {
+    assert.equal(approval.hostId, "local");
+    assert.match(String(approval.nativeKey), /^desktop:/);
+    assert.ok(Array.isArray(approval.options));
+  }
+  assert.deepEqual(approvals.map(({ hostId, nativeKey, options, ...request }) => request), [{
     kind: "command",
     threadId: "thread-one",
     turnId: "turn-one",
@@ -244,6 +249,22 @@ async function approvalFixture(t: test.TestContext, options: Partial<CodexDeskto
   };
   return { monitor, snapshot, patches, respond, peer, results, approvals, messages, decisionMessages, nativeRequest };
 }
+
+for (const kind of ["command", "file", "permissions"] as const) test(`Desktop preserves ${kind} session scope on its native IPC method`, async t => {
+  const f = await approvalFixture(t, { onApproval: () => "session" });
+  const method = kind === "command" ? "item/commandExecution/requestApproval"
+    : kind === "file" ? "item/fileChange/requestApproval" : "item/permissions/requestApproval";
+  const ipcMethod = kind === "command" ? "thread-follower-command-approval-decision"
+    : kind === "file" ? "thread-follower-file-approval-decision" : "thread-follower-permissions-request-approval-response";
+  const permissions = { network: { enabled: true } };
+  f.snapshot([{ ...f.nativeRequest, method, params: { ...f.nativeRequest.params, permissions } }]);
+  await waitFor(() => f.messages.some(m => m.method === ipcMethod));
+  const decision = f.messages.find(m => m.method === ipcMethod)!;
+  assert.deepEqual(decision.params, { conversationId: "thread-one", requestId: 42,
+    ...(kind === "permissions" ? { response: { permissions, scope: "session" } } : { decision: "acceptForSession" }) });
+  writeFrame(f.peer, { type: "response", requestId: decision.requestId, method: ipcMethod, resultType: "success", result: { ok: true } });
+  await waitFor(() => f.results.length === 1); assert.deepEqual(f.results, ["confirmed"]);
+});
 
 test("waits for the actual Desktop decision receipt and deduplicates snapshots/subscriptions", async t => {
   const f = await approvalFixture(t);

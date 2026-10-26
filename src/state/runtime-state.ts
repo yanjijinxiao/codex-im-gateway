@@ -174,6 +174,7 @@ export class RuntimeStateStore {
   }
 
   get controlJournalPath(): string { return path.join(this.paths.runtimeDir, "session-controls.json"); }
+  get approvalJournalPath(): string { return path.join(path.dirname(this.paths.statePath), "approvals.json"); }
 
   /** Shared by all IM accounts and backends, never stored in Codex's database. */
   get sessionPurposeRegistryPath(): string { return path.join(this.paths.root, "session-purposes.json"); }

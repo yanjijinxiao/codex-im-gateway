@@ -24,7 +24,7 @@ type Options = {
   accepted: (scope: CapacityFailure, turnId: string) => Promise<void>;
   progress: (scope: CapacityFailure, text: string) => Promise<void>;
   terminal: (scope: CapacityFailure, text: string, outcome?: "completed" | "failed" | "interrupted") => Promise<void>;
-  handlers?: (scope: CapacityFailure) => Pick<CodexCapacityResumeInput, "onApproval" | "onUserInput" | "onUserInputResult">;
+  handlers?: (scope: CapacityFailure) => Pick<CodexCapacityResumeInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult">;
   delaysMs?: readonly number[];
   now?: () => number;
 };

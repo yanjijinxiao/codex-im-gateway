@@ -43,7 +43,7 @@ export class NativeQueueCoordinator {
       && (unsettled.has(r.status) || r.status === "completed" && !r.delivered));
   }
   async enqueue(origin: QueueOrigin, prompt: string, backend: CodexBridgeBackend,
-    handlers: Pick<CodexQueueAddInput, "onApproval" | "onUserInput" | "onUserInputResult"> = {}): Promise<QueueReceipt> {
+    handlers: Pick<CodexQueueAddInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult"> = {}): Promise<QueueReceipt> {
     if (!backend.addQueuedSubmission || backend.backendInfo(origin.hostId).capabilities.nativeQueue === false) {
       throw new CodexBackendCapabilityError("nativeQueue", backend.backendInfo(origin.hostId).id);
     }

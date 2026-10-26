@@ -7,6 +7,7 @@ import { communicationError, isCodexCommunicationFailure, CodexCommunicationErro
 import { parseUserInputRequest } from "./user-input.js";
 import { parseMcpForm, mcpFormResponse, safeElicitationUrl, type McpForm } from "./elicitation.js";
 import type { CodexUserInputResultHandler, CodexUserInputResult } from "./backend.js";
+import type { CodexApprovalRequest, CodexApprovalResult, CodexApprovalResultHandler } from "./approval.js";
 import { desktopSessionMembership } from "./desktop-session-membership.js";
 import { codexFailureCode, lastCodexTurnFailure, type CodexFailureCode } from "./turn-failure.js";
 import { codexTurnRecovery, codexRecoverySummary, type CodexTurnRecovery } from "./turn-recovery.js";
@@ -148,6 +149,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private lines?: readline.Interface;
   private connectPromise?: Promise<void>;
   private initialized = false;
+  private readonly approvalResults = new Map<string, CodexApprovalResultHandler>();
+  private readonly approvalRequests = new Map<string, { request: CodexApprovalRequest; submitted: boolean; notify?: CodexApprovalResultHandler }>();
+  private readonly observedApprovalIds = new Set<string>();
   private closed = false;
   private nextId = 1;
   private stderr = "";
@@ -207,6 +211,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           catch (error) { failed(error); throw error; }
         }, onProgress: resume.onProgress, onRecovery: resume.onRecovery,
         onApproval: resume.onApproval ? async request => { await ready; return resume.onApproval!(request); } : undefined,
+        onApprovalResult: resume.onApprovalResult,
         onUserInput: resume.onUserInput ? async request => { await ready; return resume.onUserInput!(request); } : undefined,
         onUserInputResult: resume.onUserInputResult ? async (request, result) => { await ready; await resume.onUserInputResult!(request, result); } : undefined }, resume);
     } catch (error) { failed(error); throw error;
@@ -367,6 +372,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         if (isCodexCommunicationFailure(error)) this.unconfirmedStarts.add(threadId);
         else {
           this.approvalHandlersByThread.delete(threadId);
+          this.approvalResults.delete(threadId);
           this.dynamicToolHandlersByThread.delete(threadId);
           this.userInputHandlersByThread.delete(threadId);
           this.userInputResultHandlersByThread.delete(threadId);
@@ -379,6 +385,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       } catch (retryError) {
         this.approvalHandlersByThread.delete(threadId);
+        this.approvalResults.delete(threadId);
         this.dynamicToolHandlersByThread.delete(threadId);
         this.userInputHandlersByThread.delete(threadId);
         this.userInputResultHandlersByThread.delete(threadId);
@@ -1213,6 +1220,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       windowsHide: true
     });
     this.child = child;
+    this.observedApprovalIds.clear();
     this.stderr = "";
     this.lines = readline.createInterface({ input: child.stdout });
     this.lines.on("line", (line) => this.handleMessage(line));
@@ -1349,6 +1357,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
     if (method === "serverRequest/resolved") {
       const key = JSON.stringify([params.threadId, typeof params.requestId, params.requestId]);
+      const approval = this.approvalRequests.get(key);
+      if (approval) this.resolveApproval(key, approval.submitted ? "confirmed" : "withdrawn");
       const pending = this.userInputRequests.get(key);
       if (pending) this.resolveUserInput(key, pending.submitted ? "confirmed" : "withdrawn");
       return;
@@ -1533,6 +1543,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       ...(previousState?.preview ? { preview: previousState.preview } : {})
     });
     this.approvalHandlersByThread.delete(threadId);
+    this.approvalResults.delete(threadId);
+    for (const [approvalKey, pending] of this.approvalRequests) {
+      if (pending.request.threadId === threadId) this.resolveApproval(approvalKey, pending.submitted ? "failed" : "withdrawn");
+    }
     this.dynamicToolHandlersByThread.delete(threadId);
     this.userInputHandlersByThread.delete(threadId);
     this.userInputResultHandlersByThread.delete(threadId);
@@ -1690,16 +1704,31 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           turnId: "",
           itemId: ""
         };
-        this.send({ id, result: appServerApprovalResult(method, fallback, "decline") });
+        const reject = fallback.options?.some(o => o.id === "cancel") && !fallback.options.some(o => o.id === "decline") ? "cancel" : "decline";
+        this.send({ id, result: appServerApprovalResult(method, fallback, reject) });
         return;
       }
-      Promise.resolve(handler(request))
+      const key = JSON.stringify([request.threadId, typeof id, id]);
+      if (this.approvalRequests.has(key) || this.observedApprovalIds.has(key)) return;
+      this.observedApprovalIds.add(key);
+      while (this.observedApprovalIds.size > 2000) this.observedApprovalIds.delete(this.observedApprovalIds.values().next().value!);
+      const owner = this.child;
+      request.hostId = this.options.hostId ?? "local";
+      request.nativeKey = JSON.stringify(["app-server", owner?.pid, request.hostId, method, key]);
+      const pending = { request, submitted: false, notify: this.approvalResults.get(request.threadId) };
+      this.approvalRequests.set(key, pending);
+      Promise.resolve().then(() => handler(request))
         .then((decision) => {
+          if (this.child !== owner || this.approvalRequests.get(key) !== pending) return;
+          pending.submitted = true;
           this.send({ id, result: appServerApprovalResult(method, request, decision) });
         })
         .catch((error) => {
+          this.resolveApproval(key, "failed");
+          if (this.child !== owner) return;
           try {
-            this.send({ id, result: appServerApprovalResult(method, request, "decline") });
+            const reject = request.options?.some(o => o.id === "cancel") && !request.options.some(o => o.id === "decline") ? "cancel" : "decline";
+            this.send({ id, result: appServerApprovalResult(method, request, reject) });
           } catch (sendError) {
             const approvalError = error instanceof Error ? error.message : String(error);
             const transportError = sendError instanceof Error ? sendError.message : String(sendError);
@@ -1780,9 +1809,19 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }).catch(() => this.resolveUserInput(key, "failed"));
   }
 
-  private bindUserInputHandlers(threadId: string, input: Pick<CodexRunnerInput, "onUserInput" | "onUserInputResult">): void {
+  private bindUserInputHandlers(threadId: string, input: Pick<CodexRunnerInput, "onUserInput" | "onUserInputResult" | "onApprovalResult">): void {
+    if (input.onApprovalResult) this.approvalResults.set(threadId, input.onApprovalResult);
     if (input.onUserInput) this.userInputHandlersByThread.set(threadId, input.onUserInput);
     if (input.onUserInputResult) this.userInputResultHandlersByThread.set(threadId, input.onUserInputResult);
+  }
+
+  private resolveApproval(key: string, result: CodexApprovalResult): void {
+    const pending = this.approvalRequests.get(key);
+    if (!pending) return;
+    this.approvalRequests.delete(key);
+    void Promise.resolve().then(() => pending.notify?.(pending.request, result)).catch(() => {
+      console.warn("[codex-im-gateway] approval resolution notice unavailable");
+    });
   }
 
   private resolveUserInput(key: string, result: CodexUserInputResult): void {
@@ -1802,6 +1841,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private failTransport(error: Error, kill: boolean): void {
+    for (const [key, request] of this.approvalRequests) this.resolveApproval(key, request.submitted ? "failed" : "withdrawn");
+    this.approvalResults.clear();
     const child = this.child;
     this.child = undefined;
     this.initialized = false;

@@ -124,6 +124,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 function bindEvents() {
+  window.gatewayApprovals = window.createApprovalView({ api, escapeHtml, escapeAttr });
   bindingOverview = window.createBindingOverview({ snapshot: () => state, escapeHtml, escapeAttr,
     accountName: accountDisplayName, showView, sessionAction: handleSessionAction,
     refresh: () => refreshData(true), drawIcons });
@@ -414,6 +415,7 @@ async function refreshData(notify) {
     renderAccounts();
     renderSessions();
     bindingOverview?.render();
+    void window.gatewayApprovals?.refresh();
     renderTaskboardStatus();
     window.renderKnowledgeBasesPage?.();
     if (!taskboardEditing) renderTaskboardWorkbench();
@@ -2324,7 +2326,8 @@ async function saveSettings(event) {
 }
 
 function showView(name, updateHash = true) {
-  const valid = ["accounts", "sessions", "bindings", "taskboard", "knowledge", "ide", "settings"].includes(name) ? name : "accounts";
+  const valid = ["accounts", "sessions", "bindings", "approvals", "taskboard", "knowledge", "ide", "settings"].includes(name) ? name : "accounts";
+  if (valid === "approvals") void window.gatewayApprovals?.refresh();
   if (valid === "bindings") bindingOverview?.render();
   if (valid === "ide") void window.gatewayIDE?.refresh();
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {

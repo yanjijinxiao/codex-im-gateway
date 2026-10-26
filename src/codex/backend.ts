@@ -1,5 +1,5 @@
 import type { CodexAccountBalance } from "./account-balance.js";
-import type { CodexApprovalHandler } from "./approval.js";
+import type { CodexApprovalHandler, CodexApprovalResultHandler } from "./approval.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { codexFailureCode, type CodexFailureCode } from "./turn-failure.js";
 import type { CodexTurnRecovery } from "./turn-recovery.js";
@@ -131,6 +131,7 @@ export type CodexQueuePage = { data: CodexQueuedSubmission[]; nextCursor?: strin
 export type CodexQueueAddInput = {
   threadId: string; prompt: string; clientUserMessageId: string;
   onApproval?: CodexApprovalHandler;
+  onApprovalResult?: CodexApprovalResultHandler;
   onUserInput?: CodexUserInputHandler;
   onUserInputResult?: CodexUserInputResultHandler;
   onAccepted?: (turnId: string) => Promise<void> | void;
@@ -296,6 +297,7 @@ export type CodexRunnerInput = {
   onProgress?: (message: string) => Promise<void> | void;
   onRecovery?: (recovery: CodexTurnRecovery) => Promise<void> | void;
   onApproval?: CodexApprovalHandler;
+  onApprovalResult?: CodexApprovalResultHandler;
   onDynamicToolCall?: CodexDynamicToolHandler;
   onUserInput?: CodexUserInputHandler;
   onUserInputResult?: CodexUserInputResultHandler;
@@ -307,7 +309,7 @@ export type CodexRunnerInput = {
 };
 
 /** Explicit, journaled empty-input continuation; never replay the original prompt. */
-export type CodexCapacityResumeInput = Pick<CodexRunnerInput, "onApproval" | "onUserInput" | "onUserInputResult"> & {
+export type CodexCapacityResumeInput = Pick<CodexRunnerInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult"> & {
   threadId: string;
   hostId?: string;
   failedTurnId: string;

@@ -70,6 +70,29 @@ const native = { id: 42, method: "item/tool/requestUserInput", params: {
   questions: [{ id: "native-question", header: "问题", question: "目录在哪？" }]
 } };
 
+test("Desktop Computer Use retains native persistent choices across a filled-in turn correlation", async t => {
+  let decide!: (value: "always") => void;
+  let count = 0;
+  const receipts: string[] = [];
+  const f = await fixture(t, { onApproval: async approval => {
+    count++; assert.deepEqual(approval.request.options?.map(o => o.id), ["session", "always", "decline"]);
+    return new Promise(resolve => { decide = resolve; });
+  }, onResult: (_request, result) => { receipts.push(result); } });
+  const request = { id: "persist-native", method: "mcpServer/elicitation/request", params: {
+    threadId: "thread", turnId: null as string | null, mode: "form", serverName: "cua_repl", message: "Allow app?",
+    requestedSchema: { type: "object", properties: {} }, _meta: { codex_approval_kind: "mcp_tool_call",
+      persist: ["session", "always"], tool_params: { app: "mock.app" } } } };
+  f.snapshot({ requests: [request] }); await waitFor(() => count === 1);
+  f.snapshot({ requests: [{ ...request, params: { ...request.params, turnId: "turn-later" } }] });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(count, 1); assert.equal(f.writes().length, 0);
+  decide("always"); await waitFor(() => f.writes().length === 1);
+  assert.deepEqual(f.writes()[0].params, { conversationId: "thread", requestId: "persist-native",
+    response: { action: "accept", content: {}, _meta: { persist: "always" } } });
+  assert.deepEqual(receipts, []); f.respond({ ok: true });
+  await waitFor(() => receipts.length === 1); assert.deepEqual(receipts, ["confirmed"]);
+});
+
 test("Desktop browser confirmation waits for a human decision and a native receipt", async t => {
   let approve!: (value: "accept" | "decline") => void;
   const results: string[] = [];

@@ -242,7 +242,8 @@ export class BridgeService {
         ? this.replyActionCard(senderId, notice.card)
         : this.reply(senderId, notice.text),
       options.approvalTimeoutMs,
-      () => options.stateStore.allocateApprovalId()
+      () => options.stateStore.allocateApprovalId(),
+      options.stateStore.approvalJournalPath
     );
     this.runner = options.runner ?? new CodexBackendRouter({
       backend: options.config.codexBackend,
@@ -1776,6 +1777,7 @@ export class BridgeService {
       ...(this.participant.getStore()?.mention ? { mention: this.participant.getStore()!.mention } : {})
     }, prompt, this.runner, {
       onApproval: request => this.approvals.request(message.senderId, request),
+      onApprovalResult: (request, result) => this.approvals.reportResult(message.senderId, request, result),
       onUserInput: request => this.requestUserInput(message.senderId, request, hostId),
       onUserInputResult: (request, result) => this.reportUserInputResult(message.senderId, request, result, hostId)
     });
@@ -2362,6 +2364,7 @@ export class BridgeService {
             }
           } : {}),
           onApproval: (request: CodexApprovalRequest) => this.requestApproval(message.senderId, request),
+          onApprovalResult: (request, result) => this.reportApprovalResult(message.senderId, request, result),
           onUserInput: (request: import("../codex/backend.js").CodexUserInputRequest) => this.requestUserInput(message.senderId, request, this.sessionHostId(session)),
           onUserInputResult: (request: import("../codex/backend.js").CodexUserInputRequest, result: import("../codex/backend.js").CodexUserInputResult) =>
             this.reportUserInputResult(message.senderId, request, result, this.sessionHostId(session))
@@ -2883,6 +2886,11 @@ export class BridgeService {
 
   reportApprovalResult(senderId: string, request: CodexApprovalRequest, result: ApprovalDeliveryResult): Promise<void> {
     return this.approvals.reportResult(senderId, request, result);
+  }
+
+  listApprovals() { return this.approvals.list(); }
+  decideApproval(senderId: string, id: string, choice: string, version: string) {
+    return this.approvals.decideCurrent(senderId, id, choice, version);
   }
 
   async requestUserInput(senderId: string, request: import("../codex/backend.js").CodexUserInputRequest, hostId?: string): Promise<import("../codex/backend.js").CodexUserInputAnswer | undefined> {

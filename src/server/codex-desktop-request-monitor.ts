@@ -323,12 +323,15 @@ export class CodexDesktopRequestMonitor {
         continue;
       }
       if (request.threadId !== threadId) continue;
-      const key = JSON.stringify([hostId, threadId, request.turnId, typeof requestId, requestId]);
+      // MCP turnId is optional correlation, not the native request identity.
+      const key = JSON.stringify([hostId, threadId, method === "mcpServer/elicitation/request" ? method : request.turnId, typeof requestId, requestId]);
       present.add(key);
       const normalized = inputRequest ? { ...inputRequest, requestId, hostId }
-        : { ...request, ...((request as CodexApprovalRequest).cwd || !cwd ? {} : { cwd }) };
+        : { ...request, hostId, nativeKey: `desktop:${this.clientId}:${key}`, ...((request as CodexApprovalRequest).cwd || !cwd ? {} : { cwd }) };
       const previous = this.activeRequests.get(key);
-      if (previous && previous.method === (form ? "item/tool/requestUserInput" : method) && JSON.stringify(previous.request) === JSON.stringify(normalized)) {
+      const comparable = (value: unknown) => method === "mcpServer/elicitation/request"
+        ? JSON.stringify({ ...(value as Record<string, unknown>), turnId: undefined }) : JSON.stringify(value);
+      if (previous && previous.method === (form ? "item/tool/requestUserInput" : method) && comparable(previous.request) === comparable(normalized)) {
         if (fresh && this.retryReady.has(key)) this.dispatch(key, previous);
         continue;
       }
@@ -432,22 +435,20 @@ export class CodexDesktopRequestMonitor {
         : approval.method === "mcpServer/elicitation/request"
           ? "thread-follower-submit-mcp-server-elicitation-response"
           : "thread-follower-permissions-request-approval-response";
+    const result = appServerApprovalResult(approval.method, approval.request, decision);
     const params = approval.method === "mcpServer/elicitation/request"
       ? { conversationId: approval.request.threadId, requestId: approval.requestId,
-          response: appServerApprovalResult(approval.method, approval.request, decision) }
+          response: result }
       : approval.method === "item/permissions/requestApproval"
       ? {
           conversationId: approval.request.threadId,
           requestId: approval.requestId,
-          response: {
-            permissions: decision === "accept" ? approval.request.permissions ?? {} : {},
-            scope: "turn"
-          }
+          response: result
         }
       : {
           conversationId: approval.request.threadId,
           requestId: approval.requestId,
-          decision
+          decision: result.decision
         };
     try {
       await this.submitDecision(method, params, undefined, undefined, approval.hostId);
