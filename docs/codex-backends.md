@@ -34,6 +34,8 @@ Protocol reference: [App Server approvals](https://learn.chatgpt.com/docs/app-se
 
 ## Native execution recovery is not delivery retry
 
+Read-only startup reconciliation is independent of IM/card projection; a delayed card update cannot hold native recovery state open. Closure and protected-state diagnostics record identity/reason only, without prompts or provider details.
+
 Recovery chains have independent attempt budgets and cancellation state. A newly observed capacity failure cannot inherit an old chain's `cancelFuture` flag or remain permanently blocked by a proved-ended accepted turn. Reconciliation is read-only and coalesced by host/thread: the current loaded native snapshot must match the offered failed tail, while an uncertain old acceptance must have one exact native turn ID (or unique client-message correlation), a terminal status, and a position before that tail. Missing, contradictory, foreign or timed-out evidence preserves the uncertainty and submits nothing. Binding/backend changes, new user input and lifecycle changes invalidate pending reconciliation. Native queue/owner checks still run at the actual empty-input continuation boundary.
 
 Startup may close a previously accepted, proved-ended recovery record read-only; it does not scan historical failures to create new work. New chains durably retain retired native turn IDs and the previous closure evidence, so late old failure events cannot cancel or restart a newer chain, including after restart. Unknown submissions without exact acceptance evidence remain protected.

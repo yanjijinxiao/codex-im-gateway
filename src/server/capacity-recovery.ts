@@ -64,12 +64,13 @@ export class CapacityRecoveryCoordinator {
   start(): void {
     this.stopped = false;
     for (const record of Object.values(this.records)) {
+      // Native record reconciliation cannot wait for IM/card projection.
+      if (record.status === "uncertain") void this.settleKnownCompletion(record);
       void (async () => {
         for (let i = 1; i < record.turns.length; i++) {
           await this.options.accepted({ ...record, turnId: record.turns[i - 1] }, record.turns[i]);
         }
         if (record.status === "uncertain") this.announce(record, "重启前的自动恢复接收或执行结果尚未确认。保留原卡并只读核对，不重复提交；可用 /status、/history 查看。");
-        if (record.status === "uncertain") await this.settleKnownCompletion(record);
       })().catch(() => console.warn("[codex-im-gateway] capacity recovery projection pending"));
       if (record.status === "waiting") this.schedule(record);
     }
@@ -183,14 +184,24 @@ export class CapacityRecoveryCoordinator {
     try {
       const snapshot = await this.snapshot(record), accepted = this.acceptedTurn(record, snapshot);
       if (this.stopped || generation !== this.generation || this.records[key] !== record || this.checking.has(key)
-        || this.options.backend().backendInfo(record.hostId).id !== record.backend
-        || this.executing.has(key) || record.status !== "uncertain" || snapshot.state.persistence !== "active"
-        || !["idle", "systemError"].includes(snapshot.state.runtimeStatus) || snapshot.state.activeFlags.length || snapshot.state.pendingTurnWithoutId
-        || !this.terminal(accepted)) return;
+        || this.executing.has(key) || record.status !== "uncertain") return;
+      const reason = this.options.backend().backendInfo(record.hostId).id !== record.backend ? "backend-changed"
+        : snapshot.state.persistence !== "active" ? "persistence-unconfirmed"
+          : !["idle", "systemError"].includes(snapshot.state.runtimeStatus) || snapshot.state.activeFlags.length || snapshot.state.pendingTurnWithoutId ? "runtime-unconfirmed"
+            : !this.terminal(accepted) ? "acceptance-unconfirmed" : undefined;
+      if (reason) { this.reconciliationDiagnostic(record, "protected", reason); return; }
       if (!record.cancelFuture && snapshot.turns.at(-1)?.id === accepted!.id && snapshot.state.lastTurnFailure?.turnId === accepted!.id
         && snapshot.state.lastTurnFailure.code === "model-capacity") return;
       record.status = "finished"; record.closedBy = { turnId: accepted!.id, status: accepted!.status, at: this.now() }; this.save();
-    } catch { /* Unknown acceptance remains protected; no execution replay. */ }
+      this.reconciliationDiagnostic(record, "closed");
+    } catch (error) {
+      if (!this.stopped && this.records[key] === record) this.reconciliationDiagnostic(record, "protected",
+        error instanceof CodexCommunicationError ? error.code : "observation-unavailable");
+    }
+  }
+  private reconciliationDiagnostic(record: RecordState, status: "closed" | "protected", reason?: string): void {
+    console.info(`[codex-im-gateway] capacity reconciliation ${JSON.stringify({ timestamp: new Date().toISOString(),
+      hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, status, ...(reason ? { reason } : {}) })}`);
   }
   private async reconcile(key: string, check: { previous: RecordState; scopes: Map<string, CapacityFailure> }): Promise<void> {
     const generation = this.generation, previous = check.previous;

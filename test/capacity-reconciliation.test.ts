@@ -118,6 +118,14 @@ test("restart retires proved-ended recovery read-only, without scanning history 
   assert.equal(f.calls.length, 0); assert.equal(f.terminal.length, 0);
 });
 
+test("blocked IM projection cannot prevent native recovery records from closing read-only", async t => {
+  const f = fixture(t);
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, accepted: () => new Promise<void>(() => {}) });
+  t.after(() => coordinator.stop()); coordinator.start();
+  await until(() => !coordinator.hasPending("thread", "local"));
+  assert.equal(f.saved().status, "finished"); assert.equal(f.calls.length, 0);
+});
+
 test("a late old failure cannot cancel a waiting new chain", async t => {
   const f = fixture(t); f.options.delaysMs.splice(0, f.options.delaysMs.length, 1000);
   f.coordinator.offer(scope); await until(() => f.saved().turnId === scope.turnId);
