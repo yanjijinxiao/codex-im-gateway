@@ -66,7 +66,11 @@ test("fresh native membership reconciles every IM edge, preserves unknown, and n
   let native: CodexThreadState = { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [],
     cwd: "/project", projectId: "native-project", projectMembership: "assigned" };
   let inspections = 0;
-  const manager = new AccountManager({ paths, runnerFactory: () => ({ async warmUp() {}, async inspectThread() { inspections++; return native; } }) as never });
+  const manager = new AccountManager({ paths, runnerFactory: () => ({ async warmUp() {}, async inspectThread(threadId: string, hostId: string, observation: unknown) {
+    assert.equal(threadId, "thread"); assert.equal(hostId, "remote:test");
+    assert.deepEqual(observation, { includeTurns: false, timeoutMs: 5000 });
+    inspections++; return native;
+  } }) as never });
   manager.ide.configStore.save({ ...manager.ide.config(), enabled: true,
     hosts: [{ hostId: "local", enabled: true, binary: "code-server" }, { hostId: "remote:test", enabled: true, binary: "code-server" }] });
   const entries = await Promise.all(ids.map(id => manager.ide.freshEntry("account", id)));

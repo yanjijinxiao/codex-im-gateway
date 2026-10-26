@@ -853,7 +853,7 @@ export class AccountManager {
     const key = JSON.stringify([hostId, threadId]), pending = this.membershipReads.get(key);
     if (pending) return pending;
     let timer: NodeJS.Timeout | undefined;
-    const work = Promise.race([this.runnerFor().inspectThread(threadId, hostId),
+    const work = Promise.race([this.runnerFor().inspectThread(threadId, hostId, { includeTurns: false, timeoutMs: 5_000 }),
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("无法核对原生 session 目录，未启动 IDE")), 15_000); })])
       .finally(() => { if (timer) clearTimeout(timer); if (this.membershipReads.get(key) === work) this.membershipReads.delete(key); });
     this.membershipReads.set(key, work);

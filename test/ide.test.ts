@@ -122,6 +122,41 @@ test("external first hop silently rechecks Strict cookies without approval UI, g
   assert.equal(transport.launches.length, 1);
 });
 
+test("temporary membership failure returns retryable 503, preserves existing grants and POST tickets, and never opens a stale target", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-membership-unavailable-")), transport = new FakeTransport();
+  let unavailable = false, removed = false;
+  const target: IDEWorkspace = { owner: "owner", sessionId: "s", workspace: "/project", hostId: "local", projectName: "project", projectId: "p" };
+  const manager = new WorkspaceIDEManager({ root, transport, resolve: () => removed ? undefined : target,
+    refresh: async () => { if (unavailable) throw Error("thread/read timed out"); return removed ? undefined : target; } });
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`, management = "http://127.0.0.1:18788";
+  manager.configStore.save(config(manager.configStore, port));
+  const access = new IDEAccessServer(manager); access.setManagementOrigin(management); await access.reload(false);
+  t.after(async () => { await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const entry = manager.entry("account", "s")!, grant = await access.grant(entry.id);
+  const authorizationBytes = () => fs.existsSync(manager.authorizationFile()) ? fs.readFileSync(manager.authorizationFile(), "utf8") : undefined;
+  const before = authorizationBytes();
+  unavailable = true;
+  const page = await fetch(entry.url), text = await page.text();
+  assert.equal(page.status, 503); assert.equal(page.headers.get("retry-after"), "3");
+  assert.match(text, /项目状态暂时无法核验/); assert.match(text, /setTimeout\(\(\)=>location.reload\(\),3000\)/); assert.doesNotMatch(text, /<section data-ide-wait|<form data-ide-auto-open/);
+  assert.equal(page.headers.get("set-cookie"), null); assert.equal(access.pendingAccess().length, 0); assert.equal(transport.launches.length, 0);
+  const form = new URLSearchParams({ entryId: entry.id, token: grant.token });
+  const blocked = await fetch(origin + "/authorize", { method: "POST", redirect: "manual", headers: { Origin: management }, body: form });
+  assert.equal(blocked.status, 503); assert.doesNotMatch(await blocked.text(), /setTimeout\(\(\)=>location.reload/);
+  assert.equal(authorizationBytes(), before, "failed observation cannot consume or revoke a ticket");
+  unavailable = false;
+  const authorized = await fetch(origin + "/authorize", { method: "POST", redirect: "manual", headers: { Origin: management }, body: form });
+  assert.equal(authorized.status, 303); const cookie = authorized.headers.get("set-cookie")!.split(";")[0];
+  const granted = fs.readFileSync(manager.authorizationFile(), "utf8");
+  unavailable = true;
+  assert.equal((await fetch(entry.url, { headers: { Cookie: cookie } })).status, 503);
+  assert.equal(fs.readFileSync(manager.authorizationFile(), "utf8"), granted, "an existing browser login is retained");
+  unavailable = false;
+  assert.match(await (await fetch(entry.url, { headers: { Cookie: cookie } })).text(), /data-ide-auto-open/);
+  removed = true;
+  assert.equal((await fetch(entry.url)).status, 404, "actual project removal stays fail-closed");
+});
+
 for (const source of ["local", "personal"] as const) test(`${source} browser authentication guards HTTP/WS, strips credentials, denies foreign origins and revokes sockets`, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-access-")), transport = new FakeTransport();
   const manager = new WorkspaceIDEManager({ root, transport, resolve: () => ({ owner: "owner", sessionId: "s", workspace: "/project", hostId: "local", projectName: "<project>" }),

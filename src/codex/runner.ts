@@ -13,6 +13,7 @@ import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
 import type {
   CodexAppServerBackend,
+  CodexMetadataObservation,
   CodexBridgeBackend,
   CodexHistoryMessage,
   CodexHistoryPage,
@@ -431,7 +432,12 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     await this.backendForSharedOperation(hostId).clearGoal(threadId);
   }
 
-  inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState> {
+  inspectThread(threadId: string, hostId?: string, observation?: CodexMetadataObservation): Promise<CodexThreadState> {
+    // Project authorization needs current host-scoped membership, not an entire
+    // history or Desktop writer ownership. Keep write preflight unchanged.
+    if (observation) return this.observeOnce("metadata", threadId, hostId, () => this.selectedBackend === "exec"
+      ? this.backendForSharedOperation(hostId).inspectThread(threadId)
+      : this.appServerFor(hostId).inspectThread(threadId, observation));
     return this.observeOnce("inspect", threadId, hostId, () => this.inspectThreadOnce(threadId, hostId));
   }
 

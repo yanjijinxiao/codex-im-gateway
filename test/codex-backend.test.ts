@@ -53,6 +53,26 @@ test("message inspection reads metadata first and hydrates turns only for an act
   assert.deepEqual(reads.slice(1), [{ includeTurns: false, timeoutMs: 5000 }, undefined]);
 });
 
+test("explicit membership metadata uses the exact host, shares only in-flight reads, and never hydrates history or discovers a writer", async t => {
+  const reads: Array<{ host: string; observation: unknown }> = [];
+  const gate = Promise.withResolvers<void>();
+  const backend = (host: string) => ({ async inspectThread(_id: string, observation?: unknown) {
+    reads.push({ host, observation }); if (observation) await gate.promise;
+    return { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [], projectId: host, projectMembership: "assigned" };
+  }, close() {} });
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: backend("local") as never,
+    desktopRunner: { async inspectThread() { assert.fail("membership must not discover a Desktop writer"); }, close() {} } as never });
+  (router as unknown as { remoteAppServers: Map<string, unknown> }).remoteAppServers.set("remote:test", backend("remote:test"));
+  t.after(() => router.close());
+  const observation = { includeTurns: false as const, timeoutMs: 5000 };
+  const a = router.inspectThread("thread", "remote:test", observation), b = router.inspectThread("thread", "remote:test", observation);
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(reads, [{ host: "remote:test", observation }]);
+  gate.resolve(); assert.equal((await a).projectId, "remote:test"); assert.equal((await b).projectId, "remote:test");
+  await router.inspectThread("thread", "remote:test", observation); assert.equal(reads.length, 2, "a later access requires a fresh observation");
+  await router.inspectThread("thread", "local", observation); assert.equal(reads.at(-1)?.host, "local");
+  await router.inspectThread("thread", "remote:test"); assert.equal(reads.at(-1)?.observation, undefined, "ordinary remote execution preflight is unchanged");
+});
+
 test("inspection and following share in-flight metadata, select the real owner before expensive private history, and never cache old state", async t => {
   let metadata = 0, fullReads = 0, snapshots = 0;
   let release!: () => void;

@@ -190,6 +190,20 @@ export class IDEAccessServer {
   private setCookie(res: ServerResponse, name: string, value: string, maxAge: number): void {
     res.setHeader("Set-Cookie", `${name}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${this.manager.config().publicOrigin.startsWith("https:") ? "; Secure" : ""}`);
   }
+  private async refreshEntry(id: string, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+    // Missing/moved/foreign entries are distinct from a backend whose current
+    // membership cannot be read. Neither condition may grant or proxy access.
+    try { this.manager.resolve(id); } catch { res.writeHead(404).end(); return false; }
+    try { await this.manager.refresh(id); return true; }
+    catch {
+      try { this.manager.resolve(id); } catch { res.writeHead(404).end(); return false; }
+      res.setHeader("Retry-After", "3");
+      const retry = req.method === "GET" && req.url?.startsWith(`/workspace/${id}`);
+      this.page(res, 503, "项目状态暂时无法核验", "Gateway 暂时无法读取 Codex 的当前项目归属，尚未开放 IDE。原有浏览器授权已保留；请稍后重试，无需重新配对。",
+        `<a href="/workspace/${id}">重新核验并进入</a>`, retry ? "setTimeout(()=>location.reload(),3000);" : undefined);
+      return false;
+    }
+  }
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // no-referrer serializes form navigation Origin as "null" in Chromium,
     // which would (correctly) fail the strict Origin check below.
@@ -198,7 +212,7 @@ export class IDEAccessServer {
     if (!this.validHost(req)) { res.writeHead(403).end(); return; }
     const url = new URL(req.url ?? "/", this.manager.config().publicOrigin);
     const entryId = /^\/(?:workspace|open|ide|logout)\/([a-f0-9]{32})(?:\/|$)/.exec(url.pathname)?.[1] ?? "";
-    if (entryId) { try { await this.manager.refresh(entryId); } catch { res.writeHead(404).end(); return; } }
+    if (entryId && !await this.refreshEntry(entryId, req, res)) return;
     const session = this.authenticate(req, entryId), method = req.method ?? "GET";
     const copyPanel = /^\/approval\/([a-f0-9]{32})$/.exec(url.pathname);
     if (copyPanel) {
@@ -223,7 +237,7 @@ export class IDEAccessServer {
       const allowed = authority && [this.managementOrigin, `http://localhost:${authority.port}`];
       if (!allowed || !allowed.includes(req.headers.origin)) { res.writeHead(403).end(); return; }
       const form = new URLSearchParams(await readBody(req)), id = form.get("entryId") ?? "";
-      try { await this.manager.refresh(id); } catch { res.writeHead(404).end(); return; }
+      if (!await this.refreshEntry(id, req, res)) return;
       this.assertEntry(id);
       const access = this.authorization.consume(form.get("token") ?? "", id, this.scope(id));
       if (!access) { this.page(res, 401, "授权已失效", "请从 Gateway 管理页重新打开；授权只能使用一次。"); return; }

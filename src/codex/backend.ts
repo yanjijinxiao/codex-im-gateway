@@ -461,10 +461,11 @@ export interface CodexBackendControls {
   deleteThread(threadId: string): Promise<void>;
 }
 
+export type CodexMetadataObservation = { includeTurns: false; timeoutMs: number };
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   /** Read metadata without loading the complete turn history for message preflight. */
-  inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState>;
+  inspectThread(threadId: string, observation?: CodexMetadataObservation): Promise<CodexThreadState>;
   readonly id: "app-server";
 }
 
@@ -498,7 +499,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
     hostId?: string
   ): Promise<CodexThreadGoal | undefined>;
   clearGoal(threadId: string, hostId?: string): Promise<void>;
-  inspectThread(threadId: string, hostId?: string): Promise<CodexThreadState>;
+  inspectThread(threadId: string, hostId?: string, observation?: CodexMetadataObservation): Promise<CodexThreadState>;
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]>;
   listSessionCatalog(input?: CodexThreadListInput, hostId?: string): Promise<CodexSessionCatalog>;
   archiveThread(threadId: string, hostId?: string): Promise<void>;
