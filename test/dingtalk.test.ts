@@ -1521,10 +1521,12 @@ for (const transport of ["https", "sdk"] as const) {
       assert.equal(delivery.outTrackId, receipt.messageId); assert.equal(delivery.openSpaceId, "dtv1.card//IM_GROUP.conversation-123");
       assert.deepEqual(delivery.imGroupOpenDeliverModel.atUserIds, { "staff-123": "Tester", "staff-456": "Other" });
       assert.deepEqual(calls.filter(item => item.operation === "stream").map(item => [item.body.outTrackId, item.body.content]),
-        [["original-segment", "phase summary"]]);
+        [], "a sealed source card must never reopen its streaming component for an @ summary");
+      assert.deepEqual(calls.filter(item => item.operation === "state" && item.body.outTrackId === "original-segment")
+        .map(item => [item.body.cardData.cardParamMap.flowStatus, selectedBody(item.body.cardData.cardParamMap)]), [["3", "phase summary"]]);
       assert.deepEqual(calls.filter(item => item.operation === "state" && item.body.outTrackId === receipt.messageId)
         .map(item => selectedBody(item.body.cardData.cardParamMap)), [expected]);
-      assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "state", "stream", "state"]);
+      assert.deepEqual(calls.map(item => item.operation), ["create", "deliver", "state", "state"]);
       const newFinal = calls.findIndex(item => item.operation === "state" && item.body.outTrackId === receipt.messageId && item.body.cardData.cardParamMap.flowStatus === "3");
       const oldFirst = calls.findIndex(item => item.body.outTrackId === "original-segment");
       assert.ok(newFinal > 0 && oldFirst > newFinal, "never remove the old answer before the new final content is acknowledged");

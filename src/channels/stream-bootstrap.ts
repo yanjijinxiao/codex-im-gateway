@@ -1,4 +1,5 @@
 import type { TurnActivity } from "./turn-status.js";
+import type { ChannelProgressLayout } from "./types.js";
 
 /** Delivery identity is not a visible-message receipt. No credentials belong here. */
 export type ChannelStreamBootstrap = {
@@ -27,6 +28,7 @@ export type ChannelStreamStartInput = {
   toUserId: string; text: string; contextToken?: string; streamId?: string;
   /** Presentation-only activity from the existing durable task checkpoint. */
   activity?: TurnActivity;
+  progressLayout?: ChannelProgressLayout;
   /** Must persist each transition before the next provider mutation. */
   onBootstrap?: (state: ChannelStreamBootstrap) => void;
 };

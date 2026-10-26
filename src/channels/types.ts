@@ -9,6 +9,9 @@ export type ChannelDeliveryPart = { messageId: string; text: string };
 export type ChannelReceipt = { messageId: string; parts?: ChannelDeliveryPart[] };
 export type ChannelTextInput = { toUserId: string; text: string; contextToken?: string };
 export type ChannelMention = { userId: string; name?: string };
+/** Trusted view regions, never recovered by parsing model-authored Markdown.
+ * A native stream cursor belongs to body; interactive/static widgets to footer. */
+export type ChannelProgressLayout = { body: string; footer: string };
 /** Provider-confirmed public conversation metadata, never inferred from IDs or session titles. */
 export type ChannelConversationIdentity = { kind: "direct" | "group"; name?: string };
 /** Trusted application intent, not part of model-authored card content. */
@@ -50,6 +53,7 @@ export type ChannelTextClient = {
     error?: boolean;
     /** Trusted task activity; adapters must not infer loading from body text. */
     activity?: TurnActivity;
+    progressLayout?: ChannelProgressLayout;
   }): Promise<void>;
   sendImage?(input: { toUserId: string; path: string }): Promise<{ messageId: string }>;
   sendActionCard?(input: ChannelActionCardInput): Promise<ChannelReceipt>;
@@ -80,6 +84,7 @@ export type ChannelCapabilities = {
   readonly progress: Capability;
   /** Trusted, persistent task-state heading above progress and result bodies. */
   readonly turnStatusHeader?: Capability;
+  readonly progressFooter?: Capability;
   readonly resumableProgress: boolean;
   readonly streamBootstrapRecovery?: Capability;
   readonly actions: Capability;

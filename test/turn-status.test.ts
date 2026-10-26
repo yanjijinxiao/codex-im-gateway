@@ -54,7 +54,7 @@ test("status remains first above concrete commentary/tools; body text never dete
   await f.stream.finalize("真实最终结果");
   assert.ok(f.updates.at(-1)!.text.startsWith(turnStatusHeading("completed")));
   assert.equal(f.updates.at(-1)!.finalize, true);
-  assert.equal(f.updates.at(-1)!.activity, undefined);
+  assert.equal(f.updates.at(-1)!.activity, "running", "task presentation metadata is retained; finalize owns the terminal transition");
   assert.equal(f.stream.checkpoint().terminal!.text, "真实最终结果");
 });
 
@@ -97,7 +97,8 @@ test("an incomplete code preview cannot swallow the stop control or native-curso
   const text = renderTurnProgressCard({ activity: "running", elapsed: "1 秒", current: "公开进展",
     recent: [], tools: { completed: 0, failed: 0 }, answerPreview: "```ts\n" + "const data = 1;\n".repeat(100) });
   const tokens = Lexer.lex(text);
-  assert.equal(tokens.filter(token => token.type === "code").length, 2);
+  assert.deepEqual(tokens.filter(token => token.type === "code").map(token => token.text), ["/stop"]);
+  assert.match(text, /代码将在最终答复中完整显示/);
   assert.equal(tokens.at(-1)?.type, "paragraph");
   assert.equal(tokens.at(-1)?.raw, "任务仍在执行");
   assert.match(text, /回复预览（尚未完成）/);
@@ -190,7 +191,9 @@ test("DingTalk production REST lifecycle retains native streaming while active a
   await stream.fail("具体错误", "interrupted");
   const last = calls.filter(call => call.url.endsWith("/streaming")).at(-1)!;
   assert.equal(last.body.isFinalize, true); assert.equal(last.body.isError, false); // Keep supplied error body visible.
-  assert.ok(last.body.content.startsWith(turnStatusHeading("interrupted")));
+  assert.equal(last.body.content, "回复已整理。", "only a small complete frame closes the native stream");
   assert.equal(calls.at(-1)!.body.cardData.cardParamMap.flowStatus, "3");
+  assert.ok(calls.at(-1)!.body.cardData.cardParamMap.staticMsgContent.startsWith(turnStatusHeading("interrupted")));
+  assert.match(calls.at(-1)!.body.cardData.cardParamMap.staticMsgContent, /具体错误/);
   assert.equal(new Set(calls.map(call => call.body.outTrackId)).size, 1);
 });

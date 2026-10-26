@@ -1,12 +1,12 @@
 import crypto from "node:crypto";
-import type { ChannelTextClient } from "./types.js";
+import type { ChannelTextClient, ChannelProgressLayout } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
 import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import { copyBlock } from "./copyable.js";
 import { TURN_STATUS_BYTES, turnStatusHeading, withTurnStatus, type TurnActivity, type TurnOutcome } from "./turn-status.js";
-import { renderTurnProgressCard } from "./turn-progress-card.js";
+import { renderTurnProgressCard, renderTurnProgressLayout } from "./turn-progress-card.js";
 import { restoredBootstrap, canRetryUnsentCreation, type ChannelStreamBootstrap, type ChannelStreamFailure } from "./stream-bootstrap.js";
 
 const MAX_RECOVERY_PROBES = 3;
@@ -73,6 +73,7 @@ export class ChannelTurnTextStream {
   private terminalPages: NonNullable<ChannelStreamCheckpoint["terminalPages"]> = [];
   private notifying?: Promise<boolean>;
   private latestText = "";
+  private latestLayout?: ChannelProgressLayout;
   private latestActivity?: TurnActivity;
   private startedAt = Date.now();
   private finished = false;
@@ -358,7 +359,8 @@ export class ChannelTurnTextStream {
           } finally { this.persistence?.save(this.checkpoint()); }
         }
         await this.client.updateTextStream!({ toUserId: this.toUserId, messageId: receipt.messageId!,
-          text: page.text, finalize: true, ...(this.terminal!.error ? { error: true } : {}) });
+          text: page.text, finalize: true, ...(this.terminal!.error ? { error: true } : {}),
+          ...(this.activityMetadata ? { activity: this.activity } : {}) });
         receipt.delivered = true;
         this.persistence?.save(this.checkpoint());
       }
@@ -469,7 +471,7 @@ export class ChannelTurnTextStream {
         const activity = this.latestActivity;
         attemptedActivity = activity;
         await this.client.updateTextStream!({ toUserId: this.toUserId, messageId: this.messageId, text,
-          ...(activity ? { activity } : {}) });
+          ...(activity ? { activity } : {}), ...(this.latestLayout ? { progressLayout: this.latestLayout } : {}) });
         this.recovered();
       } catch (error) { this.unavailable(error); }
     });
@@ -510,6 +512,15 @@ export class ChannelTurnTextStream {
   }
 
   private render(): string {
+    this.latestLayout = undefined;
+    // A frozen legacy terminal page plan does not pin the active layout.
+    if (this.activityMetadata && this.client.capabilities?.progressFooter === "available") {
+      const layout = renderTurnProgressLayout(this.progressFacts());
+      try { layout.footer = this.persistence?.decorateProgress?.(layout.footer) ?? layout.footer; }
+      catch { /* Optional metadata cannot prevent progress delivery. */ }
+      this.latestLayout = layout;
+      return `${layout.body}\n\n${layout.footer}`;
+    }
     const text = this.renderBody();
     try { return this.persistence?.decorateProgress?.(text) ?? text; }
     catch { return text; } // Optional entry metadata must not stop task progress.
@@ -517,12 +528,7 @@ export class ChannelTurnTextStream {
 
   private renderBody(): string {
     const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
-    if (this.statusHeader) return renderTurnProgressCard({ activity: this.visibleActivity(),
-      elapsed: formatTurnElapsed(Date.now() - this.startedAt), current: current || this.thought || "等待新的可展示进展。",
-      thought: current && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步)/.test(this.thought)
-        ? this.thought : undefined,
-      recent: this.progressEntries.filter(entry => entry !== current), tools: this.toolActivity,
-      answerPreview: this.answerPreview, notice: this.communicationNotice || this.recoveryNotice });
+    if (this.statusHeader) return renderTurnProgressCard(this.progressFacts());
     const sections = [
       this.activityMetadata ? turnStatusHeading(this.visibleActivity())
         : this.communicationNotice ? "⏳ **等待后端确认**" : this.recoveryNotice ? "⏳ **等待 Codex 后续状态**"
@@ -552,6 +558,16 @@ export class ChannelTurnTextStream {
     return sections.join("\n\n");
   }
 
+  private progressFacts(): Parameters<typeof renderTurnProgressCard>[0] {
+    const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
+    return { activity: this.visibleActivity(), elapsed: formatTurnElapsed(Date.now() - this.startedAt),
+      current: current || this.thought || "等待新的可展示进展。",
+      thought: current && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步)/.test(this.thought)
+        ? this.thought : undefined,
+      recent: this.progressEntries.filter(entry => entry !== current), tools: this.toolActivity,
+      answerPreview: this.answerPreview, notice: this.communicationNotice || this.recoveryNotice };
+  }
+
   private visibleActivity(): TurnActivity {
     return this.communicationNotice ? "unconfirmed" : this.recoveryNotice ? "recovering" : this.activity;
   }
@@ -574,6 +590,7 @@ export class ChannelTurnTextStream {
         if (!this.terminal && this.persistence?.decorateProgress) this.latestText = this.render();
         const input = { toUserId: this.toUserId, text: this.latestText, streamId: this.streamId,
           ...(this.latestActivity ? { activity: this.latestActivity } : {}),
+          ...(!this.terminal && this.latestLayout ? { progressLayout: this.latestLayout } : {}),
           onBootstrap: (state: ChannelStreamBootstrap) => this.saveBootstrap(state),
           ...(this.persistence?.contextToken ? { contextToken: this.persistence.contextToken } : {}) };
         const result = resume && recover

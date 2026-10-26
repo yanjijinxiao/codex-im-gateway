@@ -19,7 +19,7 @@ const first = "https://203.0.113.1:8790/workspace/project", second = "https://20
 function fixture(t: test.TestContext) {
   const starts: Array<{ text: string; streamId?: string }> = [], frames: Array<{ text: string; finalize?: boolean; activity?: string; messageId: string }> = [];
   let url: string | undefined = first;
-  const client = createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available", resumableProgress: true }, {
+  const client = createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available", progressFooter: "available", resumableProgress: true }, {
     async sendText() { throw Error("must keep the original card"); },
     async startTextStream(input) { starts.push(input); return { messageId: input.streamId! }; },
     async updateTextStream(input) { frames.push(input); }
@@ -83,7 +83,7 @@ for (const managed of [false, true]) test(`${managed ? "managed" : "followed"} h
   let url: string | undefined = first;
   const starts: string[] = [], updates: string[] = [], finals: string[] = [];
   const sub: ThreadSubscription = { key: "exact-binding", hostId: "remote:project", threadId: "thread", recipientId: "group", managed,
-    client: createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available", resumableProgress: true }, {
+    client: createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available", progressFooter: "available", resumableProgress: true }, {
       async sendText() { throw Error("no fallback"); },
       async startTextStream(input) { starts.push(input.text); return { messageId: "card" }; },
       async updateTextStream(input) { (input.finalize ? finals : updates).push(input.text); }
@@ -142,7 +142,7 @@ test("standalone Bridge progress uses the current managed session and the termin
   const frames: string[] = [], final: string[] = [];
   let lookupSession: string | undefined;
   const service = new BridgeService({ config: { ...defaultConfig(root), streamReplies: true, allowedSenderIds: ["alice"] }, stateStore: store,
-    channel: createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available" }, {
+    channel: createChannelClient("dingtalk", { ...TEXT_CAPABILITIES, progress: "available", turnStatusHeader: "available", progressFooter: "available" }, {
       async sendText() { return { messageId: "text" }; },
       async startTextStream(input) { frames.push(input.text); return { messageId: "card" }; },
       async updateTextStream(input) { (input.finalize ? final : frames).push(input.text); }
