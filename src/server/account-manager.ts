@@ -36,6 +36,7 @@ import type {
   CodexBridgeBackend,
   CodexHistoryMessage,
   CodexModelOption,
+  CodexProjectCatalog,
   CodexRuntimeInfo
 } from "../codex/backend.js";
 import type { CodexThreadState } from "../codex/backend.js";
@@ -123,6 +124,7 @@ import { ChannelMessageWebhook } from "../webhooks/channel-message-webhook.js";
 import { resolveChannelModeSettings } from "./channel-mode-settings.js";
 import { WorkspaceIDEManager, type IDEWorkspace } from "../ide/manager.js";
 import { withIDEEntry } from "../ide/completion.js";
+import { desktopIDEProjectId } from "../ide/project-identity.js";
 import { IDEApprovalService } from "../ide/approval-service.js";
 import { BindingExpiryCoordinator, type ExpiringBinding } from "./binding-expiry.js";
 import type { BindingExpiry } from "../state/binding-expiry.js";
@@ -250,6 +252,7 @@ export type AccountManagerOptions = {
   adapterFactory?: ChannelAdapterFactory;
   paths: StatePaths;
   configProvider?: () => CodexImGatewayConfig;
+  ideProjectsProvider?: () => readonly CodexProjectCandidate[];
   clientFactory?: (account: WeixinAccount) => WeixinApiClient;
   channelFactory?: (
     account: WeComAccount | FeishuAccount | DingTalkAccount,
@@ -294,6 +297,7 @@ export class AccountManager {
   private readonly codexDesktopRequestMonitorFactory: NonNullable<AccountManagerOptions["codexDesktopRequestMonitorFactory"]>;
   private readonly externalCodexTasks = new Map<string, CodexSessionTask>();
   private readonly membershipReads = new Map<string, Promise<CodexThreadState>>();
+  private readonly ideProjectReads = new Map<string, Promise<CodexProjectCatalog>>();
   private readonly managedTurnCompletions = new Set<string>();
   private readonly threadEvents: ThreadEventHub;
   private readonly sessionControls: SessionControlJournal;
@@ -330,6 +334,14 @@ export class AccountManager {
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
+      decorateProgress: (sub, text) => {
+        let url: string | undefined;
+        try {
+          const [accountId, sessionId] = JSON.parse(sub.key) as string[];
+          url = this.ide.entry(accountId, sessionId)?.url;
+        } catch { /* Optional metadata fails closed, never reuse an old URL. */ }
+        return withIDEEntry(text, url, { atEnd: true });
+      },
       decorateFinal: async (sub, text) => {
         const [accountId, sessionId] = JSON.parse(sub.key) as string[];
         let url: string | undefined;
@@ -507,6 +519,7 @@ export class AccountManager {
       ideApprovals: this.ideApprovals,
       ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
       ideEntry: async session => (await this.ide.freshEntry(account.accountId, session.id))?.url,
+      ideProgressEntry: session => this.ide.entry(account.accountId, session.id)?.url,
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
@@ -824,7 +837,7 @@ export class AccountManager {
       // Desktop can change project membership while Gateway is running. Read
       // its full root set, not just the thread cwd; never mix hosts or backends.
       const nativeProject = this.configProvider().codexBackend === "exec" ? undefined
-        : readCodexDesktopProjects().find(candidate => (candidate.hostId ?? "local") === hostId
+        : this.ideProjects().find(candidate => (candidate.hostId ?? "local") === hostId
           && (project.sourceProjectId ? candidate.projectId === project.sourceProjectId : candidate.workspace === project.workspace));
       if (nativeProject?.available === false) return;
       const roots = nativeProject?.rootPaths ?? (nativeProject ? [nativeProject.workspace] : project.rootPaths);
@@ -844,16 +857,40 @@ export class AccountManager {
     const hostId = session.hostId ?? store.getProject(session.projectId ?? "")?.hostId ?? "local";
     if (!session.threadId || this.configProvider().codexBackend === "exec") return this.ideWorkspace(accountId, sessionId);
     const state = await this.readMembership(session.threadId, hostId);
+    if (state.persistence === "archived" || state.persistence === "missing") return;
     if (state.threadId !== session.threadId || state.internal || state.persistence !== "active" || !state.cwd
-      || !this.observeThreadMembership(hostId, state)) return;
+      || state.projectMembership === "unknown" || !this.observeThreadMembership(hostId, state))
+      throw new Error("当前原生 session 的项目归属尚未核对，未开放 IDE");
     return this.ideWorkspace(accountId, sessionId);
+  }
+
+  private ideProjects() { return (this.options.ideProjectsProvider ?? readCodexDesktopProjects)(); }
+  private readIDEProjects(hostId: string): Promise<CodexProjectCatalog> {
+    const pending = this.ideProjectReads.get(hostId); if (pending) return pending;
+    let timer: NodeJS.Timeout | undefined;
+    const work = Promise.race([this.runnerFor().listProjects(hostId), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("原生项目目录核验超时")), 5_000);
+    })]).finally(() => { if (timer) clearTimeout(timer); if (this.ideProjectReads.get(hostId) === work) this.ideProjectReads.delete(hostId); });
+    this.ideProjectReads.set(hostId, work); return work;
+  }
+  private async ideMembershipIdentity(state: CodexThreadState, hostId: string): Promise<CodexThreadState> {
+    if (state.persistence !== "active" || state.projectMembership !== "assigned" || !state.projectId) return state;
+    const projects = this.ideProjects();
+    if (projects.some(p => p.projectId === state.projectId && (p.hostId ?? "local") === hostId)
+      || listAccounts(this.options.paths).some(account => this.storeFor(account.accountId).listProjects()
+        .some(p => p.sourceProjectId === state.projectId && (p.hostId ?? "local") === hostId))) return state;
+    const catalog = await this.readIDEProjects(hostId);
+    const native = catalog.backend === "app-server" && catalog.projects.find(p => p.id === state.projectId);
+    const projectId = native && desktopIDEProjectId(native, hostId, projects);
+    return projectId ? { ...state, projectId } : state;
   }
 
   private readMembership(threadId: string, hostId: string): Promise<CodexThreadState> {
     const key = JSON.stringify([hostId, threadId]), pending = this.membershipReads.get(key);
     if (pending) return pending;
     let timer: NodeJS.Timeout | undefined;
-    const work = Promise.race([this.runnerFor().inspectThread(threadId, hostId, { includeTurns: false, timeoutMs: 5_000 }),
+    const work = Promise.race([this.runnerFor().inspectThread(threadId, hostId, { includeTurns: false, timeoutMs: 5_000 })
+      .then(state => this.ideMembershipIdentity(state, hostId)),
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("无法核对原生 session 目录，未启动 IDE")), 15_000); })])
       .finally(() => { if (timer) clearTimeout(timer); if (this.membershipReads.get(key) === work) this.membershipReads.delete(key); });
     this.membershipReads.set(key, work);
@@ -865,7 +902,7 @@ export class AccountManager {
   private observeThreadMembership(hostId: string, state: CodexThreadState): boolean {
     if (state.internal || state.persistence !== "active" || state.projectMembership === "unknown"
       || !state.projectId && state.projectMembership !== "none") return false;
-    const native = state.projectId ? readCodexDesktopProjects().find(p => p.projectId === state.projectId && (p.hostId ?? "local") === hostId) : undefined;
+    const native = state.projectId ? this.ideProjects().find(p => p.projectId === state.projectId && (p.hostId ?? "local") === hostId) : undefined;
     for (const account of listAccounts(this.options.paths)) {
       const store = this.storeFor(account.accountId);
       const matching = store.listSessions().filter(s => s.threadId === state.threadId && s.mode !== "qa"

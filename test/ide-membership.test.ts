@@ -12,6 +12,7 @@ import { resolveStatePaths, accountStatePaths } from "../src/state/paths.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 import type { CodexThreadState } from "../src/codex/backend.js";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
+import { desktopIDEProjectId } from "../src/ide/project-identity.js";
 
 test("a project/worktree entry survives alias removal and restart without retargeting or widening authorization", async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-entry-identity-"));
@@ -77,7 +78,7 @@ test("fresh native membership reconciles every IM edge, preserves unknown, and n
   const entry = entries[0]!;
   assert.equal(entry.id, entries[1]!.id); assert.equal(inspections, 1, "concurrent IM/HTTP projections share one native read, not stale persisted observations");
   native = { ...native, projectId: undefined, projectMembership: "unknown" };
-  assert.equal(await manager.ide.freshEntry("account", ids[0]), undefined);
+  await assert.rejects(manager.ide.freshEntry("account", ids[0]), /项目归属尚未核对/);
   assert.ok(manager.listSessions().filter(s => ids.includes(s.id)).every(s => s.projectId === p.id && s.binding.bound));
   native = { ...native, projectMembership: "none" };
   assert.equal(await manager.ide.freshEntry("account", ids[1]), undefined);
@@ -94,6 +95,57 @@ test("fresh native membership reconciles every IM edge, preserves unknown, and n
   assert.notEqual(moved.id, entry.id);
   assert.ok(manager.listSessions().filter(s => ids.includes(s.id)).every(s => s.projectId === p2.id && s.binding.bound && s.workspace === "/other"));
   assert.throws(() => manager.ide.resolve(entry.id), /失效/);
+});
+
+test("native/Desktop project ID translation requires exact host and complete authoritative roots, never cwd or ambiguous directories", () => {
+  const native = { id: "backend-project", roots: ["/project", "/sibling"] };
+  const desktop = { projectId: "desktop-project", hostId: "remote:a", workspace: "/project", rootPaths: ["/sibling", "/project"] };
+  assert.equal(desktopIDEProjectId(native, "remote:a", [desktop]), desktop.projectId);
+  assert.equal(desktopIDEProjectId(native, "remote:b", [desktop]), undefined);
+  assert.equal(desktopIDEProjectId({ ...native, roots: ["/project"] }, "remote:a", [desktop]), undefined);
+  assert.equal(desktopIDEProjectId(native, "remote:a", [desktop, { ...desktop, projectId: "duplicate" }]), undefined);
+  assert.equal(desktopIDEProjectId(native, "remote:a", [{ ...desktop, available: false }]), undefined);
+  assert.equal(desktopIDEProjectId({ ...native, roots: ["relative"] }, "remote:a", [desktop]), undefined);
+});
+
+test("IDE membership resolves a newly created backend project ID into its registered Desktop identity without changing the project link", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-project-ids-")), paths = resolveStatePaths(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  saveAccount(paths, { accountId: "account", token: "fixture", baseUrl: "http://localhost" });
+  const store = new RuntimeStateStore(accountStatePaths(paths, "account"));
+  const project = store.createProject("project", "/project", { sourceProjectId: "desktop-id", hostId: "remote:a", projectKind: "remote" });
+  const session = store.createSession("group", "/project", "new task", project.id); store.setSessionThread(session.id, "thread");
+  let membership: CodexThreadState = { threadId: "thread", cwd: "/project", projectId: "backend-id", projectMembership: "assigned", persistence: "active", runtimeStatus: "idle", activeFlags: [] };
+  let catalogs = 0;
+  const manager = new AccountManager({ paths,
+    ideProjectsProvider: () => [{ projectId: "desktop-id", hostId: "remote:a", workspace: "/project", name: "project", projectKind: "remote", available: true, sessionCount: 1, lastUsedAt: "" }],
+    runnerFactory: () => ({ async warmUp() {}, async inspectThread() { return membership; }, async listProjects(hostId: string) {
+      assert.equal(hostId, "remote:a"); catalogs++; return { backend: "app-server", projects: [{ id: "backend-id", name: "project", roots: ["/project"] }] };
+    } }) as never });
+  manager.ide.configStore.save({ ...manager.ide.config(), enabled: true, hosts: [{ hostId: "remote:a", enabled: true, binary: "code-server" }] });
+  const original = manager.ide.entry("account", session.id)!;
+  const fresh = await manager.ide.freshEntry("account", session.id);
+  assert.equal(fresh?.id, original.id); assert.equal(catalogs, 1);
+  assert.equal(new RuntimeStateStore(accountStatePaths(paths, "account")).getSession(session.id)!.projectId, project.id);
+  membership = { ...membership, projectId: undefined, projectMembership: "none" };
+  assert.equal(await manager.ide.freshEntry("account", session.id), undefined); assert.equal(catalogs, 1, "explicit projectless state never triggers root-based translation");
+});
+
+test("project entry refresh skips a confirmed archived alias, retains its scope, and never falls back after an unknown read", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-live-alias-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = (sessionId: string): IDEWorkspace => ({ owner: "owner", sessionId, hostId: "remote:a", workspace: "/project", projectName: "project", projectId: "p" });
+  let unavailable = false; const reads: string[] = [];
+  const manager = new WorkspaceIDEManager({ root, resolve: (_account, sessionId) => target(sessionId), refresh: async (_account, sessionId) => {
+    reads.push(sessionId); if (unavailable) throw Error("unconfirmed"); return sessionId === "archived" ? undefined : target(sessionId);
+  } });
+  manager.configStore.save({ ...manager.config(), enabled: true, hosts: [{ hostId: "remote:a", enabled: true, binary: "code-server" }] });
+  const entry = manager.entry("account", "archived")!; assert.equal(manager.entry("account", "active")!.id, entry.id);
+  const scope = manager.authorizationScope(entry.id);
+  assert.equal((await manager.refresh(entry.id)).workspace, "/project"); assert.deepEqual(reads, ["archived", "active"]);
+  assert.equal(manager.authorizationScope(entry.id), scope);
+  reads.length = 0; unavailable = true;
+  await assert.rejects(manager.refresh(entry.id), /unconfirmed/); assert.deepEqual(reads, ["active"], "cannot authorize through another alias after a temporary failure");
 });
 
 test("async IDE enrichment cannot deliver an old result after its IM binding is detached", async t => {

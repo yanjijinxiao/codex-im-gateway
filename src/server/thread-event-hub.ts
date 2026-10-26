@@ -62,6 +62,7 @@ type FollowState = {
 };
 type Options = {
   decorateFinal?: (sub: ThreadSubscription, text: string) => string | Promise<string>;
+  decorateProgress?: (sub: ThreadSubscription, text: string) => string;
   onThreadState?: (sub: ThreadSubscription, state: CodexThreadState) => void;
   onCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   holdsCapacityStart?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
@@ -842,6 +843,7 @@ export class ThreadEventHub {
       ? saved : undefined;
     stream = new ChannelTurnPresentation(sub.client, sub.recipientId, {
       restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
+      ...(this.options.decorateProgress ? { decorateProgress: (text: string) => this.isLive(sub) ? this.options.decorateProgress!(sub, text) : text } : {}),
       save: (checkpoint) => {
         // A retired stream's late HTTP acknowledgement cannot poison the new
         // turn. The streamId is the transport-neutral presentation identity.

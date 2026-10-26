@@ -109,11 +109,22 @@ export class WorkspaceIDEManager {
    * Unknown observations fail closed and do not rewrite stored membership. */
   async refresh(id: string): Promise<IDEWorkspace> {
     const { reference, sessionId } = this.referenceTarget(id);
-    const current = this.options.refresh ? await this.options.refresh(reference.accountId, sessionId) : this.resolve(id);
-    if (!current) throw new Error("项目关系无法确认，IDE 入口失效");
-    if (reference.identity && this.entryIdentity(reference.accountId, current) !== reference.identity) throw new Error("项目上下文已改变，IDE 入口失效");
-    const latest = this.resolve(id);
-    return reference.identity === id ? latest : current;
+    for (const candidate of new Set([sessionId, reference.sessionId, ...(reference.sessionIds ?? [])])) {
+      const before = this.options.resolve(reference.accountId, candidate);
+      if (!before || reference.identity && this.entryIdentity(reference.accountId, before) !== reference.identity) continue;
+      // Undefined means confirmed absence/archive. An unknown/failed read must
+      // reject, never silently authorize through another alias's cached state.
+      const current = this.options.refresh ? await this.options.refresh(reference.accountId, candidate) : before;
+      if (!current || reference.identity && this.entryIdentity(reference.accountId, current) !== reference.identity) continue;
+      const fresh = this.options.resolve(reference.accountId, candidate);
+      if (!fresh || reference.identity && this.entryIdentity(reference.accountId, fresh) !== reference.identity) continue;
+      if (reference.identity === id && reference.sessionId !== candidate) {
+        reference.sessionId = candidate; writeJsonFile(this.referencePath, this.references);
+      }
+      const latest = this.resolve(id);
+      return reference.identity === id ? latest : current;
+    }
+    throw new Error("项目关系无法确认，IDE 入口失效");
   }
   accountForEntry(id: string): string { this.resolve(id); return this.references[id].accountId; }
   authorizationScope(id: string): string { return crypto.createHash("sha256").update(JSON.stringify(this.resolve(id))).digest("hex"); }

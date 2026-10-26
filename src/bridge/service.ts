@@ -142,6 +142,7 @@ export type BridgeServiceOptions = {
   /** Captured from the actual running adapter account, not mutable UI state. */
   ideProviderId?: string;
   ideEntry?: (session: ManagedSession) => string | undefined | Promise<string | undefined>;
+  ideProgressEntry?: (session: ManagedSession) => string | undefined;
   deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
@@ -2272,6 +2273,14 @@ export class BridgeService {
       if (!progressEnabled || replyStream || !stillBound()) return;
       replyStream = await this.options.createTextStream?.(session, acceptedTurnId) ?? new ChannelTurnPresentation(this.channel, message.senderId, {
         save: () => undefined, contextToken: this.options.stateStore.getContextToken(message.senderId),
+        decorateProgress: text => {
+          let url: string | undefined;
+          try {
+            const current = this.options.stateStore.getSession(session.id);
+            if (current && stillBound()) url = this.options.ideProgressEntry?.(current);
+          } catch { /* IDE metadata must not interrupt progress delivery. */ }
+          return withIDEEntry(text, url, { atEnd: true });
+        },
         onTextDelivered: (part) => this.options.onOutboundMessage?.({ direction: "outbound", id: part.messageId,
           recipientId: message.senderId, text: part.text, attachments: [] })
       });

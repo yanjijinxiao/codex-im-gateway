@@ -99,6 +99,9 @@ export class ChannelTurnTextStream {
       contextToken?: string;
       onTextDelivered?: (part: { messageId: string; text: string }) => void;
       progressEnabled?: boolean;
+      /** Read-only presentation projection. Re-evaluated at send time and
+       * heartbeats; never persisted into task facts or terminal page plans. */
+      decorateProgress?: (text: string) => string;
     }
   ) {
     const saved = persistence?.restore;
@@ -459,7 +462,8 @@ export class ChannelTurnTextStream {
     this.chain = this.chain.catch(() => undefined).then(async () => {
       if (!this.canUpdate() || !this.messageId || Date.now() < this.retryAt) return;
       // Read the latest snapshot only when this operation actually runs.
-      const text = this.latestText;
+      const text = this.persistence?.decorateProgress ? this.render() : this.latestText;
+      this.latestText = text;
       attemptedText = text;
       try {
         const activity = this.latestActivity;
@@ -506,6 +510,12 @@ export class ChannelTurnTextStream {
   }
 
   private render(): string {
+    const text = this.renderBody();
+    try { return this.persistence?.decorateProgress?.(text) ?? text; }
+    catch { return text; } // Optional entry metadata must not stop task progress.
+  }
+
+  private renderBody(): string {
     const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
     if (this.statusHeader) return renderTurnProgressCard({ activity: this.visibleActivity(),
       elapsed: formatTurnElapsed(Date.now() - this.startedAt), current: current || this.thought || "等待新的可展示进展。",
@@ -561,6 +571,7 @@ export class ChannelTurnTextStream {
     this.persistence?.save(this.checkpoint());
     this.opening = (async () => {
       try {
+        if (!this.terminal && this.persistence?.decorateProgress) this.latestText = this.render();
         const input = { toUserId: this.toUserId, text: this.latestText, streamId: this.streamId,
           ...(this.latestActivity ? { activity: this.latestActivity } : {}),
           onBootstrap: (state: ChannelStreamBootstrap) => this.saveBootstrap(state),

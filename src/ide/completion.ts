@@ -1,3 +1,5 @@
+import { closeMarkdownFence } from "../channels/result-pages.js";
+
 /** A presentation label, not a URL shortener or an authorization credential. */
 export function ideEntryLink(url: string): string {
   const target = new URL(url);
@@ -9,7 +11,7 @@ export function ideEntryLink(url: string): string {
 }
 
 /** Presentation-only enrichment. Never alters the model history or submission. */
-export function withIDEEntry(text: string, url?: string): string {
+export function withIDEEntry(text: string, url?: string, options: { atEnd?: boolean } = {}): string {
   // This standalone label is Gateway-owned, including legacy model-authored
   // footers. Reconcile it semantically, not by comparing two session URLs.
   let fence: string | undefined;
@@ -23,6 +25,7 @@ export function withIDEEntry(text: string, url?: string): string {
   }).join("\n").trimEnd();
   if (!url) return text;
   const link = ideEntryLink(url);
-  if (text.includes(url) || text.includes(link)) return text;
+  if (!options.atEnd && (text.includes(url) || text.includes(link))) return text;
+  if (options.atEnd) text = closeMarkdownFence(text);
   return `${text.trim()}\n\n${link}`;
 }
