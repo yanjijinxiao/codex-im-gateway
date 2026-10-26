@@ -31,7 +31,9 @@ export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
-import { dingTalkLoadingBody, dingTalkPlainText, dingTalkVisibleOrdinals } from "./dingtalk-markdown.js";
+import { dingTalkLoadingBody, dingTalkPlainText, normalizeDingTalkCardContent } from "./dingtalk-markdown.js";
+// Keep the existing adapter export stable for embedders and transport tests.
+export { normalizeDingTalkCardContent } from "./dingtalk-markdown.js";
 import { dingTalkMentionCard, dingTalkCardAtParameters } from "./dingtalk-mentions.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import {
@@ -1438,81 +1440,6 @@ async function sendDingTalkEmotionRequest(
     ? result.message
     : `HTTP ${response.status}`;
   throw new Error(`钉钉表情请求失败（${pathname}）：${detail}`);
-}
-
-export function normalizeDingTalkCardContent(text: string): string {
-  const lines = ensureDingTalkTableSpacing(dingTalkVisibleOrdinals(text.replace(/\r\n?/g, "\n"))).split("\n");
-  const markdownBlockStart = /^(\s{0,3}(?:[-*+]|\d+[.)])[ ])|(\s{0,3}\|)|(\s{0,3}#{1,6}\s)|(\s{0,3}(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))/;
-  const fence = /^\s{0,3}```/;
-  const quote = /^\s{0,3}>\s?/;
-  const merged: string[] = [];
-  let pendingQuote: string[] = [];
-  let inCodeBlock: boolean = false;
-  const flushQuote = () => {
-    if (!pendingQuote.length) return;
-    merged.push(pendingQuote.join("<br>"));
-    pendingQuote = [];
-  };
-
-  for (const line of lines) {
-    const isFence = fence.test(line);
-    if (inCodeBlock) {
-      flushQuote();
-      merged.push(line);
-      if (isFence) inCodeBlock = false;
-      continue;
-    }
-    if (isFence) {
-      flushQuote();
-      merged.push(line);
-      inCodeBlock = true;
-      continue;
-    }
-    if (quote.test(line)) {
-      pendingQuote.push(pendingQuote.length ? line.replace(quote, "") : line);
-    } else {
-      flushQuote();
-      merged.push(line);
-    }
-  }
-  flushQuote();
-
-  inCodeBlock = false;
-  const parts: string[] = [];
-  for (let index = 0; index < merged.length; index += 1) {
-    const current = merged[index] ?? "";
-    const nextInCodeBlock: boolean = fence.test(current) ? !inCodeBlock : inCodeBlock;
-    if (index < merged.length - 1) {
-      const next = merged[index + 1] ?? "";
-      const keepNewline = nextInCodeBlock
-        || current === ""
-        || next === ""
-        || fence.test(next)
-        || markdownBlockStart.test(next);
-      parts.push(current, keepNewline ? "\n" : "<br>");
-    } else {
-      parts.push(current);
-    }
-    inCodeBlock = nextInCodeBlock;
-  }
-  return parts.join("");
-}
-
-function ensureDingTalkTableSpacing(text: string): string {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n");
-  const result: string[] = [];
-  const tableDivider = /^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$/;
-  const tableRow = /^\s*\|?.*\|.*\|?\s*$/;
-  for (let index = 0; index < lines.length; index += 1) {
-    const current = lines[index] ?? "";
-    const next = lines[index + 1] ?? "";
-    if (tableRow.test(current) && tableDivider.test(next) && index > 0) {
-      const previous = lines[index - 1] ?? "";
-      if (previous.trim() && !tableRow.test(previous)) result.push("");
-    }
-    result.push(current);
-  }
-  return result.join("\n");
 }
 
 function acknowledge(client: DingTalkStreamClient, frame: DWClientDownStream): void {

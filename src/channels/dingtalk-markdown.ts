@@ -26,6 +26,70 @@ export function dingTalkPlainText(source: string): string {
   return result + source.slice(cursor);
 }
 
+/** One presentation boundary for initial/static, streaming and terminal card
+ * bodies. Markdown code is opaque: neither its values nor its closing newline
+ * may be rewritten into HTML. Preserve containing lists/quotes as a block too,
+ * so their indentation and code-fence scope remain intact. */
+export function normalizeDingTalkCardContent(text: string): string {
+  const source = dingTalkVisibleOrdinals(text.replace(/\r\n?/g, "\n"));
+  let result = "", cursor = 0, plainStart = 0;
+  for (const token of Lexer.lex(source, { gfm: true })) {
+    const offset = source.indexOf(token.raw, cursor);
+    if (offset < 0 || !token.raw) continue;
+    cursor = offset + token.raw.length;
+    if (!containsBlockCode(token)) continue;
+    result += normalizeCardProse(source.slice(plainStart, offset)) + token.raw;
+    plainStart = cursor;
+  }
+  return result + normalizeCardProse(source.slice(plainStart));
+}
+
+function containsBlockCode(token: Token): boolean {
+  if (token.type === "code") return true;
+  if (token.type === "blockquote") return (token as Tokens.Blockquote).tokens.some(containsBlockCode);
+  if (token.type === "list") return (token as Tokens.List).items.some(item => item.tokens.some(containsBlockCode));
+  return false;
+}
+
+/** Only non-code source reaches the template's newline/quote/table adapter. */
+function normalizeCardProse(text: string): string {
+  const lines = ensureCardTableSpacing(text).split("\n");
+  const markdownBlockStart = /^(\s{0,3}(?:[-*+]|\d+[.)])[ ])|(\s{0,3}\|)|(\s{0,3}#{1,6}\s)|(\s{0,3}(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))/;
+  const quote = /^\s{0,3}>\s?/;
+  const merged: string[] = [];
+  let pendingQuote: string[] = [];
+  const flushQuote = () => {
+    if (pendingQuote.length) merged.push(pendingQuote.join("<br>"));
+    pendingQuote = [];
+  };
+  for (const line of lines) {
+    if (quote.test(line)) pendingQuote.push(pendingQuote.length ? line.replace(quote, "") : line);
+    else { flushQuote(); merged.push(line); }
+  }
+  flushQuote();
+  return merged.map((current, index) => {
+    if (index === merged.length - 1) return current;
+    const next = merged[index + 1];
+    return current + (current === "" || next === "" || markdownBlockStart.test(next) ? "\n" : "<br>");
+  }).join("");
+}
+
+function ensureCardTableSpacing(text: string): string {
+  const lines = text.split("\n");
+  const result: string[] = [];
+  const tableDivider = /^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$/;
+  const tableRow = /^\s*\|?.*\|.*\|?\s*$/;
+  for (let index = 0; index < lines.length; index += 1) {
+    const current = lines[index], next = lines[index + 1] ?? "";
+    if (tableRow.test(current) && tableDivider.test(next) && index > 0) {
+      const previous = lines[index - 1];
+      if (previous.trim() && !tableRow.test(previous)) result.push("");
+    }
+    result.push(current);
+  }
+  return result.join("\n");
+}
+
 /**
  * The AI Card template can render list bodies without their native ordered-list
  * markers. Put ordinals in the body instead. This is presentation-only: never
