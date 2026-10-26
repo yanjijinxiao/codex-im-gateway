@@ -231,6 +231,15 @@ export function assertCodexThreadRunnable(state: CodexThreadState): void {
   }
 }
 
+/** A preflight hint for the dedicated capacity coordinator, never permission
+ * for ordinary run()/steer(). The coordinator must re-read the failed tail. */
+export function capacityFailureScope(state: CodexThreadState, threadId: string, hostId = "local") {
+  return state.threadId === threadId && state.persistence === "active" && !state.internal
+    && state.runtimeStatus === "systemError" && !state.activeFlags.length && !state.pendingTurnWithoutId
+    && state.lastTurnFailure?.code === "model-capacity"
+    ? { hostId, threadId, turnId: state.lastTurnFailure.turnId } : undefined;
+}
+
 export type CodexRunResult = {
   text: string;
   threadId?: string;

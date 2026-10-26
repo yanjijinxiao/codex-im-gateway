@@ -37,6 +37,10 @@ export function userFacingMessageHandlingError(error: unknown): string {
       case "missing":
         return copyableChoices("[codex-im-gateway] 当前 Codex session 已不存在或被删除，请选择已有会话或新建。", [{ label: "选择已有会话", value: "/sessions" }, { label: "新建会话", value: "/new" }]);
       case "system-error":
+        if (error.lastTurnFailure?.code === "model-capacity") return [
+          "[codex-im-gateway] 上一轮因模型容量不足失败，这条新消息未提交；绑定已保留。",
+          "当前未安排新的容量恢复：自动恢复预算已用尽、原生状态未确认或接口暂不支持。可用 /status、/history 核对；未重发消息或切换模型。"
+        ].join("\n");
         return ["[codex-im-gateway] 当前 Codex session 处于系统错误状态（systemError），这条新消息未提交；绑定已保留。",
           ...(error.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(error.lastTurnFailure.code)}`] : []),
           "请先在 Codex App 原会话中查看并处理错误，恢复可用后再发送新消息。Gateway 未自动恢复任务、重试或换后端重发。"].join("\n");

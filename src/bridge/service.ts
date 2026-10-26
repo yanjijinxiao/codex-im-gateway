@@ -71,7 +71,7 @@ import type {
   CodexThreadGoal,
   CodexThreadGoalStatus
 } from "../codex/backend.js";
-import { assertCodexThreadRunnable, CodexBackendCapabilityError } from "../codex/backend.js";
+import { assertCodexThreadRunnable, capacityFailureScope, CodexBackendCapabilityError } from "../codex/backend.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
@@ -144,6 +144,7 @@ export type BridgeServiceOptions = {
   ideEntry?: (session: ManagedSession) => string | undefined | Promise<string | undefined>;
   ideProgressEntry?: (session: ManagedSession) => string | undefined;
   deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
+  requestCapacityRecovery?: (scope: { hostId: string; threadId: string; turnId: string }, assertCurrent: () => void) => Promise<boolean>;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
@@ -1622,6 +1623,7 @@ export class BridgeService {
       await this.reply(message.senderId, copyableChoices("绑定的会话当前不可接收消息，未提交；绑定未删除。", [{ label: "核对当前状态", value: "/status" }]));
       return true;
     }
+    if (await this.recoverCapacityPreflight(message.senderId, session, state)) return true;
     assertCodexThreadRunnable(state);
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, copyableChoices("Codex App 存在未确认轮次，实际任务已空闲，消息未提交。请重新加载 App 后核对状态。", [{ label: "核对状态", value: "/status" }]));
@@ -1674,6 +1676,22 @@ export class BridgeService {
         ...(canSteer ? ["steer 介入"] : []), ...(canQueue ? ["queue 原生排队"] : []), "cancel 取消"
       ].join("，") + "。"
     }));
+    return true;
+  }
+
+  private async recoverCapacityPreflight(senderId: string, session: ManagedSession, state: import("../codex/backend.js").CodexThreadState): Promise<boolean> {
+    if (!session.threadId) return false;
+    const hostId = this.sessionHostId(session) ?? "local", threadId = session.threadId;
+    const scope = capacityFailureScope(state, threadId, hostId);
+    if (!scope || !this.options.requestCapacityRecovery) return false;
+    const assertCurrent = () => {
+      const current = this.executionSession(senderId);
+      if (current?.id !== session.id || current.threadId !== threadId || (this.sessionHostId(current) ?? "local") !== hostId) {
+        throw Error("Capacity recovery binding changed");
+      }
+    };
+    if (!await this.options.requestCapacityRecovery(scope, assertCurrent)) return false;
+    await this.reply(senderId, "已接入容量恢复流程，正在核对并继续原轮次；这条新消息未提交。恢复进展会回到本对话，执行结果以原生回执为准。");
     return true;
   }
 
@@ -2262,7 +2280,11 @@ export class BridgeService {
     const workspace = session.workspace;
     const threadId = session.threadId || undefined;
     if (threadId && typeof this.runner.inspectThread === "function") {
-      try { assertCodexThreadRunnable(await this.runner.inspectThread(threadId, this.sessionHostId(session))); }
+      try {
+        const state = await this.runner.inspectThread(threadId, this.sessionHostId(session));
+        if (!queued && await this.recoverCapacityPreflight(message.senderId, session, state)) return;
+        assertCodexThreadRunnable(state);
+      }
       catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;

@@ -55,6 +55,32 @@ test("new confirmed failure supersedes a proved-ended old recovery without inher
   assert.equal(restarted.offer({ ...scope, turnId: "old-retry" }), true); assert.equal(f.reads(), 1);
 });
 
+test("explicit recovery rechecks the current tail before entering the shared coordinator", async t => {
+  const f = fixture(t, async () => snapshot(), { status: "finished" });
+  assert.equal(await f.coordinator.request(scope, () => {}), true);
+  await until(() => f.calls.length === 1);
+  assert.ok(f.reads() >= 2); assert.equal(f.calls[0].failedTurnId, scope.turnId);
+});
+
+test("explicit recovery cannot reset an exhausted budget for the same native failure", async t => {
+  const f = fixture(t, async () => snapshot(), { status: "finished", turns: [scope.turnId], turnId: scope.turnId, acceptedTurnId: undefined, attempts: 4 });
+  assert.equal(await f.coordinator.request(scope, () => {}), false);
+  assert.equal(f.calls.length, 0); assert.equal(f.saved().attempts, 4);
+});
+
+test("explicit recovery rejects a changed binding before creating a continuation claim", async t => {
+  const f = fixture(t, async () => snapshot(), { status: "finished" });
+  assert.equal(await f.coordinator.request(scope, () => { throw Error("binding changed"); }), false);
+  assert.equal(f.calls.length, 0); assert.equal(f.saved().turnId, "old-retry");
+});
+
+test("explicit recovery rejects an outdated native failure instead of replaying it", async t => {
+  const value = snapshot(); value.turns.push({ id: "newer", status: "completed", messages: [] });
+  const f = fixture(t, async () => value, { status: "finished" });
+  assert.equal(await f.coordinator.request(scope, () => {}), false);
+  assert.equal(f.calls.length, 0); assert.equal(f.saved().turnId, "old-retry");
+});
+
 for (const invalid of ["missing-old", "old-active", "missing-acceptance", "foreign", "new-active", "wrong-cause", "superseded", "unknown-runtime"] as const) {
   test(`uncertain recovery remains protected when fresh proof is invalid: ${invalid}`, async t => {
     const value = snapshot();

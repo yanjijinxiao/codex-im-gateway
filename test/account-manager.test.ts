@@ -1529,6 +1529,23 @@ test("keeps the GPT-5.6 provider family available after selecting another model"
   );
 });
 
+test("Web input on a capacity-failed bound session uses the same recovery coordinator without submitting the message", async t => {
+  const f = setup(t), session = seedApprovalBinding(f.paths, "account-one", "capacity-room");
+  const state = { threadId: "bound-approval-thread", persistence: "active", runtimeStatus: "systemError", executionOwner: "desktop", activeFlags: [],
+    lastTurnFailure: { turnId: "failed-capacity", code: "model-capacity" } };
+  Object.assign(f.runner, { backendInfo: () => ({ id: "app-server", capabilities: {} }), async inspectThread() { return state; },
+    async readThreadSnapshot() { return { state, turns: [{ id: "failed-capacity", status: "failed", messages: [] }] }; },
+    async resumeAfterCapacity() { throw Error("scheduled continuation must not start before its delay"); } });
+  await f.manager.startAll();
+  t.after(() => f.manager.stopAll());
+  const result = await f.manager.continueSession("account-one", session.id, "恢复原任务");
+  assert.match(result.message.text, /已接入容量恢复流程/); assert.match(result.message.text, /新消息未提交/);
+  assert.equal(f.runs.length, 0);
+  const disk = JSON.parse(fs.readFileSync(path.join(f.paths.runtimeDir, "capacity-recovery.json"), "utf8"));
+  const record = disk.records[JSON.stringify(["local", "bound-approval-thread"])];
+  assert.equal(record.status, "waiting"); assert.equal(record.turnId, "failed-capacity"); assert.equal(record.attempts, 0);
+});
+
 test("reads managed thread history and continues the same session from Web", async (t) => {
   const { manager, root, runs } = setup(t);
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Web chat");

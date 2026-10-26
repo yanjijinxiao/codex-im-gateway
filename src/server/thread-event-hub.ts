@@ -651,7 +651,13 @@ export class ThreadEventHub {
       && sub.hostId === scope.hostId && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
         if (!this.isLive(sub)) return;
         const state = this.state(sub);
-        if (state.turnId !== scope.turnId || state.completed.includes(acceptedTurnId) || state.checkpoint?.terminal) return;
+        if (state.completed.includes(acceptedTurnId) || state.retired?.includes(acceptedTurnId)
+          || state.turnId && state.turnId !== scope.turnId && !state.completed.includes(state.turnId)) return;
+        // A user may request continuation after the failure result was already
+        // delivered. Preserve that terminal card; only a confirmed new native
+        // acceptance may create the next progress card.
+        const newCard = Boolean(state.checkpoint?.terminal || state.turnId && state.completed.includes(state.turnId));
+        if (newCard) this.rotateStream(sub);
         const oldScope = { ...scope, bindingKey: sub.key, conversationId: sub.recipientId };
         for (const participant of this.options.turnAudience?.participants(oldScope) ?? []) {
           this.options.turnAudience?.record({ ...oldScope, turnId: acceptedTurnId },
@@ -661,7 +667,9 @@ export class ThreadEventHub {
         state.turnId = acceptedTurnId; state.checkpointTurnId = acceptedTurnId;
         state.terminalPending = undefined;
         state.sequence++; this.save();
-        await this.stream(sub).waitForRecovery("容量自动恢复已获 Codex 接收，正在原会话中继续执行。沿用本张卡片，未重新发送原问题。");
+        await this.stream(sub).waitForRecovery(newCard
+          ? "容量恢复已获 Codex 接收，正在原会话中继续执行。上一张卡保留失败记录，本卡跟随新接收的原生轮次。"
+          : "容量自动恢复已获 Codex 接收，正在原会话中继续执行。沿用本张卡片，未重新发送原问题。");
       })));
   }
 

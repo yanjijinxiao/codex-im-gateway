@@ -128,6 +128,22 @@ export class CapacityRecoveryCoordinator {
 
   /** Called only for a confirmed native capacity failure. No historical scan
    * or arbitrary error string can authorize a write through this boundary. */
+  async request(scope: CapacityFailure, assertCurrent: () => void): Promise<boolean> {
+    const generation = this.generation;
+    if (this.stopped || !this.options.eligible(scope)) return false;
+    try {
+      // An explicit message/recovery request may reach an already-delivered
+      // failed turn. Re-read the exact tail; never clear systemError or replay
+      // that new message through the ordinary run() boundary.
+      const snapshot = await this.snapshot(scope);
+      assertCapacityResume(snapshot, scope.turnId);
+      if (snapshot.turns.some(turn => turn.status === "inProgress")) return false;
+      assertCurrent();
+      if (this.stopped || generation !== this.generation) return false;
+      return this.offer(scope);
+    } catch { return false; }
+  }
+
   offer(scope: CapacityFailure): boolean {
     if (this.stopped || !this.options.eligible(scope)) return false;
     const backend = this.options.backend(), backendId = backend.backendInfo(scope.hostId).id;

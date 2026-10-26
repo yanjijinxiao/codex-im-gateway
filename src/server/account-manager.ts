@@ -41,7 +41,7 @@ import type {
 } from "../codex/backend.js";
 import type { CodexThreadState } from "../codex/backend.js";
 import { desktopSessionMembership } from "../codex/desktop-session-membership.js";
-import { assertCodexThreadRunnable } from "../codex/backend.js";
+import { assertCodexThreadRunnable, capacityFailureScope } from "../codex/backend.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
   LlmWikiMcpClientPool,
@@ -525,6 +525,7 @@ export class AccountManager {
       accountId: account.accountId,
       nativeQueue: this.nativeQueue,
       deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
+      requestCapacityRecovery: (scope, assertCurrent) => this.capacityRecovery.request(scope, assertCurrent),
       sessionControls: this.sessionControls,
       turnAudience: this.turnAudience,
       onAcceptedInput: input => {
@@ -1331,6 +1332,19 @@ export class AccountManager {
     }
     this.setSessionResponding(accountId, session.id, true);
     try {
+      if (session.threadId && typeof this.runnerFor(config).inspectThread === "function") {
+        const hostId = session.hostId ?? project?.hostId ?? "local", threadId = session.threadId;
+        const state = await this.runnerFor(config).inspectThread(threadId, hostId);
+        const scope = capacityFailureScope(state, threadId, hostId);
+        if (scope && await this.capacityRecovery.request(scope, () => {
+          const current = store.getSession(session.id);
+          if (current?.threadId !== threadId || (current.hostId ?? store.getProject(current.projectId ?? "")?.hostId ?? "local") !== hostId) {
+            throw Error("Capacity recovery binding changed");
+          }
+        })) return { threadId, message: { id: crypto.randomUUID(), role: "assistant", createdAt: new Date().toISOString(), attachments: [],
+          text: "已接入容量恢复流程，正在核对并继续原轮次；这条新消息未提交。恢复进展会回到绑定对话，执行结果以原生回执为准。" } };
+        assertCodexThreadRunnable(state);
+      }
       const promptParts = buildPromptParts(
         prompt,
         attachments,
