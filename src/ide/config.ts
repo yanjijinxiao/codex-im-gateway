@@ -50,8 +50,13 @@ export type RemoteIDEAccess = z.infer<typeof remoteIDEAccessSchema>;
 // itself and its advertised IP must equal the exact local listening address.
 const localIDEAccessSchema = z.object({
   publicOrigin: z.string().url().max(500), bindAddress: exactAddress,
+  // When present, the IP fields are the last resolved IPv4 binding. The
+  // endpoint coordinator follows only this explicitly selected interface.
+  interfaceName: z.string().min(1).max(128).refine(value => !/[\s\0]/.test(value)).optional(),
   port: z.number().int().min(1024).max(65535)
 }).strict().superRefine((access, context) => {
+  if (access.interfaceName && net.isIP(access.bindAddress) !== 4)
+    context.addIssue({ code: "custom", message: "自动跟随网卡目前需要 IPv4 地址" });
   if (!URL.canParse(access.publicOrigin)) return;
   const u = new URL(access.publicOrigin);
   if (u.protocol !== "https:" || u.hostname.replace(/^\[|\]$/g, "") !== access.bindAddress

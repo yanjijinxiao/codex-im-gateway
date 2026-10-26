@@ -224,10 +224,12 @@
         <p>共享入口中断时不回退到其他地址，后台自动重连。手机需能通过公司内网/VPN 访问对应端口并信任证书；本机休眠或离线时入口也暂不可用。请勿公开 Gateway 管理端口。</p>
         <fieldset class="ide-tls" id="ideLocalAccessFields" hidden><legend>本机项目 · 内网 / VPN 直连</legend>
           <label class="ide-inline"><input id="ideLocalDirectEnabled" type="checkbox">本机项目使用 Gateway 自己的 IP，不经过远程转发器</label>
-          <label>监听的精确本机 IP<select id="ideLocalDirectAddress" aria-describedby="ideLocalDirectHint"></select></label>
+          <label class="ide-inline"><input id="ideLocalDirectAuto" type="checkbox">自动跟随指定网卡的 IPv4 地址</label>
+          <label id="ideLocalDirectInterfaceField" hidden>自动跟随的网卡<select id="ideLocalDirectInterface" aria-describedby="ideLocalDirectHint"></select></label>
+          <label id="ideLocalDirectAddressField">监听的精确本机 IP<select id="ideLocalDirectAddress" aria-describedby="ideLocalDirectHint"></select></label>
           <label>直连 HTTPS 端口<input id="ideLocalDirectPort" type="number" min="1024" max="65535" value="8790"></label>
           <p id="ideLocalDirectHint">保存时使用原有 CA 自动准备该 IP 的证书，只开放 IDE 数据面，审批仍由 Gateway 负责；不开放管理端口或裸 code-server。本机维护入口和远程入口不变。</p>
-          <p>VPN IP 可能变化，不是固定地址；变化后旧直连链接失效，需要重新选择地址。地址离线时停止发布该入口，不自动改发其他地址。启用新的地址后，浏览器需重新批准一次，有效期以服务端显示为准。手机到该 IP 的连通性需单独确认。</p>
+          <p>自动模式每 3 秒检测指定网卡，地址变化后自动更新监听、证书和新链接；网卡离线或有多个 IPv4 时暂停入口，恢复后自动重试。固定模式需手动更换 IP。旧 IP 链接无法重定向，IP 变化后浏览器需重新批准；其他入口授权保留。手机连通性需单独确认。</p>
         </fieldset>
         <label>浏览器访问地址<input id="ideOrigin" type="url" required placeholder="https://ide.example.com"></label>
         <small>本机访问可使用回环 HTTP；内网/VPN 可启用下方内置 HTTPS，无需另装反向代理。不要公开 Gateway 管理端口。</small>

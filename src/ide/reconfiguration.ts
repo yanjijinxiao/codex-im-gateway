@@ -33,7 +33,7 @@ export function entrances(config: IDEConfig): IDEEntrance[] {
   });
   const local = config.hosts.find(h => h.hostId === "local" && h.enabled);
   if (local && config.localAccess) result.push({ key: LOCAL_DIRECT_ENDPOINT, hostId: "local", localDirect: true,
-    fingerprint: JSON.stringify(["local-direct", config.localAccess]),
+    fingerprint: JSON.stringify(["local-direct", config.localAccess.publicOrigin, config.localAccess.bindAddress, config.localAccess.port]),
     config: { ...config, hosts: [local], publicOrigin: config.localAccess.publicOrigin, port: config.localAccess.port } });
   return result;
 }

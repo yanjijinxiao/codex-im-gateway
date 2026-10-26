@@ -23,7 +23,7 @@ function latch() { let release!: () => void; const promise = new Promise<void>(r
 
 /** Real HTTP/TLS/upgrade traffic and owned Unix sockets; no real SSH hosts,
  * production grants, files or Codex turns are used by this regression. */
-async function fixture(t: test.TestContext, legacy = false) {
+async function fixture(t: test.TestContext, legacy = false, networkPollMs?: number) {
   const root = fs.mkdtempSync("/private/tmp/cig-hotplug-"), port = await freePort(), external = await freePort();
   const origin = legacy ? `http://127.0.0.1:${port}` : `https://203.0.113.10:${external}`;
   const url = new URL(origin);
@@ -58,7 +58,7 @@ async function fixture(t: test.TestContext, legacy = false) {
   manager.configStore.save({ ...manager.config(), enabled: true, ...(legacy ? {} : { routing: "per-host", sharedIngressHostId: ingressHost }),
     port, publicOrigin: `http://127.0.0.1:${port}`, hosts: [{ hostId: "local", enabled: true, binary: "code-server" },
       { hostId: ingressHost, enabled: true, binary: "code-server", ...(legacy ? {} : { access: { publicOrigin: origin, bindAddress: "192.168.5.3", port: 80 } }) }] });
-  const access = new IDEEndpointManager(manager, { localAddresses: () => localAddresses, ingressTiming: { retryMs: 5, probeMs: 100 }, ingressIO: {
+  const access = new IDEEndpointManager(manager, { localAddresses: () => localAddresses, networkPollMs, ingressTiming: { retryMs: 5, probeMs: 100 }, ingressIO: {
     connect: async input => {
       relays.push(input.hostId); if (offline.has(input.hostId)) throw Error("fixture offline ingress");
       const sockets = new Set<net.Socket>(), server = net.createServer(client => {
@@ -155,6 +155,74 @@ test("missing local IP suppresses direct publication without affecting remote av
   await f.access.configure({ ...f.manager.config(), hosts: [...config.hosts, f.enabledHost(secondHost)] });
   assert.equal(new URL(f.manager.entry("account", secondHost)!.url).origin, f.origin);
   assert.equal((await f.request("/")).status, 200); assert.equal(f.relays.length, 1);
+});
+
+test("automatic local startup replaces a stale IP before publication; policy-only saves, restart and same-IP recovery retain grants", async t => {
+  const f = await fixture(t), remote = await f.login(ingressHost), socket = await f.open(remote), port = await freePort();
+  const config = f.manager.config(), origin = `https://127.0.0.1:${port}`;
+  await f.access.configure({ ...config, localAccess: { publicOrigin: origin, bindAddress: "127.0.0.1", port } });
+  const entry = f.manager.entry("account", "local")!, grant = await f.access.grant(entry.id);
+  const authorized = await f.request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() }, origin);
+  assert.equal(authorized.status, 303); const cookie = authorized.headers["set-cookie"]![0].split(";")[0];
+  const before = f.files(), ca = f.access.tls.caCertificate();
+  await f.access.configure({ ...f.manager.config(), localAccess: { ...f.manager.config().localAccess!, interfaceName: "isolated-loopback-fixture" } });
+  assert.deepEqual(f.files(), before, "enabling automatic policy at the same IP does not revoke any grants");
+  f.manager.configStore.save({ ...f.manager.config(), localAccess: { ...f.manager.config().localAccess!, publicOrigin: `https://127.0.0.2:${port}`, bindAddress: "127.0.0.2" } });
+  await f.access.reload();
+  assert.equal(f.manager.config().localAccess!.bindAddress, "127.0.0.1");
+  assert.equal(new URL(f.manager.entry("account", "local")!.url).origin, origin);
+  assert.deepEqual(f.files(), before, "stale cached IP is resolved before listener reconciliation");
+  f.localAddresses.length = 0; await f.access.refreshLocalAddress();
+  assert.equal(f.manager.entry("account", "local"), undefined);
+  assert.equal(f.access.statuses().find(s => s.localDirect)?.state, "error");
+  await assert.rejects(f.request("/", {}, origin), /ECONNREFUSED/);
+  await f.access.configure({ ...f.manager.config(), hosts: [...config.hosts, f.enabledHost(secondHost)] });
+  assert.equal(new URL(f.manager.entry("account", secondHost)!.url).origin, f.origin, "offline automatic local selection does not block remote hot-add");
+  f.localAddresses.push({ name: "isolated-loopback-fixture", address: "127.0.0.1" }); await f.access.refreshLocalAddress();
+  assert.equal((await f.request(`/workspace/${entry.id}`, { headers: { Cookie: cookie } }, origin)).status, 200);
+  assert.deepEqual(f.files(), before); assert.equal(f.relays.length, 1); assert.equal(socket.destroyed, false);
+  assert.equal(f.stops.length, 0); assert.deepEqual(f.access.tls.caCertificate(), ca);
+});
+
+test("automatic IP migration persists the new origin and invalidates only local grants even if the new bind is unavailable", async t => {
+  const f = await fixture(t), remote = await f.login(ingressHost), socket = await f.open(remote), before = f.files();
+  const port = await freePort(), origin = `https://127.0.0.1:${port}`;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: origin, bindAddress: "127.0.0.1", port, interfaceName: "isolated-loopback-fixture" } });
+  const entry = f.manager.entry("account", "local")!, grant = await f.access.grant(entry.id);
+  f.localAddresses[0]!.address = "127.0.0.2"; await f.access.refreshLocalAddress();
+  assert.equal(f.manager.config().localAccess!.bindAddress, "127.0.0.2");
+  assert.equal(f.manager.config().localAccess!.publicOrigin, `https://127.0.0.2:${port}`);
+  const changed = f.manager.entry("account", "local");
+  if (changed) assert.equal(new URL(changed.url).hostname, "127.0.0.2", "only the newly bound origin may be published");
+  await assert.rejects(f.request("/", {}, origin), /ECONNREFUSED/, "old IP listener has been closed");
+  f.localAddresses[0]!.address = "127.0.0.1"; await f.access.refreshLocalAddress();
+  assert.equal((await f.request("/authorize", { method: "POST", headers: { Origin: management }, body: new URLSearchParams({ token: grant.token, entryId: entry.id }).toString() }, origin)).status, 401);
+  assert.equal(f.manager.entry("account", "local")!.id, entry.id, "project identity does not change with IP");
+  for (const [name, bytes] of before) assert.equal(f.files().get(name), bytes);
+  assert.equal(socket.destroyed, false); assert.equal(f.relays.length, 1); assert.equal(f.stops.length, 0);
+});
+
+test("automatic timer retries only the local listener, pauses on ambiguity, and stops after close", async t => {
+  const f = await fixture(t, false, 15), remote = await f.login(ingressHost), socket = await f.open(remote), before = f.files();
+  const port = await freePort(), origin = `https://127.0.0.1:${port}`;
+  await f.access.configure({ ...f.manager.config(), localAccess: { publicOrigin: origin, bindAddress: "127.0.0.1", port, interfaceName: "isolated-loopback-fixture" } });
+  f.localAddresses.push({ name: "isolated-loopback-fixture", address: "30.1.2.99" });
+  assert.equal(f.manager.entry("account", "local"), undefined, "ambiguous interface suppresses links immediately");
+  await until(() => /多个 IPv4/.test(f.access.statuses().find(s => s.localDirect)?.error || ""));
+  // Wait for the actual timer to close the stale listener, not just status projection.
+  await until(() => f.access.statuses().find(s => s.localDirect)?.state === "error");
+  f.localAddresses.length = 0;
+  await f.access.refreshLocalAddress();
+  await assert.rejects(f.request("/", {}, origin), /ECONNREFUSED/);
+  f.localAddresses.push({ name: "utun4", address: "30.9.8.7" });
+  await f.access.refreshLocalAddress(); assert.equal(f.manager.entry("account", "local"), undefined, "VPN never substitutes for selected interface");
+  f.localAddresses.push({ name: "isolated-loopback-fixture", address: "127.0.0.1" });
+  await until(() => f.access.statuses().find(s => s.localDirect)?.state === "ready");
+  assert.equal(new URL(f.manager.entry("account", "local")!.url).origin, origin);
+  for (const [name, bytes] of before) assert.equal(f.files().get(name), bytes);
+  assert.equal(socket.destroyed, false); assert.equal(f.relays.length, 1); assert.equal(f.stops.length, 0);
+  await f.access.close(); await delay(35);
+  assert.equal(f.access.statuses().length, 0); assert.equal(f.manager.entry("account", "local"), undefined);
 });
 
 test("a direct port conflict fails independently; explicit retry repairs only that listener", async t => {

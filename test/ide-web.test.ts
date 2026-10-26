@@ -216,3 +216,28 @@ test("local direct management preserves its independent binding on save, includi
   ui.renderActivity({ endpoints: [{ hostId: "local", localDirect: true, state: "ready", publicOrigin: localAccess.publicOrigin }] });
   assert.match(node("#ideEndpoints").innerHTML, /本机项目 · 内网 \/ VPN 直连/);
 });
+
+test("local automatic management saves the selected interface and reports automatic recovery without changing remote publication", async () => {
+  const localAccess = { publicOrigin: "https://30.1.2.3:8790", bindAddress: "30.1.2.3", port: 8790, interfaceName: "en1" };
+  const config = { enabled: true, routing: "per-host", sharedIngressHostId: "remote:test", port: 8790, publicOrigin: "http://127.0.0.1:8790", localAccess,
+    hosts: [{ hostId: "local", enabled: true, binary: "code-server" }], profile: { settings: {}, extensions: [] } };
+  let saved: any;
+  const { ui, node, context } = fixture(async (url, options) => {
+    if (url === "/api/ide") return { config, hosts: ["local"], networkAddresses: [{ name: "utun4", address: "30.9.8.7" }, { name: "en1", address: "30.1.2.4" }], extensionChoices: [], instances: [] };
+    assert.equal(url, "/api/ide/config"); saved = options.body.config;
+  });
+  await ui.refresh(); assert.equal(node("#ideLocalDirectAuto").checked, true);
+  assert.equal(node("#ideLocalDirectInterface").value, "en1");
+  assert.equal(node("#ideLocalDirectAddressField").hidden, true); assert.equal(node("#ideLocalDirectInterfaceField").hidden, false);
+  context.document.querySelectorAll = (selector: string) => selector === "[data-ide-host]" ? [{ dataset: { ideHost: "local" }, checked: true }]
+    : selector === "[data-ide-auto]" ? [{ dataset: { ideAuto: "local" }, checked: false }]
+    : selector === "[data-ide-binary]" ? [{ dataset: { ideBinary: "local" }, value: "code-server" }] : [];
+  await ui.save({ preventDefault() {} });
+  assert.equal(saved.localAccess.interfaceName, "en1"); assert.equal(saved.localAccess.bindAddress, "30.1.2.4");
+  assert.equal(saved.localAccess.publicOrigin, "https://30.1.2.4:8790"); assert.equal(saved.sharedIngressHostId, "remote:test");
+  ui.renderActivity({ networkAddresses: [{ name: "utun4", address: "30.9.8.7" }] });
+  await ui.save({ preventDefault() {} });
+  assert.equal(saved.localAccess.interfaceName, "en1"); assert.equal(saved.localAccess.bindAddress, "30.1.2.4", "offline policy retains the most recently saved binding, never the VPN IP");
+  ui.renderActivity({ endpoints: [{ hostId: "local", localDirect: true, interfaceName: "en1", state: "error", publicOrigin: localAccess.publicOrigin }] });
+  assert.match(node("#ideEndpoints").innerHTML, /等待网卡自动恢复/); assert.match(node("#ideEndpoints").innerHTML, /自动跟随 en1/);
+});

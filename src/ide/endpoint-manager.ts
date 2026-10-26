@@ -7,9 +7,10 @@ import type { WorkspaceIDEManager } from "./manager.js";
 import { RemoteIDEIngress, type IDEIngressIO, type IDEIngressState } from "./remote-ingress.js";
 import type { IDEApprovalCopyPort } from "./approval-service.js";
 import type { IDEAccessAuthority, IDEAccessSubject } from "./access-subject.js";
-import { entrances, publicationKey, runtimeChanges, type IDEEntrance } from "./reconfiguration.js";
+import { entrances, LOCAL_DIRECT_ENDPOINT, publicationKey, runtimeChanges, type IDEEntrance } from "./reconfiguration.js";
+import { resolveLocalIDEAccess } from "./local-address.js";
 
-export type IDEEndpointStatus = { hostId: string; publicOrigin: string; shared?: boolean; localDirect?: boolean; state: "starting" | "ready" | "error" | "connecting" | "reconnecting";
+export type IDEEndpointStatus = { hostId: string; publicOrigin: string; shared?: boolean; localDirect?: boolean; interfaceName?: string; state: "starting" | "ready" | "error" | "connecting" | "reconnecting";
   error?: string };
 type Endpoint = { server: IDEAccessServer; context: IDEAccessContext; config: IDEConfig; fingerprint: string;
   status: IDEEndpointStatus; ingress?: RemoteIDEIngress };
@@ -24,9 +25,12 @@ export class IDEEndpointManager {
   private managementOrigin?: string;
   private approvalCopies?: IDEApprovalCopyPort;
   private accessAuthority?: IDEAccessAuthority;
+  private networkTimer?: ReturnType<typeof setInterval>;
+  private networkQueued = false;
+  private stopped = false;
   error?: string;
   constructor(private readonly manager: WorkspaceIDEManager, private readonly options: { ingressIO?: IDEIngressIO; ingressTiming?: { retryMs: number; probeMs: number };
-    localAddresses?: typeof localIDEAddresses } = {}) {
+    localAddresses?: typeof localIDEAddresses; networkPollMs?: number } = {}) {
     this.tls = new IDETLSManager(path.join(path.dirname(manager.configStore.filePath), "tls"));
     manager.accessAvailable = false;
     manager.accessOrigin = hostId => {
@@ -39,22 +43,63 @@ export class IDEEndpointManager {
   private enqueue(work: () => Promise<void>): Promise<void> {
     const next = this.transition.catch(() => {}).then(work); this.transition = next; return next;
   }
-  reload(revoke = false): Promise<void> { return this.enqueue(() => this.apply(this.manager.config(), revoke)); }
+  reload(revoke = false): Promise<void> { return this.enqueue(() => {
+    this.stopped = false;
+    return this.applyDesired(this.manager.config(), revoke);
+  }); }
   /** Validate, revoke affected scopes, persist and reconcile in one queue.
    * Concurrent HTTP saves cannot overwrite the config a previous apply uses.
    * Failed durable revocation prevents the new policy from being committed. */
   configure(input: IDEConfig): Promise<void> {
     const config = ideConfigSchema.parse(input);
     return this.enqueue(async () => {
-      await this.validateConfig(config);
-      await this.apply(config, false, () => this.manager.configStore.save(config));
+      this.stopped = false;
+      const desired = this.resolveConfig(config);
+      await this.validateConfig(desired);
+      await this.apply(desired, false, () => this.manager.configStore.save(desired));
     });
+  }
+  private resolveConfig(config: IDEConfig): IDEConfig {
+    if (!config.localAccess?.interfaceName) return config;
+    try { return ideConfigSchema.parse({ ...config, localAccess: resolveLocalIDEAccess(config.localAccess, this.addresses()) }); }
+    catch { return config; } // Existing offline interfaces must not block other hosts.
+  }
+  private addresses() { return (this.options.localAddresses ?? localIDEAddresses)(); }
+  private applyDesired(config: IDEConfig, revoke: boolean): Promise<void> {
+    const desired = this.resolveConfig(config);
+    return this.apply(desired, revoke, JSON.stringify(desired) !== JSON.stringify(config) ? () => this.manager.configStore.save(desired) : undefined);
+  }
+  /** Serialized with config saves/close. The timer never overlaps itself or
+   * rewrites a newer user policy captured before an asynchronous transition. */
+  refreshLocalAddress(): Promise<void> {
+    return this.enqueue(async () => {
+      if (this.stopped) return;
+      const config = this.manager.config();
+      if (!config.enabled || !config.localAccess?.interfaceName || !config.hosts.some(h => h.hostId === "local" && h.enabled)) return;
+      const desired = this.resolveConfig(config), endpoint = this.endpoints.get(LOCAL_DIRECT_ENDPOINT);
+      if (JSON.stringify(desired) !== JSON.stringify(config) || !endpoint || this.endpointStatus(endpoint).state !== "ready")
+        await this.applyDesired(config, false);
+    });
+  }
+  private watchNetwork(config: IDEConfig): void {
+    if (this.networkTimer) clearInterval(this.networkTimer);
+    this.networkTimer = undefined;
+    if (this.stopped || !config.enabled || !config.localAccess?.interfaceName || !config.hosts.some(h => h.hostId === "local" && h.enabled)) return;
+    this.networkTimer = setInterval(() => {
+      if (this.networkQueued) return;
+      this.networkQueued = true;
+      void this.refreshLocalAddress().catch(() => {
+        const endpoint = this.endpoints.get(LOCAL_DIRECT_ENDPOINT);
+        if (endpoint) endpoint.status = { ...endpoint.status, state: "error", error: "本机网卡地址更新失败，后台继续重试。" };
+      }).finally(() => { this.networkQueued = false; });
+    }, this.options.networkPollMs ?? 3000);
+    this.networkTimer.unref();
   }
   async validateConfig(config: IDEConfig): Promise<void> {
     if (config.enabled && config.hosts.some(h => h.hostId === "local" && h.enabled) && config.localAccess) {
       // An offline existing local address must not block unrelated remote
       // hot-adds. A new/changed binding is always validated before commit.
-      if (JSON.stringify(config.localAccess) !== JSON.stringify(this.applied?.localAccess)) this.requireLocalAddress(config.localAccess.bindAddress);
+      if (JSON.stringify(config.localAccess) !== JSON.stringify(this.applied?.localAccess)) this.requireLocalBinding(config);
       await this.tls.prepare(config.localAccess.bindAddress);
     }
     if (config.tls) {
@@ -69,13 +114,21 @@ export class IDEEndpointManager {
     return this.tls.prepare(address);
   }
   private requireLocalAddress(address: string): void {
-    if (!(this.options.localAddresses ?? localIDEAddresses)().some(item => item.address === address))
+    if (!this.addresses().some(item => item.address === address))
       throw new Error("所选本机 IP 当前未分配；请在管理页重新选择内网/VPN 地址，不会自动回退到其他入口");
+  }
+  private requireLocalBinding(config: IDEConfig): void {
+    const access = config.localAccess!;
+    if (access.interfaceName && resolveLocalIDEAccess(access, this.addresses()).bindAddress !== access.bindAddress)
+      throw new Error(`网卡 ${access.interfaceName} 的 IPv4 地址已变化，正在自动更新入口。`);
+    this.requireLocalAddress(access.bindAddress);
   }
   private endpointStatus(record: Endpoint): IDEEndpointStatus {
     if (record.status.localDirect) {
-      try { this.requireLocalAddress(record.config.localAccess!.bindAddress); }
-      catch { return { ...record.status, state: "error", error: "本机直连 IP 当前已离线或发生变化；请重新选择地址。旧 IP 链接无法自动恢复，不会改发回环或远程入口。" }; }
+      const interfaceName = record.config.localAccess?.interfaceName;
+      try { this.requireLocalBinding(record.config); }
+      catch (error) { return { ...record.status, interfaceName, state: "error", error: interfaceName ? (error as Error).message : "本机直连 IP 当前已离线或发生变化；请重新选择地址。旧 IP 链接无法自动恢复，不会改发回环或远程入口。" }; }
+      return { ...record.status, interfaceName };
     }
     return { ...record.status };
   }
@@ -101,7 +154,8 @@ export class IDEEndpointManager {
     const closing: Promise<void>[] = [];
     for (const [key, record] of this.endpoints) {
       const spec = desired.get(key);
-      if (spec?.fingerprint === record.fingerprint && record.server.running() && !record.server.error) {
+      if (spec?.fingerprint === record.fingerprint && record.server.running() && !record.server.error
+        && (!record.status.localDirect || this.endpointStatus(record).state !== "error")) {
         // A retained listener reads this mutable desired policy, not a closure
         // over its startup host list. TLS identity and port remain unchanged.
         record.config = { ...spec.config, tls: record.config.tls };
@@ -111,9 +165,10 @@ export class IDEEndpointManager {
       }
     }
     await Promise.all([processes, ...closing]);
-    if (!config.enabled) { this.manager.accessAvailable = false; this.applied = config; return; }
+    if (!config.enabled) { this.manager.accessAvailable = false; this.applied = config; this.watchNetwork(config); return; }
     await Promise.all([...desired.values()].filter(spec => !this.endpoints.has(spec.key)).map(spec => this.startEndpoint(spec)));
     this.applied = config;
+    this.watchNetwork(config);
   }
   private async startEndpoint(spec: IDEEntrance): Promise<void> {
     const hostId = spec.hostId, record = {} as Endpoint;
@@ -145,7 +200,7 @@ export class IDEEndpointManager {
     try {
       record.server.revokeEntries(id => { try { resolve(id); return false; } catch { return true; } });
       if (spec.localDirect) {
-        this.requireLocalAddress(record.config.localAccess!.bindAddress);
+        this.requireLocalBinding(record.config);
         const files = await this.tls.prepare(record.config.localAccess!.bindAddress);
         record.config = { ...record.config, tls: files };
       } else if (hostId && hostId !== "local") {
@@ -214,6 +269,9 @@ export class IDEEndpointManager {
   }
   revoke(): void { for (const endpoint of this.endpoints.values()) endpoint.server.revoke(); }
   close(): Promise<void> {
+    this.stopped = true;
+    if (this.networkTimer) clearInterval(this.networkTimer);
+    this.networkTimer = undefined;
     return this.enqueue(async () => {
       this.manager.accessAvailable = false;
       const records = [...this.endpoints.values()]; this.endpoints.clear();

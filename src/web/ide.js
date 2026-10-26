@@ -30,7 +30,7 @@ window.gatewayIDE = (() => {
   }
   function renderActivity(data) {
     if (data.authorization?.error) message(data.authorization.error, true);
-    if (current) current.instances = data.instances || [];
+    if (current) { current.instances = data.instances || []; current.networkAddresses = data.networkAddresses || []; }
     if (data.approvers) renderApprovers(data.approvers);
     const labels = { checking: "检查主机", "remote-download": "远程下载官方包", "gateway-download": "Gateway 兜底下载", transferring: "SSH 传输", verifying: "校验并安装", ready: "已就绪", error: "失败，可重试" };
     $("#ideInstallations").innerHTML = data.installations?.length ? data.installations.map(item => `<article class="ide-instance"><div><strong>${escapeHtml(labels[item.phase] || item.phase)}</strong><p>${escapeHtml(item.hostId)} · ${escapeHtml(item.version)}${item.total ? ` · ${Math.round((item.bytes || 0) / 1048576)} / ${Math.round(item.total / 1048576)} MB` : ""}</p>${item.error ? `<p class="ide-error">${escapeHtml(item.error)}</p>` : ""}</div></article>`).join("") : '<p>暂无安装任务。自动安装需先保存主机授权。</p>';
@@ -40,7 +40,7 @@ window.gatewayIDE = (() => {
     renderRequests();
     renderInstances(data.instances || []);
     const states = { starting: "正在启动", connecting: "正在连接", ready: "已就绪", reconnecting: "正在自动重连", error: "连接失败，后台重试" };
-    const markup = data.endpoints?.length ? data.endpoints.map(endpoint => `<article class="ide-instance"><div><strong>${escapeHtml(endpoint.localDirect ? "本机项目 · 内网 / VPN 直连" : endpoint.shared ? `共享浏览器入口 · ${endpoint.hostId}` : endpoint.hostId === "local" ? "本机维护入口 · 仅本机浏览器" : endpoint.hostId)}</strong><p role="status">${escapeHtml(endpoint.localDirect && endpoint.state === "error" ? "入口未就绪，请检查后重新保存" : states[endpoint.state] || endpoint.state)}</p><p>${escapeHtml(endpoint.publicOrigin)}</p>${endpoint.error ? `<p class="ide-error">${escapeHtml(endpoint.error)}</p>` : ""}</div></article>`).join("") : '<p>未配置固定远程入口。入口不可达时不会改发其他地址。</p>';
+    const markup = data.endpoints?.length ? data.endpoints.map(endpoint => `<article class="ide-instance"><div><strong>${escapeHtml(endpoint.localDirect ? "本机项目 · 内网 / VPN 直连" : endpoint.shared ? `共享浏览器入口 · ${endpoint.hostId}` : endpoint.hostId === "local" ? "本机维护入口 · 仅本机浏览器" : endpoint.hostId)}</strong><p role="status">${escapeHtml(endpoint.localDirect && endpoint.state === "error" ? endpoint.interfaceName ? "入口未就绪，等待网卡自动恢复" : "入口未就绪，请检查后重新保存" : states[endpoint.state] || endpoint.state)}${endpoint.interfaceName ? ` · 自动跟随 ${escapeHtml(endpoint.interfaceName)}` : ""}</p><p>${escapeHtml(endpoint.publicOrigin)}</p>${endpoint.error ? `<p class="ide-error">${escapeHtml(endpoint.error)}</p>` : ""}</div></article>`).join("") : '<p>未配置固定远程入口。入口不可达时不会改发其他地址。</p>';
     if (markup !== endpointMarkup) { endpointMarkup = markup; $("#ideEndpoints").innerHTML = markup; }
   }
   function renderApprovers(data) {
@@ -74,6 +74,9 @@ window.gatewayIDE = (() => {
     $("#ideSharedIngressHost").disabled = !perHost;
     $("#ideTLSLegacyFields").hidden = perHost; $("#ideOrigin").readOnly = perHost;
     $("#ideLocalAccessFields").hidden = !perHost;
+    const automatic = $("#ideLocalDirectAuto").checked;
+    $("#ideLocalDirectInterfaceField").hidden = !automatic;
+    $("#ideLocalDirectAddressField").hidden = automatic;
     if (perHost) { $("#ideOrigin").value = `http://127.0.0.1:${$("#idePort").value}`; $("#ideTLSEnabled").checked = false; }
   }
   function renderInstances(instances) {
@@ -143,6 +146,11 @@ window.gatewayIDE = (() => {
         directAddresses.unshift({ name: "已配置，当前不在线", address: config.localAccess.bindAddress });
       $("#ideLocalDirectAddress").innerHTML = '<option value="">请选择本机当前地址</option>' + directAddresses.map(item => `<option value="${escapeAttr(item.address)}">${escapeHtml(item.name)} · ${escapeHtml(item.address)}</option>`).join("");
       $("#ideLocalDirectAddress").value = config.localAccess?.bindAddress || "";
+      $("#ideLocalDirectAuto").checked = Boolean(config.localAccess?.interfaceName);
+      const interfaces = [...new Set((current.networkAddresses || []).filter(item => !item.address.includes(":")).map(item => item.name))];
+      if (config.localAccess?.interfaceName && !interfaces.includes(config.localAccess.interfaceName)) interfaces.unshift(config.localAccess.interfaceName);
+      $("#ideLocalDirectInterface").innerHTML = '<option value="">请选择要跟随的网卡</option>' + interfaces.map(name => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join("");
+      $("#ideLocalDirectInterface").value = config.localAccess?.interfaceName || (current.networkAddresses || []).find(item => item.address === config.localAccess?.bindAddress)?.name || "";
       const addresses = [...(current.networkAddresses || [])];
       if (config.tls && !addresses.some(item => item.address === config.tls.bindAddress)) addresses.unshift({ name: "已配置，当前不在线", address: config.tls.bindAddress });
       $("#ideTLSAddress").innerHTML = addresses.map(item => `<option value="${escapeAttr(item.address)}" ${config.tls?.bindAddress === item.address ? "selected" : ""}>${escapeHtml(item.name)} · ${escapeHtml(item.address)}</option>`).join("");
@@ -181,9 +189,13 @@ window.gatewayIDE = (() => {
         ...(!perHost && $("#ideTLSEnabled").checked ? { tls: { bindAddress: $("#ideTLSAddress").value, certFile: $("#ideTLSCert").value.trim(), keyFile: $("#ideTLSKey").value.trim() } } : {}),
         profile: { settings: JSON.parse($("#ideProfile").value), extensions: [...document.querySelectorAll("#ideExtensions input:checked")].map(el => el.value) } };
       if (perHost && $("#ideLocalDirectEnabled").checked) {
-        const bindAddress = $("#ideLocalDirectAddress").value, port = Number($("#ideLocalDirectPort").value);
+        const port = Number($("#ideLocalDirectPort").value), automatic = $("#ideLocalDirectAuto").checked;
+        const interfaceName = automatic ? $("#ideLocalDirectInterface").value : undefined;
+        const addresses = [...new Set((current.networkAddresses || []).filter(item => item.name === interfaceName && !item.address.includes(":")).map(item => item.address))];
+        if (automatic && (!interfaceName || addresses.length > 1)) throw new Error("请选择有唯一 IPv4 地址的网卡");
+        const bindAddress = automatic ? addresses[0] || (current.config.localAccess?.interfaceName === interfaceName ? current.config.localAccess.bindAddress : "") : $("#ideLocalDirectAddress").value;
         if (!bindAddress || !Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("请选择本机直连 IP 和有效端口");
-        config.localAccess = { bindAddress, port, publicOrigin: `https://${bindAddress.includes(":") ? `[${bindAddress}]` : bindAddress}:${port}` };
+        config.localAccess = { bindAddress, port, publicOrigin: `https://${bindAddress.includes(":") ? `[${bindAddress}]` : bindAddress}:${port}`, ...(interfaceName ? { interfaceName } : {}) };
       }
       const previous = current.config;
       const affectsExisting = previous.enabled && (!config.enabled || previous.routing !== config.routing
@@ -255,6 +267,7 @@ window.gatewayIDE = (() => {
     $("#ideForm").addEventListener("submit", save);
     $("#ideRefresh").addEventListener("click", () => void refresh());
     $("#idePerHostRouting").addEventListener("change", routingFields);
+    $("#ideLocalDirectAuto").addEventListener("change", routingFields);
     $("#idePort").addEventListener("input", routingFields);
     $("#ideTLSGenerate").addEventListener("click", () => void prepareTLS());
     $("#ideRevoke").addEventListener("click", async () => { try { await api("/api/ide/revoke", { method: "POST" }); message("全部 IDE 浏览器登录和连接已撤销。"); } catch (error) { message(error.message, true); } });
