@@ -10,6 +10,7 @@ import { DesktopCodexRunner } from "./desktop-runner.js";
 import { assertCodexThreadRunnable, assertCapacityResume, CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError, type CodexCapacityResumeInput } from "./backend.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
+import { CodexMetadataReader, type MetadataConnection } from "./metadata-reader.js";
 import { stageRemoteFiles, type StageInboundFiles } from "./inbound-files.js";
 import type {
   CodexAppServerBackend,
@@ -58,6 +59,7 @@ export type CodexBackendRouterOptions = {
   execBackend?: CodexBackendAdapter;
   remoteTransportResolver?: typeof resolveRemoteCodexTransport;
   stageAttachments?: StageInboundFiles;
+  metadataConnectionFactory?: (hostId: string) => MetadataConnection;
 };
 
 export type { EphemeralCodexRunnerInput } from "./backend.js";
@@ -81,6 +83,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly desktopOwnedThreads = new Set<string>();
   /** Only in-flight read sharing; never reuse an old snapshot to authorize a write. */
   private readonly observations = new Map<string, Promise<unknown>>();
+  private readonly metadataReader: CodexMetadataReader;
   private selectedAutoBackend?: "exec" | "app-server";
   private get selectedBackend() { return this.options.backend === "auto" ? this.selectedAutoBackend ?? "app-server" : this.options.backend; }
 
@@ -92,7 +95,8 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       ? "stdio"
       : requestedTransport;
     const appServerTransport = resolveLocalAppServerTransport({
-      mode: effectiveTransport
+      mode: effectiveTransport,
+      codexHome: options.codexHome
     });
     this.appServer = options.appServerBackend ?? new AppServerCodexRunner({
       codexHome: options.codexHome,
@@ -112,6 +116,12 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       codexHome: options.codexHome,
       ...(options.codexHome ? { socketPath: path.join(options.codexHome, "ipc", "ipc.sock") } : {})
     });
+    this.metadataReader = new CodexMetadataReader(options.metadataConnectionFactory ?? (hostId => new AppServerCodexRunner({
+      codexHome: options.codexHome, codexBin: options.codexBin, hostId,
+      metadataOnly: true,
+      requestTimeoutMs: options.timeoutMs, sandbox: options.execSandbox,
+      transport: isRemoteHost(hostId) ? this.remoteTransport(hostId) : appServerTransport
+    })));
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
@@ -326,7 +336,8 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     await this.backendForSharedOperation(hostId).warmUp(cwd);
   }
 
-  async listProjects(hostId?: string): Promise<CodexProjectCatalog> {
+  async listProjects(hostId?: string, observation?: Pick<CodexMetadataObservation, "timeoutMs">): Promise<CodexProjectCatalog> {
+    if (observation && this.selectedBackend !== "exec") return this.metadataReader.projects(hostId ?? "local", observation.timeoutMs);
     if (isRemoteHost(hostId)) return this.appServerFor(hostId).listProjects();
     if (this.selectedBackend === "exec") return this.exec.listProjects();
     if (this.options.backend === "app-server" || this.selectedAutoBackend === "app-server") return this.appServer.listProjects();
@@ -435,9 +446,9 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   inspectThread(threadId: string, hostId?: string, observation?: CodexMetadataObservation): Promise<CodexThreadState> {
     // Project authorization needs current host-scoped membership, not an entire
     // history or Desktop writer ownership. Keep write preflight unchanged.
-    if (observation) return this.observeOnce("metadata", threadId, hostId, () => this.selectedBackend === "exec"
+    if (observation) return this.observeOnce("membership", threadId, hostId, () => this.selectedBackend === "exec"
       ? this.backendForSharedOperation(hostId).inspectThread(threadId)
-      : this.appServerFor(hostId).inspectThread(threadId, observation));
+      : this.metadataReader.inspect(threadId, hostId ?? "local", observation));
     return this.observeOnce("inspect", threadId, hostId, () => this.inspectThreadOnce(threadId, hostId));
   }
 
@@ -523,6 +534,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   close(): void {
+    this.metadataReader.close();
     this.appServer.close();
     this.exec.close();
     this.desktop.close();

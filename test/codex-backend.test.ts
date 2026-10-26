@@ -60,7 +60,8 @@ test("explicit membership metadata uses the exact host, shares only in-flight re
     reads.push({ host, observation }); if (observation) await gate.promise;
     return { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [], projectId: host, projectMembership: "assigned" };
   }, close() {} });
-  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: backend("local") as never,
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: backend("local-writer") as never,
+    metadataConnectionFactory: host => ({ ...backend(host), listProjects: async () => ({ backend: "app-server", projects: [] }) }) as never,
     desktopRunner: { async inspectThread() { assert.fail("membership must not discover a Desktop writer"); }, close() {} } as never });
   (router as unknown as { remoteAppServers: Map<string, unknown> }).remoteAppServers.set("remote:test", backend("remote:test"));
   t.after(() => router.close());
@@ -71,6 +72,23 @@ test("explicit membership metadata uses the exact host, shares only in-flight re
   await router.inspectThread("thread", "remote:test", observation); assert.equal(reads.length, 2, "a later access requires a fresh observation");
   await router.inspectThread("thread", "local", observation); assert.equal(reads.at(-1)?.host, "local");
   await router.inspectThread("thread", "remote:test"); assert.equal(reads.at(-1)?.observation, undefined, "ordinary remote execution preflight is unchanged");
+});
+
+test("recovering project observations cannot close or write through the execution connection", async t => {
+  let writerClosed = 0, observers = 0;
+  const writer = { inspectThread() { assert.fail("metadata used the writer"); }, listProjects() { assert.fail("catalog used the writer"); }, close() { writerClosed++; } };
+  const router = new CodexBackendRouter({ backend: "app-server", appServerBackend: writer as never,
+    metadataConnectionFactory: host => {
+      const generation = ++observers;
+      return { async inspectThread(threadId) {
+        if (generation === 1) throw Error("app-server connection disconnected");
+        return { threadId, persistence: "active", runtimeStatus: "idle", activeFlags: [], projectId: host, projectMembership: "assigned" };
+      }, listProjects: async () => ({ backend: "app-server", projects: [] }), close() {} } as never;
+    } });
+  t.after(() => router.close());
+  assert.equal((await router.inspectThread("thread", "remote:test", { includeTurns: false, timeoutMs: 100 })).projectId, "remote:test");
+  assert.deepEqual(await router.listProjects("remote:test", { timeoutMs: 100 }), { backend: "app-server", projects: [] });
+  assert.equal(writerClosed, 0); assert.equal(observers, 2);
 });
 
 test("inspection and following share in-flight metadata, select the real owner before expensive private history, and never cache old state", async t => {

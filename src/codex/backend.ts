@@ -484,7 +484,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   stop(threadId?: string, hostId?: string): Promise<CodexStopResult>;
   runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult>;
   warmUp(cwd: string, hostId?: string): Promise<void>;
-  listProjects(hostId?: string): Promise<CodexProjectCatalog>;
+  listProjects(hostId?: string, observation?: Pick<CodexMetadataObservation, "timeoutMs">): Promise<CodexProjectCatalog>;
   getHistory(threadId: string, hostId?: string): Promise<CodexHistoryMessage[]>;
   getHistoryPage(
     threadId: string,

@@ -870,7 +870,7 @@ export class AccountManager {
   private readIDEProjects(hostId: string): Promise<CodexProjectCatalog> {
     const pending = this.ideProjectReads.get(hostId); if (pending) return pending;
     let timer: NodeJS.Timeout | undefined;
-    const work = Promise.race([this.runnerFor().listProjects(hostId), new Promise<never>((_, reject) => {
+    const work = Promise.race([this.runnerFor().listProjects(hostId, { timeoutMs: 2_000 }), new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error("原生项目目录核验超时")), 5_000);
     })]).finally(() => { if (timer) clearTimeout(timer); if (this.ideProjectReads.get(hostId) === work) this.ideProjectReads.delete(hostId); });
     this.ideProjectReads.set(hostId, work); return work;

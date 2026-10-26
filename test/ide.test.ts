@@ -18,6 +18,7 @@ import { AccountManager } from "../src/server/account-manager.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import { TurnAudienceJournal } from "../src/bridge/turn-audience.js";
+import { CodexMetadataReader } from "../src/codex/metadata-reader.js";
 
 async function freePort(): Promise<number> {
   const server = net.createServer(); await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -44,6 +45,7 @@ class FakeTransport implements IDEHostTransport {
     server.on("connection", socket => { this.sockets.push(socket); });
     server.on("upgrade", (_req, socket) => {
       socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
+      socket.on("data", data => socket.write(data));
     });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); }); this.servers.push(server);
     return { socketPath, ...(input.rootPaths ? { workspaceFile: `/private/ide/${input.id}/project.code-workspace` } : {}), alive: () => alive, stop: async () => {
@@ -218,6 +220,62 @@ for (const source of ["local", "personal"] as const) test(`${source} browser aut
   if (source === "personal") { personalAllowed = false; access.reconcileAccess(); } else access.revoke();
   await closed;
   assert.equal((await fetch(`${origin}/ide/${entry.id}/file`, { headers: { Cookie: cookie }, redirect: "manual" })).status, 303);
+});
+
+for (const ending of ["removed", "revoked", "unavailable"] as const) test(`IDE recovers a stalled metadata observer without losing its socket, then blocks ${ending} access`, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-observer-recovery-")), transport = new FakeTransport();
+  let stalled = false, removed = false, created = 0, retired = 0, checks = 0;
+  const target: IDEWorkspace = { owner: "owner", sessionId: "s", workspace: "/project", hostId: "local", projectName: "project" };
+  const reader = new CodexMetadataReader(() => {
+    const generation = ++created;
+    return { async inspectThread(threadId) {
+      checks++;
+      if (stalled && (generation === 1 || ending === "unavailable")) return new Promise<never>(() => {});
+      return { threadId, cwd: "/project", projectId: "p", projectMembership: "assigned" as const,
+        persistence: "active" as const, runtimeStatus: "idle" as const, activeFlags: [] };
+    }, listProjects: async () => ({ backend: "app-server" as const, projects: [] }), close() { retired++; } };
+  });
+  const manager = new WorkspaceIDEManager({ root, transport, resolve: () => removed ? undefined : target,
+    refresh: async () => { await reader.inspect("thread", "local", { includeTurns: false, timeoutMs: 30 }); return removed ? undefined : target; } });
+  const port = await freePort(), origin = `http://127.0.0.1:${port}`, management = "http://127.0.0.1:18788";
+  manager.configStore.save(config(manager.configStore, port));
+  const access = new IDEAccessServer(manager, { verificationIntervalMs: 30 }); access.setManagementOrigin(management); await access.reload(false);
+  t.after(async () => { reader.close(); await access.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const entry = manager.entry("account", "s")!, grant = await access.grant(entry.id);
+  const logged = await fetch(origin + "/authorize", { method: "POST", redirect: "manual", headers: { Origin: management },
+    body: new URLSearchParams({ entryId: entry.id, token: grant.token }) });
+  const cookie = logged.headers.get("set-cookie")!.split(";")[0];
+  const landing = await (await fetch(entry.url + "?auth_check=1", { headers: { Cookie: cookie } })).text();
+  const csrf = /name="csrf" value="([^"]+)"/.exec(landing)![1];
+  await fetch(`${origin}/open/${entry.id}`, { method: "POST", redirect: "manual", headers: { Cookie: cookie, Origin: origin }, body: new URLSearchParams({ csrf }) });
+  const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const req = http.request(`${origin}/ide/${entry.id}/socket`, { headers: { Cookie: cookie, Origin: origin, Connection: "Upgrade", Upgrade: "websocket" } });
+    req.on("upgrade", (_res, socket) => resolve(socket)); req.on("error", reject); req.end();
+  });
+  let disconnected = false; socket.on("close", () => { disconnected = true; }); socket.resume();
+  const wait = async (condition: () => boolean) => {
+    const until = Date.now() + 2000;
+    while (!condition()) { if (Date.now() > until) throw Error("IDE recovery test condition timed out"); await new Promise(resolve => setTimeout(resolve, 5)); }
+  };
+  const bytes = fs.readFileSync(manager.authorizationFile());
+  stalled = true;
+  if (ending === "unavailable") {
+    await wait(() => disconnected); assert.ok(created >= 2); assert.ok(retired >= 2);
+    assert.deepEqual(fs.readFileSync(manager.authorizationFile()), bytes, "sustained uncertainty closes access but retains the login");
+    assert.equal((await fetch(entry.url, { headers: { Cookie: cookie } })).status, 503);
+    return;
+  }
+  await wait(() => created === 2 && checks > 2);
+  assert.equal(disconnected, false);
+  const echo = new Promise<string>(resolve => socket.once("data", data => resolve(data.toString())));
+  socket.write("after-recovery"); assert.equal(await echo, "after-recovery");
+  assert.deepEqual(fs.readFileSync(manager.authorizationFile()), bytes);
+  const reopened = await fetch(entry.url, { headers: { Cookie: cookie }, redirect: "manual" });
+  assert.equal(reopened.status, 303, "refresh now reaches the already-authorized IDE");
+  if (ending === "removed") removed = true; else access.revoke();
+  await wait(() => disconnected);
+  const blocked = ending === "removed" ? entry.url : `${origin}/ide/${entry.id}/file`;
+  assert.equal((await fetch(blocked, { headers: { Cookie: cookie }, redirect: "manual" })).status, ending === "removed" ? 404 : 303);
 });
 
 test("management entry API is mutation-protected and never trusts a client path or host", async t => {

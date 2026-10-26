@@ -30,12 +30,13 @@ export class IDEAccessServer {
   private readonly authorizationError?: string;
   private readonly connections = new Map<Duplex, { session: BrowserSession; instanceId: string; timer: NodeJS.Timeout }>();
   private readonly decisions = new Set<{ entryId: string; invalidated: boolean }>();
+  private readonly membershipChecks = new Map<string, Promise<void>>();
   private managementOrigin?: string;
   private approvalCopies?: IDEApprovalCopyPort;
   private accessAuthority?: IDEAccessAuthority;
   private transition: Promise<void> = Promise.resolve();
   error?: string;
-  constructor(private readonly manager: IDEAccessContext) {
+  constructor(private readonly manager: IDEAccessContext, private readonly options: { verificationIntervalMs?: number } = {}) {
     this.tls = new IDETLSManager(path.join(path.dirname(manager.configStore.filePath), "tls"));
     try { this.authorization = new IDEAuthorization(Date.now, manager.authorizationFile(), new URL(manager.config().publicOrigin).origin,
       subject => this.accessAuthority?.isSubjectAllowed(subject) === true); }
@@ -112,7 +113,7 @@ export class IDEAccessServer {
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
       const scope = this.scope(entryId);
-      await this.manager.refresh(entryId);
+      await this.refreshWorkspace(entryId);
       if (expectedScope !== undefined && scope !== expectedScope) throw new Error("项目目录已改变，请重新核对完整目录后授权");
       const directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未签发授权");
@@ -130,7 +131,7 @@ export class IDEAccessServer {
   async approveAccess(requestId: string, entryId: string, trustWorkspace = false, beforeCommit?: () => void, subject?: IDEAccessSubject): Promise<void> {
     const decision = { entryId, invalidated: false }; this.decisions.add(decision);
     try {
-      await this.manager.refresh(entryId);
+      await this.refreshWorkspace(entryId);
       this.assertEntry(entryId); const scope = this.scope(entryId), directory = trustWorkspace ? await this.manager.canonicalForTrust(entryId) : undefined;
       this.assertEntry(entryId); if (scope !== this.scope(entryId)) throw new Error("项目已改变，未批准授权");
       if (decision.invalidated) throw new Error("项目授权配置已改变，未批准授权");
@@ -194,7 +195,7 @@ export class IDEAccessServer {
     // Missing/moved/foreign entries are distinct from a backend whose current
     // membership cannot be read. Neither condition may grant or proxy access.
     try { this.manager.resolve(id); } catch { res.writeHead(404).end(); return false; }
-    try { await this.manager.refresh(id); return true; }
+    try { await this.refreshWorkspace(id); return true; }
     catch {
       try { this.manager.resolve(id); } catch { res.writeHead(404).end(); return false; }
       res.setHeader("Retry-After", "3");
@@ -203,6 +204,14 @@ export class IDEAccessServer {
         `<a href="/workspace/${id}">重新核验并进入</a>`, retry ? "setTimeout(()=>location.reload(),3000);" : undefined);
       return false;
     }
+  }
+  /** Share only a live check. Every later access observes native state again. */
+  private refreshWorkspace(id: string): Promise<void> {
+    const existing = this.membershipChecks.get(id); if (existing) return existing;
+    const work = Promise.resolve().then(() => this.manager.refresh(id)).then(() => undefined).finally(() => {
+      if (this.membershipChecks.get(id) === work) this.membershipChecks.delete(id);
+    });
+    this.membershipChecks.set(id, work); return work;
   }
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // no-referrer serializes form navigation Origin as "null" in Chromium,
@@ -346,7 +355,7 @@ export class IDEAccessServer {
   private async upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
     const url = new URL(req.url ?? "/", this.manager.config().publicOrigin), match = /^\/ide\/([a-f0-9]{32})(\/.*)$/.exec(url.pathname);
     if (!match) { socket.destroy(); return; }
-    try { await this.manager.refresh(match[1]); } catch { socket.destroy(); return; }
+    try { await this.refreshWorkspace(match[1]); } catch { socket.destroy(); return; }
     const session = this.authenticate(req, match[1]);
     if (!this.validHost(req) || !this.validOrigin(req) || !session) { socket.destroy(); return; }
     const endpoint = this.manager.endpoint(match[1], session.trustWorkspace === true); if (!endpoint) { socket.destroy(); return; }
@@ -368,15 +377,24 @@ export class IDEAccessServer {
   private track(socket: Duplex, session: BrowserSession, instanceId: string): void {
     const previous = this.connections.get(socket); if (previous) clearTimeout(previous.timer);
     const verify = async () => {
+      if (this.connections.get(socket) !== entry || socket.destroyed) return;
       try {
-        await this.manager.refresh(session.entryId);
-        if (!this.authorization.active(session) || session.scope !== this.scope(session.entryId)) { socket.destroy(); return; }
-        const entry = this.connections.get(socket); if (!entry) return;
-        entry.timer = setTimeout(verify, Math.max(1, Math.min(30_000, session.expiresAt - Date.now()))); entry.timer.unref();
-      } catch { socket.destroy(); }
+        if (!this.authorization.active(session)) { disconnect("authorization-inactive"); return; }
+        await this.refreshWorkspace(session.entryId);
+        if (this.connections.get(socket) !== entry || socket.destroyed) return;
+        if (!this.authorization.active(session) || session.scope !== this.scope(session.entryId)) { disconnect("authorization-or-scope-changed"); return; }
+        entry.timer = setTimeout(verify, interval()); entry.timer.unref();
+      } catch { disconnect("membership-unavailable"); }
     };
-    const timer = setTimeout(verify, Math.max(1, Math.min(30_000, session.expiresAt - Date.now()))); timer.unref();
-    this.connections.set(socket, { session, instanceId, timer });
+    const disconnect = (reason: string) => {
+      if (this.connections.get(socket) !== entry || socket.destroyed) return;
+      console.warn(`[codex-im-gateway] IDE connection verification ${JSON.stringify({ timestamp: new Date().toISOString(), entryId: session.entryId, reason })}`);
+      socket.destroy();
+    };
+    const interval = () => Math.max(1, Math.min(this.options.verificationIntervalMs ?? 30_000, session.expiresAt - Date.now()));
+    const timer = setTimeout(verify, interval()); timer.unref();
+    const entry = { session, instanceId, timer };
+    this.connections.set(socket, entry);
     if (!previous) socket.once("close", () => { const entry = this.connections.get(socket); if (entry) clearTimeout(entry.timer); this.connections.delete(socket); });
   }
   private redirect(res: ServerResponse, location: string): void { res.writeHead(303, { Location: location }).end(); }

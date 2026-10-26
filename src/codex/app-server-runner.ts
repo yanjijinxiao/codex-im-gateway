@@ -89,6 +89,8 @@ export type AppServerRunnerOptions = {
   requestTimeoutMs?: number;
   sandbox?: CodexExecSandbox;
   transport?: AppServerTransport;
+  /** Dedicated project observation: no task controls or native decisions. */
+  metadataOnly?: boolean;
 };
 
 type JsonRpcId = number | string;
@@ -1208,6 +1210,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   private async startAppServer(): Promise<void> {
     await this.options.transport?.prepare?.();
+    if (this.closed) throw new Error("Codex app-server runner closed during initialization");
     const localCommand = resolveCodexCommand(this.options.codexBin ?? "codex");
     const command = this.options.transport?.command ?? localCommand.command;
     const args = this.options.transport?.args
@@ -1243,7 +1246,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     try {
       await this.request("initialize", {
         clientInfo: {
-          name: "codex-im-gateway",
+          name: this.options.metadataOnly ? "codex-im-gateway-metadata" : "codex-im-gateway",
           title: "Codex IM Gateway",
           version: "0.4.0"
         },
@@ -1295,6 +1298,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private send(message: WireMessage): void {
+    if (this.options.metadataOnly && (!message.method || !["initialize", "initialized", "thread/read", "thread/list", "project/list"].includes(message.method)
+      || message.method === "thread/read" && message.params?.includeTurns !== false)) {
+      throw new Error("Metadata-only connection cannot submit task controls or approval decisions");
+    }
     if (!this.child || this.child.exitCode !== null || this.child.stdin.destroyed) {
       throw new Error("Codex app-server stdio transport is not connected");
     }
@@ -1677,6 +1684,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleServerRequest(message: WireMessage): void {
+    // Requests observed from a shared native owner remain its responsibility.
+    // A read-only client must not even decline somebody else's approval.
+    if (this.options.metadataOnly) return;
     const id = message.id as JsonRpcId;
     if (isAppServerApprovalMethod(message.method)) {
       const method = message.method;
