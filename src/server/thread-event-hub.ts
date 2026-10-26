@@ -438,9 +438,13 @@ export class ThreadEventHub {
     if (snapshot.state.activeTurnId && this.options.holdsCapacityStart?.({ hostId: sub.hostId,
       threadId: sub.threadId, turnId: snapshot.state.activeTurnId })) return;
     state.observedAt = new Date().toISOString();
-    // Runtime availability is an observation, never evidence that a particular
-    // turn completed. Keep its binding, card and real result journal untouched.
-    if (["archived", "missing"].includes(snapshot.state.persistence) || snapshot.state.runtimeStatus === "systemError") return;
+    // Runtime availability alone is never a terminal receipt. A system error
+    // may nevertheless contain an explicit failure for our exact tracked turn.
+    if (["archived", "missing"].includes(snapshot.state.persistence)) return;
+    if (snapshot.state.runtimeStatus === "systemError") {
+      await this.reconcileConfirmedFailure(sub, snapshot, force, options);
+      return;
+    }
     if (!state.historyBoundary && ["active", "idle"].includes(snapshot.state.runtimeStatus)) {
       // Migration must not trust an old cursor already moved backwards by the
       // replay bug. Freeze the newly visible history at its native tail. The
@@ -571,6 +575,32 @@ export class ThreadEventHub {
       this.save();
     }
   }
+  /** Settle only an already tracked native failure, not arbitrary history or
+   * a systemError observation. Execution availability remains unchanged. */
+  private async reconcileConfirmedFailure(sub: ThreadSubscription, snapshot: CodexThreadSnapshot,
+    force: boolean, options: FollowSyncOptions): Promise<void> {
+    const state = this.state(sub);
+    const turnId = state.turnId;
+    const failure = snapshot.state.lastTurnFailure;
+    if (sub.managed || snapshot.state.persistence !== "active" || !turnId || failure?.turnId !== turnId
+      || state.completed.includes(turnId) || state.baseline?.includes(turnId) || state.retired?.includes(turnId)
+      || state.checkpointTurnId && state.checkpointTurnId !== turnId
+      || state.terminalPending && (state.terminalPending.turnId !== turnId || state.terminalPending.outcome !== "failed")) return;
+    const turn = snapshot.turns.find(item => item.id === turnId && item.status === "failed");
+    if (!turn) return;
+    // Do not replace a persisted card on a transport that cannot resume it.
+    if (hasDeliveredCard(state.checkpoint) && !sub.client.resumableTextStream && !this.streams.has(sub.key)) return;
+    if (failure.code === "model-capacity"
+      && this.options.onCapacityFailure?.({ hostId: sub.hostId, threadId: sub.threadId, turnId })) return;
+    const partial = visibleText(turn.messages.filter(message => message.role === "assistant" && message.kind !== "progress")
+      .map(message => message.text).join("\n\n")).trim();
+    const text = state.terminalPending?.text ?? [codexFailureSummary(failure.code),
+      "原生轮次已确认失败；Gateway 未重新执行任务或切换模型。",
+      ...(partial ? [`已生成的回复（本轮未成功完成）：\n\n${partial}`] : [])].join("\n\n");
+    await this.finish(sub, turnId, text, false, { recoverBootstrap: force,
+      confirmUncertainDelivery: options.confirmUncertainDelivery, outcome: "failed" });
+  }
+
   /** Only an actual start event (or a loaded backend snapshot) may switch turns. */
   async started(hostId: string, threadId: string, turnId: string, startedAt: string): Promise<void> {
     if (this.options.holdsCapacityStart?.({ hostId, threadId, turnId })) return;
