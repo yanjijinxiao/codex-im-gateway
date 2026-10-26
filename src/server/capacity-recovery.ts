@@ -31,8 +31,12 @@ type Options = {
   delaysMs?: readonly number[];
   now?: () => number;
   reconcileTimeoutMs?: number;
+  reconcileIntervalMs?: number;
 };
 const keyOf = (scope: CapacityFailure) => JSON.stringify([scope.hostId, scope.threadId]);
+class CapacityObservationError extends Error {
+  constructor(readonly code: "timeout" | "identity-mismatch") { super(`Capacity observation ${code}`); }
+}
 
 /** One execution coordinator per Gateway, not per IM binding. It owns the
  * explicit continuation policy; the follow hub remains a read-only observer.
@@ -42,6 +46,8 @@ export class CapacityRecoveryCoordinator {
   private readonly timers = new Map<string, NodeJS.Timeout>();
   private readonly executing = new Set<string>();
   private readonly checking = new Map<string, { previous: RecordState; scopes: Map<string, CapacityFailure> }>();
+  private readonly settling = new Map<string, symbol>();
+  private reconciliationTimer?: NodeJS.Timeout;
   private readonly delays: readonly number[];
   private readonly now: () => number;
   private stopped = false;
@@ -63,9 +69,12 @@ export class CapacityRecoveryCoordinator {
   }
   start(): void {
     this.stopped = false;
+    if (!this.reconciliationTimer) {
+      this.reconciliationTimer = setInterval(() => this.reconcileUncertain(), this.options.reconcileIntervalMs ?? 30_000);
+      this.reconciliationTimer.unref();
+    }
+    this.reconcileUncertain();
     for (const record of Object.values(this.records)) {
-      // Native record reconciliation cannot wait for IM/card projection.
-      if (record.status === "uncertain") void this.settleKnownCompletion(record);
       void (async () => {
         for (let i = 1; i < record.turns.length; i++) {
           await this.options.accepted({ ...record, turnId: record.turns[i - 1] }, record.turns[i]);
@@ -85,6 +94,9 @@ export class CapacityRecoveryCoordinator {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     this.checking.clear();
+    if (this.reconciliationTimer) clearInterval(this.reconciliationTimer);
+    this.reconciliationTimer = undefined;
+    this.settling.clear();
   }
   holdsStart(scope: CapacityFailure): boolean {
     if (this.checking.get(keyOf(scope))?.scopes.has(scope.turnId)) return true;
@@ -163,8 +175,8 @@ export class CapacityRecoveryCoordinator {
     let timer: NodeJS.Timeout | undefined;
     try {
       const snapshot = await Promise.race([this.options.backend().readThreadSnapshot(record.threadId, record.hostId),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error("Capacity reconciliation timed out")), this.options.reconcileTimeoutMs ?? 5000); })]);
-      if (snapshot.state.threadId !== record.threadId || snapshot.state.internal) throw Error("Capacity observation identity mismatch");
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new CapacityObservationError("timeout")), this.options.reconcileTimeoutMs ?? 25_000); })]);
+      if (snapshot.state.threadId !== record.threadId || snapshot.state.internal) throw new CapacityObservationError("identity-mismatch");
       return snapshot;
     } finally { if (timer) clearTimeout(timer); }
   }
@@ -179,8 +191,20 @@ export class CapacityRecoveryCoordinator {
   }
   /** A restart may retire a proved-ended chain, but cannot discover a new
    * failure from history and authorize execution by itself. */
+  private reconcileUncertain(): void {
+    if (this.stopped) return;
+    for (const record of Object.values(this.records)) {
+      const key = keyOf(record);
+      // Native reconciliation is independent of card delivery. Coalesce slow
+      // observations, and leave replacement/execution decisions to offer().
+      if (record.status === "uncertain" && !this.settling.has(key) && !this.checking.has(key) && !this.executing.has(key)) {
+        void this.settleKnownCompletion(record);
+      }
+    }
+  }
   private async settleKnownCompletion(record: RecordState): Promise<void> {
-    const generation = this.generation, key = keyOf(record);
+    const generation = this.generation, key = keyOf(record), token = Symbol(), started = this.now();
+    this.settling.set(key, token);
     try {
       const snapshot = await this.snapshot(record), accepted = this.acceptedTurn(record, snapshot);
       if (this.stopped || generation !== this.generation || this.records[key] !== record || this.checking.has(key)
@@ -195,13 +219,17 @@ export class CapacityRecoveryCoordinator {
       record.status = "finished"; record.closedBy = { turnId: accepted!.id, status: accepted!.status, at: this.now() }; this.save();
       this.reconciliationDiagnostic(record, "closed");
     } catch (error) {
-      if (!this.stopped && this.records[key] === record) this.reconciliationDiagnostic(record, "protected",
-        error instanceof CodexCommunicationError ? error.code : "observation-unavailable");
+      if (!this.stopped && generation === this.generation && this.records[key] === record) this.reconciliationDiagnostic(record, "protected",
+        error instanceof CodexCommunicationError || error instanceof CapacityObservationError ? error.code : "observation-unavailable",
+        { elapsedMs: this.now() - started, errorType: error instanceof Error
+          && ["Error", "TypeError", "RangeError", "SyntaxError", "CodexCommunicationError"].includes(error.name) ? error.name : "unknown" });
+    } finally {
+      if (this.settling.get(key) === token) this.settling.delete(key);
     }
   }
-  private reconciliationDiagnostic(record: RecordState, status: "closed" | "protected", reason?: string): void {
+  private reconciliationDiagnostic(record: RecordState, status: "closed" | "protected", reason?: string, detail?: { elapsedMs: number; errorType: string }): void {
     console.info(`[codex-im-gateway] capacity reconciliation ${JSON.stringify({ timestamp: new Date().toISOString(),
-      hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, status, ...(reason ? { reason } : {}) })}`);
+      hostId: record.hostId, threadId: record.threadId, turnId: record.turnId, status, ...(reason ? { reason } : {}), ...detail })}`);
   }
   private async reconcile(key: string, check: { previous: RecordState; scopes: Map<string, CapacityFailure> }): Promise<void> {
     const generation = this.generation, previous = check.previous;

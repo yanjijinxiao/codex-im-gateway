@@ -126,6 +126,48 @@ test("blocked IM projection cannot prevent native recovery records from closing 
   assert.equal(f.saved().status, "finished"); assert.equal(f.calls.length, 0);
 });
 
+test("a transient startup observation failure is reconciled later without submitting work", async t => {
+  let reads = 0;
+  const f = fixture(t, async () => { if (++reads === 1) throw Error("transport not ready"); return snapshot(); });
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, reconcileIntervalMs: 10 });
+  t.after(() => coordinator.stop()); coordinator.start();
+  await until(() => f.saved().status === "finished");
+  assert.equal(reads, 2); assert.equal(f.calls.length, 0); assert.equal(f.terminal.length, 0);
+  assert.equal(f.saved().attempts, 3); assert.equal(f.saved().closedBy.turnId, "old-retry");
+});
+
+test("a timed-out startup read can recover at the next read-only check", async t => {
+  let reads = 0;
+  const f = fixture(t, () => ++reads === 1 ? new Promise(() => {}) : Promise.resolve(snapshot()));
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, reconcileIntervalMs: 10, reconcileTimeoutMs: 5 });
+  t.after(() => coordinator.stop()); coordinator.start();
+  await until(() => f.saved().status === "finished");
+  assert.equal(reads, 2); assert.equal(f.calls.length, 0);
+});
+
+test("read-only checks coalesce slow reads and stop does not leave a reconciliation timer", async t => {
+  let release!: (value: CodexThreadSnapshot) => void;
+  const f = fixture(t, () => new Promise(resolve => { release = resolve; }));
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, reconcileIntervalMs: 5, reconcileTimeoutMs: 200 });
+  t.after(() => coordinator.stop()); coordinator.start();
+  await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(f.reads(), 1);
+  coordinator.stop(); release(snapshot());
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.reads(), 1); assert.equal(f.saved().status, "uncertain"); assert.equal(f.calls.length, 0);
+});
+
+test("late evidence from a stopped generation cannot close a restarted recovery", async t => {
+  const releases: Array<(value: CodexThreadSnapshot) => void> = [];
+  const f = fixture(t, () => new Promise(resolve => { releases.push(resolve); }));
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, reconcileIntervalMs: 5, reconcileTimeoutMs: 200 });
+  t.after(() => coordinator.stop()); coordinator.start(); coordinator.stop(); coordinator.start();
+  assert.equal(releases.length, 2); releases[0](snapshot());
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(f.saved().status, "uncertain"); assert.equal(f.reads(), 2);
+  releases[1](snapshot()); await until(() => f.saved().status === "finished");
+  assert.equal(f.calls.length, 0);
+});
+
 test("a late old failure cannot cancel a waiting new chain", async t => {
   const f = fixture(t); f.options.delaysMs.splice(0, f.options.delaysMs.length, 1000);
   f.coordinator.offer(scope); await until(() => f.saved().turnId === scope.turnId);
