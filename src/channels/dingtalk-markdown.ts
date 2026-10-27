@@ -8,6 +8,27 @@ export function dingTalkLoadingBody(source: string): string {
   return last && !["paragraph", "text"].includes(last.type) ? `${closeMarkdownFence(source).trimEnd()}\n\n正在处理…` : source;
 }
 
+/** The native streaming Markdown parser can retain/drop block widgets when a
+ * whole multi-block document is rewritten. Task snapshots use one paragraph;
+ * the static footer owns copy widgets/links. Terminal documents retain Markdown.
+ */
+export function dingTalkProgressContent(source: string): string {
+  const plain = (token: Token): string => {
+    if (token.type === "space" || token.type === "br" || token.type === "hr") return "\n\n";
+    if (token.type === "list") return (token as Tokens.List).items.map(item => "• " + item.tokens.map(plain).join("").trim()).join("\n") + "\n\n";
+    if (token.type === "code") return (token as Tokens.Code).text + "\n\n";
+    if ("tokens" in token && Array.isArray(token.tokens)) return token.tokens.map(plain).join("")
+      + (["paragraph", "heading", "blockquote"].includes(token.type) ? "\n\n" : "");
+    return "text" in token && typeof token.text === "string" ? token.text : token.raw;
+  };
+  const content = Lexer.lex(source, { gfm: true }).map(plain).join("").trim()
+    .replace(/&(?!(?:amp|lt|gt|quot|#\d+|#x[\da-f]+);)/gi, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/[\\`*_{}\[\]()#+!|~]/g, "\\$&")
+    .replace(/\n{3,}/g, "\n\n").replace(/\n/g, "<br>");
+  const heading = /^\*\*([^*`<>&\n]{1,40})\*\*/.exec(source);
+  return heading && content.startsWith(heading[1]) ? `**${heading[1]}**${content.slice(heading[1].length)}` : content;
+}
+
 /** Plain webhook transport has no Markdown renderer. Remove only code-block
  * wrappers, never rewrite the literal reply/command inside them. */
 export function dingTalkPlainText(source: string): string {

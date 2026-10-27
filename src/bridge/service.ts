@@ -196,6 +196,12 @@ export class BridgeService {
     rows: SessionCatalogRow[];
     page: number; pageSize: number; createdAt: number; label: string; warnings: string[];
   }>();
+  private readonly projectLists = new Map<string, { createdAt: number; codes: Map<string, { projectId?: string; candidate?: CodexProjectCandidate }> }>();
+
+  private catalogActorKey(senderId: string): string {
+    return JSON.stringify([senderId, this.actor.getStore() ?? senderId]);
+  }
+
   private readonly actor = new AsyncLocalStorage<string>();
   private readonly participant = new AsyncLocalStorage<Pick<TurnParticipantOrigin, "actorId" | "conversationId" | "mention">>();
   private readonly conversationWork = new Map<string, number>();
@@ -424,7 +430,7 @@ export class BridgeService {
           deferredCommands.push(command);
           continue;
         }
-        await this.handleCommand(scopedMessage, command, channelCapabilities);
+        if (await this.handleCommand(scopedMessage, command, channelCapabilities) === false) return;
       }
       if (!continueAsConversation) return;
     }
@@ -454,7 +460,7 @@ export class BridgeService {
     if (await this.handleActiveMessage(scopedMessage, items)) return;
     await this.runCodexTurn(scopedMessage, "", items);
     for (const command of deferredCommands) {
-      await this.handleCommand(scopedMessage, command, channelCapabilities);
+      if (await this.handleCommand(scopedMessage, command, channelCapabilities) === false) return;
     }
   }
 
@@ -498,7 +504,7 @@ export class BridgeService {
     message: ChannelMessage,
     command: ChannelCommand,
     channelCapabilities: readonly ChannelCommandCapability[]
-  ): Promise<void> {
+  ): Promise<void | false> {
     // Command controllers own exact native receipts; an interrupted dispatch is
     // never replayed merely because the transport redelivers its source message.
     this.options.inputReceipts?.submitting();
@@ -566,8 +572,7 @@ export class BridgeService {
         return;
       case "project":
       case "projects":
-        await this.handleProjectCommand(message.senderId, command.arg);
-        return;
+        return await this.handleProjectCommand(message.senderId, command.arg) ? undefined : false;
       case "task":
         this.options.stateStore.setInteractionMode(message.senderId, "task");
         await this.taskboardController.handle(message, command.arg);
@@ -594,8 +599,7 @@ export class BridgeService {
           this.participantOrigin(this.executionSession(message.senderId))));
         return;
       case "new":
-        await this.handleNewSessionCommand(message.senderId, command.arg);
-        return;
+        return await this.handleNewSessionCommand(message.senderId, command.arg) ? undefined : false;
       case "session":
       case "sessions":
         await this.handleSessionCommand(message.senderId, command.arg);
@@ -711,12 +715,12 @@ export class BridgeService {
     }
   }
 
-  private async handleNewSessionCommand(senderId: string, arg: string): Promise<void> {
+  private async handleNewSessionCommand(senderId: string, arg: string): Promise<boolean> {
     const target = parseNewSessionTarget(arg);
     const store = this.options.stateStore;
     if (target.kind === "invalid" || target.kind === "help") {
       await this.reply(senderId, `${target.kind === "invalid" ? "参数无效；指定项目和独立会话不能同时使用。\n\n" : ""}${NEW_SESSION_USAGE}`);
-      return;
+      return false;
     }
     if (target.kind === "standalone") {
       // Never reuse the current project's cwd, and never allocate on an inferred remote host.
@@ -725,7 +729,7 @@ export class BridgeService {
       const session = store.createSession(senderId, workspace, undefined, undefined, "session", undefined, { standalone: true, hostId: "local" });
       store.setInteractionMode(senderId, "session");
       await this.reply(senderId, `已新建并绑定本机独立会话：${session.title}\n\n项目：无\n\n工作目录：${session.workspace}\n\n下一条消息将在这个新会话中开始；目录会持久保留。`);
-      return;
+      return true;
     }
     const project = target.kind === "project"
       ? await this.resolveSelectedProject(senderId, target.selector)
@@ -742,19 +746,42 @@ export class BridgeService {
           ]
         }));
       }
-      return;
+      return false;
     }
-    if (target.kind === "current" && !await this.validateProjectRoute(senderId, project)) return;
+    if (target.kind === "current" && !await this.validateProjectRoute(senderId, project)) return false;
     const session = store.createSession(senderId, project.workspace, undefined, project.id);
     store.setInteractionMode(senderId, "session");
     await this.reply(senderId, `已在${target.kind === "current" ? "当前" : "指定"}项目“${project.name}”新建并绑定会话：${session.title}\n\n主机：${project.hostId ?? "local"}\n\n工作目录：${session.workspace}\n\n下一条消息将在这个新会话中开始。`);
+    return true;
+  }
+
+  private selectProject(senderId: string, selector: string, candidates: readonly CodexProjectCandidate[], projects: readonly ManagedProject[]) {
+    let selected: ReturnType<typeof selectChannelProject>;
+    const snapshot = this.projectLists.get(this.catalogActorKey(senderId));
+    if (/^[pc][1-9]\d*$/i.test(selector) && !snapshot) return {
+      error: copyableChoices("当前没有这份项目列表，请刷新后重新选择。", [{ label: "刷新项目列表", value: "/project" }])
+    };
+    if (/^[pc][1-9]\d*$/i.test(selector) && snapshot) {
+      const saved = snapshot.codes.get(selector.toUpperCase());
+      const project = saved?.projectId && projects.find(p => p.id === saved.projectId);
+      const candidate = saved?.candidate && candidates.find(c => c.projectId === saved.candidate!.projectId
+        && (c.hostId ?? "local") === (saved.candidate!.hostId ?? "local") && c.workspace === saved.candidate!.workspace);
+      selected = Date.now() - snapshot.createdAt > 15 * 60_000 || (!project && !candidate) || (saved?.candidate && !candidate)
+        ? { error: copyableChoices("项目列表已变化或过期，请刷新后重新选择。", [{ label: "刷新项目列表", value: "/project" }]) }
+        : project ? { project } : { candidate: candidate! };
+    } else selected = selectChannelProject(selector, projects, candidates, candidate => this.boundProjectForCandidate(candidate, projects));
+    if (selected.candidate) {
+      const bound = this.boundProjectForCandidate(selected.candidate, projects);
+      if (bound) return { project: bound };
+    }
+    return selected;
   }
 
   private async resolveSelectedProject(senderId: string, selector: string, catalog?: readonly CodexProjectCandidate[]): Promise<ManagedProject | undefined> {
     const candidates = catalog ?? await this.codexProjectCandidates();
     this.synchronizeManagedProjects(candidates);
     const projects = this.options.stateStore.listProjects();
-    const selected = selectChannelProject(selector, projects, candidates, candidate => this.boundProjectForCandidate(candidate, projects));
+    const selected = this.selectProject(senderId, selector, candidates, projects);
     if (selected.error) {
       await this.reply(senderId, selected.error);
       return;
@@ -781,7 +808,7 @@ export class BridgeService {
     return true;
   }
 
-  private async handleProjectCommand(senderId: string, arg: string): Promise<void> {
+  private async handleProjectCommand(senderId: string, arg: string): Promise<boolean> {
     const candidates = await this.codexProjectCandidates();
     this.synchronizeManagedProjects(candidates);
     // add is a compatibility alias; discovery alone never creates bindings.
@@ -789,36 +816,54 @@ export class BridgeService {
     const addMatch = /^(c[1-9]\d*)$/i.exec(input);
     if (addMatch) {
       const project = await this.resolveSelectedProject(senderId, input, candidates);
-      if (!project) return;
+      if (!project) return false;
       this.options.stateStore.activateProject(senderId, project.id);
       this.options.stateStore.setInteractionMode(senderId, "session");
       await this.reply(
         senderId,
         `已绑定并切换 Codex 项目：${project.name}${project.hostId ? `\n远程主机：${project.hostId}` : ""}\n${project.workspace}`
       );
-      return;
+      return true;
     }
     const projects = this.options.stateStore.listProjects();
+    const detail = /^detail\s+(.+)$/i.exec(input);
+    if (detail) {
+      const selected = this.selectProject(senderId, detail[1].trim(), candidates, projects);
+      if (selected.error) { await this.reply(senderId, selected.error); return false; }
+      const project = selected.project ?? selected.candidate!;
+      await this.reply(senderId, [`项目详情 · ${project.name}（查看不会切换项目）`, `主机：${project.hostId ?? "local"}`,
+        `目录：${project.workspace}`, ...("rootPaths" in project && project.rootPaths?.length ? [`项目根目录：${project.rootPaths.join("、")}`] : []),
+        `项目 ID：${selected.project?.sourceProjectId ?? selected.candidate?.projectId ?? selected.project?.id}`].join("\n\n"));
+      return false;
+    }
     const renameMatch = /^(?:rename|rn)\s+(.+)$/i.exec(input);
     if (renameMatch) {
       const [rawCode, name] = renameMatch[1].split("|").map((value) => value.trim());
       const match = /^p([1-9]\d*)$/i.exec(rawCode ?? "");
-      const project = match ? projects[Number(match[1]) - 1] : undefined;
+      const snapshot = this.projectLists.get(this.catalogActorKey(senderId));
+      const savedId = match && snapshot?.codes.get(`P${match[1]}`)?.projectId;
+      const project = !match ? undefined : snapshot
+        ? Date.now() - snapshot.createdAt <= 15 * 60_000 ? projects.find(p => p.id === savedId) : undefined
+        : undefined;
       if (!project || !name) {
         await this.reply(senderId, "用法：/project rename P1|新名称");
-        return;
+        return false;
       }
       const renamed = this.options.stateStore.renameProject(project.id, name);
       await this.reply(senderId, `已修改 Gateway 项目显示名称：${renamed.name}\nCodex App 项目名称和磁盘目录未改变。`);
-      return;
+      return false;
     }
     const deleteMatch = /^(?:delete|d)\s+(.+)$/i.exec(input);
     if (deleteMatch) {
       const match = /^p([1-9]\d*)$/i.exec(deleteMatch[1].trim());
-      const project = match ? projects[Number(match[1]) - 1] : undefined;
+      const snapshot = this.projectLists.get(this.catalogActorKey(senderId));
+      const savedId = match && snapshot?.codes.get(`P${match[1]}`)?.projectId;
+      const project = !match ? undefined : snapshot
+        ? Date.now() - snapshot.createdAt <= 15 * 60_000 ? projects.find(p => p.id === savedId) : undefined
+        : undefined;
       if (!project) {
         await this.reply(senderId, "用法：/project delete P1");
-        return;
+        return false;
       }
       try {
         this.options.stateStore.deleteProject(project.id);
@@ -826,74 +871,69 @@ export class BridgeService {
       } catch {
         await this.reply(senderId, "项目下还有任务，请先删除或迁移任务后再移除项目。");
       }
-      return;
+      return false;
     }
-    if (!input || input.toLowerCase() === "list" || input.toLowerCase() === "l") {
+    const listingInput = /^(?:list|l|retained(?:\s+page\s+[1-9]\d*)?|page\s+[1-9]\d*)?$/i.exec(input);
+    if (listingInput) {
+      const retained = /^retained/i.test(input);
       const activeProjectId = this.options.stateStore.getActiveProject(senderId)?.id;
+      const codes = new Map<string, { projectId?: string; candidate?: CodexProjectCandidate }>();
+      const currentIds = new Set<string>();
       let nextAddIndex = 1;
-      const catalogRows = candidates.map((candidate) => {
+      const rows = candidates.map(candidate => {
         const bound = this.boundProjectForCandidate(candidate, projects);
-        const projectIndex = bound ? projects.findIndex((project) => project.id === bound.id) : -1;
-        return {
-          candidate,
-          bound,
-          projectIndex,
-          addIndex: bound ? undefined : nextAddIndex++
-        };
+        if (bound) currentIds.add(bound.id);
+        const code = bound ? `P${projects.findIndex(p => p.id === bound.id) + 1}` : `C${nextAddIndex++}`;
+        codes.set(code, bound ? { projectId: bound.id, candidate } : { candidate });
+        return { code, name: candidate.name, host: sessionHostLabel(candidate.hostId ?? "local"), workspace: candidate.workspace,
+          status: bound && bound.id === activeProjectId ? "当前" : bound ? "已登记" : "可选择" };
       });
-      const catalogProjectIds = new Set(catalogRows.flatMap((row) => row.bound ? [row.bound.id] : []));
-      const retainedProjects = projects.filter((project) => !catalogProjectIds.has(project.id));
-      const fallbackText = [
-        `Codex 项目：${candidates.length} 个（已绑定 ${projects.length} 个）`,
-        ...catalogRows.map(({ candidate, addIndex, bound, projectIndex }) => bound
-          ? `[P${projectIndex + 1}] ${bound.id === activeProjectId ? "【当前】 " : ""}${candidate.name}\n\n路径：${candidate.workspace}`
-          : `[C${addIndex}] 【未绑定】 ${candidate.name}\n\n路径：${candidate.workspace}`),
-        ...(retainedProjects.length
-          ? ["Gateway 保留的其他项目：", ...retainedProjects.map((project) => {
-            const projectIndex = projects.findIndex((item) => item.id === project.id);
-            return `[P${projectIndex + 1}] ${project.id === activeProjectId ? "【当前】 " : ""}${project.name}\n\n路径：${project.workspace}`;
-          })]
-          : []),
-        "发送 /project P1 或 /project C1 选择项目，未绑定的项目会自动绑定。也可以直接用 /sessions 选择会话。"
-      ].join("\n\n");
-      if (!projects.length && !candidates.length) {
-        await this.replyActionCard(senderId, createChoiceCard({
-          title: "选择 Codex 项目",
-          body: "当前后端没有可用项目。已有会话可直接通过 /sessions 选择；CLI 项目目录来自本机会话记录。",
-          fallbackText,
-          choices: [{ label: "重新读取", command: "project", arg: "list", style: "primary" }]
-        }));
-        return;
+      // Historical native registrations remain durable, but do not masquerade
+      // as projects currently present in the App or create false name matches.
+      const historical = projects.filter(p => !currentIds.has(p.id));
+      for (const p of historical) {
+        const code = `P${projects.findIndex(item => item.id === p.id) + 1}`;
+        codes.set(code, { projectId: p.id });
+        if (retained || !p.sourceProjectId) rows.push({ code, name: p.name, host: sessionHostLabel(p.hostId ?? "local"), workspace: p.workspace,
+          status: p.id === activeProjectId ? "当前 · 历史登记" : "历史登记" });
       }
-      await this.replyActionCard(senderId, createCommandSelectionCard({
-        title: "选择 Codex 项目",
-        body: [
-          ...catalogRows.map(({ candidate, bound }) => `**${bound?.id === activeProjectId ? "当前" : bound ? "已绑定" : "未绑定"} · ${candidate.name}**\n\n路径：${candidate.workspace}`),
-          ...retainedProjects.map((project) => `**${project.id === activeProjectId ? "当前" : "Bridge 保留"} · ${project.name}**\n\n路径：${project.workspace}`)
-        ].join("\n\n"),
-        command: "project",
-        choices: [
-          ...catalogRows.map(({ candidate, addIndex, bound, projectIndex }) => ({
-            label: conciseButtonLabel(candidate.name),
-            arg: bound ? `P${projectIndex + 1}` : `add C${addIndex}`,
-            active: bound?.id === activeProjectId
-          })),
-          ...retainedProjects.map((project) => {
-            const projectIndex = projects.findIndex((item) => item.id === project.id);
-            return {
-              label: conciseButtonLabel(project.name),
-              arg: `P${projectIndex + 1}`,
-              active: project.id === activeProjectId
-            };
-          })
-        ],
-        fallbackText
-      }));
-      return;
+      const displayed = retained ? rows.filter(row => row.status.includes("历史登记")) : rows;
+      const pageSize = 10, pages = Math.max(1, Math.ceil(displayed.length / pageSize));
+      const page = Math.min(pages, Number(/(?:^|\s)page\s+(\d+)$/i.exec(input)?.[1] ?? 1));
+      const pageRows = displayed.slice((page - 1) * pageSize, page * pageSize);
+      const key = this.catalogActorKey(senderId);
+      const previous = this.projectLists.get(key);
+      // Page navigation uses the exact same identities; refresh is explicit.
+      if (/(?:^|\s)page/i.test(input) && (!previous || Date.now() - previous.createdAt > 15 * 60_000)) {
+        await this.reply(senderId, copyableChoices("项目列表已过期，请刷新后翻页。", [{ label: "刷新项目列表", value: "/project" }])); return false;
+      }
+      if (/(?:^|\s)page/i.test(input) && previous) {
+        if (codes.size !== previous.codes.size || [...codes].some(([code, value]) => JSON.stringify(value) !== JSON.stringify(previous.codes.get(code)))) {
+          await this.reply(senderId, copyableChoices("项目目录已变化，请刷新后重新选择。", [{ label: "刷新项目列表", value: "/project" }])); return false;
+        }
+      }
+      for (const [k,v] of this.projectLists) if (Date.now() - v.createdAt > 15 * 60_000 && k !== key) this.projectLists.delete(k);
+      this.projectLists.set(key, { createdAt: previous && /(?:^|\s)page/i.test(input) ? previous.createdAt : Date.now(), codes });
+      const title = `${retained ? "历史项目登记" : "Codex 项目"} · ${displayed.length} 个 · ${page}/${pages} 页`;
+      const table: ChannelTable = { columns: ["编号", "项目", "主机", "状态"].map(label => ({ label })),
+        rows: pageRows.map(row => [row.code, compactTableCell(row.name, 32), row.host, row.status]) };
+      const body = pageRows.length ? "" : "当前没有可选择的项目。";
+      const note = (retained ? "历史登记不会被删除，也不参与当前项目的同名匹配。" : "来自当前 Codex 目录；手工登记及历史项目单独标明。") + "\n查看路径：/project detail 项目编号。";
+      const navigation = [
+        ...(page > 1 ? [{ label: "上一页", value: `/project ${retained ? "retained " : ""}page ${page - 1}` }] : []),
+        ...(page < pages ? [{ label: "下一页", value: `/project ${retained ? "retained " : ""}page ${page + 1}` }] : []),
+        ...(!retained && historical.some(p => p.sourceProjectId) ? [{ label: "查看历史登记", value: "/project retained" }] : [])
+      ];
+      await this.replyActionCard(senderId, createChoiceCard({ title, body, table, note,
+        fallbackText: [title, body, renderTextTable(table), note].filter(Boolean).join("\n\n"),
+        copyChoices: [...(pageRows.length ? [{ label: "选择项目模板（将“项目编号”替换为上表的 P 或 C 编号）", value: "/project 项目编号" }] : []), ...navigation],
+        choices: [...pageRows.map(row => ({ label: `${row.code} ${row.name}`, command: "project" as const, arg: row.code })),
+          ...navigation.map(item => ({ label: item.label, command: "project" as const, arg: item.value.slice(9) }))] }));
+      return false;
     }
     const requestedProject = /^(?:switch)\s+(.+)$/i.exec(input)?.[1]?.trim() ?? input;
     const project = await this.resolveSelectedProject(senderId, requestedProject, candidates);
-    if (!project) return;
+    if (!project) return false;
     this.options.stateStore.activateProject(senderId, project.id);
     this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
     const fallbackText = [
@@ -908,6 +948,7 @@ export class BridgeService {
       fallbackText,
       choices: this.modeChoices(this.modeSettings.defaultMode)
     }));
+    return true;
   }
 
   private async handleModeCommand(message: ChannelMessage, arg: string): Promise<void> {
@@ -1272,7 +1313,7 @@ export class BridgeService {
         if (!row) { await this.reply(senderId, copyableChoices("没有这个编号，请查看当前会话列表。", [{ label: "查看会话列表", value: "/sessions" }])); return; }
         await this.bindCatalogSession(senderId, row.state.threadId, row.hostId); return;
       }
-      const requested = /^page\s+(\d+)$/i.exec(input);
+      const requested = /(?:^|\s)page\s+(\d+)$/i.exec(input);
       if (!resized) listing.page = requested ? Number(requested[1]) - 1 : listing.page + (/^prev$/i.test(input) ? -1 : 1);
       listing.page = Math.min(Math.max(0, Math.ceil(listing.rows.length / listing.pageSize) - 1), Math.max(0, listing.page));
     } else if (input && !/^(all|unbound|unassigned|project|search\s+.+)$/i.test(input)) {
@@ -1303,7 +1344,7 @@ export class BridgeService {
       if (projectOnly) { hosts.clear(); hosts.add(activeProject?.hostId ?? "local"); }
       else if (this.options.config.codexBackend !== "exec") {
         for (const p of projectCatalog) if (p.hostId) hosts.add(p.hostId);
-        for (const p of this.options.stateStore.listProjects()) if (p.hostId) hosts.add(p.hostId);
+        if (!projectCatalog.length) for (const p of this.options.stateStore.listProjects()) if (p.hostId) hosts.add(p.hostId);
       }
       const rows: NonNullable<typeof listing>["rows"] = [];
       const visitedHosts = new Set<string>();
@@ -1322,7 +1363,7 @@ export class BridgeService {
             if (!projectOnly && catalog.backend === "app-server") for (const host of catalog.hostIds) hosts.add(host);
           }
           for (const state of states) {
-            if (state.persistence !== "active" || state.internal || state.runtimeStatus === "systemError" || !state.cwd || (unassigned && state.projectId)) continue;
+            if (state.persistence !== "active" || state.internal || (unassigned && state.projectId)) continue;
             if (query && !`${state.title ?? ""} ${state.preview ?? ""} ${state.threadId} ${state.cwd ?? ""}`.toLocaleLowerCase().includes(query)) continue;
             if (purposes.isProbe(state.threadId, hostId)) {
               hiddenProbes.add(JSON.stringify([hostId, state.threadId]));
@@ -1351,14 +1392,18 @@ export class BridgeService {
       const current = active?.threadId === state.threadId && this.sessionHostId(active) === hostId;
       const name = state.title || codexSessionCandidatePreview(codexThreadStateCandidate(state, state.cwd ?? "")) || "未命名";
       const status = projectSessionChoiceStateLabel({ title: name, updatedAt: state.updatedAt ?? "", candidate: codexThreadStateCandidate(state, state.cwd ?? "") });
-      return [`R${start + index + 1}`, compactTableCell(`${current ? "【当前】 " : ""}${name}`, 28),
+      return [`R${start + index + 1}`, compactTableCell(`${state.catalogOrder?.pinnedIndex !== undefined ? "📌 " : ""}${current ? "【当前】 " : ""}${name}`, 28),
         group?.label ?? `无项目${hostId !== "local" ? ` · ${compactTableCell(sessionHostLabel(hostId), 15)}` : ""}`,
         status.replace("Desktop 已打开", "已打开").replace("上次执行失败", "上次失败").replace("上次已停止", "已停止").replace("状态未知", "未知")];
     }) };
     const body = [...(!pageRows.length ? ["没有符合条件的未归档会话。"] : []), ...listing.warnings].join("\n\n");
-    const note = `按项目分组 · 组内最近更新优先 · 每页 ${listing.pageSize} 条\n选择 /session R编号 · 详情 /sessions detail R编号\n翻页 /sessions more|prev · 条数 /sessions size 50`;
+    const note = `置顶 → 项目目录顺序 → 其他会话；组内遵循 App 排序 · 每页 ${listing.pageSize} 条。\n查看详情：/sessions detail R编号。`;
     const text = [title, body, renderTextTable(table), note].filter(Boolean).join("\n\n");
     await this.replyActionCard(senderId, createChoiceCard({ title, body: escapeTableMarkdown(body), ...(pageRows.length ? { table } : {}), note, fallbackText: text,
+      copyChoices: [
+        ...(pageRows.length ? [{ label: "选择会话模板（将“编号”替换为上表数字）", value: "/session R编号" }] : []),
+        ...(listing.page > 0 ? [{ label: "上一页", value: "/sessions prev" }] : []),
+        ...(start + listing.pageSize < listing.rows.length ? [{ label: "下一页", value: "/sessions more" }] : [])],
       choices: [...pageRows.map(({state,hostId}, i): ChannelChoice => ({ label: `R${start+i+1}`, command: "session", arg: `${state.threadId} --host ${hostId}`, copyValue: `/session R${start+i+1}` })),
         ...(listing.page > 0 ? [{ label: "上一页", command: "sessions" as const, arg: "prev" }] : []),
         ...(start + listing.pageSize < listing.rows.length ? [{ label: "下一页", command: "sessions" as const, arg: "more" }] : [])] }));
@@ -2525,7 +2570,7 @@ export class BridgeService {
 
   private boundProjectForCandidate(
     candidate: CodexProjectCandidate,
-    projects = this.options.stateStore.listProjects()
+    projects: readonly ManagedProject[] = this.options.stateStore.listProjects()
   ): ManagedProject | undefined {
     const candidateHost = candidate.hostId ?? "local";
     return projects.find((project) => (

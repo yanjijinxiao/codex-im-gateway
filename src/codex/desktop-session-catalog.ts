@@ -7,7 +7,7 @@ import { desktopSessionMembership } from "./desktop-session-membership.js";
 
 type CatalogRow = {
   thread_id: string; display_title: string; cwd: string | null;
-  source_updated_at: number; source_kind: string; thread_source: string | null;
+  project_id?: string | null; source_recency_at: number; source_updated_at: number; source_kind: string; thread_source: string | null;
 };
 
 /** Desktop's own persisted catalog (not its sidebar order and not state_*.sqlite).
@@ -31,7 +31,8 @@ export function readDesktopSessionCatalog(
     if (!hostIds.includes(hostId)) throw new Error(`Codex Desktop 目录尚未收录主机 ${hostId}。`);
     const sync = db.prepare("SELECT initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = ?").get(hostId) as { initial_build_complete: number } | undefined;
     const complete = sync?.initial_build_complete === 1;
-    const rows = db.prepare(`SELECT thread_id, display_title, cwd, source_updated_at, source_kind, thread_source
+    const hasProjectId = (db.prepare("PRAGMA table_info(local_thread_catalog)").all() as Array<{ name: string }>).some(c => c.name === "project_id");
+    const rows = db.prepare(`SELECT thread_id, display_title, cwd, source_updated_at, source_recency_at, source_kind, thread_source, ${hasProjectId ? "project_id" : "NULL AS project_id"}
       FROM local_thread_catalog WHERE host_id = ? AND missing_candidate = 0 AND source_kind != 'chatgpt'
       ORDER BY source_recency_at DESC, source_created_at DESC, thread_id`).all(hostId) as CatalogRow[];
     const unsupported = hostId === "local" ? Number((db.prepare("SELECT count(*) AS n FROM local_thread_catalog WHERE source_kind = 'chatgpt' AND missing_candidate = 0").get() as { n: number }).n) : 0;
@@ -48,7 +49,9 @@ export function readDesktopSessionCatalog(
         || row.thread_source === "ambient_suggestions" || row.thread_source === "pull_request_fix_automation") continue;
       const state = membership({
         threadId: row.thread_id, title: row.display_title, cwd: row.cwd ?? undefined,
+        ...(row.project_id ? { projectId: row.project_id, projectMembership: "assigned" as const } : {}),
         updatedAt: new Date(row.source_updated_at * 1000).toISOString(),
+        catalogOrder: { recency: row.source_recency_at },
         persistence: "active", runtimeStatus: "unknown", activeFlags: []
       });
       if (input.persistence === "archived" || (input.projectId && state.projectId !== input.projectId)

@@ -105,6 +105,8 @@ export type ChannelActionCard = {
   readonly note?: string;
   readonly actionGroups: readonly (readonly ChannelCardAction[])[];
   readonly fallbackText: string;
+  /** Complete reply controls for a template without native action widgets. */
+  readonly replyInstructions?: string;
   readonly form?: { readonly name: "answer"; readonly label: string; readonly maximumLength: number;
     readonly submit: ChannelCardAction };
 };
@@ -126,6 +128,8 @@ type CreateChoiceCardInput = {
   readonly choices: readonly ChannelChoice[];
   readonly fallbackText: string;
   readonly note?: string;
+  /** Text-only surfaces can present a selector template instead of duplicating every row. */
+  readonly copyChoices?: readonly { label: string; value: string }[];
   readonly template?: ChannelCardTemplate;
 };
 
@@ -141,11 +145,12 @@ export function createChoiceCard(input: CreateChoiceCardInput): ChannelActionCar
   return {
     title: input.title,
     template: input.template ?? "blue",
-    body: copyableChoices(input.body, values),
+    body: input.body,
     ...(input.table ? { table: input.table } : {}),
     ...(input.note ? { note: input.note } : {}),
     actionGroups: groupActions(actions),
-    fallbackText: copyableChoices(input.fallbackText, values)
+    fallbackText: copyableChoices(input.fallbackText, input.copyChoices ?? values),
+    replyInstructions: copyableChoices("", input.copyChoices ?? values).trim()
   };
 }
 

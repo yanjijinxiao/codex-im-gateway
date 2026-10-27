@@ -24,11 +24,11 @@ test("sorts whole projects before recency; native membership beats cwd and stand
   const rows = [row("free"), row("a-old", "a", 20), row("b-new", "b"), row("current", "current", 999), row("a-new", "a"), row("b-old", "b", 10)];
   const before = structuredClone(rows);
   const result = orderSessionCatalog(rows, catalog, [active], active);
-  assert.deepEqual(result.map(r => r.state.threadId), ["current", "a-new", "a-old", "b-new", "b-old", "free"]);
-  assert.equal(result[0].group?.name, "Z 当前", "prefer backend's current project name");
+  assert.deepEqual(result.map(r => r.state.threadId), ["a-new", "a-old", "b-new", "b-old", "current", "free"]);
+  assert.equal(result[4].group?.name, "Z 当前", "prefer backend's current project name");
   assert.equal(result.at(-1)?.group, undefined, "an App standalone task sharing cwd is still standalone");
   assert.deepEqual(rows, before, "presentation must not mutate backend state");
-  assert.deepEqual(orderSessionCatalog([...rows].reverse(), [...catalog].reverse(), [active], active), result);
+  assert.deepEqual(orderSessionCatalog([...rows].reverse(), catalog, [active], active), result);
 });
 
 test("duplicate names and identical project IDs on different hosts remain separate contiguous groups", () => {
@@ -117,4 +117,17 @@ test("missing project catalog preserves readable local and known remote sessions
   assert.match(cards[0].body, /目录暂不可用/);
   assert.match(cards[0].table!.rows[0][2], /Known remote/);
   assert.equal(store.listProjects().length, 1);
+});
+
+test("pinned rows precede native project order and other sessions; recency is independent of metadata updates", () => {
+  const catalog = [candidate("z", "Zulu"), candidate("a", "Alpha")];
+  const pinnedProject = row("pin-project", "a", 999), pinnedFree = row("pin-free", undefined, 999);
+  pinnedProject.state.catalogOrder = {pinnedIndex: 1}; pinnedFree.state.catalogOrder = {pinnedIndex: 0};
+  const oldFree = row("old-free"), recentFree = row("recent-free", undefined, 999);
+  oldFree.state.catalogOrder = { recency: 1 }; recentFree.state.catalogOrder = { recency: 100 };
+  const nativeFirst = row("z-first", "z", 999), nativeSecond = row("z-second", "z");
+  nativeFirst.state.catalogOrder = {manualIndex: 0}; nativeSecond.state.catalogOrder = {manualIndex: 1};
+  const result = orderSessionCatalog([oldFree, row("alpha", "a"), pinnedProject, nativeSecond, recentFree, pinnedFree, nativeFirst], catalog, []);
+  assert.deepEqual(result.map(r => r.state.threadId), ["pin-free", "pin-project", "z-first", "z-second", "alpha", "recent-free", "old-free"]);
+  assert.equal(new Set(result.map(r => r.state.threadId)).size, result.length, "pinned project members appear once");
 });

@@ -14,7 +14,7 @@ import { renderMarkdownTable, renderTextTable } from "../src/channels/table.js";
 import { normalizeDingTalkCardContent } from "../src/channels/dingtalk.js";
 
 for (const backend of ["exec", "app-server"] as const) {
-  test(`${backend}: 103 sessions fit four default pages; resizing preserves identity, filter and preferences`, async t => {
+  test(`${backend}: 103 sessions fit eleven compact default pages; resizing preserves identity, filter and preferences`, async t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-session-density-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const paths = resolveStatePaths(root), store = new RuntimeStateStore(paths);
@@ -30,10 +30,10 @@ for (const backend of ["exec", "app-server"] as const) {
       runner: { async listThreads() { lists++; return states; }, async inspectThread() { inspections++; throw new Error("Listing must not bind"); } } as never });
     const send = (text: string, actor = "alice", chat = "chat") => service.handleMessage({ senderId: actor, replyTargetId: chat, id: String(seq++), text, raw: {} });
     await send("/sessions");
-    assert.match(cards[0].title, /103 个.*第 1\/4 页/);
-    assert.equal(cards[0].table!.rows.length, 30);
+    assert.match(cards[0].title, /103 个.*第 1\/11 页/);
+    assert.equal(cards[0].table!.rows.length, 10);
     const numbers = cards[0].table!.rows.map(r => r[0]);
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 10; i++) {
       await send("/sessions more");
       numbers.push(...cards.at(-1)!.table!.rows.map(r => r[0]));
     }
@@ -41,11 +41,12 @@ for (const backend of ["exec", "app-server"] as const) {
     assert.equal(lists, 1, "paging never rediscovers the catalog");
     states.reverse();
     await send("/sessions size 50");
-    assert.match(cards.at(-1)!.title, /第 2\/3 页/);
-    assert.equal(cards.at(-1)!.table!.rows[0][0], "R51", "new page contains the old anchor R91");
-    assert.equal(cards.at(-1)!.table!.rows.length, 50);
-    assert.equal(cards.at(-1)!.actionGroups.flat()[0].value.arg, "task-50 --host local");
+    assert.match(cards.at(-1)!.title, /第 3\/3 页/);
+    assert.equal(cards.at(-1)!.table!.rows[0][0], "R101", "new page contains the old anchor R101");
+    assert.equal(cards.at(-1)!.table!.rows.length, 3);
+    assert.equal(cards.at(-1)!.actionGroups.flat()[0].value.arg, "task-100 --host local");
     assert.equal(lists, 1, "resizing uses exactly the same snapshot");
+    await send("/sessions page 2");
     const fifty = cards.at(-1)!;
     await send("/sessions page 3");
     assert.deepEqual(cards.at(-1)!.table!.rows.map(r => r[0]), ["R101", "R102", "R103"]);
@@ -62,9 +63,9 @@ for (const backend of ["exec", "app-server"] as const) {
     assert.equal(store.listSessions().length, 0);
     assert.equal(new RuntimeStateStore(paths).getSessionPageSize("chat", "alice"), 50);
     await send("/sessions", "bob");
-    assert.equal(cards.at(-1)!.table!.rows.length, 30, "another actor retains default");
+    assert.equal(cards.at(-1)!.table!.rows.length, 10, "another actor retains default");
     await send("/sessions", "alice", "other");
-    assert.equal(cards.at(-1)!.table!.rows.length, 30, "another chat retains default");
+    assert.equal(cards.at(-1)!.table!.rows.length, 10, "another chat retains default");
     await send("/sessions search 任务 10");
     assert.equal(cards.at(-1)!.table!.rows.length, 4);
     assert.match(cards.at(-1)!.note!, /每页 50 条/);
@@ -100,10 +101,10 @@ test("saved page sizes reject invalid values and keep defaults for old state fil
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-session-settings-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const paths = resolveStatePaths(root), store = new RuntimeStateStore(paths);
-  assert.equal(store.getSessionPageSize("chat", "actor"), 30);
+  assert.equal(store.getSessionPageSize("chat", "actor"), 10);
   for (const size of [0, 51, NaN, Infinity, 7.5]) assert.throws(() => store.setSessionPageSize("chat", "actor", size));
   fs.writeFileSync(paths.statePath, JSON.stringify({ sessionPageSizes: { '["chat","actor"]': 10000 } }));
-  assert.equal(new RuntimeStateStore(paths).getSessionPageSize("chat", "actor"), 30);
+  assert.equal(new RuntimeStateStore(paths).getSessionPageSize("chat", "actor"), 10);
   fs.writeFileSync(paths.statePath, "{}");
-  assert.equal(new RuntimeStateStore(paths).getSessionPageSize("chat", "actor"), 30);
+  assert.equal(new RuntimeStateStore(paths).getSessionPageSize("chat", "actor"), 10);
 });

@@ -25,7 +25,7 @@ function fixture(t: { after(fn: () => void): void }) {
     INSERT INTO local_thread_catalog_hosts VALUES('local','local'),('remote','ssh'),('chatgpt-account','chatgpt');
     INSERT INTO local_thread_catalog_sync_state VALUES('local',1),('remote',1);`);
   const add = (id: string, host = "local", source = "vscode", missing = 0, title = id, cwd = "/repo") => db.prepare(
-    "INSERT INTO local_thread_catalog VALUES(?,?,?,?,?,NULL,100,100,100,?)"
+    "INSERT INTO local_thread_catalog(host_id,thread_id,display_title,cwd,source_kind,thread_source,source_updated_at,source_recency_at,source_created_at,missing_candidate) VALUES(?,?,?,?,?,NULL,100,100,100,?)"
   ).run(host, id, title, cwd, source, missing);
   t.after(() => db.close());
   return { home, file, db, add };
@@ -171,4 +171,50 @@ test("sessions uses backend catalog, discovers hosts without projects, and dedup
   assert.match(texts.at(-1)!, /2 个/);
   assert.match(texts.at(-1)!, /local task/); assert.match(texts.at(-1)!, /remote task/);
   assert.equal(texts.at(-1)!.match(/来源：App目录/g)?.length, 1);
+});
+
+test("native project membership overrides a stale legacy assignment and resolves exact host/home migration aliases", t => {
+  const { home, db, add } = fixture(t);
+  db.exec("ALTER TABLE local_thread_catalog ADD COLUMN project_id TEXT");
+  add("moved-native"); add("legacy-assigned"); add("independent"); add("remote-task", "remote");
+  db.exec("UPDATE local_thread_catalog SET project_id='native-p' WHERE thread_id='moved-native'");
+  fs.writeFileSync(path.join(home, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": { p: { rootPaths: ["/repo"] }, p2: { rootPaths: ["/other"] } },
+    "remote-projects": [{id: "rp", hostId: "remote", remotePath: "/remote"}],
+    "app-server-project-id-by-legacy-project-id-by-host": { [`local:${home}`]: {p: "native-p"}, [`local:/other-home`]: {p2: "native-p"} },
+    "thread-project-assignments": { "moved-native": { projectId: "p2" }, "legacy-assigned": { projectId: "native-p" },
+      "remote-task": { projectId: "native-p" } },
+    "projectless-thread-ids": ["independent"]
+  }));
+  const rows = readDesktopSessionCatalog(home)!.threads;
+  assert.equal(rows.find(r => r.threadId === "moved-native")?.projectId, "p");
+  assert.equal(rows.find(r => r.threadId === "moved-native")?.projectMembership, "assigned");
+  assert.equal(rows.find(r => r.threadId === "legacy-assigned")?.projectId, "p");
+  assert.equal(rows.find(r => r.threadId === "independent")?.projectMembership, "none");
+  assert.equal(readDesktopSessionCatalog(home, "remote")!.threads[0].projectId, undefined, "local migration aliases cannot assign a remote thread");
+  assert.equal(readDesktopSessionCatalog(home, "local", {projectId: "p"})!.threads.length, 2);
+});
+
+test("native pin order supersedes stale legacy pins, remains host scoped, and retains native recency", t => {
+  const { home, add, db } = fixture(t);
+  for (const id of ["first", "second", "unpinned", "shared", "one", "two"]) add(id);
+  add("shared", "remote");
+  db.exec("UPDATE local_thread_catalog SET source_recency_at=800,source_updated_at=900 WHERE thread_id='one'");
+  fs.writeFileSync(path.join(home, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": { p: {rootPaths: ["/repo"]} }, "remote-projects": [{id: "rp", hostId: "remote", remotePath: "/repo"}],
+    "sidebar-project-thread-orders": {p: {threadIds: ["two", "one"]}},
+    "pinned-thread-ids": ["unpinned", "second", "first"],
+    "thread-project-membership-host-ids": {shared: "remote"},
+    "electron-persisted-atom-state": {"app-server-pinned-thread-order-v1": ["first", "second", "shared"],
+      "flat-project-sidebar-preferences-v1": {chatSortMode: "manual"}}
+  }));
+  const rows = readDesktopSessionCatalog(home)!.threads;
+  assert.equal(rows.find(r => r.threadId === "first")!.catalogOrder!.pinnedIndex, 0);
+  assert.equal(rows.find(r => r.threadId === "second")!.catalogOrder!.pinnedIndex, 1);
+  assert.equal(rows.find(r => r.threadId === "unpinned")!.catalogOrder!.pinnedIndex, undefined);
+  assert.equal(rows.find(r => r.threadId === "shared")!.catalogOrder!.pinnedIndex, undefined);
+  assert.equal(readDesktopSessionCatalog(home, "remote")!.threads[0].catalogOrder!.pinnedIndex, 2);
+  assert.equal(rows.find(r => r.threadId === "one")!.catalogOrder!.recency, 800);
+  assert.equal(rows.find(r => r.threadId === "two")!.catalogOrder!.manualIndex, 0);
+  assert.equal(rows.find(r => r.threadId === "one")!.catalogOrder!.manualIndex, 1);
 });

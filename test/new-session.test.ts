@@ -59,6 +59,7 @@ for (const backend of ["exec", "app-server"] as const) {
     const oldSession = store.getActiveSession("alice")!;
     assert.equal(oldSession.projectId, first.id);
     assert.equal(runs.length, 0);
+    await send("/project");
     await send(`/new ${projectCode(second.id)}`);
     assert.equal(store.getActiveSession("alice")?.projectId, second.id);
     assert.notEqual(store.getActiveSession("alice")?.id, oldSession.id);
@@ -132,6 +133,7 @@ test("/new preserves host routing, rejects ambiguous names and enforces ACL/mode
   await send("/new Same");
   assert.match(texts.at(-1)!, /多个同名项目/);
   assert.equal(store.listSessions().length, 0);
+  await send("/project");
   await send("/new C2");
   assert.match(texts.at(-1)!, /hostId/);
   assert.equal(store.listProjects().length, 1);

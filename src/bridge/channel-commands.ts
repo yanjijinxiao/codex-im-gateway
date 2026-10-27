@@ -48,7 +48,7 @@ const COMMAND_ALIASES: Readonly<Record<string, string>> = Object.fromEntries(
 
 const SESSION_HELP_LINES = [
   "会话介入与跟随",
-  "/sessions（/ss）- 未归档会话按项目分组，组内最近更新优先；每页 30 个",
+  "/sessions（/ss）- 未归档会话按置顶 → 项目目录顺序 → 其他会话排列；默认每页 10 个",
   "/sessions size 50 - 每页条数设为 50（5-50，自动保存）",
   "/sessions detail R编号 - 查看完整标题、主机、目录和 ID，不切换会话",
   "/sessions more|prev - 下一页或上一页；/sessions page 2 - 跳页",

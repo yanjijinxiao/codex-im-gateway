@@ -9,7 +9,6 @@ export type SessionCatalogRow = {
   group?: { id: string; hostId: string; name: string; label: string; current: boolean };
 };
 
-const names = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const compareId = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 
 export function sessionHostLabel(hostId: string): string {
@@ -54,14 +53,26 @@ export function orderSessionCatalog(
       ? compactTableCell(group.name, 18) + suffix
       : `${compactTableCell(group.name, 12)}${suffix} · ${compactTableCell(sessionHostLabel(hostId), 15)}`;
   }
+  const catalogOrder = new Map(catalog.map((p, i) => [JSON.stringify([p.hostId ?? "local", p.projectId]), i]));
   return result.sort((a,b) => {
-    const rank = (row: SessionCatalogRow) => row.group ? row.group.current ? 0 : 1 : 2;
+    const pinA = a.state.catalogOrder?.pinnedIndex, pinB = b.state.catalogOrder?.pinnedIndex;
+    if (pinA !== undefined || pinB !== undefined) return (pinA ?? Number.MAX_SAFE_INTEGER) - (pinB ?? Number.MAX_SAFE_INTEGER)
+      || compareId(a.hostId, b.hostId) || compareId(a.state.threadId, b.state.threadId);
+    const rank = (row: SessionCatalogRow) => row.group ? 0 : 1;
     const priority = rank(a) - rank(b);
     if (priority) return priority;
     if (a.group && b.group && a.group.id !== b.group.id) {
-      return names.compare(a.group.name, b.group.name) || compareId(a.group.id, b.group.id);
+      return (catalogOrder.get(a.group.id) ?? Number.MAX_SAFE_INTEGER) - (catalogOrder.get(b.group.id) ?? Number.MAX_SAFE_INTEGER)
+        || compareId(a.group.id, b.group.id);
     }
-    return compareId(b.state.updatedAt ?? "", a.state.updatedAt ?? "")
+    const indexA = a.state.catalogOrder?.manualIndex, indexB = b.state.catalogOrder?.manualIndex;
+    if (indexA !== undefined || indexB !== undefined) {
+      const manual = (indexA ?? Number.MAX_SAFE_INTEGER) - (indexB ?? Number.MAX_SAFE_INTEGER);
+      if (manual) return manual;
+    }
+    const recency = (row: SessionCatalogRow) => row.state.catalogOrder?.recency
+      ?? (Date.parse(row.state.updatedAt ?? "") / 1000 || 0);
+    return recency(b) - recency(a) || compareId(b.state.updatedAt ?? "", a.state.updatedAt ?? "")
       || compareId(a.hostId, b.hostId) || compareId(a.state.threadId, b.state.threadId);
   });
 }

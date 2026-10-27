@@ -69,6 +69,8 @@ export type CodexThreadState = {
   title?: string;
   preview?: string;
   updatedAt?: string;
+  /** Read-only presentation hints from the native catalog; never execution/access authority. */
+  catalogOrder?: { pinnedIndex?: number; recency?: number; manualIndex?: number };
 };
 
 export type CodexThreadListInput = {

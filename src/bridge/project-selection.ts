@@ -25,7 +25,7 @@ export function selectChannelProject(
   }
   const sameName = (name: string) => name.localeCompare(selector, undefined, { sensitivity: "accent" }) === 0;
   const matches: ProjectSelection[] = [
-    ...projects.filter(p => sameName(p.name)).map(project => ({ project })),
+    ...projects.filter(p => sameName(p.name) && (!p.sourceProjectId || candidates.some(c => bound(c)?.id === p.id))).map(project => ({ project })),
     ...unbound.filter(p => sameName(p.name)).map(candidate => ({ candidate }))
   ];
   return matches.length === 1 ? matches[0] : {

@@ -183,7 +183,7 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
 
   assert.deepEqual(cards.map((card) => card.title), [
     "Codex 渠道工作台",
-    "选择 Codex 项目",
+    "Codex 项目 · 2 个 · 1/1 页",
     "可绑定会话 · 全部 · 0 个 · 第 1/1 页",
     "选择模型",
     "选择推理强度",
@@ -202,7 +202,9 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
     ["1", "2", "default"]
   );
   assert.equal(texts.length, 0);
-  assert.equal(cards[0].body, cards[0].fallbackText, "native help must not hide its command guide in fallbackText");
+  assert.match(cards[0].body, /\/history/);
+  assert.ok(cards[0].fallbackText.startsWith(cards[0].body), "native help retains its full command guide; fallback adds only text controls");
+  assert.match(cards[0].fallbackText, /发送命令操作/);
   for (const command of ["history", "follow", "policy", "role"]) {
     assert.ok(cards[0].actionGroups.flat().some((action) => action.value.command === command));
   }
@@ -259,7 +261,7 @@ test("Bridge refreshes the originating native action card after a card callback"
   assert.equal(sent.length, 1);
   assert.equal(updated.length, 1);
   assert.equal(updated[0]?.messageId, "om_help_card");
-  assert.equal(updated[0]?.card.title, "选择 Codex 项目");
+  assert.equal(updated[0]?.card.title, "Codex 项目 · 1 个 · 1/1 页");
 });
 
 test("keeps project mode, plan mode, and goals on the selected project's thread", async (t) => {
@@ -307,7 +309,7 @@ test("keeps project mode, plan mode, and goals on the selected project's thread"
     raw: {}
   });
 
-  await send("project", `/project P${secondIndex}`);
+  await send("project", `/project ${secondProject.name}`);
   assert.deepEqual(cards[0].actionGroups.flatMap((group) => group.map((action) => action.value)), [
     { version: 1, command: "mode", arg: "session" },
     { version: 1, command: "mode", arg: "task" },

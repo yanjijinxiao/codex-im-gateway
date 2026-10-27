@@ -49,6 +49,9 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
     assert.equal(values.flowStatus, "2");
     assert.deepEqual(JSON.parse(values.sys_full_json_obj).order, ["msgContent", "staticMsgContent"]);
     assert.match(values.msgContent, /任务仍在执行$/);
+    assert.deepEqual(Lexer.lex(values.msgContent).map(token => token.type), ["paragraph"], "rewrites never replace native block widgets");
+    assert.match(values.msgContent, /当前进展/);
+    assert.match(values.msgContent, /正在检查选项定义/);
     assert.doesNotMatch(values.msgContent, /\/stop|打开项目 Web IDE|203\.0\.113/);
     assert.deepEqual(Lexer.lex(values.staticMsgContent).filter(token => token.type === "code").map(token => token.text), ["/stop"]);
     assert.equal(view().split("/stop").length - 1, 1);

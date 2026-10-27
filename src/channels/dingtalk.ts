@@ -31,7 +31,7 @@ export { assertDingTalkCardMutationSucceeded } from "./dingtalk-card-response.js
 import { createChannelClient, TEXT_CAPABILITIES, NO_MEDIA } from "./client.js";
 import type { ChannelStreamBootstrap, ChannelStreamFailure, ChannelStreamStartInput, ChannelStreamResumeInput } from "./stream-bootstrap.js";
 import { DingTalkCardRouting } from "./dingtalk-card-routing.js";
-import { dingTalkLoadingBody, dingTalkPlainText, normalizeDingTalkCardContent } from "./dingtalk-markdown.js";
+import { dingTalkLoadingBody, dingTalkPlainText, dingTalkProgressContent, normalizeDingTalkCardContent } from "./dingtalk-markdown.js";
 // Keep the existing adapter export stable for embedders and transport tests.
 export { normalizeDingTalkCardContent } from "./dingtalk-markdown.js";
 import { dingTalkMentionCard, dingTalkCardAtParameters } from "./dingtalk-mentions.js";
@@ -316,7 +316,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       return { messageId: parts.at(-1)!.messageId, parts };
     }
     if (card.table && this.account.cardTemplateId) {
-      const text = [escapeTableMarkdown(card.title), card.body, renderMarkdownTable(card.table), card.note].filter(Boolean).join("\n\n");
+      const text = [escapeTableMarkdown(card.title), card.body, renderMarkdownTable(card.table), card.note, card.replyInstructions].filter(Boolean).join("\n\n");
       try {
         return await this.createTextCard(this.cardTarget(input.toUserId), text, true);
       } catch (error) {
@@ -846,7 +846,7 @@ export class DingTalkHttpsAICardClient implements DingTalkAICardClient {
 
   private async updateWithRetry(input: DingTalkAICardUpdateInput, lifecycleId: string): Promise<void> {
     const footer = activeDingTalkFooter(input);
-    const content = visibleDingTalkTerminalContent({ ...input, text: footer === undefined ? input.text : input.progressLayout!.body });
+    const content = footer === undefined ? visibleDingTalkTerminalContent(input) : dingTalkProgressContent(input.progressLayout!.body);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     if (input.presentation === "static") {
       if (!input.finalize) throw new Error("Static DingTalk card cannot represent active work");
@@ -1083,7 +1083,7 @@ export class DingTalkSdkAICardClient implements DingTalkAICardClient {
 
   private async updateWithRetry(input: DingTalkAICardUpdateInput): Promise<void> {
     const footer = activeDingTalkFooter(input);
-    const content = visibleDingTalkTerminalContent({ ...input, text: footer === undefined ? input.text : input.progressLayout!.body });
+    const content = footer === undefined ? visibleDingTalkTerminalContent(input) : dingTalkProgressContent(input.progressLayout!.body);
     if (content.length > 50_000) throw new Error("DingTalk card payload requires pagination");
     if (input.presentation === "static") {
       if (!input.finalize) throw new Error("Static DingTalk card cannot represent active work");
@@ -1233,7 +1233,7 @@ function nativeDingTalkLoading(input: DingTalkCardActivity): boolean {
 function initialDingTalkCardData(input: { contentKey: string; text: string; finalize?: boolean } & DingTalkCardActivity): Record<string, string> {
   const footer = activeDingTalkFooter(input);
   const source = footer === undefined ? input.text : input.progressLayout!.body;
-  const text = normalizeDingTalkCardContent(!input.finalize && nativeDingTalkLoading(input) ? dingTalkLoadingBody(source) : source);
+  const text = footer !== undefined ? dingTalkProgressContent(source) : normalizeDingTalkCardContent(!input.finalize && nativeDingTalkLoading(input) ? dingTalkLoadingBody(source) : source);
   if (!text.trim()) throw new Error("DingTalk card initial content must not be empty");
   if (text.length > 50_000) throw new Error("DingTalk card payload requires pagination");
   // Publish a populated first frame, not an empty template awaiting a second request.

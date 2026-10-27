@@ -1,5 +1,5 @@
 /** Presentation only: never limit backend discovery or change session identities. */
-export const DEFAULT_SESSION_PAGE_SIZE = 30;
+export const DEFAULT_SESSION_PAGE_SIZE = 10;
 export const MIN_SESSION_PAGE_SIZE = 5;
 export const MAX_SESSION_PAGE_SIZE = 50;
 

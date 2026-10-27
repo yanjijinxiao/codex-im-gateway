@@ -1389,22 +1389,22 @@ test("authorized WeChat can add, list, and switch Codex projects", async (t) => 
 
   // Given an authorized sender, when they choose a project sourced from Codex history
   await sendWithProjects("project-discover", "/p a");
-  assert.match(replies.at(-1) ?? "", /Codex 项目：2 个（已绑定 0 个）/);
-  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 嘉兴AI社区/);
-  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 嘉兴AI社区\n\n路径：[^\n]+\n\n\[C2\]/);
+  assert.match(replies.at(-1) ?? "", /Codex 项目 · 2 个 · 1\/1 页/);
+  assert.match(replies.at(-1) ?? "", /\[C1\] 嘉兴AI社区 · 本机 · 可选择/);
+  assert.match(replies.at(-1) ?? "", /\[C1\] 嘉兴AI社区[^\n]+\n\[C2\]/);
   assert.doesNotMatch(replies.at(-1) ?? "", /项目名称\|绝对路径/);
   await sendWithProjects("project-add", "/p a C1");
   await sendWithProjects("project-list", "/p l");
   const projects = stateStore.listProjects();
   const projectNumber = projects.findIndex((project) => project.name === "嘉兴AI社区") + 1;
   const addedProject = projects[projectNumber - 1];
-  assert.match(replies.at(-1) ?? "", /Codex 项目：2 个（已绑定 1 个）/);
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区`));
-  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 Desktop 未绑定项目/);
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区\\n\\n路径：[^\\n]+\\n\\n\\[C1\\]`));
+  assert.match(replies.at(-1) ?? "", /Codex 项目 · 2 个 · 1\/1 页/);
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区 · 本机 · 当前`));
+  assert.match(replies.at(-1) ?? "", /\[C1\] Desktop 未绑定项目 · 本机 · 可选择/);
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区[^\\n]+\\n\\[C1\\]`));
   await sendWithProjects("project-discover-again", "/p a");
-  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 【当前】 嘉兴AI社区`));
-  assert.match(replies.at(-1) ?? "", /\[C1\] 【未绑定】 Desktop 未绑定项目/);
+  assert.match(replies.at(-1) ?? "", new RegExp(`\\[P${projectNumber}\\] 嘉兴AI社区 · 本机 · 当前`));
+  assert.match(replies.at(-1) ?? "", /\[C1\] Desktop 未绑定项目 · 本机 · 可选择/);
 
   // Removed legacy channel commands are not retained as compatibility aliases.
   const manualWorkspace = path.join(tmpDir, "manual-path");
@@ -1461,6 +1461,7 @@ test("switching projects does not expose or control the previous project's sessi
   });
   const secondIndex = stateStore.listProjects().findIndex((project) => project.id === secondProject.id) + 1;
 
+  await service.handleMessage({ id: "list-before-switch", senderId: "alice@im.wechat", text: "/project", raw: {} });
   await service.handleMessage({
     id: "switch", senderId: "alice@im.wechat", text: `/project P${secondIndex}`, attachments: [], raw: {}
   });
