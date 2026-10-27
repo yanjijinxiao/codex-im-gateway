@@ -286,6 +286,8 @@ export type CodexUserInputResultHandler = (request: CodexUserInputRequest, resul
 
 export type CodexRunnerInput = {
   prompt: string;
+  /** Stable source identity, never permission to replay an uncertain submission. */
+  clientUserMessageId?: string;
   developerInstructions?: string;
   cwd: string;
   hostId?: string;

@@ -1141,3 +1141,23 @@ test("session attachments use scoped URLs and support video byte ranges", async 
   assert.equal(rangeResponse.headers.get("content-range"), "bytes 2-5/10");
   assert.equal(await rangeResponse.text(), "2345");
 });
+
+for (const streaming of [false, true]) test(`Web ${streaming ? 'stream' : 'JSON'} preserves request identity and native uncertainty`, async t => {
+  const { CodexCommunicationError } = await import('../src/codex/communication-error.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-web-receipt-http-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true })); const ids: unknown[] = [];
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {
+    isSessionStreamEnabled() { return streaming; },
+    async continueSession(_a: string, _s: string, _t: string, _u: unknown, _p: unknown, id: unknown) {
+      ids.push(id); throw new CodexCommunicationError('observation', 'turn/observe', 'thread', 'accepted');
+    }
+  } as never }); t.after(() => server.close());
+  const headers = { Origin: server.url, 'X-Codex-Im-Gateway-Token': server.requestToken, 'Content-Type': 'application/json' };
+  const url = `${server.url}/api/sessions/account/session/messages${streaming ? '?stream=1' : ''}`;
+  const response = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ text: 'test', requestId: 'stable-web-id' }) });
+  const result = streaming ? JSON.parse((await response.text()).trim()) : await response.json();
+  assert.deepEqual(ids, ['stable-web-id']); assert.equal(result.submission, 'accepted'); assert.match(result.error, /未.*重发|继续|已.*接收/);
+  const invalid = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ text: 'test', requestId: '../wrong' }) });
+  assert.equal(invalid.status, 400); assert.equal(ids.length, 1);
+  assert.equal((await fetch(`${server.url}/api/build`)).status, 200);
+});

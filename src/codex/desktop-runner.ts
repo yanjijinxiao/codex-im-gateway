@@ -249,6 +249,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
         turnTrigger: "capacity_retry_automatic" } : compactObject({
         threadId: input.threadId,
         input: [{ type: "text", text: input.prompt, text_elements: [] }],
+        clientUserMessageId: input.clientUserMessageId,
         cwd: input.cwd,
         approvalPolicy: input.onApproval ? "on-request" : "never",
         sandboxPolicy: appServerSandboxPolicy(input.sandbox),

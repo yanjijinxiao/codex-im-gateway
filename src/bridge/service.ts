@@ -10,6 +10,8 @@ import { ChannelTurnPresentation, type TurnReplyStream } from "../channels/turn-
 import { completedCardForMentions } from "../channels/completion-mentions.js";
 import { ideEntryLink, withIDEEntry } from "../ide/completion.js";
 import { NativeQueueCoordinator, type QueueReceipt } from "./native-queue.js";
+import { InboundReceiptJournal } from "./inbound-receipts.js";
+import { prepareTurnSubmission, stageTurnAttachments, TurnSubmission, TurnDeliveryError, TurnApplicationError } from "./turn-submission.js";
 import { CodexTurnExecutionError, CodexInterventionError } from "../codex/backend.js";
 import { communicationError, CodexCommunicationError } from "../codex/communication-error.js";
 import { codexRecoverySummary } from "../codex/turn-recovery.js";
@@ -138,6 +140,7 @@ type ProjectSessionChoice = {
 };
 
 export type BridgeServiceOptions = {
+  inputReceipts?: InboundReceiptJournal;
   ideApprovals?: IDEApprovalService;
   /** Captured from the actual running adapter account, not mutable UI state. */
   ideProviderId?: string;
@@ -496,6 +499,9 @@ export class BridgeService {
     command: ChannelCommand,
     channelCapabilities: readonly ChannelCommandCapability[]
   ): Promise<void> {
+    // Command controllers own exact native receipts; an interrupted dispatch is
+    // never replayed merely because the transport redelivers its source message.
+    this.options.inputReceipts?.submitting();
     const capabilityResolution = isReservedChannelCommandToken(command.name)
       ? undefined
       : resolveChannelCapabilityCommand(command, channelCapabilities);
@@ -1393,7 +1399,8 @@ export class BridgeService {
     }
     const session = existing ? store.activateSession(existing.id) : store.createSession(senderId, state.cwd, state.title || `会话 ${threadId.slice(0,8)}`, project?.id, "session", undefined, { standalone: !project, hostId });
     if (!existing) store.setSessionThread(session.id, threadId);
-    store.setSessionFollow(session.id, this.runner.backendInfo?.(hostId).capabilities.liveFollow ?? this.options.config.codexBackend !== "exec");
+    const canFollow = this.runner.backendInfo?.(hostId).capabilities.liveFollow ?? this.options.config.codexBackend !== "exec";
+    if (!canFollow) store.setSessionFollow(session.id, false);
     store.setInteractionMode(senderId, "session");
     await this.reply(senderId, `已绑定会话：${session.title}\n\n主机：${hostId}\n\n工作目录：${state.cwd}\n\n下一条消息将继续这个会话；/history 查看历史，/leave 退出绑定。`);
     await this.handleHistoryCommand(senderId, "6");
@@ -1489,6 +1496,7 @@ export class BridgeService {
       await this.reply(message.senderId, copyableChoices("目标任务已结束或发生切换，未发送这条介入。核对历史后再发送新的要求。", [{ label: "核对当前会话历史", value: "/history" }]));
       return;
     }
+    this.options.inputReceipts?.submitting({ sessionId: session.id, hostId: hostId ?? "local", threadId: session.threadId });
     const result = await this.observeControlAudience(session, state.activeTurnId, () => this.controls.steer(
       JSON.stringify([hostId ?? "local", session.threadId]),
       JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
@@ -1704,6 +1712,7 @@ export class BridgeService {
       }
     };
     assertCurrent();
+    this.options.inputReceipts?.submitting({ sessionId: session.id, hostId: hostId ?? "local", threadId: session.threadId });
     const result = await this.observeControlAudience(session, expectedTurnId, () => this.controls.submit(
       JSON.stringify([hostId ?? "local", session.threadId]),
       JSON.stringify([session.id, message.senderId, this.actor.getStore(), message.id]),
@@ -1787,6 +1796,7 @@ export class BridgeService {
     const preview = buildPromptPreview(text, items) ?? text;
     const knowledge = this.options.stateStore.relevantKnowledge(preview, session.projectId);
     const { prompt } = buildPromptParts(text, await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), knowledge);
+    this.options.inputReceipts?.submitting({ sessionId: session.id, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId });
     const receipt = await this.nativeQueue.enqueue({
       accountId: this.options.accountId ?? "standalone", conversationId: message.senderId,
       actorId: this.actor.getStore() ?? message.senderId, messageId: message.id,
@@ -2207,16 +2217,8 @@ export class BridgeService {
   }
 
   private async stagePromptItems(items: PromptBufferItem[], session: ManagedSession, message: ChannelMessage): Promise<PromptBufferItem[]> {
-    const files = items.filter((item): item is Exclude<PromptBufferItem, { kind: "text" }> => item.kind !== "text");
-    if (!files.length) return items;
-    const hostId = this.sessionHostId(session);
-    if (!hostId || hostId === "local") return items;
-    if (!this.runner.stageAttachments) throw new Error("当前远端后端未实现附件转存，消息未提交；请在远端提供可读取的文件。");
-    const staged = await this.runner.stageAttachments(files, { hostId,
-      scope: JSON.stringify([this.options.accountId, message.senderId, session.id]), maxBytes: this.options.config.maxInboundBytes });
-    if (staged.length !== files.length) throw new Error("Remote backend did not stage every attachment");
-    let index = 0;
-    return items.map(item => item.kind === "text" ? item : { ...item, path: staged[index++].path });
+    return stageTurnAttachments(this.runner, items, { accountId: this.options.accountId,
+      conversationId: message.senderId, sessionId: session.id, hostId: this.sessionHostId(session), maxBytes: this.options.config.maxInboundBytes });
   }
 
   private async promptItemsFromMessageWithNotice(message: ChannelMessage): Promise<PromptBufferItem[] | undefined> {
@@ -2313,6 +2315,7 @@ export class BridgeService {
     let streamedAnswer = "";
     let acceptedQueueTurn = false;
     let backendEntered = false;
+    const submission = new TurnSubmission(this.options.inputReceipts, session.id);
     let acceptedTurnId: string | undefined;
     let activeMarked = false;
     const markActive = () => {
@@ -2327,21 +2330,16 @@ export class BridgeService {
         console.log(`[codex-im-gateway] starting Codex turn for ${message.senderId} in ${workspace}`);
         if (!queued && replyStream?.supported) await replyStream.progress("🤔 正在理解任务并规划下一步…");
         const knowledge = this.options.stateStore.relevantKnowledge(promptPreview ?? text, session.projectId);
-        const promptParts = buildPromptParts(text, await this.stagePromptItems(attachments, session, message), channelPromptSource(this.channel.channel), knowledge);
+        const prepared = await prepareTurnSubmission({ runner: this.runner, session, project, config: this.options.config,
+          accountId: this.options.accountId, conversationId: message.senderId, text, items: attachments,
+          source: channelPromptSource(this.channel.channel), knowledge });
         const runInput: CodexRunnerInput = {
-          prompt: qaContext ? buildQaPrompt(promptParts.prompt, project!, qaContext) : promptParts.prompt,
+          ...prepared,
+          prompt: qaContext ? buildQaPrompt(prepared.prompt, project!, qaContext) : prepared.prompt,
           onRecovery: async recovery => {
             if (!stillBound() || recovery.threadId !== session.threadId || recovery.turnId !== acceptedTurnId) return;
             if (wantsProgress()) await replyStream?.waitForRecovery(codexRecoverySummary(recovery));
           },
-          developerInstructions: promptParts.developerInstructions,
-          cwd: workspace,
-          hostId: this.sessionHostId(session),
-          projectId: project?.sourceProjectId,
-          projectName: project?.name,
-          projectBinding: session.projectBinding,
-          threadId,
-          threadTitle: preferredThreadTitle(session.title, promptPreview),
           onThreadCreated: (createdThreadId) => {
             this.options.stateStore.setSessionThread(session.id, createdThreadId);
             return this.options.onSubscriptionsChanged?.();
@@ -2358,10 +2356,6 @@ export class BridgeService {
             await this.options.onTurnStarted?.(session, turnId);
             if (queued && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
           },
-          queueKey: threadId ?? session.id,
-          model: session.model ?? this.options.config.model,
-          effort: session.effort ?? this.options.config.effort,
-          collaborationMode: session.collaborationMode === "plan" ? "plan" : undefined,
           ...(qaContext ? {
             dynamicTools: llmWikiDynamicTools(),
             onDynamicToolCall: (call: CodexDynamicToolCall) => this.handleKnowledgeToolCall(qaContext, call)
@@ -2403,7 +2397,7 @@ export class BridgeService {
             // settings. Do not silently apply later Bridge setting changes.
             model: undefined, effort: undefined, collaborationMode: undefined,
             projectId: undefined, projectName: undefined, threadTitle: undefined })
-          : await this.runner.run(runInput);
+          : await submission.run(this.runner, runInput, () => { if (!stillBound()) throw new CodexInterventionError("绑定已改变，消息未提交。"); });
         console.log(`[codex-im-gateway] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
           this.options.stateStore.setSessionThread(session.id, result.threadId);
@@ -2462,8 +2456,13 @@ export class BridgeService {
         await this.options.onSubscriptionsChanged?.();
         return; // Coordinator owns recovery; do not terminalize, notify, or replay input.
       }
-      error = communicationError(error, { phase: acceptedTurnId ? "observation" : backendEntered ? "submission" : "preflight",
-        operation: acceptedTurnId ? "turn/observe" : backendEntered ? "turn/submit" : "turn/prepare", threadId: session.threadId, turnId: acceptedTurnId });
+      error = queued ? communicationError(error, { phase: acceptedTurnId ? "observation" : backendEntered ? "submission" : "preflight",
+        operation: acceptedTurnId ? "turn/observe" : backendEntered ? "turn/submit" : "turn/prepare", threadId: session.threadId, turnId: acceptedTurnId }) : submission.error(error);
+      if (error instanceof TurnDeliveryError) throw error;
+      if (error instanceof TurnApplicationError) {
+        if (await replyStream?.waitForBackend(error.message)) markMessageHandlingErrorReported(error);
+        await this.options.onSubscriptionsChanged?.(); throw error;
+      }
       if (error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
         console.warn(`[codex-im-gateway] backend communication ${JSON.stringify({ timestamp: new Date().toISOString(),
           phase: error.phase, operation: error.operation, submission: error.submission, code: error.code,
@@ -2488,7 +2487,7 @@ export class BridgeService {
       if (failureWasReported && error instanceof CodexTurnExecutionError && acceptedTurnId && stillBound()) {
         void this.notifyTurnParticipants(session, acceptedTurnId, stillBound, replyStream?.checkpoint());
       }
-      await this.options.onTurnCompleted?.({
+      if (error instanceof CodexTurnExecutionError) await this.options.onTurnCompleted?.({
         senderId: message.senderId,
         sessionId: session.id,
         text: stripBridgeErrorPrefix(userFacingMessageHandlingError(error)),
@@ -3171,10 +3170,6 @@ function stripBridgeErrorPrefix(message: string): string {
   return message.replace(/^\[(?:codex-im-gateway|codex-channel-bridge)]\s*/i, "");
 }
 
-function preferredThreadTitle(sessionTitle: string, promptPreview?: string): string {
-  const genericSessionTitle = /^(?:会话\s*\d+|新会话|Codex 会话(?:\s+[\da-f-]+)?)$/i.test(sessionTitle.trim());
-  return (genericSessionTitle ? promptPreview : sessionTitle) ?? promptPreview ?? sessionTitle;
-}
 
 const fallbackEfforts = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 

@@ -85,6 +85,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   private readonly observations = new Map<string, Promise<unknown>>();
   private readonly metadataReader: CodexMetadataReader;
   private selectedAutoBackend?: "exec" | "app-server";
+  private appServerRuns = 0;
   private get selectedBackend() { return this.options.backend === "auto" ? this.selectedAutoBackend ?? "app-server" : this.options.backend; }
 
   constructor(private readonly options: CodexBackendRouterOptions) {
@@ -245,6 +246,9 @@ export class CodexBackendRouter implements CodexBridgeBackend {
       return this.appServerFor(input.hostId).run(input);
     }
     if (this.selectedBackend === "exec") {
+      if (this.options.backend === "auto" && !canRunWithoutCapabilityLoss(this.exec, input)) {
+        throw new CodexInterventionError("自动选择的 CLI 后端不支持本次请求的交互或项目能力；消息未提交，请显式选择支持这些能力的后端。");
+      }
       return this.exec.run(withInlineDeveloperInstructions(input));
     }
     // Read and write must target the same owner. A private app-server can read
@@ -275,9 +279,11 @@ export class CodexBackendRouter implements CodexBridgeBackend {
           return this.runOnAppServer(input);
         }
       }
-      if (this.options.backend === "app-server" || this.selectedAutoBackend || input.threadId || !canRunWithoutCapabilityLoss(this.exec, input)) {
+      if (this.options.backend === "app-server" || this.selectedAutoBackend || this.appServerRuns > 0 || input.threadId
+        || error instanceof CodexCommunicationError && error.submission !== "not-submitted" || !canRunWithoutCapabilityLoss(this.exec, input)) {
         throw error;
       }
+      this.selectedAutoBackend = "exec";
       const fallback = await this.exec.run({
         ...withInlineDeveloperInstructions(input),
         onDelta: undefined,
@@ -292,16 +298,22 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   private async runOnAppServer(input: CodexRunnerInput): Promise<CodexRunResult> {
-    const result = await this.appServer.run({
-      ...input,
-      onThreadCreated: async (threadId) => {
-        try { await input.onThreadCreated?.(threadId); }
-        finally { await this.refreshDesktopTaskList(threadId); }
-      }
-    });
-    await this.refreshDesktopTaskList(result.threadId);
-    if (this.options.backend === "auto") this.selectedAutoBackend = "app-server";
-    return result;
+    const accepted = () => { if (this.options.backend === "auto") this.selectedAutoBackend = "app-server"; };
+    this.appServerRuns++;
+    try {
+      const result = await this.appServer.run({
+        ...input,
+        onThreadCreated: async (threadId) => {
+          accepted();
+          try { await input.onThreadCreated?.(threadId); }
+          finally { await this.refreshDesktopTaskList(threadId); }
+        },
+        onTurnStarted: async turn => { accepted(); await input.onTurnStarted?.(turn); }
+      });
+      await this.refreshDesktopTaskList(result.threadId);
+      if (this.options.backend === "auto") this.selectedAutoBackend = "app-server";
+      return result;
+    } finally { this.appServerRuns--; }
   }
 
   async stop(threadId?: string, hostId?: string): Promise<CodexStopResult> {
@@ -343,7 +355,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (this.options.backend === "app-server" || this.selectedAutoBackend === "app-server") return this.appServer.listProjects();
     try {
       const catalog = await this.appServer.listProjects();
-      this.selectedAutoBackend = "app-server";
+      this.selectedAutoBackend ??= "app-server";
       return catalog;
     } catch (error) {
       // Another discovery operation may already have selected App while this
@@ -354,7 +366,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
           error instanceof Error ? error.message : String(error)
         }`
       );
-      this.selectedAutoBackend = "exec";
+      // A catalog fallback is a read result, not permission to switch writers.
       return this.exec.listProjects();
     }
   }

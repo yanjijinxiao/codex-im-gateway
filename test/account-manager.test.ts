@@ -25,7 +25,7 @@ import type { NormalizedWeixinMessage } from "../src/weixin/messages.js";
 function setup(t: test.TestContext, options: { taskboardClient?: object; taskCards?: boolean; llmWiki?: object; root?: string;
   adapterFactory?: ConstructorParameters<typeof AccountManager>[0]["adapterFactory"] } = {}) {
   const root = options.root ?? fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-manager-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(async () => { await manager.stopAll(); fs.rmSync(root, { recursive: true, force: true }); });
   const paths = resolveStatePaths(root);
   for (const accountId of ["account-one", "account-two"]) {
     saveAccount(paths, {
@@ -108,7 +108,7 @@ function setup(t: test.TestContext, options: { taskboardClient?: object; taskCar
     adapterFactory: options.adapterFactory,
     configProvider: () => ({ ...defaultConfig(root), taskboardEnabled: Boolean(options.taskboardClient) }),
     taskboardClientFactory: () => options.taskboardClient as never,
-    llmWiki: options.llmWiki as never,
+    llmWiki: (options.llmWiki ? { close() {}, ...options.llmWiki } : undefined) as never,
     clientFactory: (account) => ({
       accountId: account.accountId,
       async sendText(input: { toUserId: string; text: string }) {
@@ -556,6 +556,7 @@ test("notifies the configured channel and mirrors the outbound message to its we
     enabled: true
   }]);
 
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "执行发布检查");
 
   assert.deepEqual(sent, [{
@@ -635,6 +636,7 @@ test("notifies the configured channel when an existing Codex client task ends", 
     "服务内任务",
     project.id
   );
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", managedSession.id, "执行服务内任务");
   await emitCodexCompletion({
     sessionId: "thread-web",
@@ -675,6 +677,7 @@ test("streams externally owned Codex progress into a bound channel session and f
     threadId: "desktop-live-thread",
     turnId: "binding-turn"
   }));
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "绑定桌面会话");
 
   await emitCodexActivity({
@@ -870,6 +873,7 @@ test("reset reconciles a stale primary and only a newly accepted IM origin can r
     await (input.onTurnStarted as (r: {threadId:string;turnId:string})=>void)({threadId:"bound-approval-thread",turnId:"new-origin"});
     return {raw:"",text:"done",threadId:"bound-approval-thread",turnId:"new-origin"};
   });
+  await f.manager.startAccount("account-two");
   await f.manager.continueSession("account-two",two.id,"new input");
   assert.equal(f.manager.getSessionInteractionRoute("account-two",two.id).current,true);
   await f.manager.stopAll();
@@ -893,6 +897,7 @@ test("manager restart retains exact turn origins and the separate primary for ne
     await (input.onTurnStarted as (r: { threadId: string; turnId: string }) => void)({ threadId: "bound-approval-thread", turnId: "approval-turn" });
     return { raw: "", text: "done", threadId: "bound-approval-thread", turnId: "approval-turn" };
   });
+  await first.manager.startAccount("account-one");
   await first.manager.continueSession("account-one", one.id, "start");
   await first.manager.stopAll();
   const restored = setup(t, { root: first.root }); await restored.manager.startAll();
@@ -958,6 +963,7 @@ test("web-started questions use the same channel handler and native result callb
     await (input.onUserInputResult as (r: unknown, result: string) => Promise<void>)(question, "confirmed");
     return { raw: "", text: "done", threadId: question.threadId };
   });
+  await f.manager.startAccount("account-one");
   await f.manager.continueSession("account-one", session.id, "continue");
   assert.equal(f.channelQuestions[0].senderId, "one-room");
   assert.deepEqual(f.questionResults, [{ senderId: "one-room", result: "confirmed" }]);
@@ -1027,6 +1033,7 @@ test("pins a managed turn's approval to its originating binding when several gro
     assert.equal(await emitDesktopApproval(boundApproval()), "accept");
     return { raw: "", text: "done", threadId: "bound-approval-thread", turnId: "approval-turn" };
   });
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "continue");
   assert.equal(channelApprovals[0]?.senderId, "origin-room");
   await manager.stopAll();
@@ -1041,6 +1048,7 @@ test("web-initiated app-server approvals also use standalone session bindings", 
     assert.equal(await onApproval(boundApproval().request), "accept");
     return { raw: "", text: "done", threadId: "bound-approval-thread" };
   });
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "continue");
   assert.equal(channelApprovals[0]?.senderId, "standalone-room");
   await manager.stopAll();
@@ -1538,6 +1546,7 @@ test("Web input on a capacity-failed bound session uses the same recovery coordi
     async resumeAfterCapacity() { throw Error("scheduled continuation must not start before its delay"); } });
   await f.manager.startAll();
   t.after(() => f.manager.stopAll());
+  await f.manager.startAccount("account-one");
   const result = await f.manager.continueSession("account-one", session.id, "恢复原任务");
   assert.match(result.message.text, /已接入容量恢复流程/); assert.match(result.message.text, /新消息未提交/);
   assert.equal(f.runs.length, 0);
@@ -1551,6 +1560,7 @@ test("reads managed thread history and continues the same session from Web", asy
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Web chat");
 
   assert.deepEqual(await manager.getSessionMessages("account-one", session.id), []);
+  await manager.startAccount("account-one");
   const result = await manager.continueSession("account-one", session.id, "继续这个会话");
 
   assert.equal(result.threadId, "thread-web");
@@ -1587,6 +1597,7 @@ test("Web turns learn and reuse the owning WeChat account knowledge", async (t) 
     ].join("\n")
   }));
 
+  await manager.startAccount("account-one");
   const first = await manager.continueSession("account-one", session.id, "记住交付检查流程");
   assert.equal(first.message.text, "已记录。");
   assert.equal(new RuntimeStateStore(accountStatePaths(paths, "account-one")).listKnowledge().length, 1);
@@ -1603,6 +1614,7 @@ test("uses WeChat session model overrides when continuing the same session from 
   store.setModelOverride("alice@im.wechat", "gpt-session");
   store.setEffortOverride("alice@im.wechat", "high");
 
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "从 Web 继续");
 
   assert.equal(runs[0].model, "gpt-session");
@@ -1621,6 +1633,7 @@ test("streams Web progress without exposing final-answer deltas", async (t) => {
   });
 
   assert.equal(manager.isSessionStreamEnabled("account-one", session.id), true);
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "开始", [], async (message) => {
     progress.push(message);
   });
@@ -1634,6 +1647,7 @@ test("stores Web uploads per session and exposes them in user history", async (t
   const { manager, root, runs, history } = setup(t);
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Upload chat");
 
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "分析附件", [{
     name: "report?.txt",
     data: Buffer.from("report body")
@@ -1662,15 +1676,18 @@ test("stores Web uploads per session and exposes them in user history", async (t
 
 test("reports a managed session as responding only while its Web turn is active", async (t) => {
   const { manager, paths, root, emitCodexTask, setRunHandler } = setup(t);
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
   let finish: ((value: { raw: string; text: string; threadId: string }) => void) | undefined;
   setRunHandler(() => new Promise((resolve) => {
-    finish = resolve;
+    finish = resolve; entered();
   }));
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Busy chat");
   new RuntimeStateStore(accountStatePaths(paths, "account-one"))
     .setSessionThread(session.id, "thread-busy");
   await manager.startAll();
 
+  await manager.startAccount("account-one");
   const pending = manager.continueSession("account-one", session.id, "继续");
   assert.equal(manager.listSessions().find((item) => item.id === session.id)?.responding, true);
   emitCodexTask({
@@ -1685,6 +1702,7 @@ test("reports a managed session as responding only while its Web turn is active"
   const project = manager.listProjects("account-one").find((item) => item.id === session.projectId);
   assert.equal(project?.activeTaskCount, 1);
   assert.deepEqual(project?.runningTasks.map((task) => task.source), ["managed"]);
+  await started;
   finish?.({ raw: "", text: "完成", threadId: "thread-busy" });
   await pending;
   assert.equal(manager.listSessions().find((item) => item.id === session.id)?.responding, false);
@@ -1694,6 +1712,7 @@ test("reports a managed session as responding only while its Web turn is active"
 test("keeps source citations in session history without fabricated attachments", async (t) => {
   const { manager, root, history } = setup(t);
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Code review");
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "解释这两个类的职责");
   history.push({
     id: "assistant-sources",
@@ -1726,6 +1745,7 @@ test("exposes files sent by Codex as session attachments", async (t) => {
   const videoPath = path.join(root, "demo.mp4");
   fs.writeFileSync(videoPath, "video-bytes");
   const session = manager.createSession("account-one", "alice@im.wechat", root, "Media chat");
+  await manager.startAccount("account-one");
   await manager.continueSession("account-one", session.id, "发送视频");
   history.push({
     id: "assistant-video",

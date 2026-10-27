@@ -876,3 +876,10 @@ test("app-server backend never silently falls back to codex exec", async (t) => 
     /app-server|initialize|exited|closed/i
   );
 });
+
+test("ordinary App Server turn/start transmits the stable source identity", async t => {
+  const runner = new AppServerCodexRunner({ codexBin: path.join(fixturesDir, 'fake-codex-app-server.mjs'), requestTimeoutMs: 2000 });
+  t.after(() => runner.close());
+  const result = await runner.run({ cwd: '/tmp/project', threadId: 'thread-existing', prompt: 'fixture-stable-origin', clientUserMessageId: 'gateway-original-source' });
+  assert.equal(result.text, 'reply:fixture-stable-origin');
+});

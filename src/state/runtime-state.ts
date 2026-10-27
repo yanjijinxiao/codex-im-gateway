@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 
 import type { ProjectInteractionMode } from "../channels/channel-mode-settings.js";
@@ -33,6 +35,8 @@ export type ManagedSession = {
   streamReplies?: boolean;
   collaborationMode?: "default" | "plan";
   follow?: boolean;
+  /** Detaching suspends delivery without discarding the user's follow preference. */
+  followBeforeDetach?: boolean;
   activeMessagePolicy?: "ask" | "steer" | "queue";
   createdAt: string;
   updatedAt: string;
@@ -141,10 +145,22 @@ export function emptyRuntimeState(): RuntimeState {
 }
 
 export class RuntimeStateStore {
-  private state: RuntimeState;
+  private state!: RuntimeState;
+  private revision?: string;
 
   constructor(private readonly paths: StatePaths) {
-    this.state = normalizeRuntimeState(readJsonFile<Partial<RuntimeState>>(paths.statePath, {}));
+    this.refresh();
+  }
+
+  /** Reconcile external administrative edits without constructing another writer. */
+  refresh(): void {
+    const revision = stateRevision(this.paths.statePath);
+    if (this.state && revision === this.revision) return;
+    if (this.state && this.revision && !revision) throw Error("账号状态文件丢失，未初始化为空状态。");
+    const loaded = readJsonFile<Partial<RuntimeState>>(this.paths.statePath, {});
+    this.revision = revision;
+    const before = structuredClone(loaded);
+    this.state = normalizeRuntimeState(loaded);
     for (const sender of new Set([...Object.keys(this.state.activeSessionIds), ...Object.keys(this.state.activeQaSessionIds)])) {
       const bound = this.getBoundSession(sender);
       // The selected native edge owns its project projection. Repair legacy
@@ -155,7 +171,8 @@ export class RuntimeStateStore {
         this.renewBindingActivity(sender);
       }
     }
-    this.save();
+    // Persist actual initialization/migration, never a no-op read.
+    if (!isDeepStrictEqual(this.state, before)) this.save();
   }
 
   get snapshot(): RuntimeState {
@@ -202,7 +219,9 @@ export class RuntimeStateStore {
   }
 
   setSessionFollow(sessionId: string, follow: boolean): void {
-    this.mutableSession(sessionId).follow = follow;
+    const session = this.mutableSession(sessionId);
+    session.follow = follow;
+    delete session.followBeforeDetach;
     this.save();
   }
 
@@ -219,7 +238,10 @@ export class RuntimeStateStore {
   private detachSessionSelection(senderId: string, reason: "manual" | "idle"): void {
     const endedSessionId = this.getBoundSession(senderId)?.id;
     for (const session of [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]) {
-      if (session) session.follow = false;
+      if (session) {
+        session.followBeforeDetach ??= session.follow !== false;
+        session.follow = false;
+      }
     }
     delete this.state.activeSessionIds[senderId];
     delete this.state.activeQaSessionIds[senderId];
@@ -323,7 +345,17 @@ export class RuntimeStateStore {
   }
 
   save(): void {
-    writeJsonFile(this.paths.statePath, this.state);
+    if (stateRevision(this.paths.statePath) !== this.revision) {
+      this.refresh();
+      throw new Error("账号状态已被其他写入者修改，本次旧快照未保存；请刷新后重试。");
+    }
+    try { writeJsonFile(this.paths.statePath, this.state); }
+    catch (error) {
+      // A failed commit must not leave the live owner advertising an unsaved mutation.
+      if (this.revision) { this.revision = undefined; this.refresh(); }
+      throw error;
+    }
+    this.revision = stateRevision(this.paths.statePath);
   }
 
   listPairedSenderIds(): string[] {
@@ -652,6 +684,7 @@ export class RuntimeStateStore {
       id: crypto.randomUUID(),
       name: cleanProjectName(name),
       workspace: resolvedWorkspace,
+      notifications: [],
       ...(metadata.rootPaths?.length ? { rootPaths: [...metadata.rootPaths] } : {}),
       ...(metadata.sourceProjectId ? { sourceProjectId: metadata.sourceProjectId } : {}),
       ...(metadata.projectKind ? { projectKind: metadata.projectKind } : {}),
@@ -826,7 +859,8 @@ export class RuntimeStateStore {
       ...(project ? { projectId: project.id } : {}),
       ...(context?.standalone ? { projectBinding: "none" as const } : {}),
       ...(context?.hostId ? { hostId: context.hostId } : {}),
-      ...(mode === "qa" ? { mode, ...(knowledgeBaseId ? { knowledgeBaseId } : {}) } : {}),
+      mode: mode === "qa" ? "qa" : "session",
+      ...(mode === "qa" && knowledgeBaseId ? { knowledgeBaseId } : {}),
       createdAt: now,
       updatedAt: now
     };
@@ -870,6 +904,10 @@ export class RuntimeStateStore {
 
   activateSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
+    if (typeof session.followBeforeDetach === "boolean") {
+      session.follow = session.followBeforeDetach;
+      delete session.followBeforeDetach;
+    }
     this.state.detachedSessionSenders = this.state.detachedSessionSenders.filter(id => id !== session.senderId);
     if (session.mode === "qa") this.state.activeQaSessionIds[session.senderId] = session.id;
     else this.state.activeSessionIds[session.senderId] = session.id;
@@ -1004,6 +1042,7 @@ export class RuntimeStateStore {
       id: crypto.randomUUID(),
       name: path.basename(workspace) || workspace,
       workspace,
+      notifications: [],
       createdAt: now,
       updatedAt: now
     };
@@ -1022,6 +1061,13 @@ export class RuntimeStateStore {
       candidate.id === sessionId && candidate.senderId === senderId && candidate.mode === "qa"
     ));
   }
+}
+
+function stateRevision(file: string): string | undefined {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
 }
 
 function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {

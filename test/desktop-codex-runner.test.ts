@@ -100,6 +100,7 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
   const progress: string[] = [];
   const outcome = runner.run({
     prompt: "hello from DingTalk",
+    clientUserMessageId: "gateway-original-source",
     cwd: "/tmp/project",
     threadId: "thread-desktop",
     sandbox: "workspace-write",
@@ -153,6 +154,7 @@ test("relays a turn to the Desktop thread owner and returns its session-log comp
     ((start?.params as Record<string, unknown>).turnStart as Record<string, unknown>).request,
     {
       threadId: "thread-desktop",
+      clientUserMessageId: "gateway-original-source",
       input: [{ type: "text", text: "hello from DingTalk", text_elements: [] }],
       cwd: "/tmp/project",
       approvalPolicy: "never",

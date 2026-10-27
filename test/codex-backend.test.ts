@@ -376,3 +376,30 @@ test("a task active on the selected app-server is not overridden by unrelated De
   assert.equal((await router.readThreadSnapshot("thread")).state.activeTurnId, "owned");
   assert.equal(desktopReads, 0);
 });
+
+for (const accepted of [false, true]) test(`auto catalog failure cannot replace an ${accepted ? 'accepted' : 'unresolved'} App writer`, async t => {
+  let release!: () => void, entered!: () => void, execCalls = 0;
+  const started = new Promise<void>(r => { entered = r; });
+  const app = { id: "app-server", capabilities: APP_SERVER_BACKEND_CAPABILITIES,
+    async listProjects() { throw Error("catalog unavailable"); }, async run(input: CodexRunnerInput) {
+      if (accepted) await input.onTurnStarted?.({ threadId: "thread", turnId: "turn" });
+      entered(); await new Promise<void>(r => { release = r; }); return { threadId: "thread", turnId: "turn", text: "done", raw: "" };
+    }, close() {} } as any;
+  const exec = { id: "exec", capabilities: EXEC_BACKEND_CAPABILITIES, async run() { execCalls++; return { text: "wrong", raw: "" }; },
+    async listProjects() { return { backend: "exec", projects: [] }; }, close() {} } as any;
+  const router = new CodexBackendRouter({ backend: "auto", desktopRunner: { async run() { throw Error("unused"); }, async steer() { throw Error("unused"); }, async stop() { return "not-active" as const; }, close() {} }, appServerBackend: app, execBackend: exec }); t.after(() => router.close());
+  const pending = router.run({ cwd: "/work", prompt: "run", onApproval: async () => "decline" }); await started;
+  if (accepted) await assert.rejects(router.listProjects(), /catalog unavailable/); else assert.equal((await router.listProjects()).backend, "exec");
+  assert.equal(router.backendInfo().id, "app-server"); release(); await pending;
+  assert.equal(router.backendInfo().id, "app-server"); assert.equal(execCalls, 0);
+});
+
+test("an earlier safe CLI fallback cannot silently absorb a later interactive request", async t => {
+  let calls = 0;
+  const router = new CodexBackendRouter({ backend: "auto", desktopRunner: { async run() { throw Error("unused"); }, async steer() { throw Error("unused"); }, async stop() { return "not-active" as const; }, close() {} },
+    appServerBackend: { id: "app-server", capabilities: APP_SERVER_BACKEND_CAPABILITIES, async run() { throw Error("not available"); }, close() {} } as any,
+    execBackend: { id: "exec", capabilities: EXEC_BACKEND_CAPABILITIES, async run() { calls++; return { raw: "", text: "done" }; }, close() {} } as any });
+  t.after(() => router.close()); await router.run({ cwd: "/work", prompt: "plain" });
+  await assert.rejects(router.run({ cwd: "/work", prompt: "interactive", onApproval: async () => "decline" }), /消息未提交/);
+  assert.equal(calls, 1);
+});

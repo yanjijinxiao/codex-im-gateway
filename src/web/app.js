@@ -20,8 +20,8 @@ const state = {
   sessionMessages: [],
   loadedSessionKey: "",
   loadingMessages: false,
-  sendingMessage: false,
-  savingSessionRuntime: false,
+  sendingSessions: new Set(),
+  savingRuntimeSessions: new Set(),
   updateInfo: null,
   updateChecking: false,
   updateInstalling: false,
@@ -427,7 +427,7 @@ async function refreshData(notify) {
       && sessionKey(previousSession) === sessionKey(currentSession)
       && previousSession.updatedAt !== currentSession.updatedAt
       && state.loadedSessionKey === state.selectedSessionKey
-      && !state.sendingMessage
+      && !isSessionSending()
     ) {
       void loadSelectedSessionMessages();
     } else if (previousSession?.responding !== currentSession?.responding) {
@@ -1417,13 +1417,21 @@ async function loadSelectedSessionMessages() {
   }
 }
 
+function isSessionSending(session = selectedSession()) {
+  return Boolean(session && state.sendingSessions.has(sessionKey(session)));
+}
+
+function isSessionSavingRuntime(session = selectedSession()) {
+  return Boolean(session && state.savingRuntimeSessions.has(sessionKey(session)));
+}
+
 function renderChatPanel() {
   const session = selectedSession();
-  const enabled = Boolean(session) && !state.sendingMessage && !state.savingSessionRuntime;
+  const enabled = Boolean(session) && !isSessionSending() && !isSessionSavingRuntime();
   els.chatInput.disabled = !enabled;
   els.chatAttachButton.disabled = !enabled;
   els.chatFileInput.disabled = !enabled;
-  els.refreshMessagesButton.disabled = !session || state.loadingMessages || state.sendingMessage;
+  els.refreshMessagesButton.disabled = !session || state.loadingMessages || isSessionSending();
   renderComposerFiles();
   updateComposerState();
   renderSessionRuntimeControls(session);
@@ -1436,7 +1444,7 @@ function renderChatPanel() {
 
   els.chatTitle.textContent = session.title;
   els.chatContext.textContent = `${accountDisplayName(session.accountId)} · ${session.workspace}`;
-  const responding = Boolean(session.responding || state.sendingMessage);
+  const responding = Boolean(session.responding || isSessionSending());
   if (state.loadingMessages) {
     setChatMessagesHtml(
       `<div class="chat-loading"><div class="spinner" aria-label="正在加载历史消息"></div><span>正在读取 Codex 历史</span></div>`,
@@ -1515,7 +1523,7 @@ function formatProcessingDuration(startValue, endValue) {
 }
 
 function renderSessionRuntimeControls(session) {
-  const disabled = !session || state.sendingMessage || state.savingSessionRuntime;
+  const disabled = !session || isSessionSending() || isSessionSavingRuntime();
   els.sessionModelInput.disabled = disabled;
   els.sessionEffortInput.disabled = disabled;
   els.sessionStreamInput.disabled = disabled;
@@ -1607,12 +1615,12 @@ async function handleSessionModelChange() {
 
 async function saveSessionRuntimeSettings() {
   const session = selectedSession();
-  if (!session || state.savingSessionRuntime) return;
+  if (!session || isSessionSavingRuntime()) return;
   const key = sessionKey(session);
   const model = els.sessionModelInput.value;
   const effort = els.sessionEffortInput.value;
   const stream = els.sessionStreamInput.value;
-  state.savingSessionRuntime = true;
+  state.savingRuntimeSessions.add(key);
   renderChatPanel();
   try {
     const result = await api(`/api/sessions/${encodeURIComponent(session.accountId)}/${encodeURIComponent(session.id)}`, {
@@ -1632,7 +1640,7 @@ async function saveSessionRuntimeSettings() {
     toast(error.message, true);
     await refreshData(false);
   } finally {
-    state.savingSessionRuntime = false;
+    state.savingRuntimeSessions.delete(key);
     renderChatPanel();
   }
 }
@@ -1690,11 +1698,11 @@ async function sendSessionMessage(event) {
   const session = selectedSession();
   const text = els.chatInput.value.trim();
   const files = [...state.chatFiles];
-  if (!session || (!text && !files.length) || state.sendingMessage) return;
+  if (!session || (!text && !files.length) || isSessionSending()) return;
   const key = sessionKey(session);
   const streaming = session.streamReplies ?? Boolean(state.config?.streamReplies);
   let progressSequence = 0;
-  state.sendingMessage = true;
+  state.sendingSessions.add(key);
   state.sessionMessages.push({
     id: `pending-${Date.now()}`,
     role: "user",
@@ -1715,6 +1723,7 @@ async function sendSessionMessage(event) {
   try {
     const body = new FormData();
     body.append("text", text);
+    body.append("requestId", Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join(""));
     files.forEach((file) => body.append("files", file, file.name));
     const url = `/api/sessions/${encodeURIComponent(session.accountId)}/${encodeURIComponent(session.id)}/messages`;
     if (streaming) {
@@ -1746,14 +1755,16 @@ async function sendSessionMessage(event) {
   } catch (error) {
     toast(error.message, true);
     if (state.selectedSessionKey === key) {
-      els.chatInput.value = text;
-      state.chatFiles = files;
+      if (!["accepted", "unconfirmed"].includes(error.submission)) {
+        els.chatInput.value = text;
+        state.chatFiles = files;
+      }
       await loadSelectedSessionMessages();
     }
   } finally {
-    state.sendingMessage = false;
+    state.sendingSessions.delete(key);
     renderChatPanel();
-    els.chatInput.focus();
+    if (state.selectedSessionKey === key) els.chatInput.focus();
   }
 }
 
@@ -1787,7 +1798,7 @@ function handleChatFileSelection(event) {
 
 function handleComposerFileAction(event) {
   const button = event.target.closest("[data-remove-chat-file]");
-  if (!button || state.sendingMessage) return;
+  if (!button || isSessionSending()) return;
   state.chatFiles.splice(Number(button.dataset.removeChatFile), 1);
   renderComposerFiles();
   updateComposerState();
@@ -1804,7 +1815,7 @@ function renderComposerFiles() {
 }
 
 function updateComposerState() {
-  const canCompose = Boolean(selectedSession()) && !state.sendingMessage && !state.savingSessionRuntime;
+  const canCompose = Boolean(selectedSession()) && !isSessionSending() && !isSessionSavingRuntime();
   els.chatInput.disabled = !canCompose;
   els.chatAttachButton.disabled = !canCompose;
   els.chatFileInput.disabled = !canCompose;
@@ -2364,7 +2375,7 @@ async function api(url, options = {}) {
     body: options.body ? (isFormData ? options.body : JSON.stringify(options.body)) : undefined
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+  if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission });
   return data;
 }
 
@@ -2379,7 +2390,7 @@ async function streamApi(url, options, onEvent) {
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.startsWith("application/x-ndjson")) {
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+    if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission });
     return data.result;
   }
   if (!response.ok || !response.body) {
@@ -2392,7 +2403,7 @@ async function streamApi(url, options, onEvent) {
   const consumeLine = (line) => {
     if (!line.trim()) return;
     const streamEvent = JSON.parse(line);
-    if (streamEvent.type === "error") throw new Error(streamEvent.error || "过程进度失败");
+    if (streamEvent.type === "error") throw Object.assign(new Error(streamEvent.error || "过程进度失败"), { submission: streamEvent.submission });
     onEvent(streamEvent);
     if (streamEvent.type === "done") result = streamEvent.result;
   };

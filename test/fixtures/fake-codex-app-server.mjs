@@ -505,6 +505,9 @@ rl.on("line", (line) => {
   if (message.method === "turn/start") {
     const turnId = `turn-${nextTurn++}`;
     const prompt = message.params?.input?.[0]?.text;
+    if (prompt === "fixture-stable-origin" && message.params.clientUserMessageId !== "gateway-original-source") {
+      fail(message.id, "Stable client origin was not transmitted"); return;
+    }
     if (message.params?.input?.[0]?.type !== "text" || typeof prompt !== "string") {
       fail(message.id, "turn/start requires text input");
       return;

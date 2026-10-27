@@ -316,6 +316,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const turnParams = compactObject({
       threadId,
       input: resume ? [] : [{ type: "text", text: input.prompt, text_elements: [] }],
+      clientUserMessageId: input.clientUserMessageId,
       ...(resume ? { clientUserMessageId: resume.clientUserMessageId, turnTrigger: "capacity_retry_automatic" } : {}),
       cwd: resume ? undefined : input.cwd,
       approvalPolicy: resume ? undefined : input.onApproval ? "on-request" : "never",

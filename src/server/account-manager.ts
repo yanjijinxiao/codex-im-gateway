@@ -11,13 +11,16 @@ import type {
   ChannelCapabilityProvider
 } from "../bridge/channel-capability.js";
 import { createInstalledSkillCapabilitiesProvider } from "../bridge/installed-skill-capabilities.js";
-import { buildPromptParts, buildPromptPreview, parsePrompt } from "../bridge/format.js";
+import { buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
 import { SessionControlJournal } from "../bridge/session-control.js";
 import { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
+import { InboundReceiptJournal } from "../bridge/inbound-receipts.js";
+import { prepareTurnSubmission, TurnSubmission, TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
 import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import { CapacityRecoveryCoordinator } from "./capacity-recovery.js";
@@ -41,7 +44,7 @@ import type {
 } from "../codex/backend.js";
 import type { CodexThreadState } from "../codex/backend.js";
 import { desktopSessionMembership } from "../codex/desktop-session-membership.js";
-import { assertCodexThreadRunnable, capacityFailureScope } from "../codex/backend.js";
+import { assertCodexThreadRunnable, capacityFailureScope, CodexTurnExecutionError } from "../codex/backend.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
   LlmWikiMcpClientPool,
@@ -289,6 +292,9 @@ export class AccountManager {
   private readonly interactionRouting: InteractionRoutingJournal;
   private readonly unresolvedInteractions = new Set<string>();
   private readonly entries = new Map<string, RuntimeEntry>();
+  /** Account lifecycle and Web requests share the same state owner, even while stopped. */
+  private readonly stores = new Map<string, RuntimeStateStore>();
+  private readonly inputReceipts = new Map<string, InboundReceiptJournal>();
   private readonly respondingSessions = new Map<string, number>();
   private readonly configProvider: () => CodexImGatewayConfig;
   private readonly adapterFactory: ChannelAdapterFactory;
@@ -504,7 +510,7 @@ export class AccountManager {
 
     const controller = new AbortController();
     const statePaths = accountStatePaths(this.options.paths, account.accountId);
-    const store = new RuntimeStateStore(statePaths);
+    const store = this.storeFor(account.accountId);
     this.synchronizeManagedProjects(store);
     const channel = accountChannel(account);
     const webhook = new ChannelMessageWebhook({
@@ -579,6 +585,7 @@ export class AccountManager {
       }, turnId, text),
       config,
       stateStore: store,
+      inputReceipts: this.receiptsFor(account.accountId),
       channel: client,
       inboundDir: statePaths.inboundDir,
       inboundReferences: new InboundReferenceStore(path.join(statePaths.inboundDir, "references.json")),
@@ -635,9 +642,10 @@ export class AccountManager {
         text: messageWithConversation.text,
         attachments: messageWithConversation.attachments.map(({ kind, label }) => ({ kind, label }))
       });
-      await service.handleMessage(messageWithConversation);
+      await this.receiptsFor(account.accountId).handle(messageWithConversation, () => service.handleMessage(messageWithConversation));
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      this.receiptsFor(account.accountId).releasePreparation(message.id);
       if (wasMessageHandlingErrorReported(error)) return;
       await this.sendChannelText(entry, {
         recipientId: message.replyTargetId ?? message.senderId,
@@ -656,7 +664,14 @@ export class AccountManager {
           : connection.state === "stopped" ? "stopped" : connection.state === "error" ? "error" : "starting";
         entry.error = connection.state === "error" ? connection.detail : undefined;
       },
-      claimMessage: (message) => store.claimProcessedMessage(message.id),
+      claimMessage: (message) => {
+        const conversation = message.source === "native-menu" ? store.getAuthorizedConversation(message.senderId) : undefined;
+        if (!this.receiptsFor(account.accountId).claim(conversation ? { ...message, replyTargetId: conversation } : message)) return false;
+        // Compatibility tombstone for code rollback. The new journal, rather
+        // than this legacy bounded list, decides preparation recovery.
+        store.claimProcessedMessage(message.id);
+        return true;
+      },
       onMessage: handleMessage,
       onMessageError
     });
@@ -708,6 +723,8 @@ export class AccountManager {
       });
     }
     this.entries.delete(account.accountId);
+    this.stores.delete(account.accountId);
+    this.inputReceipts.delete(account.accountId);
     this.interactionRouting.reconcileBindings([], [account.accountId]);
     this.refreshDesktopRequestSubscriptions();
   }
@@ -1316,8 +1333,21 @@ export class AccountManager {
     sessionId: string,
     text: string,
     uploads: SessionUpload[] = [],
-    onProgress?: (message: string) => Promise<void> | void
+    onProgress?: (message: string) => Promise<void> | void,
+    requestId: string = crypto.randomUUID()
   ): Promise<SessionChatResult> {
+    if (!/^[a-zA-Z0-9-]{1,100}$/.test(requestId)) throw Error("Invalid Web request id");
+    const session = requireSession(this.storeFor(accountId), sessionId);
+    let result: SessionChatResult | undefined;
+    await this.receiptsFor(accountId).handle({ id: `web:${requestId}`, senderId: "web-admin", replyTargetId: session.senderId }, async () => {
+      result = await this.runWebSession(accountId, sessionId, text, uploads, onProgress);
+    });
+    if (!result) throw Error("这条 Web 请求已有接收记录；未重复提交，请刷新查看原会话状态。");
+    return result;
+  }
+
+  private async runWebSession(accountId: string, sessionId: string, text: string, uploads: SessionUpload[],
+    onProgress?: (message: string) => Promise<void> | void): Promise<SessionChatResult> {
     const prompt = text.trim();
     if (!prompt && !uploads.length) {
       throw new Error("Message text or attachment is required");
@@ -1325,7 +1355,13 @@ export class AccountManager {
     const store = this.storeFor(accountId);
     const session = requireSession(store, sessionId);
     const project = session.projectId ? store.getProject(session.projectId) : undefined;
+    const entry = this.entries.get(accountId);
+    if (!entry?.service || !["starting", "running"].includes(entry.status)) {
+      throw Error("请先启动此渠道账号再从 Web 继续会话，以确保审批和提问可以送达；消息未提交。");
+    }
+    if (store.getBoundSession(session.senderId)?.id !== session.id) throw Error("请先绑定此会话再继续，以确保问题投递到正确对话；消息未提交。");
     const config = this.configProvider();
+    const submission = new TurnSubmission(this.receiptsFor(accountId), session.id);
     const attachments = this.saveSessionUploads(accountId, session.id, uploads);
     const promptPreview = buildPromptPreview(prompt, attachments);
     if (promptPreview) {
@@ -1346,21 +1382,11 @@ export class AccountManager {
           text: "已接入容量恢复流程，正在核对并继续原轮次；这条新消息未提交。恢复进展会回到绑定对话，执行结果以原生回执为准。" } };
         assertCodexThreadRunnable(state);
       }
-      const promptParts = buildPromptParts(
-        prompt,
-        attachments,
-        "Web",
-        store.relevantKnowledge(promptPreview ?? prompt, session.projectId)
-      );
-      const result = await this.runnerFor(config).run({
-        prompt: promptParts.prompt,
-        developerInstructions: promptParts.developerInstructions,
-        cwd: session.workspace,
-        hostId: session.hostId ?? project?.hostId,
-        projectId: project?.sourceProjectId,
-        projectName: project?.name,
-        threadId: session.threadId,
-        threadTitle: preferredThreadTitle(session.title, promptPreview),
+      const prepared = await prepareTurnSubmission({ runner: this.runnerFor(config), session, project, config,
+        accountId, conversationId: session.senderId, text: prompt, items: attachments, source: "Web",
+        knowledge: store.relevantKnowledge(promptPreview ?? prompt, session.projectId) });
+      const result = await submission.run(this.runnerFor(config), {
+        ...prepared,
         onThreadCreated: (createdThreadId) => {
           store.setSessionThread(session.id, createdThreadId);
           this.ensureCodexSessionMonitor();
@@ -1370,16 +1396,25 @@ export class AccountManager {
           this.rememberInteractionOrigin(accountId, { ...session, threadId }, turnId);
           this.refreshDesktopRequestSubscriptions();
         },
-        queueKey: session.threadId ?? session.id,
-        model: session.model ?? config.model,
-        effort: session.effort ?? config.effort,
         onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
         onApprovalResult: (request, result) => this.reportSessionApprovalResult(request, result),
-        onUserInput: request => this.entries.get(accountId)?.service?.requestUserInput(session.senderId, request, session.hostId) ?? Promise.resolve(undefined),
-        onUserInputResult: (request, result) => this.entries.get(accountId)?.service?.reportUserInputResult(session.senderId, request, result, session.hostId),
+        onUserInput: request => {
+          if (this.entries.get(accountId) !== entry || !["starting", "running"].includes(entry.status)
+            || store.getBoundSession(session.senderId)?.id !== session.id) {
+            throw new CodexCommunicationError("observation", "interaction/unavailable", request.threadId, request.turnId);
+          }
+          return entry.service!.requestUserInput(session.senderId, request, prepared.hostId);
+        },
+        onUserInputResult: (request, result) => entry.service!.reportUserInputResult(session.senderId, request, result, prepared.hostId),
         ...((session.streamReplies ?? config.streamReplies) && onProgress
           ? { onProgress }
           : {})
+      }, () => {
+        const current = store.getSession(session.id);
+        if (this.entries.get(accountId) !== entry || !["starting", "running"].includes(entry.status)
+          || !current || current.threadId !== session.threadId || current.projectBinding !== session.projectBinding
+          || (current.hostId ?? store.getProject(current.projectId ?? "")?.hostId ?? "local") !== (prepared.hostId ?? "local")
+          || store.getBoundSession(session.senderId)?.id !== session.id) throw Error("会话、绑定或渠道状态已改变，消息未提交。");
       });
       const threadId = result.threadId ?? session.threadId;
       if (!threadId) {
@@ -1406,7 +1441,14 @@ export class AccountManager {
       await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim(), true, result.turnId);
       return response;
     } catch (error) {
-      await this.notifyProjectCompletion(
+      error = submission.error(error);
+      if (error instanceof TurnDeliveryError) throw error;
+      if (error instanceof TurnApplicationError || error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
+        this.ensureCodexSessionMonitor();
+        this.refreshDesktopRequestSubscriptions();
+        throw error; // Transport uncertainty is not a native task failure.
+      }
+      if (error instanceof CodexTurnExecutionError) await this.notifyProjectCompletion(
         accountId,
         session.id,
         error instanceof Error ? error.message : String(error),
@@ -1494,8 +1536,24 @@ export class AccountManager {
 
   private storeFor(accountId: string): RuntimeStateStore {
     const account = loadAccount(this.options.paths, accountId);
-    return this.entries.get(account.accountId)?.store
-      ?? new RuntimeStateStore(accountStatePaths(this.options.paths, account.accountId));
+    let store = this.stores.get(account.accountId);
+    if (!store) {
+      store = new RuntimeStateStore(accountStatePaths(this.options.paths, account.accountId));
+      this.stores.set(account.accountId, store);
+    }
+    store.refresh();
+    return store;
+  }
+
+  private receiptsFor(accountId: string): InboundReceiptJournal {
+    accountId = loadAccount(this.options.paths, accountId).accountId;
+    const store = this.storeFor(accountId);
+    let receipts = this.inputReceipts.get(accountId);
+    if (!receipts) {
+      receipts = new InboundReceiptJournal(path.join(this.options.paths.runtimeDir, accountId, "inbound-receipts.jsonl"), store.snapshot.processedMessageIds);
+      this.inputReceipts.set(accountId, receipts);
+    }
+    return receipts;
   }
 
   private isActive(accountId: string, sessionId: string): boolean {
@@ -2259,7 +2317,7 @@ export class AccountManager {
 
   private summary(account: ChannelAccount): AccountSummary {
     const entry = this.entries.get(account.accountId);
-    const store = entry?.store ?? new RuntimeStateStore(accountStatePaths(this.options.paths, account.accountId));
+    const store = this.storeFor(account.accountId);
     return {
       ...publicAccount(account),
       status: entry?.status ?? "stopped",
@@ -2379,10 +2437,6 @@ function sessionRuntimeKey(accountId: string, sessionId: string): string {
   return `${accountId}\n${sessionId}`;
 }
 
-function preferredThreadTitle(sessionTitle: string, promptPreview?: string): string {
-  const genericSessionTitle = /^(?:会话\s*\d+|新会话|Codex 会话(?:\s+[\da-f-]+)?)$/i.test(sessionTitle.trim());
-  return (genericSessionTitle ? promptPreview : sessionTitle) ?? promptPreview ?? sessionTitle;
-}
 
 function taskRuntimeKey(sessionId: string, turnId: string): string {
   return `${sessionId}\n${turnId}`;

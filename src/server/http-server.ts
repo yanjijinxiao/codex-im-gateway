@@ -1,3 +1,7 @@
+import { TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
+import { readBuildInfo } from "./build-info.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
+import { userFacingMessageHandlingError } from "../bridge/errors.js";
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -371,6 +375,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (method === "POST" && instance) { await ide.stop(instance.id); sendJson(response, 200, { ok: true }); return; }
     sendJson(response, 404, { error: "Not found" }); return;
   }
+  if (method === "GET" && url.pathname === "/api/build") {
+    sendJson(response, 200, { product: "codex-im-gateway", version: context.productVersion, build: readBuildInfo() }); return;
+  }
   if (method === "GET" && url.pathname === "/api/bootstrap") {
     const config = loadConfig(context.paths);
     const [codex, codexRuntime, codexModels] = await Promise.all([
@@ -381,6 +388,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, {
       product: "codex-im-gateway",
       version: context.productVersion,
+      build: readBuildInfo(),
       requestToken: context.requestToken,
       config,
       codex,
@@ -704,27 +712,27 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
           sessionAction.sessionId,
           body.text,
           body.uploads,
-          async (message) => writeNdjson(response, { type: "progress", message })
+          async (message) => writeNdjson(response, { type: "progress", message }),
+          body.requestId
         );
         await writeNdjson(response, { type: "done", result });
       } catch (error) {
         await writeNdjson(response, {
-          type: "error",
-          error: error instanceof Error ? error.message : String(error)
+          type: "error", error: userFacingMessageHandlingError(error),
+          ...(error instanceof CodexCommunicationError ? { submission: error.submission } : error instanceof TurnDeliveryError || error instanceof TurnApplicationError ? { submission: "accepted" } : {})
         });
       } finally {
         if (!response.writableEnded) response.end();
       }
       return;
     }
-    sendJson(response, 200, {
-      result: await context.accountManager.continueSession(
-        sessionAction.accountId,
-        sessionAction.sessionId,
-        body.text,
-        body.uploads
-      )
-    });
+    try {
+      sendJson(response, 200, { result: await context.accountManager.continueSession(
+        sessionAction.accountId, sessionAction.sessionId, body.text, body.uploads, undefined, body.requestId) });
+    } catch (error) {
+      sendJson(response, 500, { error: userFacingMessageHandlingError(error),
+        ...(error instanceof CodexCommunicationError ? { submission: error.submission } : error instanceof TurnDeliveryError || error instanceof TurnApplicationError ? { submission: "accepted" } : {}) });
+    }
     return;
   }
   if (method === "POST" && sessionAction?.action === "activate") {
@@ -924,12 +932,12 @@ async function readBodyBuffer(request: IncomingMessage, maxBytes: number, limitM
 async function readSessionMessageBody(
   request: IncomingMessage,
   maxUploadBytes: number
-): Promise<{ text: string; uploads: SessionUpload[] }> {
+): Promise<{ text: string; uploads: SessionUpload[]; requestId?: string }> {
   const contentType = request.headers["content-type"];
   const normalizedContentType = Array.isArray(contentType) ? contentType[0] : contentType ?? "";
   if (!normalizedContentType.toLowerCase().startsWith("multipart/form-data")) {
     const body = bodySchema.parse(await readJsonBody(request));
-    return { text: requiredString(body.text, "text"), uploads: [] };
+    return { text: requiredString(body.text, "text"), uploads: [], requestId: webRequestId(body.requestId) };
   }
 
   const limitMessage = `Attachments exceed the ${formatByteLimit(maxUploadBytes)} limit`;
@@ -964,7 +972,12 @@ async function readSessionMessageBody(
   if (!text && !uploads.length) {
     throw new Error("Message text or attachment is required");
   }
-  return { text, uploads };
+  return { text, uploads, requestId: webRequestId(formData.get("requestId")) };
+}
+
+function webRequestId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return z.string().regex(/^[a-zA-Z0-9-]{1,100}$/).parse(value);
 }
 
 function formatByteLimit(bytes: number): string {
