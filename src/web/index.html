@@ -79,10 +79,17 @@
     </section>
 
     <section class="view" id="approvalsView" data-view-panel="approvals" hidden>
-      <div class="section-heading"><div><p class="eyebrow">NATIVE APPROVALS</p><h1>待审批</h1>
-        <p class="chat-context">与 IM 共用同一请求。选择授权范围后，等待 Codex 原生确认。</p></div>
+      <div class="section-heading"><div><p class="eyebrow">APPROVALS</p><h1>待审批</h1>
+        <p class="chat-context">准入申请与 Codex 工具审批在此统一查看。准入审批管理员也可在钉钉发送 /access 处理准入申请；Codex 审批仍在原绑定聊天处理。</p></div>
         <button class="button button-secondary" id="refreshApprovalsButton" type="button">刷新</button></div>
       <p id="approvalFeedback" role="status" aria-live="polite"></p>
+      <h2>Gateway 准入申请</h2>
+      <div id="admissionList" class="approval-list" aria-live="polite"></div>
+      <details><summary>远程准入管理员</summary>
+        <p class="chat-context">首次需在此明确登记一次。请本人向对应机器人发送 /access identity，再从下方选择已核验的个人身份。普通用户、群授权和会话 controller 不会自动成为管理员；管理员只能处理所属渠道的准入申请。</p>
+        <div id="admissionAdmins" class="approval-list"></div>
+      </details>
+      <h2>Codex 工具审批</h2>
       <div id="approvalsList" class="approval-list" aria-live="polite"></div>
     </section>
 

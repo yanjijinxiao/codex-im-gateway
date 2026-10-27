@@ -1,3 +1,4 @@
+import { AdmissionService } from "../bridge/admission.js";
 import crypto from "node:crypto";
 import { migrateCardBootstrap } from "./migrate-card-bootstrap.js";
 import { InboundReferenceStore } from "../bridge/inbound-references.js";
@@ -292,6 +293,7 @@ export class AccountManager {
   private stoppingAll = false;
   readonly ide: WorkspaceIDEManager;
   readonly ideApprovals: IDEApprovalService;
+  readonly admission: AdmissionService;
   private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
   private readonly approvalRoutes = new WeakMap<CodexDesktopApproval, { service: BridgeService; recipientId: string }>();
   private readonly sessionApprovalRoutes = new WeakMap<CodexApprovalRequest, { service: BridgeService; recipientId: string }>();
@@ -334,12 +336,19 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    const principalAccounts = () => listAccounts(options.paths).map(account => ({ accountId: account.accountId, channel: accountChannel(account),
+      providerId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId }));
     this.ideApprovals = new IDEApprovalService({ root: options.paths.root,
       // Exact actor lookup only. Never use requireAccess(actor, conversation):
       // its group-wide ACL is intentionally insufficient for browser pairing.
       allowedPersonal: principal => this.storeFor(principal.accountId).listPairedSenderIds().includes(principal.actorId),
-      accounts: () => listAccounts(options.paths).map(account => ({ accountId: account.accountId, channel: accountChannel(account),
-        providerId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId })) });
+      accounts: principalAccounts });
+    this.admission = new AdmissionService({ root: options.paths.root, accounts: principalAccounts,
+      allowed: (accountId, actorId, conversationId) => {
+        const paired = this.storeFor(accountId).listPairedSenderIds();
+        const configured = this.configProvider().allowedSenderIds;
+        return [...paired, ...configured].some(id => id === actorId || id === conversationId);
+      }, allow: (accountId, target) => this.allowSender(accountId, target) });
     this.ide = new WorkspaceIDEManager({ root: options.paths.root, resolve: (accountId, sessionId) => this.ideWorkspace(accountId, sessionId),
       refresh: (accountId, sessionId) => this.refreshIDEWorkspace(accountId, sessionId) });
     this.interactionRouting = new InteractionRoutingJournal(path.join(options.paths.runtimeDir, "interaction-routing.json"));
@@ -577,6 +586,7 @@ export class AccountManager {
     const service = this.bridgeFactory({
       assertRuntimeWritable: () => this.assertRuntimeWritable(),
       ideApprovals: this.ideApprovals,
+      admission: this.admission,
       ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
       ideEntry: async session => (await this.ide.freshEntry(account.accountId, session.id))?.url,
       ideProgressEntry: session => this.ide.entry(account.accountId, session.id)?.url,
@@ -776,6 +786,7 @@ export class AccountManager {
         const userId = weixin.userId;
         if (userId) forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId });
       }
+      this.admission.forgetAccount(accountId);
       deleteAccount(this.options.paths, accountId);
       if (!retainHistory) {
         fs.rmSync(path.dirname(accountStatePaths(this.options.paths, account.accountId).statePath), {

@@ -1,8 +1,7 @@
 import { z } from "zod";
 
-const identifier = z.string().trim().min(1).max(300).regex(/^[^\s\x00-\x1f\x7f]+$/);
-export const idePrincipalSchema = z.object({ accountId: identifier,
-  channel: z.enum(["dingtalk", "feishu", "wecom", "weixin"]), providerId: identifier, actorId: identifier }).strict();
+import { channelPrincipalSchema } from "../channels/principal.js";
+export const idePrincipalSchema = channelPrincipalSchema;
 export type IDEPrincipal = z.infer<typeof idePrincipalSchema>;
 
 /** Provenance, not another allowlist. A durable revocation epoch prevents a

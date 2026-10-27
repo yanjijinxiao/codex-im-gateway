@@ -1775,3 +1775,16 @@ test("exposes files sent by Codex as session attachments", async (t) => {
     /not found/
   );
 });
+
+test("running account receives the same admission service and a remote decision updates its existing ACL owner", async t => {
+  const f = setup(t); await f.manager.startAccount("account-one");
+  assert.equal(f.bridges.get("account-one")!.admission, f.manager.admission);
+  const principal = f.manager.ideApprovals.principal("account-one", "weixin", "admin-person", "account-one");
+  const admin = f.manager.admission.observe(principal, "admin-person", "direct");
+  f.manager.admission.setAdmin(admin.id, admin.version);
+  const request = f.manager.admission.observe({ ...principal, actorId: "new-person" }, "new-person", "direct");
+  f.manager.admission.decideRemote(principal, request.id, request.version, "actor");
+  assert.ok(f.bridges.get("account-one")!.stateStore.listPairedSenderIds().includes("new-person"));
+  assert.equal(f.manager.ideApprovals.registrationStatus({ ...principal, actorId: "new-person" }), "allowed");
+  assert.equal(f.runs.length, 0);
+});

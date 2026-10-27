@@ -1,3 +1,4 @@
+import { AdmissionService, admissionPrincipal } from "./admission.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
@@ -140,6 +141,7 @@ type ProjectSessionChoice = {
 export type BridgeServiceOptions = {
   inputReceipts?: InboundReceiptJournal;
   ideApprovals?: IDEApprovalService;
+  admission?: AdmissionService;
   /** Captured from the actual running adapter account, not mutable UI state. */
   ideProviderId?: string;
   ideEntry?: (session: ManagedSession) => string | undefined | Promise<string | undefined>;
@@ -371,8 +373,24 @@ export class BridgeService {
       else await this.replyActionCard(replyTargetId, result);
       return;
     }
+    const principal = admissionPrincipal(this.options.accountId, this.options.ideProviderId, this.channel.channel, message);
+    if (control?.name === "access") {
+      if (!principal || !this.options.admission) { await this.reply(replyTargetId, "无法核验个人来源或准入审批服务未就绪。请从机器人私聊或已核验群聊发送。"); return; }
+      try {
+        const result = this.options.admission.command(principal, replyTargetId, message.conversationKind as "direct" | "group", control.arg);
+        if (typeof result === "string") await this.reply(replyTargetId, result); else await this.replyActionCard(replyTargetId, result);
+      } catch (error) { await this.reply(replyTargetId, error instanceof Error ? error.message : "准入审批未完成，请重新查看申请。"); }
+      return;
+    }
     const access = this.access.requireAccess(message.senderId, replyTargetId);
     if (!access.allowed) {
+      if (principal && this.options.admission) {
+        try {
+          const request = this.options.admission.observe(principal, replyTargetId, message.conversationKind as "direct" | "group");
+          await this.reply(replyTargetId, `尚未获准使用 Gateway。准入申请已登记（${request.id}），请联系准入审批管理员在机器人会话发送 /access 处理，或在本机管理页「待审批」处理。原消息未提交；获准后请重新发送。`);
+        } catch (error) { await this.reply(replyTargetId, `准入申请未能登记：${error instanceof Error ? error.message : String(error)}。原消息未提交，请管理员检查。`); }
+        return;
+      }
       await this.reply(replyTargetId, access.message);
       return;
     }

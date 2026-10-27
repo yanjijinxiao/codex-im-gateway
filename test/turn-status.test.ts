@@ -98,7 +98,8 @@ test("an incomplete code preview cannot swallow the stop control or native-curso
     recent: [], tools: { completed: 0, failed: 0 }, answerPreview: "```ts\n" + "const data = 1;\n".repeat(100) });
   const tokens = Lexer.lex(text);
   assert.deepEqual(tokens.filter(token => token.type === "code").map(token => token.text), ["/stop"]);
-  assert.match(text, /代码将在最终答复中完整显示/);
+  assert.match(text, /`const data = 1;`/);
+  assert.doesNotMatch(text, /代码将在最终答复中完整显示/);
   assert.equal(tokens.at(-1)?.type, "paragraph");
   assert.equal(tokens.at(-1)?.raw, "任务仍在执行");
   assert.match(text, /回复预览（尚未完成）/);

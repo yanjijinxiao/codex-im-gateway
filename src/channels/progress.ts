@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { markdownPreview } from "./markdown-preview.js";
 import type { ChannelTextClient, ChannelProgressLayout } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
@@ -247,7 +248,6 @@ export class ChannelTurnTextStream {
     this.recoveryNotice = undefined;
     this.activity = "running";
     this.answerPreview = boundedProgressText(content, 2_400);
-    this.thought = "正在组织最终回复…";
     return this.publish(this.render());
   }
 
@@ -565,7 +565,7 @@ export class ChannelTurnTextStream {
     // Keep an actual public reasoning summary available without replacing a
     // concrete task update with a generated, generic "thinking" sentence.
     if (current && this.thought && this.thought !== current
-      && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步)/.test(this.thought)) {
+      && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步|正在组织最终回复)/.test(this.thought)) {
       sections.push(`**公开摘要**\n${boundedProgressText(this.thought, 240)}`);
     }
     const recent = this.progressEntries.filter(entry => entry !== current);
@@ -576,7 +576,7 @@ export class ChannelTurnTextStream {
     if (this.toolActivity.active) sections.push(`_工具活动：${this.toolActivity.active}_`);
     else if (this.toolActivity.completed || this.toolActivity.failed) sections.push(`_工具活动：${this.toolActivity.completed} 次成功${this.toolActivity.failed ? `，${this.toolActivity.failed} 次失败（不代表整体任务失败）` : ""}_`);
     if (this.answerPreview) {
-      sections.push(`---\n✍️ **正在组织回复**\n\n${this.answerPreview}`);
+      sections.push(`---\n✍️ **正在组织回复**\n\n${markdownPreview(this.answerPreview, 600)}`);
     }
     sections.push(this.communicationNotice ? "_只读核对原会话中；未重发消息或停止原任务_"
       : this.recoveryNotice ? "_保留本张进度卡；等待 Codex 后续进展或最终状态_"
@@ -589,7 +589,7 @@ export class ChannelTurnTextStream {
     const current = this.progressEntries.filter(entry => progressKind(entry) === "update").at(-1);
     return { activity: this.visibleActivity(), elapsed: formatTurnElapsed(Date.now() - this.startedAt),
       current: current || this.thought || "等待新的可展示进展。",
-      thought: current && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步)/.test(this.thought)
+      thought: current && !/^(?:正在理解任务并规划下一步|正在等待当前步骤返回结果|正在应用并检查代码修改|正在分析刚完成步骤的结果并决定下一步|正在分析失败原因并寻找可行的下一步|正在处理当前步骤并决定下一步|正在组织最终回复)/.test(this.thought)
         ? this.thought : undefined,
       recent: this.progressEntries.filter(entry => entry !== current), tools: this.toolActivity,
       answerPreview: this.answerPreview, notice: this.communicationNotice || this.recoveryNotice };

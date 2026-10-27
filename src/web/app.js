@@ -1148,7 +1148,7 @@ async function handleAccountAction(event) {
       toast(userScope ? `已允许用户 ${actorId}。请回聊天重新发送消息。` : `已允许整个会话 ${conversationId}。请回聊天重新发送消息。`);
     }
     if (action === "revoke-all" && account) {
-      if (!window.confirm(`撤销“${accountDisplayName(accountId)}”的全部用户及会话授权？同时撤销由这些个人准入签发的 IDE 登录，断开对应终端连接。旧版未记录个人来源的浏览器授权和独立兼容身份不受影响；必要时在 Web IDE 页面另行撤销。继续？`)) return;
+      if (!window.confirm(`撤销“${accountDisplayName(accountId)}”的全部用户及会话授权？同时撤销由这些个人准入签发的 IDE 登录，断开对应终端连接。旧版未记录个人来源的浏览器授权和独立兼容身份不受影响；必要时在 Web IDE 页面另行撤销。独立的准入审批管理员资格需在「待审批」另行撤销。继续？`)) return;
       await Promise.all(account.pairedSenderIds.map((senderId) => api(
         `/api/accounts/${encodeURIComponent(accountId)}/senders/${encodeURIComponent(senderId)}/remove`,
         { method: "POST" }
@@ -2386,14 +2386,10 @@ async function api(url, options = {}) {
   const isFormData = options.body instanceof FormData;
   const headers = { ...(options.body && !isFormData ? { "Content-Type": "application/json" } : {}) };
   if (options.token !== false && state.requestToken) headers["X-Codex-IM-Gateway-Token"] = state.requestToken;
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers,
+  const response = await fetchWithRequestContext(url, {
+    method: options.method || "GET", headers,
     body: options.body ? (isFormData ? options.body : JSON.stringify(options.body)) : undefined
-  }).catch(error => {
-    if (!["GET", "HEAD"].includes(options.method || "GET")) error.submission = "unconfirmed";
-    throw error;
-  });
+  }, options.token !== false);
   const data = await response.json().catch(() => { throw Object.assign(new Error("响应内容不完整，请核对状态。"), { submission: !["GET", "HEAD"].includes(options.method || "GET") ? "unconfirmed" : undefined }); });
   if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission ?? (!["GET", "HEAD"].includes(options.method || "GET") ? "unconfirmed" : undefined) });
   return data;
@@ -2402,11 +2398,7 @@ async function api(url, options = {}) {
 async function streamApi(url, options, onEvent) {
   const headers = {};
   if (state.requestToken) headers["X-Codex-IM-Gateway-Token"] = state.requestToken;
-  const response = await fetch(url, {
-    method: options.method || "POST",
-    headers,
-    body: options.body
-  }).catch(error => { error.submission = "unconfirmed"; throw error; });
+  const response = await fetchWithRequestContext(url, { method: options.method || "POST", headers, body: options.body });
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.startsWith("application/x-ndjson")) {
     const data = await response.json().catch(() => { throw Object.assign(new Error("响应内容不完整，请核对历史。"), { submission: "unconfirmed" }); });
@@ -2443,6 +2435,33 @@ async function streamApi(url, options, onEvent) {
   if (buffer) consumeLine(buffer);
   if (!terminal) throw Object.assign(new Error("响应连接已结束，但任务结果未确认；请查看历史，未重新提交。"), { submission: "unconfirmed" });
   return result;
+}
+
+let requestContextRefresh;
+async function fetchWithRequestContext(url, options, useToken = true) {
+  const mutation = !["GET", "HEAD"].includes(options.method || "GET");
+  const sentToken = state.requestToken;
+  const send = () => fetch(url, { ...options, headers: { ...options.headers,
+    ...(useToken && state.requestToken ? { "X-Codex-IM-Gateway-Token": state.requestToken } : {}) }
+  }).catch(error => { if (mutation) error.submission = "unconfirmed"; throw error; });
+  const response = await send();
+  if (!mutation || !useToken || response.status !== 403) return response;
+  const rejected = await response.clone().json().catch(() => ({}));
+  // Only this ingress rejection proves that no handler or native write ran.
+  // Network loss, provider errors and other 403 responses never authorize replay.
+  if (rejected.code !== "request-token-invalid" || rejected.submission !== "not-submitted") return response;
+  try {
+    if (state.requestToken === sentToken) {
+      requestContextRefresh ??= (async () => {
+        const result = await fetch("/api/request-context", { cache: "no-store" });
+        const data = await result.json();
+        if (!result.ok || typeof data.requestToken !== "string" || !/^[A-Za-z0-9_-]{16,200}$/.test(data.requestToken)) throw Error("Invalid request context");
+        state.requestToken = data.requestToken;
+      })().finally(() => { requestContextRefresh = undefined; });
+      await requestContextRefresh;
+    }
+  } catch { throw Object.assign(new Error("页面连接凭据已过期，恢复连接失败；请刷新页面后重试。"), { submission: "not-submitted" }); }
+  return send(); // At most once; exact URL, body and requestId from the user's click.
 }
 
 function emptyState(icon, title, description = "", action = "") {

@@ -59,6 +59,8 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
     if (expected) assert.ok(values.staticMsgContent.endsWith(`(${expected})`));
   };
   await stream.progress("正在检查选项定义"); running(first);
+  await stream.progress("🤔 正在核对三类 property 规则"); await stream.flush();
+  assert.match(values.msgContent, /\*\*公开摘要\*\*.*核对三类/);
   const id = stream.checkpoint().messageId;
   const states = calls.filter(call => call.kind === "state").length;
   // The screenshot's failing transition: partial table + unclosed inline code,
@@ -66,8 +68,12 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
   for (const preview of ["新增 **SnapshotTableOptionsConfig**。\n\n| Option | 值 |\n|---|---|\n| `expiration",
     "新增 **SnapshotTableOptionsConfig**。\n\n| Option | 值 |\n|---|---|\n| `expiration_timestamp` | Timestamp |\n\n```java\nclass Config {"]) {
     await stream.answer(preview); await stream.flush(); running(first);
+    assert.match(values.msgContent, /核对三类 property 规则/);
+    assert.doesNotMatch(values.msgContent, /正在组织最终回复/);
     assert.equal(Lexer.lex(values.msgContent).filter(token => ["code", "table"].includes(token.type)).length, 0);
-    assert.match(values.msgContent, /表格将在最终答复中完整显示/);
+    assert.match(values.msgContent, /Option.*expiration/);
+    assert.match(values.msgContent, /\*\*SnapshotTableOptionsConfig\*\*/);
+    assert.doesNotMatch(values.msgContent, /表格将在最终答复中完整显示/);
   }
   assert.equal(calls.filter(call => call.kind === "state").length, states, "unchanged widgets are not rewritten by body/heartbeat frames");
   for (const activity of ["waiting-input", "waiting-approval", "unconfirmed"] as const) {

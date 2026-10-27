@@ -1,3 +1,5 @@
+import { channelPrincipalSchema } from "../channels/principal.js";
+import { AdmissionConflictError, admissionId, admissionVersion } from "../bridge/admission.js";
 import { TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
 import { readBuildInfo } from "./build-info.js";
 import { RuntimeConfigurationBusyError } from "./account-manager.js";
@@ -287,9 +289,16 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     if (request.headers["x-codex-im-gateway-token"] !== context.requestToken
       && request.headers["x-codex-channel-bridge-token"] !== context.requestToken
       && request.headers["x-codex-weixin-token"] !== context.requestToken) {
-      sendJson(response, 403, { error: "Invalid request token" });
+      sendJson(response, 403, { error: "页面连接凭据已过期，请刷新页面后重试。", code: "request-token-invalid", submission: "not-submitted" });
       return;
     }
+  }
+
+  if (method === "GET" && url.pathname === "/api/request-context") {
+    if (request.headers.origin && !isAllowedOrigin(request.headers.origin, context.port)) {
+      sendJson(response, 403, { error: "Local origin required" }); return;
+    }
+    sendJson(response, 200, { requestToken: context.requestToken }); return;
   }
 
   const ide = context.accountManager.ide;
@@ -336,7 +345,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       sendJson(response, 202, { installation: ide.installer.begin(host.hostId, host.binary) }); return;
     }
     if (method === "POST" && url.pathname === "/api/ide/access") {
-      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
+      const input = z.object({ entryId: z.string().regex(/^[a-f0-9]{32}$/), trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^(?:v2:)?[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
       if (!context.ideAccess) throw new Error("IDE 访问入口未就绪");
       if (ide.resolve(input.entryId).rootPaths && !input.scope) throw new Error("请先核对完整工作区目录后授权");
       sendJson(response, 200, await context.ideAccess.grant(input.entryId, input.trustWorkspace, input.scope)); return;
@@ -363,7 +372,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     }
     const workspace = matchPath(url.pathname, "/api/ide/workspaces/:id/:action");
     if (method === "POST" && workspace && ["open", "prepare"].includes(workspace.action)) {
-      const input = z.object({ trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
+      const input = z.object({ trustWorkspace: z.boolean().default(false), scope: z.string().regex(/^(?:v2:)?[a-f0-9]{64}$/).optional() }).strict().parse(await readJsonBody(request));
       const scope = ide.authorizationScope(workspace.id);
       if ((ide.resolve(workspace.id).rootPaths || input.scope) && input.scope !== scope) throw new Error("请重新核对完整工作区目录后再操作");
       const directory = input.trustWorkspace ? await ide.canonicalForTrust(workspace.id) : undefined;
@@ -446,6 +455,23 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   if (method === "GET" && url.pathname === "/api/interaction-health") {
     sendJson(response, 200, context.accountManager.interactionHealth()); return;
+  }
+  if (method === "GET" && url.pathname === "/api/admission") {
+    sendJson(response, 200, context.accountManager.admission.snapshot()); return;
+  }
+  if (method === "POST" && url.pathname === "/api/admission/decision") {
+    const body = z.object({ id: admissionId, version: admissionVersion, choice: z.enum(["actor", "conversation", "deny"]) }).strict().parse(await readJsonBody(request));
+    sendJson(response, 200, { message: context.accountManager.admission.decideLocal(body.id, body.version, body.choice) }); return;
+  }
+  if (method === "POST" && url.pathname === "/api/admission/admins") {
+    const body = z.object({ id: admissionId, version: admissionVersion }).strict().parse(await readJsonBody(request));
+    context.accountManager.admission.setAdmin(body.id, body.version);
+    sendJson(response, 200, { message: "已登记该个人为所属渠道的准入审批管理员，可在机器人私聊或群聊发送 /access 处理。没有授予本机管理页访问权限。" }); return;
+  }
+  if (method === "POST" && url.pathname === "/api/admission/admins/remove") {
+    const body = z.object({ principal: channelPrincipalSchema }).strict().parse(await readJsonBody(request));
+    context.accountManager.admission.removeAdmin(body.principal);
+    sendJson(response, 200, { message: "已撤销远程准入审批管理员资格；现有普通准入与 IDE 授权保持各自状态。" }); return;
   }
   if (method === "GET" && url.pathname === "/api/approvals") {
     sendJson(response, 200, { approvals: context.accountManager.listApprovals() }); return;
@@ -1012,7 +1038,7 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function errorStatus(error: unknown, message: string): number {
-  if (error instanceof RuntimeConfigurationBusyError || error instanceof SessionBindingConflictError || error instanceof ApprovalDecisionConflictError) return 409;
+  if (error instanceof RuntimeConfigurationBusyError || error instanceof SessionBindingConflictError || error instanceof ApprovalDecisionConflictError || error instanceof AdmissionConflictError) return 409;
   if (error instanceof z.ZodError) return 400;
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;

@@ -383,6 +383,28 @@ test("local Gateway mints IDE access only behind mutation protection and no pass
   const revoke = await fetch(`${server.url}/api/ide/revoke`, { method: "POST", headers }); assert.equal(revoke.status, 200);
 });
 
+test("management HTTP accepts v2 multi-root scope for access and prepare, but rejects stale or malformed scope before launching", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-scope-v2-http-")), transport = new FakeTransport();
+  const ide = new WorkspaceIDEManager({ root, transport, resolve: (_a, sessionId) => ({ owner: "owner", sessionId,
+    hostId: "local", workspace: "/project", rootPaths: ["/project", "/other"], projectName: "multi-root" }) });
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: { ide, listProjects: () => [] } as never });
+  t.after(async () => { await server.close(); await ide.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const headers = { Origin: server.url, "X-Codex-IM-Gateway-Token": server.requestToken, "Content-Type": "application/json" };
+  const settings = config(ide.configStore, await freePort()); settings.hosts = settings.hosts.filter(h => h.hostId === "local");
+  assert.equal((await fetch(server.url + "/api/ide/config", { method: "PUT", headers, body: JSON.stringify({ config: settings }) })).status, 200);
+  const entry = ide.entry("a", "s")!, scope = ide.authorizationScope(entry.id);
+  assert.match(scope, /^v2:[a-f0-9]{64}$/);
+  const post = (endpoint: string, body: unknown) => fetch(server.url + endpoint, { method: "POST", headers, body: JSON.stringify(body) });
+  for (const bad of ["v2:" + "0".repeat(64), "0".repeat(64), "v2:invalid", undefined]) {
+    assert.notEqual((await post("/api/ide/access", { entryId: entry.id, scope: bad })).status, 200);
+    assert.notEqual((await post(`/api/ide/workspaces/${entry.id}/prepare`, { scope: bad })).status, 200);
+  }
+  assert.equal(transport.launches.length, 0);
+  const grant = await post("/api/ide/access", { entryId: entry.id, scope }); assert.equal(grant.status, 200, await grant.text());
+  const prepared = await post(`/api/ide/workspaces/${entry.id}/prepare`, { scope }); assert.equal(prepared.status, 200, await prepared.text());
+  assert.equal(transport.launches.length, 1); assert.deepEqual(transport.launches[0].rootPaths, ["/project", "/other"]);
+});
+
 test("workspace resolution requires actual managed project membership and host identity", t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cig-ide-resolve-")), paths = resolveStatePaths(root);
   saveAccount(paths, { accountId: "account", token: "test", baseUrl: "http://localhost" });
