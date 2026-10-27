@@ -56,7 +56,7 @@ test("keeps local markdown images as references without implicit sends or lost p
   const parsed = parseActionBlocks(text);
 
   assert.deepEqual(parsed.actions.send, []);
-  assert.equal(parsed.visibleText.includes("C:/Users/THU/Downloads"), true);
+  assert.equal(parsed.visibleText.includes("Downloads/generated_image_latest.png"), true);
   assert.equal(parsed.visibleText.includes("如果图片没有直接显示"), true);
   assert.equal(parsed.visibleText.startsWith("找到了这张，来自下载目录："), true);
   assert.equal(parsed.visibleText.includes("]("), false);
@@ -66,7 +66,7 @@ test("keeps local markdown files as references without implicit sends", () => {
   const parsed = parseActionBlocks("报告在这里：[report.pdf](C:\\Users\\THU\\Downloads\\report.pdf)");
 
   assert.deepEqual(parsed.actions.send, []);
-  assert.equal(parsed.visibleText, "报告在这里：report.pdf (`C:\\Users\\THU\\Downloads\\report.pdf`)");
+  assert.equal(parsed.visibleText, "报告在这里：Downloads/report.pdf");
 });
 
 test("parses explicit video send actions", () => {
@@ -88,7 +88,7 @@ test("keeps local markdown videos as references without implicit sends", () => {
   const parsed = parseActionBlocks("Random desktop video: [demo.mp4](C:/Users/THU/Desktop/demo.mp4)");
 
   assert.deepEqual(parsed.actions.send, []);
-  assert.equal(parsed.visibleText, "Random desktop video: demo.mp4 (`C:/Users/THU/Desktop/demo.mp4`)");
+  assert.equal(parsed.visibleText, "Random desktop video: Desktop/demo.mp4");
 });
 
 test("preserves both remote source citations and their entire explanatory lines", () => {
@@ -102,25 +102,25 @@ test("preserves both remote source citations and their entire explanatory lines"
   assert.deepEqual(parsed.actions.send, []);
   assert.equal(parsed.visibleText, [
     "这两个都是无状态辅助类，但职责不同。",
-    "1. RegularTablePropertyPolicy (`/home/admin/project/RegularTablePropertyPolicy.java:32`) 负责属性过滤。",
-    "2. SchemaPartSupport (`/home/admin/project/SchemaPartSupport.java:20`) 负责构造 AST。",
+    "1. RegularTablePropertyPolicy（project/RegularTablePropertyPolicy.java:32） 负责属性过滤。",
+    "2. SchemaPartSupport（project/SchemaPartSupport.java:20） 负责构造 AST。",
     "保留后续说明。"
   ].join("\n"));
 });
 
 test("renders local URI, angle-bracket, fragment and Windows references without sends", () => {
   for (const [link, target] of [
-    ["[source](file:///tmp/source.ts#L12)", "/tmp/source.ts#L12"],
-    ["[source](</tmp/My Project (copy)/source.ts:12:3>)", "/tmp/My Project (copy)/source.ts:12:3"],
-    ["[source](/tmp/My%20Project/source.ts#L12-L18)", "/tmp/My Project/source.ts#L12-L18"],
-    ["[source](C:\\work\\source.ts:12)", "C:\\work\\source.ts:12"],
-    ["[source](\\\\server\\share\\source.ts)", "\\\\server\\share\\source.ts"],
-    ["[source](/tmp/`source`.ts)", "/tmp/`source`.ts"]
+    ["[source](file:///tmp/source.ts#L12)", "tmp/source.ts:12"],
+    ["[source](</tmp/My Project (copy)/source.ts:12:3>)", "My Project (copy)/source.ts:12"],
+    ["[source](/tmp/My%20Project/source.ts#L12-L18)", "My Project/source.ts:12"],
+    ["[source](C:\\work\\source.ts:12)", "work/source.ts:12"],
+    ["[source](\\\\server\\share\\source.ts)", "share/source.ts"],
+    ["[source](/tmp/`source`.ts)", "tmp/`source`.ts"]
   ]) {
     const parsed = parseActionBlocks(link);
     assert.deepEqual(parsed.actions.send, []);
     assert.ok(parsed.visibleText.includes(target));
-    assert.ok(parsed.visibleText.startsWith("source ("));
+    assert.ok(parsed.visibleText.startsWith("source（"));
     assert.ok(!parsed.visibleText.includes("]("));
   }
 });

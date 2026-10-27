@@ -226,6 +226,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   private async runWithLease(input: CodexRunnerInput & Partial<Pick<CodexQueuedRunInput, "queuedSubmissionId" | "clientUserMessageId" | "onQueueStarting">>, resume?: CodexCapacityResumeInput): Promise<CodexRunResult> {
     await this.ensureConnected();
+    input.assertCurrent?.();
 
     if (input.threadId) {
       try {
@@ -242,13 +243,14 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
 
     const nativeProjectId = input.projectId || input.projectName
-      ? await this.resolveProjectId(input.cwd, input.projectId, input.projectName)
+      ? await this.resolveProjectId(input.cwd, input.projectId, input.projectName, input.assertCurrent)
       : undefined;
     let threadResponse: Record<string, unknown>;
     try {
       // A missing start receipt can leave this client's subscription alive.
       // Read our subscription instead of acquiring the same writer twice.
       const alreadySubscribed = Boolean(input.threadId && this.subscribedThreads.has(input.threadId));
+      input.assertCurrent?.();
       threadResponse = await this.request(
         alreadySubscribed ? "thread/read" : input.threadId ? "thread/resume" : "thread/start",
         compactObject({
@@ -279,23 +281,27 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!input.threadId && input.projectBinding === "none" && currentProjectId) {
       // Some servers may infer a project. The protocol uses an empty string (not
       // null) to clear metadata. Never reassign an existing bound thread here.
+      input.assertCurrent?.();
       await this.request("thread/metadata/update", { threadId, projectId: "" });
       if (thread) thread.projectId = null;
     }
     if (input.threadId && nativeProjectId && currentProjectId !== nativeProjectId) {
       try {
+        input.assertCurrent?.();
         await this.request("thread/metadata/update", { threadId, projectId: nativeProjectId });
       } catch (error) {
         if (!isMissingProjectError(error)) throw error;
         this.projectIdsByRoot.delete(path.normalize(input.cwd));
-        const refreshedProjectId = await this.resolveProjectId(input.cwd, undefined, input.projectName);
+        const refreshedProjectId = await this.resolveProjectId(input.cwd, undefined, input.projectName, input.assertCurrent);
         if (!refreshedProjectId || refreshedProjectId === currentProjectId) throw error;
+        input.assertCurrent?.();
         await this.request("thread/metadata/update", { threadId, projectId: refreshedProjectId });
       }
     }
     const currentName = typeof thread?.name === "string" ? thread.name : undefined;
     const threadTitle = cleanThreadTitle(input.threadTitle);
     if (threadTitle && (!input.threadId || shouldRepairBridgeThreadName(currentName))) {
+      input.assertCurrent?.();
       await this.request("thread/name/set", { threadId, name: threadTitle });
     }
     if (!input.threadId) {
@@ -359,6 +365,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         }
         await input.onQueueStarting?.();
         try {
+          input.assertCurrent?.();
           turnResponse = await this.queueRequest("thread/queue/start", { threadId, queuedSubmissionId: input.queuedSubmissionId }) as Record<string, unknown>;
         } catch (error) {
           if (error instanceof CodexBackendCapabilityError) throw error;
@@ -372,6 +379,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           if ((await this.listQueuedSubmissions(threadId)).data.length) throw new Error("Native queue takes precedence over capacity recovery");
           resume.assertCurrent();
         }
+        input.assertCurrent?.();
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       }
     } catch (error) {
@@ -389,6 +397,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       await input.onProgress?.("当前会话刚刚开始了另一条任务，已排队等待完成。");
       await this.waitForThreadIdle(input.threadId);
       try {
+        input.assertCurrent?.();
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       } catch (retryError) {
         this.approvalHandlersByThread.delete(threadId);
@@ -713,7 +722,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return undefined;
   }
 
-  private async resolveProjectId(cwd: string, projectId?: string, projectName?: string): Promise<string | undefined> {
+  private async resolveProjectId(cwd: string, projectId?: string, projectName?: string, assertCurrent?: () => void): Promise<string | undefined> {
     const root = path.normalize(cwd);
     const cached = this.projectIdsByRoot.get(root);
     if (cached) return cached;
@@ -740,6 +749,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!projectName) return undefined;
 
     const idempotencyKey = `codex-im-gateway:${crypto.createHash("sha256").update(root).digest("hex")}`;
+    assertCurrent?.();
     try {
       const response = await this.request("project/create", {
         name: projectName,
@@ -918,6 +928,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
 
     try {
+      input.assertCurrent?.();
       const response = await this.request("turn/steer", {
         threadId: input.threadId,
         input: [{ type: "text", text: prompt, text_elements: [] }],
@@ -1261,7 +1272,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const args = this.options.transport?.args
       ?? [...localCommand.argsPrefix, "app-server", "--stdio"];
     const child = spawn(command, [...args], {
-      ...(this.options.codexHome && (!this.options.transport || this.options.transport.mode === "stdio")
+      ...(this.options.codexHome && this.options.transport?.mode !== "remote-daemon"
         ? { env: { ...process.env, CODEX_HOME: this.options.codexHome } } : {}),
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,

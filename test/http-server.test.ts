@@ -1191,3 +1191,15 @@ for (const streaming of [false, true]) test(`Web ${streaming ? 'stream' : 'JSON'
   assert.equal(invalid.status, 400); assert.equal(ids.length, 1);
   assert.equal((await fetch(`${server.url}/api/build`)).status, 200);
 });
+
+test("confirmed login completion failures stay pollable through HTTP without another scan", async t => {
+  const { LoginCompletionPendingError } = await import("../src/server/login-manager.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-login-pending-http-")); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let calls = 0;
+  const server = await startLocalHttpServer({ paths: resolveStatePaths(root), port: 0, accountManager: {} as never,
+    loginManager: { async poll() { if (++calls === 1) throw new LoginCompletionPendingError(Error("test failure")); return { status: "confirmed", account: { accountId: "a" } }; } } as never });
+  t.after(() => server.close());
+  const pending = await fetch(`${server.url}/api/logins/synthetic`); assert.equal(pending.status, 200);
+  const body = await pending.json() as any; assert.equal(body.status, "scanned"); assert.equal(body.retryPending, true);
+  const complete = await fetch(`${server.url}/api/logins/synthetic`); assert.equal((await complete.json() as any).status, "confirmed");
+});

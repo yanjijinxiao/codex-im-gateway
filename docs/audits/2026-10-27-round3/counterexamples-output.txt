@@ -1,0 +1,25 @@
+✔ PROBE: the final submission guard does not run after the backend serialization wait (1.147125ms)
+✔ PROBE: late Web completion restores the thread cleared by an explicit reset (115.494375ms)
+✔ PROBE: cosmetic IDE name changes invalidate an existing browser grant (5.305542ms)
+✔ PROBE: cosmetic IDE root-order changes invalidate an existing browser grant (0.951833ms)
+✔ PROBE: origin pruning redirects a live older turn to a newer primary (15.311209ms)
+✔ PROBE: an older Web refresh overwrites the newer binding snapshot (1.354625ms)
+✔ PROBE: distinct case-sensitive attachment paths are silently deduplicated (0.119417ms)
+✔ PROBE: synchronous WeCom receipt failure is swallowed by SDK without a Gateway error receipt (0.285083ms)
+✔ PROBE: an interrupted Web response loses submission uncertainty after receiving progress (0.803875ms)
+✔ PROBE: custom Codex home selects its binary but daemon start inherits a different state directory (889.354458ms)
+✔ PROBE: a legitimate child directory beginning with two dots is rejected as a parent escape (0.059917ms)
+✔ PROBE: Desktop review directives survive shared parsing and both DingTalk presentation routes (6.099125ms)
+✔ PROBE: a failed login account refresh becomes permanently confirmed without an account result (0.880667ms)
+✔ PROBE: global stop skips a starting account and leaves its monitor alive (41.031875ms)
+[codex-im-gateway] result delivery {"timestamp":"2026-10-27T07:19:09.111Z","operation":"final-result-delivery","hostId":"local","threadId":"native","turnId":"recovery","status":"delivered"}
+✔ PROBE: configuration barrier closes the native runner during automatic capacity recovery (132.777959ms)
+✔ PROBE: invalid replacement Taskboard URL stops the old service before validation (1.021959ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 16
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1969.139667

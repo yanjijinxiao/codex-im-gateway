@@ -257,6 +257,15 @@ test("idle start-turn uses the same observer, and an invalid native receipt is n
   assert.equal(f.writes()[0].method, "thread-follower-start-turn");
 });
 
+test("Desktop start rechecks the source after owner observation and never writes a revoked input", async t => {
+  let allowed = true;
+  const f = await fixture(t, { stage: "snapshot", runtime: "idle", onDiagnostic(event) {
+    if (event.outcome === "recovered") allowed = false;
+  } });
+  await assert.rejects(f.runner.run({ ...input, assertCurrent() { if (!allowed) throw Error("source revoked"); } }), /source revoked/);
+  assert.equal(f.writes().length, 0);
+});
+
 test("BackendRouter never wraps an exhausted Desktop observation in another retry chain", async t => {
   const f = await fixture(t, { stage: "discovery", alwaysFail: true });
   const router = new CodexBackendRouter({ backend: "app-server", desktopRunner: f.runner,

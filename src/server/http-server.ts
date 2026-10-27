@@ -18,7 +18,7 @@ import { loadConfig, saveConfig, type CodexImGatewayConfig } from "../state/conf
 import type { StatePaths } from "../state/paths.js";
 import type { CodexModelOption, CodexRuntimeInfo } from "../codex/backend.js";
 import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, SessionUpload } from "./account-manager.js";
-import { LoginManager } from "./login-manager.js";
+import { LoginManager, LoginCompletionPendingError } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
 import type { CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
@@ -593,7 +593,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   }
   const loginMatch = matchPath(url.pathname, "/api/logins/:id");
   if (method === "GET" && loginMatch) {
-    sendJson(response, 200, await context.loginManager.poll(loginMatch.id));
+    try { sendJson(response, 200, await context.loginManager.poll(loginMatch.id)); }
+    catch (error) {
+      if (!(error instanceof LoginCompletionPendingError)) throw error;
+      sendJson(response, 200, { status: "scanned", retryPending: true, message: error.message });
+    }
     return;
   }
 
@@ -804,9 +808,17 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       model: optionalString(input.model),
       effort: optionalString(input.effort)
     };
-    const commit = async () => { await context.onTaskboardConfig?.(next); saveConfig(context.paths, next); };
+    const restore = async () => { await context.onTaskboardConfig?.(current); saveConfig(context.paths, current); };
+    const commit = async () => {
+      try { await context.onTaskboardConfig?.(next); saveConfig(context.paths, next); }
+      catch (error) {
+        try { await restore(); } catch (rollback) { throw new AggregateError([error, rollback], "配置保存及旧配置恢复失败"); }
+        throw error;
+      }
+      return restore;
+    };
     if (context.accountManager.reconfigureRuntime) await context.accountManager.reconfigureRuntime(commit);
-    else { await commit(); await context.accountManager.restartRunning(); } // Older embedded test/integration port.
+    else { const rollback = await commit(); try { await context.accountManager.restartRunning(); } catch (error) { await rollback(); throw error; } }
     sendJson(response, 200, {
       config: loadConfig(context.paths),
       codexRuntime: await readCodexRuntime(context),

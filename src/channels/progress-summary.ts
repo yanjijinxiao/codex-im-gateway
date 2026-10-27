@@ -1,3 +1,4 @@
+import { presentAssistantText } from "./assistant-presentation.js";
 /** Present tool state, never shell source/arguments, in cards and native text progress. */
 export function progressKind(text: string): "thought" | "activity" | "failure" | "update" {
   if (/^🤔/u.test(text.trim())) return "thought";
@@ -15,7 +16,7 @@ export function meaningfulProgress(entries: readonly string[]): string[] {
 }
 
 export function summarizeProgress(text: string, maxLength = 600): string {
-  const content = text.trim();
+  const content = presentAssistantText(text).trim();
   const command = content.match(/^([🔎✅❌])\s*(正在执行命令|命令完成|命令失败)\s*[:：]([\s\S]*)$/u);
   if (command) {
     const [, icon, state, source] = command;

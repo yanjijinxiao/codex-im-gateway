@@ -12,6 +12,7 @@ import { copyField, COPY_SCRIPT, COPY_STYLE } from "./copy-controls.js";
 import type { IDEApprovalCopyPort } from "./approval-service.js";
 import type { IDEAccessAuthority, IDEAccessSubject } from "./access-subject.js";
 import { IDE_APPROVAL_CHOICES, ideConfirmationCommand } from "./approval-presentation.js";
+import { workspaceAuthorizationScope, legacyWorkspaceScope } from "./workspace-scope.js";
 
 type BrowserSession = IDEBrowserSession;
 export type IDEAccessContext = Pick<WorkspaceIDEManager, "configStore" | "config" | "resolve" | "refresh" | "authorizationFile" | "canonicalForTrust" | "open" | "endpoint" | "resume" | "close" | "onStop" | "accessAvailable">;
@@ -39,7 +40,8 @@ export class IDEAccessServer {
   constructor(private readonly manager: IDEAccessContext, private readonly options: { verificationIntervalMs?: number } = {}) {
     this.tls = new IDETLSManager(path.join(path.dirname(manager.configStore.filePath), "tls"));
     try { this.authorization = new IDEAuthorization(Date.now, manager.authorizationFile(), new URL(manager.config().publicOrigin).origin,
-      subject => this.accessAuthority?.isSubjectAllowed(subject) === true); }
+      subject => this.accessAuthority?.isSubjectAllowed(subject) === true,
+      id => { const target = manager.resolve(id); return { current: workspaceAuthorizationScope(target), legacy: legacyWorkspaceScope(target) }; }); }
     catch { this.authorization = new IDEAuthorization(); this.authorizationError = "IDE 授权记录无法读取；访问已拒绝，原文件未改动。"; }
     manager.accessAvailable = false;
     manager.onStop = id => { for (const [socket, entry] of this.connections) if (entry.instanceId === id) socket.destroy(); };
@@ -142,7 +144,7 @@ export class IDEAccessServer {
   rejectAccess(requestId: string, entryId: string): void {
     this.assertEntry(entryId); this.authorization.reject(requestId, entryId, this.scope(entryId));
   }
-  private scope(entryId: string): string { return crypto.createHash("sha256").update(JSON.stringify(this.manager.resolve(entryId))).digest("hex"); }
+  private scope(entryId: string): string { return workspaceAuthorizationScope(this.manager.resolve(entryId)); }
   private assertEntry(entryId: string): void {
     if (this.authorizationError) throw new Error(this.authorizationError);
     if (!this.running()) throw new Error("Web IDE 尚未启用");
@@ -382,7 +384,7 @@ export class IDEAccessServer {
         if (!this.authorization.active(session)) { disconnect("authorization-inactive"); return; }
         await this.refreshWorkspace(session.entryId);
         if (this.connections.get(socket) !== entry || socket.destroyed) return;
-        if (!this.authorization.active(session) || session.scope !== this.scope(session.entryId)) { disconnect("authorization-or-scope-changed"); return; }
+        if (!this.authorization.active(session) || (session.securityScope ?? session.scope) !== this.scope(session.entryId)) { disconnect("authorization-or-scope-changed"); return; }
         entry.timer = setTimeout(verify, interval()); entry.timer.unref();
       } catch { disconnect("membership-unavailable"); }
     };

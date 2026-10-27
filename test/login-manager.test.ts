@@ -117,3 +117,15 @@ test("restores a retained account and its sessions after QR login", async (t) =>
   assert.equal(result.account?.displayName, "张三");
   assert.equal(new RuntimeStateStore(accountStatePaths(paths, "old-bot")).listSessions()[0]?.title, "扫码前会话");
 });
+
+test("concurrent polls share native confirmation and finish a saved login once", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-login-race-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const gate = Promise.withResolvers<void>(); let polls = 0, refreshes = 0;
+  const manager = new LoginManager({ paths: resolveStatePaths(root), accountManager: { async refreshAccount() { refreshes++; await gate.promise; } } as never,
+    qrDataUrlFactory: async () => "synthetic", sessionFactory: async () => ({ qrContent: "synthetic", expiresAt: new Date(Date.now() + 60000).toISOString(),
+      async poll() { polls++; return { status: "confirmed", account: { accountId: "a", userId: "actor", token: "synthetic", baseUrl: "https://example.invalid", enabled: true } }; } }) as never });
+  const login = await manager.start(), first = manager.poll(login.id), second = manager.poll(login.id);
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(polls, 1); assert.equal(refreshes, 1);
+  gate.resolve(); assert.deepEqual(await first, await second); assert.equal((await manager.poll(login.id)).status, "confirmed"); assert.equal(refreshes, 1);
+});

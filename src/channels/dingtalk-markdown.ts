@@ -1,5 +1,6 @@
 import { Lexer, type Token, type Tokens } from "marked";
 import { closeMarkdownFence } from "./result-pages.js";
+import { presentAssistantText } from "./assistant-presentation.js";
 
 /** The client's native cursor must end in a normal paragraph, never inside a
  * code/list/table block. Display-only: the stored task/command is unchanged. */
@@ -32,6 +33,7 @@ export function dingTalkProgressContent(source: string): string {
 /** Plain webhook transport has no Markdown renderer. Remove only code-block
  * wrappers, never rewrite the literal reply/command inside them. */
 export function dingTalkPlainText(source: string): string {
+  source = presentAssistantText(source);
   let result = "", cursor = 0;
   for (const token of Lexer.lex(source, { gfm: true })) {
     const offset = source.indexOf(token.raw, cursor);
@@ -52,7 +54,7 @@ export function dingTalkPlainText(source: string): string {
  * may be rewritten into HTML. Preserve containing lists/quotes as a block too,
  * so their indentation and code-fence scope remain intact. */
 export function normalizeDingTalkCardContent(text: string): string {
-  const source = dingTalkVisibleOrdinals(text.replace(/\r\n?/g, "\n"));
+  const source = dingTalkVisibleOrdinals(presentAssistantText(text).replace(/\r\n?/g, "\n"));
   let result = "", cursor = 0, plainStart = 0;
   for (const token of Lexer.lex(source, { gfm: true })) {
     const offset = source.indexOf(token.raw, cursor);

@@ -44,3 +44,26 @@ test("a duplicate send in the same session stays blocked while the original requ
   const f = fixture(); const first = f.send(); f.elements.chatInput.value = "double click"; await f.send();
   assert.equal(f.releases.length, 1); f.releases[0](); await first;
 });
+
+test("uncertain Web sends keep the receipt identity and never refill the original input; only explicit not-submitted can refill", async () => {
+  for (const phase of [undefined, "unconfirmed", "accepted", "not-submitted"]) {
+    const f = fixture();
+    vm.runInContext(`api = async () => { throw Object.assign(new Error('lost response'), { submission: ${JSON.stringify(phase) ?? 'undefined'} }); };`, f.context);
+    await f.send();
+    const receipt = vm.runInContext("state.submissionReceipts.get(state.selectedSessionKey)", f.context);
+    assert.match(receipt.requestId, /^[a-f0-9]{32}$/);
+    assert.equal(receipt.phase, phase ?? "unconfirmed");
+    assert.equal(f.elements.chatInput.value, phase === "not-submitted" ? "new message" : "");
+  }
+});
+
+test("same-session history reads discard an older response, including an older error", async () => {
+  const f = fixture(), releases: Array<{ resolve: (value: unknown) => void; reject: (reason: unknown) => void }> = [];
+  Object.assign(f.context, { api: () => new Promise((resolve, reject) => releases.push({ resolve, reject })) });
+  const start = source.indexOf("let messageLoadGeneration =");
+  vm.runInContext(source.slice(start, source.indexOf("\nfunction renderChatPanel(", start)), f.context);
+  const first = vm.runInContext("loadSelectedSessionMessages()", f.context), second = vm.runInContext("loadSelectedSessionMessages()", f.context);
+  releases[1].resolve({ messages: [{ id: "new", text: "current" }] }); await second;
+  releases[0].reject(Error("stale read failed")); await first;
+  assert.equal((f.state.sessionMessages[0] as any).id, "new"); assert.equal(f.state.loadingMessages, false);
+});

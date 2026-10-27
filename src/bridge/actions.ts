@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { KNOWLEDGE_KINDS, type KnowledgeInput } from "../state/knowledge.js";
+import { presentAssistantText, compactSourceLocation, projectAssistantProse } from "../channels/assistant-presentation.js";
 
 export type SendAction = {
   type: "image" | "file" | "video";
@@ -76,7 +77,7 @@ function normalizeLocalMarkdownTarget(raw: string): string | undefined {
 }
 
 function appendSendAction(actions: BridgeActions, seen: Set<string>, action: SendAction): void {
-  const key = action.path.toLowerCase();
+  const key = action.path;
   if (seen.has(key)) {
     return;
   }
@@ -88,15 +89,12 @@ function renderLocalMarkdownReferences(text: string): string {
   // A source citation (including :line or #Lline) is not an attachment request.
   // Only explicit action blocks may enqueue sends. Keep the label, location and
   // surrounding prose instead of removing the whole line containing the link.
-  return text.replace(MARKDOWN_LINK_RE, (link, _image: string | undefined, label: string, raw: string) => {
+  return projectAssistantProse(text, prose => prose.replace(MARKDOWN_LINK_RE, (link, _image: string | undefined, label: string, raw: string) => {
     const target = normalizeLocalMarkdownTarget(raw);
     if (!target) return link;
-    const longestBackticks = Math.max(0, ...(target.match(/`+/g) ?? []).map((run) => run.length));
-    const delimiter = "`".repeat(longestBackticks + 1);
-    const padding = target.endsWith("`") ? " " : "";
-    const location = `${delimiter}${padding}${target}${padding}${delimiter}`;
-    return label.trim() ? `${label} (${location})` : location;
-  });
+    const location = compactSourceLocation(target);
+    return label.trim() && !location.endsWith(label.trim()) ? `${label}（${location}）` : location;
+  }));
 }
 
 function normalizeControlAction(raw: unknown): ControlAction {
@@ -161,7 +159,7 @@ export function parseActionBlocks(text: string): ParsedActionBlocks {
     };
 
     if (Array.isArray(parsed.send)) {
-      const seen = new Set(actions.send.map((action) => action.path.toLowerCase()));
+      const seen = new Set(actions.send.map((action) => action.path));
       for (const action of parsed.send.map(normalizeSendAction)) {
         appendSendAction(actions, seen, action);
       }
@@ -179,5 +177,5 @@ export function parseActionBlocks(text: string): ParsedActionBlocks {
     return "";
   }).trim();
 
-  return { visibleText: renderLocalMarkdownReferences(visibleTextWithoutBlocks), actions };
+  return { visibleText: renderLocalMarkdownReferences(presentAssistantText(visibleTextWithoutBlocks)), actions };
 }

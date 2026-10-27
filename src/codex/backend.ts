@@ -122,6 +122,7 @@ export type CodexSteerInput = {
   /** Used by the Codex Desktop relay to reconstruct the visible user message. */
   cwd?: string;
   clientUserMessageId?: string;
+  assertCurrent?: () => void;
 };
 
 export type CodexQueuedSubmission = {
@@ -298,6 +299,8 @@ export type CodexUserInputResultHandler = (request: CodexUserInputRequest, resul
 
 export type CodexRunnerInput = {
   prompt: string;
+  /** Carry the source lease through every await to the final native write. */
+  assertCurrent?: () => void;
   /** Stable source identity, never permission to replay an uncertain submission. */
   clientUserMessageId?: string;
   developerInstructions?: string;

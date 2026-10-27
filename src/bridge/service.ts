@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
+import { sessionExecutionScope } from "./session-execution.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import { TurnAudienceJournal, type TurnParticipantOrigin } from "./turn-audience.js";
@@ -1447,6 +1448,13 @@ export class BridgeService {
       return;
     }
     const hostId = this.sessionHostId(session);
+    const binding = sessionExecutionScope(this.options.stateStore, session, message.senderId);
+    const actorId = this.actor.getStore() ?? message.senderId;
+    const assertCurrent = () => {
+      this.options.assertRuntimeWritable?.();
+      if (this.audienceSuspended || !binding.current() || !this.access.requireAccess(actorId, message.senderId).allowed
+        || !roleAllows(this.role(message.senderId, actorId), "participant")) throw new CodexInterventionError("会话或准入已改变，介入消息未提交。");
+    };
     if (this.runner.backendInfo?.(hostId).capabilities.turnSteering === false) {
       await this.reply(message.senderId, "当前后端不支持介入正在执行的轮次，消息未提交。原生队列也需要后端支持；可在 Codex 中操作。");
       return;
@@ -1490,7 +1498,8 @@ export class BridgeService {
       expectedTurnId: state.activeTurnId,
       prompt,
       cwd: session.workspace,
-      clientUserMessageId: message.id
+      clientUserMessageId: message.id,
+      assertCurrent
     }, hostId), hostId ?? "local", this.participantOrigin(session)));
     this.options.stateStore.setSessionPromptPreview(session.id, prompt);
     await this.reply(message.senderId, [
@@ -1687,10 +1696,11 @@ export class BridgeService {
   private async submitActiveThreadMessage(message: ChannelMessage, session: ManagedSession, prompt: string, expectedTurnId?: string): Promise<void> {
     const hostId = this.sessionHostId(session);
     const actorId = this.actor.getStore() ?? message.senderId;
+    const binding = sessionExecutionScope(this.options.stateStore, session, message.senderId);
     const assertCurrent = () => {
       this.options.assertRuntimeWritable?.();
       const current = this.executionSession(message.senderId);
-      if (current?.id !== session.id || current.threadId !== session.threadId
+      if (!binding.current() || current?.id !== session.id || current.threadId !== session.threadId
         || current.projectId !== session.projectId || current.projectBinding !== session.projectBinding || current.workspace !== session.workspace
         || (this.sessionHostId(current) ?? "local") !== (hostId ?? "local")) {
         throw new CodexInterventionError("绑定已切换，未向旧会话提交消息，请重新发送。");
@@ -1814,15 +1824,17 @@ export class BridgeService {
   /** Called by the shared account lifecycle, not by an IM-specific scheduler. */
   async recoverNativeQueue(): Promise<void> {
     if (this.recoveringQueue) return;
+    this.options.assertRuntimeWritable?.();
     this.recoveringQueue = true;
     const accountId = this.options.accountId ?? "standalone";
     try {
-      await this.nativeQueue.reconcile(accountId, this.runner);
-    } catch {
-      // An unavailable host/thread must not starve other reconciled receipts.
-      this.warnNativeQueueRecovery();
-    } finally { this.recoveringQueue = false; }
-    await this.nativeQueue.dispatch(accountId, this.runner, async (receipt, starting, started, item) => {
+      try {
+        await this.nativeQueue.reconcile(accountId, this.runner);
+      } catch {
+        // An unavailable host/thread must not starve other reconciled receipts.
+        this.warnNativeQueueRecovery();
+      }
+      await this.nativeQueue.dispatch(accountId, this.runner, async (receipt, starting, started, item) => {
         if (!this.access.requireAccess(receipt.actorId, receipt.conversationId).allowed) {
           throw new Error("Queued origin access was revoked; native item preserved");
         }
@@ -1839,6 +1851,7 @@ export class BridgeService {
           id: receipt.messageId, senderId: receipt.conversationId, text: "", attachments: [], raw: {}
         }, item?.input.map(x => x.type === "text" ? x.text ?? "" : "").join("\n") ?? "", [], { receipt, starting, started }));
       });
+    } finally { this.recoveringQueue = false; }
   }
 
   private warnNativeQueueRecovery(): void {
@@ -2283,18 +2296,12 @@ export class BridgeService {
       catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
-    const preparedHostId = this.sessionHostId(session) ?? "local";
     const preparedActorId = origin?.actorId ?? this.actor.getStore() ?? message.senderId;
-    const identityCurrent = () => {
-      const current = this.options.stateStore.getSession(session.id);
-      return current && current.threadId === session.threadId && current.projectId === session.projectId
-        && current.projectBinding === session.projectBinding && current.workspace === session.workspace
-        && (this.sessionHostId(current) ?? "local") === preparedHostId;
-    };
+    const binding = sessionExecutionScope(this.options.stateStore, session, message.senderId);
+    const identityCurrent = binding.current;
     const stillBound = () => !this.audienceSuspended && this.executionSession(message.senderId)?.id === session.id && Boolean(identityCurrent());
     const saveNativeThread = (threadId: string) => {
-      if (!identityCurrent()) return false;
-      this.options.stateStore.setSessionThread(session.id, threadId); session.threadId = threadId; return true;
+      return binding.acceptThread(threadId);
     };
     const assertInputCurrent = () => {
       this.options.assertRuntimeWritable?.();
@@ -2403,7 +2410,7 @@ export class BridgeService {
         if (this.audienceSuspended) throw new CodexInterventionError("渠道已停止，消息未提交。");
         backendEntered = true;
         const result = queued
-          ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,
+          ? await this.runner.runQueuedSubmission!({ ...runInput, assertCurrent: assertInputCurrent, threadId: queued.receipt.threadId,
             queuedSubmissionId: queued.receipt.queuedSubmissionId, onQueueStarting: queued.starting,
             clientUserMessageId: queued.receipt.clientUserMessageId, acceptedTurnId: queued.receipt.turnId,
             observeOnly: queued.receipt.status === "completed",

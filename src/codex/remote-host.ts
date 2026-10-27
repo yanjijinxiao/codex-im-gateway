@@ -125,6 +125,7 @@ let upgraded = false;
 let fragmentOpcode = null;
 let fragments = [];
 const queued = [];
+let inputEnded = false;
 
 function fail(error) {
   const detail = error && error.message ? error.message : String(error);
@@ -249,12 +250,18 @@ socket.on("data", (chunk) => {
 });
 socket.on("error", fail);
 socket.on("close", () => {
-  if (!process.exitCode) process.exitCode = 0;
+  // A remote Desktop restart closes its control socket while Gateway still
+  // holds SSH stdin open. Do not leave readline alive masquerading as a usable
+  // transport; the caller must observe disconnect and open a fresh reader.
+  if (!inputEnded && !process.exitCode) process.exitCode = 1;
+  lines.close();
+  process.stdin.destroy();
 });
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", send);
 lines.on("close", () => {
+  inputEnded = true;
   if (socket && !socket.destroyed) socket.end(frame(0x8, Buffer.alloc(0)));
 });
 `;

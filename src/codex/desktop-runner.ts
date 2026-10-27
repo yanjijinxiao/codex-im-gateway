@@ -278,6 +278,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
             threadId: input.threadId,
             request,
             resume,
+            assertCurrent: input.assertCurrent,
             onSnapshot: (snapshot) => {
               previousTurnIds = new Set(snapshot.turns.map((turn) => turn.id));
             }
@@ -502,6 +503,7 @@ type FollowerRequest = {
   request: Record<string, unknown>;
   onSnapshot?: (snapshot: CodexThreadSnapshot) => void;
   resume?: CodexCapacityResumeInput;
+  assertCurrent?: () => void;
 };
 
 class ObservationStages {
@@ -568,6 +570,7 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
       assertCapacityResume(snapshot, input.resume.failedTurnId);
       input.resume.assertCurrent();
     }
+    input.assertCurrent?.();
     phase = "submission";
     return await connection.request("thread-follower-start-turn", 2, {
       conversationId: input.threadId,

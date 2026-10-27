@@ -118,6 +118,6 @@ export function isWorkspaceAllowed(workspace: string, allowedWorkspaces: string[
   return allowedWorkspaces.some((allowed) => {
     const root = path.resolve(allowed);
     const relative = path.relative(root, resolved);
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
   });
 }

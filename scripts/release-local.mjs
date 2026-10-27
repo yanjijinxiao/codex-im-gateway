@@ -9,6 +9,13 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+/** Existing credentials/deadlines/legacy scope must remain byte-for-byte
+ * equivalent. Only the additive, validated stable-scope migration is ignored. */
+export function grantFingerprint(row) {
+  const { securityScope, ...session } = row.session;
+  if (securityScope !== undefined && !/^v2:[a-f0-9]{64}$/.test(securityScope)) throw Error('Invalid IDE scope migration');
+  return hash(JSON.stringify({ ...row, session }));
+}
 export function treeHash(root) {
   const rows = [];
   function walk(dir, prefix = '') {
@@ -59,7 +66,7 @@ export async function main(argv) {
   const grants = () => {
     const root = path.join(state, 'ide'); if (!fs.existsSync(root)) return {};
     return Object.fromEntries(fs.readdirSync(root).filter(name => /^authorization(?:-.*)?\.json$/.test(name)).sort().map(name => [name,
-      JSON.parse(fs.readFileSync(path.join(root, name))).sessions.filter(row => row.session.expiresAt > Date.now()).map(row => ({ fingerprint: hash(JSON.stringify(row)), expiresAt: row.session.expiresAt }))]));
+      JSON.parse(fs.readFileSync(path.join(root, name))).sessions.filter(row => row.session.expiresAt > Date.now()).map(row => ({ fingerprint: grantFingerprint(row), expiresAt: row.session.expiresAt }))]));
   };
   const permissions = () => Object.fromEntries(fs.readdirSync(path.join(state, 'runtime'), { withFileTypes: true }).filter(item => item.isDirectory()
     && fs.existsSync(path.join(state, 'runtime', item.name, 'state.json'))).sort((a, b) => a.name.localeCompare(b.name)).map(item => {

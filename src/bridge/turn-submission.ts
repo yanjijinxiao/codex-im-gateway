@@ -50,12 +50,13 @@ export class TurnSubmission {
   private readonly receipts: ReturnType<InboundReceiptJournal["capture"]>;
   constructor(receipts?: InboundReceiptJournal, private readonly sessionId?: string) { this.receipts = receipts?.capture(); }
   async run(runner: Pick<CodexBridgeBackend, "run">, input: CodexRunnerInput, assertCurrent?: () => void): Promise<CodexRunResult> {
-    assertCurrent?.();
+    const current = () => { input.assertCurrent?.(); assertCurrent?.(); };
+    current();
     this.threadId = input.threadId;
     this.receipts?.submitting({ sessionId: this.sessionId, hostId: input.hostId ?? "local", threadId: input.threadId });
     this.entered = true;
     try {
-      const result = await runner.run({ ...input, clientUserMessageId: this.receipts?.currentId() ?? input.clientUserMessageId,
+      const result = await runner.run({ ...input, assertCurrent: current, clientUserMessageId: this.receipts?.currentId() ?? input.clientUserMessageId,
         onThreadCreated: async id => { this.threadId = id; await input.onThreadCreated?.(id); },
         onTurnStarted: async turn => {
           this.threadId = turn.threadId; this.turnId = turn.turnId;

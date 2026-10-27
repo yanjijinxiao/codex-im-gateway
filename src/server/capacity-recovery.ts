@@ -68,6 +68,10 @@ export class CapacityRecoveryCoordinator {
     this.save();
   }
   private save(): void { writeJsonFile(this.options.filePath, { records: this.records }, { durable: true }); }
+  hasInFlightWork(): boolean {
+    return Boolean(this.executing.size || this.checking.size || this.settling.size
+      || Object.values(this.records).some(record => !["finished", "cancelled"].includes(record.status)));
+  }
   private announce(scope: CapacityFailure, text: string): void {
     void this.options.notice(scope, text).catch(() => console.warn("[codex-im-gateway] capacity recovery notice unavailable"));
   }

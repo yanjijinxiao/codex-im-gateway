@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { parseActionBlocks } from "../bridge/actions.js";
+import { sessionExecutionScope } from "../bridge/session-execution.js";
 import type {
   ChannelCapabilityNavigation,
   ChannelCapabilityProvider
@@ -14,7 +15,7 @@ import { buildPromptPreview, parsePrompt } from "../bridge/format.js";
 import type { PromptBufferItem } from "../bridge/prompt-buffer.js";
 import { BridgeService } from "../bridge/service.js";
 import type { ApprovalDeliveryResult } from "../bridge/approval.js";
-import { SessionControlJournal } from "../bridge/session-control.js";
+import { SessionControlJournal, SessionControlQueue } from "../bridge/session-control.js";
 import { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
 import { InboundReceiptJournal } from "../bridge/inbound-receipts.js";
@@ -287,6 +288,8 @@ export type AccountManagerOptions = {
 };
 
 export class AccountManager {
+  private readonly accountOperations = new SessionControlQueue();
+  private stoppingAll = false;
   readonly ide: WorkspaceIDEManager;
   readonly ideApprovals: IDEApprovalService;
   private readonly userInputRoutes = new WeakMap<CodexDesktopUserInput, { service: BridgeService; recipientId: string }>();
@@ -376,7 +379,7 @@ export class AccountManager {
     this.capacityRecovery = new CapacityRecoveryCoordinator({
       filePath: path.join(options.paths.runtimeDir, "capacity-recovery.json"),
       backend: () => this.runnerFor(this.configProvider()),
-      eligible: scope => [...this.entries.values()].some(entry => entry.status === "running" && entry.store?.listSessions().some(session =>
+      eligible: scope => !this.runtimeConfigurationChanging && !this.stoppingAll && [...this.entries.values()].some(entry => entry.status === "running" && entry.store?.listSessions().some(session =>
         session.threadId === scope.threadId && session.follow !== false
         && (session.hostId ?? entry.store?.getProject(session.projectId ?? "")?.hostId ?? "local") === scope.hostId
         && entry.store?.getBoundSession(session.senderId)?.id === session.id)),
@@ -462,65 +465,79 @@ export class AccountManager {
   }
 
   async stopAll(): Promise<void> {
-    this.bindingExpiry.stop();
-    this.capacityRecovery.stop();
-    this.codexDesktopRequestMonitor?.stop();
-    this.codexDesktopRequestMonitor = undefined;
-    await this.codexSessionMonitor?.stop();
-    this.codexSessionMonitor = undefined;
-    this.externalCodexTasks.clear();
-    this.unresolvedInteractions.clear();
-    this.managedTurnCompletions.clear();
-    await this.threadEvents.stop();
-    this.taskboardController?.abort();
-    await this.taskboardTask;
-    this.taskboardController = undefined;
-    this.taskboardTask = undefined;
-    this.taskboard = undefined;
-    this.recentTaskboardNotifications.clear();
-    await Promise.all(listAccounts(this.options.paths)
-      .filter((account) => this.entries.get(account.accountId)?.status === "running")
-      .map((account) => this.stopAccount(account.accountId, false)));
-    await this.closeRunner();
-    this.llmWiki.close();
+    this.stoppingAll = true;
+    try {
+      this.bindingExpiry.stop();
+      this.capacityRecovery.stop();
+      this.codexDesktopRequestMonitor?.stop();
+      this.codexDesktopRequestMonitor = undefined;
+      await this.codexSessionMonitor?.stop();
+      this.codexSessionMonitor = undefined;
+      this.externalCodexTasks.clear();
+      this.unresolvedInteractions.clear();
+      this.managedTurnCompletions.clear();
+      await this.threadEvents.stop();
+      this.taskboardController?.abort();
+      await this.taskboardTask;
+      this.taskboardController = undefined;
+      this.taskboardTask = undefined;
+      this.taskboard = undefined;
+      this.recentTaskboardNotifications.clear();
+      await Promise.all([...this.entries.keys()].map(id => this.accountOperations.run(id, () => this.stopRuntime(id))));
+      await this.closeRunner();
+      this.llmWiki.close();
+    } finally { this.stoppingAll = false; }
   }
 
   private assertRuntimeWritable(): void {
-    if (this.runtimeConfigurationChanging) throw new RuntimeConfigurationBusyError();
+    if (this.runtimeConfigurationChanging || this.stoppingAll) throw new RuntimeConfigurationBusyError();
   }
 
-  async reconfigureRuntime(update: () => Promise<void>): Promise<void> {
-    if (this.runtimeConfigurationChanging || this.respondingSessions.size
+  async reconfigureRuntime(update: () => Promise<void | (() => Promise<void>)>): Promise<void> {
+    if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.capacityRecovery.hasInFlightWork()
       || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
     this.runtimeConfigurationChanging = true;
-    try { await update(); await this.restartIdleRuntimes(); }
+    const accounts = [...this.entries].filter(([, entry]) => entry.controller && !entry.controller.signal.aborted).map(([id]) => id);
+    let rollback: void | (() => Promise<void>) = undefined;
+    try { rollback = await update(); await this.restartIdleRuntimes(accounts); }
+    catch (error) {
+      if (rollback) {
+        try { await rollback(); await this.restartIdleRuntimes(accounts); }
+        catch (restore) { throw new AggregateError([error, restore], "配置切换失败，旧运行态恢复也未完成，请检查服务状态。"); }
+      }
+      throw error;
+    }
     finally { this.runtimeConfigurationChanging = false; }
   }
 
   async restartRunning(): Promise<void> { return this.reconfigureRuntime(async () => {}); }
 
-  private async restartIdleRuntimes(): Promise<void> {
-    const running = listAccounts(this.options.paths)
-      .filter((account) => this.entries.get(account.accountId)?.status === "running")
+  private async restartIdleRuntimes(accounts?: string[]): Promise<void> {
+    const running = accounts ?? listAccounts(this.options.paths)
+      .filter((account) => { const entry = this.entries.get(account.accountId); return entry?.controller && !entry.controller.signal.aborted; })
       .map((account) => account.accountId);
-    await Promise.all(running.map((accountId) => this.stopAccount(accountId, false)));
+    await Promise.all(running.map(id => this.accountOperations.run(id, () => this.stopAccountOwned(id, false))));
     this.taskboardController?.abort();
     await this.taskboardTask;
     this.taskboardController = undefined;
     this.taskboardTask = undefined;
     this.taskboard = undefined;
     await this.closeRunner();
-    await Promise.all(running.map((accountId) => this.startAccount(accountId, false)));
+    await Promise.all(running.map(id => this.accountOperations.run(id, () => this.startAccountOwned(id, false))));
     this.startTaskboardMonitor();
   }
 
   async refreshAccount(accountId: string): Promise<AccountSummary> {
-    const account = loadAccount(this.options.paths, accountId);
-    const existing = this.entries.get(account.accountId);
-    if (existing?.status === "running" || existing?.status === "starting") {
-      await this.stopAccount(account.accountId, false);
-    }
-    return this.startAccount(account.accountId, false);
+    accountId = loadAccount(this.options.paths, accountId).accountId;
+    return this.accountOperations.run(accountId, async () => {
+      this.assertRuntimeWritable();
+      const account = loadAccount(this.options.paths, accountId);
+      const existing = this.entries.get(account.accountId);
+      if (existing?.status === "running" || existing?.status === "starting") {
+        await this.stopAccountOwned(account.accountId, false);
+      }
+      return this.startAccountOwned(account.accountId, false);
+    });
   }
 
   repairQueuedTerminal(accountId: string, sessionId: string, turnId: string): Promise<boolean> {
@@ -529,6 +546,12 @@ export class AccountManager {
   }
 
   async startAccount(accountId: string, persist = true): Promise<AccountSummary> {
+    accountId = loadAccount(this.options.paths, accountId).accountId;
+    return this.accountOperations.run(accountId, () => {
+      this.assertRuntimeWritable(); return this.startAccountOwned(accountId, persist);
+    });
+  }
+  private async startAccountOwned(accountId: string, persist: boolean): Promise<AccountSummary> {
     const account = persist ? setAccountEnabled(this.options.paths, accountId, true) : loadAccount(this.options.paths, accountId);
     const existing = this.entries.get(account.accountId);
     if (existing?.status === "running" || existing?.status === "starting") {
@@ -643,6 +666,7 @@ export class AccountManager {
     this.refreshDesktopRequestSubscriptions();
 
     const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
+      if (controller.signal.aborted || this.entries.get(account.accountId) !== entry) throw new Error("渠道连接已更换，消息未提交。");
       const authorizedConversation = message.source === "native-menu"
         ? store.getAuthorizedConversation(message.senderId)
         : undefined;
@@ -680,15 +704,16 @@ export class AccountManager {
     const task = adapter.monitor({
       signal: controller.signal,
       checkpoint: store.getSyncKey(),
-      onCheckpoint: (checkpoint) => store.setSyncKey(checkpoint),
+      onCheckpoint: (checkpoint) => { if (!controller.signal.aborted && this.entries.get(account.accountId) === entry) store.setSyncKey(checkpoint); },
       onStatus: (connection) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || this.entries.get(account.accountId) !== entry) return;
         entry.connection = connection;
         entry.status = connection.state === "connected" ? "running"
           : connection.state === "stopped" ? "stopped" : connection.state === "error" ? "error" : "starting";
         entry.error = connection.state === "error" ? connection.detail : undefined;
       },
       claimMessage: (message) => {
+        if (controller.signal.aborted || this.entries.get(account.accountId) !== entry) return false;
         const conversation = message.source === "native-menu" ? store.getAuthorizedConversation(message.senderId) : undefined;
         if (!this.receiptsFor(account.accountId).claim(conversation ? { ...message, replyTargetId: conversation } : message)) return false;
         // Compatibility tombstone for code rollback. The new journal, rather
@@ -715,8 +740,18 @@ export class AccountManager {
   }
 
   async stopAccount(accountId: string, persist = true): Promise<AccountSummary> {
+    accountId = loadAccount(this.options.paths, accountId).accountId;
+    return this.accountOperations.run(accountId, () => {
+      this.assertRuntimeWritable(); return this.stopAccountOwned(accountId, persist);
+    });
+  }
+  private async stopAccountOwned(accountId: string, persist: boolean): Promise<AccountSummary> {
     const account = persist ? setAccountEnabled(this.options.paths, accountId, false) : loadAccount(this.options.paths, accountId);
-    const entry = this.entries.get(account.accountId);
+    await this.stopRuntime(account.accountId);
+    return this.summary(account);
+  }
+  private async stopRuntime(accountId: string): Promise<void> {
+    const entry = this.entries.get(accountId);
     if (entry) {
       entry.service?.suspendUserInputs?.();
       entry.controller?.abort();
@@ -724,33 +759,36 @@ export class AccountManager {
       entry.status = "stopped";
       entry.connection = { state: "stopped" };
     }
-    this.refreshDesktopRequestSubscriptions();
-    return this.summary(account);
+    if (!this.stoppingAll) this.refreshDesktopRequestSubscriptions();
   }
 
   async removeAccount(accountId: string, options: { retainHistory?: boolean } = {}): Promise<void> {
-    const account = loadAccount(this.options.paths, accountId);
-    const retainHistory = options.retainHistory === true && accountChannel(account) === "weixin";
-    await this.stopAccount(accountId, false);
-    if (retainHistory) {
-      retainAccountHistory(this.options.paths, account as WeixinAccount);
-    } else if (accountChannel(account) === "weixin" && (account as WeixinAccount).userId) {
-      const weixin = account as WeixinAccount;
-      const userId = weixin.userId;
-      if (userId) forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId });
-    }
-    deleteAccount(this.options.paths, accountId);
-    if (!retainHistory) {
-      fs.rmSync(path.dirname(accountStatePaths(this.options.paths, account.accountId).statePath), {
-        recursive: true,
-        force: true
-      });
-    }
-    this.entries.delete(account.accountId);
-    this.stores.delete(account.accountId);
-    this.inputReceipts.delete(account.accountId);
-    this.interactionRouting.reconcileBindings([], [account.accountId]);
-    this.refreshDesktopRequestSubscriptions();
+    accountId = loadAccount(this.options.paths, accountId).accountId;
+    return this.accountOperations.run(accountId, async () => {
+      this.assertRuntimeWritable();
+      const account = loadAccount(this.options.paths, accountId);
+      const retainHistory = options.retainHistory === true && accountChannel(account) === "weixin";
+      await this.stopAccountOwned(accountId, false);
+      if (retainHistory) {
+        retainAccountHistory(this.options.paths, account as WeixinAccount);
+      } else if (accountChannel(account) === "weixin" && (account as WeixinAccount).userId) {
+        const weixin = account as WeixinAccount;
+        const userId = weixin.userId;
+        if (userId) forgetRetainedAccount(this.options.paths, { accountId: weixin.accountId, userId });
+      }
+      deleteAccount(this.options.paths, accountId);
+      if (!retainHistory) {
+        fs.rmSync(path.dirname(accountStatePaths(this.options.paths, account.accountId).statePath), {
+          recursive: true,
+          force: true
+        });
+      }
+      this.entries.delete(account.accountId);
+      this.stores.delete(account.accountId);
+      this.inputReceipts.delete(account.accountId);
+      this.interactionRouting.reconcileBindings([], [account.accountId]);
+      this.refreshDesktopRequestSubscriptions();
+    });
   }
 
   updateAccount(accountId: string, patch: AccountSettingsPatch): AccountSummary {
@@ -1385,6 +1423,8 @@ export class AccountManager {
       throw Error("请先启动此渠道账号再从 Web 继续会话，以确保审批和提问可以送达；消息未提交。");
     }
     if (store.getBoundSession(session.senderId)?.id !== session.id) throw Error("请先绑定此会话再继续，以确保问题投递到正确对话；消息未提交。");
+    const binding = sessionExecutionScope(store, session);
+    const stillCurrent = () => this.entries.get(accountId) === entry && ["starting", "running"].includes(entry.status) && binding.current();
     const config = this.configProvider();
     const submission = new TurnSubmission(this.receiptsFor(accountId), session.id);
     const attachments = this.saveSessionUploads(accountId, session.id, uploads);
@@ -1413,19 +1453,18 @@ export class AccountManager {
       const result = await submission.run(this.runnerFor(config), {
         ...prepared,
         onThreadCreated: (createdThreadId) => {
-          store.setSessionThread(session.id, createdThreadId);
+          if (stillCurrent()) binding.acceptThread(createdThreadId);
           this.ensureCodexSessionMonitor();
           this.refreshDesktopRequestSubscriptions();
         },
         onTurnStarted: ({ threadId, turnId }) => {
-          this.rememberInteractionOrigin(accountId, { ...session, threadId }, turnId);
+          if (stillCurrent()) this.rememberInteractionOrigin(accountId, { ...session, threadId }, turnId);
           this.refreshDesktopRequestSubscriptions();
         },
         onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
         onApprovalResult: (request, result) => this.reportSessionApprovalResult(request, result),
         onUserInput: request => {
-          if (this.entries.get(accountId) !== entry || !["starting", "running"].includes(entry.status)
-            || store.getBoundSession(session.senderId)?.id !== session.id) {
+          if (!stillCurrent()) {
             throw new CodexCommunicationError("observation", "interaction/unavailable", request.threadId, request.turnId);
           }
           return entry.service!.requestUserInput(session.senderId, request, prepared.hostId);
@@ -1435,17 +1474,14 @@ export class AccountManager {
           ? { onProgress }
           : {})
       }, () => {
-        const current = store.getSession(session.id);
-        if (this.entries.get(accountId) !== entry || !["starting", "running"].includes(entry.status)
-          || !current || current.threadId !== session.threadId || current.projectBinding !== session.projectBinding
-          || (current.hostId ?? store.getProject(current.projectId ?? "")?.hostId ?? "local") !== (prepared.hostId ?? "local")
-          || store.getBoundSession(session.senderId)?.id !== session.id) throw Error("会话、绑定或渠道状态已改变，消息未提交。");
+        this.assertRuntimeWritable();
+        if (!stillCurrent()) throw Error("会话、绑定或渠道状态已改变，消息未提交。");
       });
       const threadId = result.threadId ?? session.threadId;
       if (!threadId) {
         throw new Error("Codex did not return a thread id");
       }
-      store.setSessionThread(session.id, threadId);
+      if (stillCurrent()) binding.acceptThread(threadId);
       const parsed = parseAssistantMessage(result.text);
       for (const memory of parsed.actions.remember) {
         store.rememberKnowledge(memory, session.projectId, session.id);
@@ -1463,7 +1499,7 @@ export class AccountManager {
           })
         }
       };
-      await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim(), true, result.turnId);
+      if (stillCurrent()) await this.notifyProjectCompletion(accountId, session.id, parsed.visibleText.trim(), true, result.turnId);
       return response;
     } catch (error) {
       error = submission.error(error);
@@ -2447,7 +2483,7 @@ function safePathSegment(value: string): string {
 
 function isPathWithin(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function canonicalWorkspace(workspace: string): string {

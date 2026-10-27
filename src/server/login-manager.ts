@@ -11,7 +11,14 @@ type LoginRecord = {
   session: WeixinQrLoginSession;
   status: QrLoginUpdate["status"];
   account?: PublicWeixinAccount;
+  confirmed?: Extract<QrLoginUpdate, { status: "confirmed" }>;
+  saved?: ReturnType<typeof saveScannedAccount>["account"];
+  polling?: Promise<{ status: QrLoginUpdate["status"]; account?: PublicWeixinAccount }>;
 };
+
+export class LoginCompletionPendingError extends Error {
+  constructor(cause: unknown) { super("身份已确认，但账号保存或连接尚未完成；将继续尝试，无需重新扫码。", { cause }); }
+}
 
 export type LoginManagerOptions = {
   paths: StatePaths;
@@ -38,10 +45,11 @@ export class LoginManager {
   async start(): Promise<{ id: string; qrDataUrl: string; expiresAt: string; status: "waiting" }> {
     const session = await this.sessionFactory();
     const id = crypto.randomUUID();
+    const qrDataUrl = await this.qrDataUrlFactory(session.qrContent);
     this.sessions.set(id, { session, status: "waiting" });
     return {
       id,
-      qrDataUrl: await this.qrDataUrlFactory(session.qrContent),
+      qrDataUrl,
       expiresAt: session.expiresAt,
       status: "waiting"
     };
@@ -55,13 +63,24 @@ export class LoginManager {
     if (record.status === "confirmed" || record.status === "expired") {
       return { status: record.status, ...(record.account ? { account: record.account } : {}) };
     }
-    const update = await record.session.poll();
-    record.status = update.status;
-    if (update.status === "confirmed") {
-      const saved = saveScannedAccount(this.options.paths, update.account);
-      await this.options.accountManager.refreshAccount(saved.account.accountId);
-      record.account = publicAccount(saved.account);
-    }
-    return { status: record.status, ...(record.account ? { account: record.account } : {}) };
+    if (record.polling) return record.polling;
+    const work = (async () => {
+      const update = record.confirmed ?? await record.session.poll();
+      if (update.status === "confirmed") {
+        // Cache native confirmation, but do not publish completion before
+        // persistence and account refresh finish. A retry resumes these steps.
+        record.confirmed = update;
+        try {
+          record.saved ??= saveScannedAccount(this.options.paths, update.account).account;
+          await this.options.accountManager.refreshAccount(record.saved.accountId);
+        } catch (error) { throw new LoginCompletionPendingError(error); }
+        record.account = publicAccount(record.saved);
+      }
+      record.status = update.status;
+      return { status: record.status, ...(record.account ? { account: record.account } : {}) };
+    })();
+    record.polling = work;
+    try { return await work; }
+    finally { if (record.polling === work) record.polling = undefined; }
   }
 }

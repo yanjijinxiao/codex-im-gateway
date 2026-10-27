@@ -394,7 +394,9 @@ function delay(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+let refreshGeneration = 0;
 async function refreshData(notify) {
+  const generation = ++refreshGeneration;
   try {
     const previousSession = selectedSession();
     const taskboardEditing = isTaskboardEditing();
@@ -405,12 +407,14 @@ async function refreshData(notify) {
       api("/api/sessions"),
       api("/api/taskboard")
     ]);
+    if (generation !== refreshGeneration) return;
     state.accounts = accounts.accounts;
     state.projects = projects.projects;
     state.knowledgeBases = knowledgeBases.knowledgeBases;
     state.sessions = sessions.sessions;
     state.taskboard = taskboard;
     await loadTaskboardIssues(!taskboardEditing && !document.querySelector("#taskboardView").hidden);
+    if (generation !== refreshGeneration) return;
     renderMetrics();
     renderAccounts();
     renderSessions();
@@ -1389,7 +1393,9 @@ function selectSession(session) {
   void loadSelectedSessionMessages();
 }
 
+let messageLoadGeneration = 0;
 async function loadSelectedSessionMessages() {
+  const generation = ++messageLoadGeneration;
   const session = selectedSession();
   if (!session) {
     renderChatPanel();
@@ -1400,16 +1406,16 @@ async function loadSelectedSessionMessages() {
   renderChatPanel();
   try {
     const result = await api(`/api/sessions/${encodeURIComponent(session.accountId)}/${encodeURIComponent(session.id)}/messages`);
-    if (state.selectedSessionKey !== key) return;
+    if (state.selectedSessionKey !== key || generation !== messageLoadGeneration) return;
     state.sessionMessages = result.messages || [];
     state.loadedSessionKey = key;
   } catch (error) {
-    if (state.selectedSessionKey !== key) return;
+    if (state.selectedSessionKey !== key || generation !== messageLoadGeneration) return;
     state.sessionMessages = [];
     state.loadedSessionKey = key;
     toast(error.message, true);
   } finally {
-    if (state.selectedSessionKey === key) {
+    if (state.selectedSessionKey === key && generation === messageLoadGeneration) {
       state.loadingMessages = false;
       renderChatPanel();
       scrollChatToEnd();
@@ -1702,6 +1708,13 @@ async function sendSessionMessage(event) {
   const key = sessionKey(session);
   const streaming = session.streamReplies ?? Boolean(state.config?.streamReplies);
   let progressSequence = 0;
+  const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+  const rememberReceipt = phase => {
+    state.submissionReceipts ??= new Map();
+    state.submissionReceipts.set(key, { requestId, phase, at: Date.now() });
+    try { window.sessionStorage?.setItem("gateway-submission-receipts", JSON.stringify([...state.submissionReceipts].slice(-100))); } catch { /* Optional browser storage never authorizes a retry. */ }
+  };
+  rememberReceipt("submitting");
   state.sendingSessions.add(key);
   state.sessionMessages.push({
     id: `pending-${Date.now()}`,
@@ -1723,7 +1736,7 @@ async function sendSessionMessage(event) {
   try {
     const body = new FormData();
     body.append("text", text);
-    body.append("requestId", Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join(""));
+    body.append("requestId", requestId);
     files.forEach((file) => body.append("files", file, file.name));
     const url = `/api/sessions/${encodeURIComponent(session.accountId)}/${encodeURIComponent(session.id)}/messages`;
     if (streaming) {
@@ -1748,14 +1761,17 @@ async function sendSessionMessage(event) {
     } else {
       await api(url, { method: "POST", body });
     }
+    rememberReceipt("completed");
     await refreshData(false);
     if (state.selectedSessionKey === key) {
       await loadSelectedSessionMessages();
     }
   } catch (error) {
+    const phase = error.submission ?? "unconfirmed";
+    rememberReceipt(phase);
     toast(error.message, true);
     if (state.selectedSessionKey === key) {
-      if (!["accepted", "unconfirmed"].includes(error.submission)) {
+      if (phase === "not-submitted") {
         els.chatInput.value = text;
         state.chatFiles = files;
       }
@@ -2034,6 +2050,7 @@ async function pollLogin(id) {
     const result = await api(`/api/logins/${encodeURIComponent(id)}`, { token: false });
     if (result.status === "waiting") setQrStatus("等待微信扫码");
     if (result.status === "scanned") setQrStatus("已扫码，请在微信中确认");
+    if (result.retryPending) setQrStatus(result.message);
     if (result.status === "expired") {
       stopLoginPoll();
       setQrStatus("二维码已过期", "error");
@@ -2373,9 +2390,12 @@ async function api(url, options = {}) {
     method: options.method || "GET",
     headers,
     body: options.body ? (isFormData ? options.body : JSON.stringify(options.body)) : undefined
+  }).catch(error => {
+    if (!["GET", "HEAD"].includes(options.method || "GET")) error.submission = "unconfirmed";
+    throw error;
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission });
+  const data = await response.json().catch(() => { throw Object.assign(new Error("响应内容不完整，请核对状态。"), { submission: !["GET", "HEAD"].includes(options.method || "GET") ? "unconfirmed" : undefined }); });
+  if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission ?? (!["GET", "HEAD"].includes(options.method || "GET") ? "unconfirmed" : undefined) });
   return data;
 }
 
@@ -2386,36 +2406,42 @@ async function streamApi(url, options, onEvent) {
     method: options.method || "POST",
     headers,
     body: options.body
-  });
+  }).catch(error => { error.submission = "unconfirmed"; throw error; });
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.startsWith("application/x-ndjson")) {
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission });
+    const data = await response.json().catch(() => { throw Object.assign(new Error("响应内容不完整，请核对历史。"), { submission: "unconfirmed" }); });
+    if (!response.ok) throw Object.assign(new Error(data.error || `请求失败 (${response.status})`), { submission: data.submission ?? "unconfirmed" });
+    if (!data.result) throw Object.assign(new Error("响应缺少任务回执，请核对历史。"), { submission: "unconfirmed" });
     return data.result;
   }
   if (!response.ok || !response.body) {
-    throw new Error(`请求失败 (${response.status})`);
+    throw Object.assign(new Error(`请求失败 (${response.status})`), { submission: "unconfirmed" });
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let result;
+  let terminal = false;
   const consumeLine = (line) => {
     if (!line.trim()) return;
-    const streamEvent = JSON.parse(line);
-    if (streamEvent.type === "error") throw Object.assign(new Error(streamEvent.error || "过程进度失败"), { submission: streamEvent.submission });
+    let streamEvent;
+    try { streamEvent = JSON.parse(line); }
+    catch { throw Object.assign(new Error("响应进度不完整，请核对历史。"), { submission: "unconfirmed" }); }
+    if (streamEvent.type === "error") throw Object.assign(new Error(streamEvent.error || "过程进度失败"), { submission: streamEvent.submission ?? "unconfirmed" });
     onEvent(streamEvent);
-    if (streamEvent.type === "done") result = streamEvent.result;
+    if (streamEvent.type === "done") { result = streamEvent.result; terminal = true; }
   };
   while (true) {
-    const { value, done } = await reader.read();
+    const { value, done } = await reader.read().catch(error => { error.submission = "unconfirmed"; throw error; });
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
-    for (const line of lines) consumeLine(line);
+    for (const line of lines) { consumeLine(line); if (terminal) break; }
+    if (terminal) { void reader.cancel?.().catch(() => {}); return result; }
     if (done) break;
   }
   if (buffer) consumeLine(buffer);
+  if (!terminal) throw Object.assign(new Error("响应连接已结束，但任务结果未确认；请查看历史，未重新提交。"), { submission: "unconfirmed" });
   return result;
 }
 

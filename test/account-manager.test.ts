@@ -1729,8 +1729,8 @@ test("keeps source citations in session history without fabricated attachments",
     id: "assistant-sources", role: "assistant",
     text: [
       "职责不同：",
-      "1. RegularTablePropertyPolicy (`/home/admin/project/RegularTablePropertyPolicy.java:32`) 负责属性过滤。",
-      "2. SchemaPartSupport (`/home/admin/project/SchemaPartSupport.java:20`) 负责构造 AST。"
+      "1. RegularTablePropertyPolicy（project/RegularTablePropertyPolicy.java:32） 负责属性过滤。",
+      "2. SchemaPartSupport（project/SchemaPartSupport.java:20） 负责构造 AST。"
     ].join("\n"),
     attachments: []
   });

@@ -93,3 +93,30 @@ test("routes remote project turns and history to a host-specific app-server tran
   assert.equal((await runner.getHistory("thread-existing", "remote-ssh-discovered:devbox"))[0]?.text, "hello history");
   assert.deepEqual(hosts, ["remote-ssh-discovered:devbox"]);
 });
+
+test("remote relay exits promptly when the control socket closes while Gateway stdin stays open", { timeout: 5000, skip: process.platform === "win32" }, async t => {
+  const { spawn } = await import("node:child_process"), net = await import("node:net");
+  const root = fs.mkdtempSync(path.join("/tmp", "relay-close-"));
+  const directory = path.join(root, ".codex", "app-server-control"); fs.mkdirSync(directory, { recursive: true });
+  const socketPath = path.join(directory, "app-server-control.sock"), connected = Promise.withResolvers<import("node:net").Socket>();
+  const sockets = new Set<import("node:net").Socket>();
+  const server = net.createServer(socket => { sockets.add(socket); socket.once("data", () => {
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"); connected.resolve(socket);
+  }); });
+  await new Promise<void>(resolve => server.listen(socketPath, resolve));
+  const command = resolveRemoteCodexTransport("remote-ssh-discovered:fixture").args.at(-1)!;
+  const encoded = /Buffer\.from\('([A-Za-z0-9+/=]+)','base64'\)/.exec(command)![1];
+  const relay = spawn(process.execPath, ["-e", Buffer.from(encoded, "base64").toString()], { env: { ...process.env, HOME: root }, stdio: ["pipe", "pipe", "pipe"] });
+  t.after(async () => { relay.kill(); for (const socket of sockets) socket.destroy(); await new Promise<void>(resolve => server.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true }); });
+  const exited = new Promise<number | null>(resolve => relay.once("exit", resolve));
+  const socket = await connected.promise;
+  // Desktop restart closes its control connection; the SSH/JSONL input is
+  // still held by Gateway. Keeping readline alive used to hide this failure.
+  socket.destroy();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const code = await Promise.race([exited, new Promise<"still-alive">(resolve => { timer = setTimeout(() => resolve("still-alive"), 700); })]);
+    assert.notEqual(code, "still-alive", "dead control socket must not masquerade as an initialized transport");
+    assert.notEqual(code, 0); assert.equal(relay.stdin.writableEnded, false);
+  } finally { if (timer) clearTimeout(timer); }
+});

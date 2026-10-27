@@ -72,7 +72,10 @@ export class InteractionRoutingJournal {
     if (!this.state.primary[primaryKey] || promoteDefault && (!this.state.primary[primaryKey].explicit || this.state.primary[primaryKey].inactive)) {
       this.state.primary[primaryKey] = { destination: { ...destination }, explicit: false };
     }
-    while (Object.keys(this.state.origins).length > 2_000) delete this.state.origins[Object.keys(this.state.origins)[0]];
+    // This is durable provenance, not a recent-items cache. Count-based eviction
+    // can send a still-active old turn's next question to a different primary.
+    // Keep exact origins (including unavailable-binding tombstones) until an
+    // explicit lifecycle-aware archival protocol can safely retire them.
     this.save();
   }
   resolve(hostId: string, threadId: string, bindings: readonly InteractionDestination[], turnId?: string): InteractionRouteStatus {

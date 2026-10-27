@@ -29,6 +29,8 @@ export type ManagedSession = {
   mode?: "session" | "qa";
   knowledgeBaseId?: string;
   threadId?: string;
+  /** Topology generation; human activity has a separate expiry generation. */
+  executionGeneration?: string;
   lastPromptPreview?: string;
   model?: string;
   effort?: string;
@@ -245,6 +247,7 @@ export class RuntimeStateStore {
     const endedSessionId = this.getBoundSession(senderId)?.id;
     for (const session of [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]) {
       if (session) {
+        session.executionGeneration = crypto.randomUUID();
         session.followBeforeDetach ??= session.follow !== false;
         session.follow = false;
       }
@@ -910,6 +913,7 @@ export class RuntimeStateStore {
 
   activateSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
+    if (this.getBoundSession(session.senderId)?.id !== session.id) session.executionGeneration = crypto.randomUUID();
     if (typeof session.followBeforeDetach === "boolean") {
       session.follow = session.followBeforeDetach;
       delete session.followBeforeDetach;
@@ -927,6 +931,7 @@ export class RuntimeStateStore {
 
   resetSession(sessionId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
+    session.executionGeneration = crypto.randomUUID();
     delete session.threadId;
     if (this.getBoundSession(session.senderId)?.id === sessionId) this.renewBindingActivity(session.senderId);
     session.updatedAt = new Date().toISOString();
@@ -936,6 +941,7 @@ export class RuntimeStateStore {
 
   setSessionThread(sessionId: string, threadId: string): ManagedSession {
     const session = this.mutableSession(sessionId);
+    if ((session.threadId ?? "") !== threadId) session.executionGeneration = crypto.randomUUID();
     if (threadId) {
       session.threadId = threadId;
     } else {
@@ -958,6 +964,7 @@ export class RuntimeStateStore {
       const workspace = cwd && path.isAbsolute(cwd) ? cwd : session.workspace;
       if (session.projectId !== projectId || session.workspace !== workspace
         || (projectId ? session.projectBinding === "none" : session.projectBinding !== "none")) {
+        session.executionGeneration = crypto.randomUUID();
         session.hostId = hostId; session.workspace = workspace;
         if (projectId) { session.projectId = projectId; delete session.projectBinding; }
         else { delete session.projectId; session.projectBinding = "none"; }

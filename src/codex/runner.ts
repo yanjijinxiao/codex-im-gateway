@@ -265,6 +265,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
+    input.assertCurrent?.();
     if (isRemoteHost(input.hostId)) {
       if (this.selectedBackend === "exec") {
         throw new Error(

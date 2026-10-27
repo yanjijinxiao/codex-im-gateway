@@ -33,16 +33,19 @@ export class WeComChannelAdapter implements ChannelAdapter, ChannelTextClient {
     const handle = (frame: WsFrame<TextMessage>) => {
       const body = frame.body;
       if (!body) return;
-      const message: ChannelMessage = {
-        id: body.msgid,
-        senderId: body.from.userid,
-        replyTargetId: body.chatid ?? body.from.userid,
-        text: body.text.content.trim(),
-        attachments: [],
-        raw: { channel: "wecom", event: body }
-      };
-      if (options.claimMessage && !options.claimMessage(message)) return;
-      void options.onMessage(message).catch(async (error) => {
+      const message: ChannelMessage = { id: typeof body.msgid === "string" ? body.msgid : "",
+        senderId: typeof body.from?.userid === "string" ? body.from.userid : "",
+        replyTargetId: typeof body.chatid === "string" ? body.chatid : body.from?.userid,
+        text: "", attachments: [], raw: { channel: "wecom", event: body } };
+      // The SDK catches synchronous listener exceptions. Put decoding and
+      // durable admission inside our own promise so failure reaches Gateway.
+      void Promise.resolve().then(async () => {
+        if (options.signal?.aborted) return;
+        if (!message.id || !message.senderId || typeof body.text?.content !== "string") throw new Error("企业微信消息格式无效，未提交。");
+        message.text = body.text.content.trim();
+        if (options.claimMessage && !options.claimMessage(message)) return;
+        await options.onMessage(message);
+      }).catch(async (error) => {
         try {
           await options.onMessageError?.(error, message);
         } catch (reportError) {

@@ -24,7 +24,11 @@ export function userFacingMessageHandlingError(error: unknown): string {
       : `[codex-im-gateway] ${codexFailureSummary(error.failureCode)}\n这是已确认的任务失败，不是钉钉投递失败；Gateway 未自动重试或换后端重发。`;
   }
   if (error instanceof CodexCommunicationError) {
-    if (error.submission === "not-submitted") return copyableChoices("[codex-im-gateway] 提交前的状态读取或准备通信失败，这条消息未提交；原任务与绑定未改变。可稍后核对状态。", [{ label: "核对状态", value: "/status" }]);
+    if (error.submission === "not-submitted") {
+      const stage = error.operation === "thread/read" ? "当前会话状态读取" : "提交准备通信";
+      const reason = error.code === "timeout" ? "超时" : "失败";
+      return `[codex-im-gateway] ${stage}${reason}，这条消息未提交、未入队；原任务与绑定已保留。可用 /status 核对状态后再发送。`;
+    }
     if (error.submission === "accepted") return "[codex-im-gateway] 原任务已接收，但进展连接中断；这不代表任务失败。Gateway 保留原卡片并继续跟随，不重发消息、不停止原任务。";
     return "[codex-im-gateway] 提交结果尚未确认；原任务可能已接收。这不代表任务失败，Gateway 保留原卡片并只读核对，不重发消息、不停止原任务。";
   }

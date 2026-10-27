@@ -8,6 +8,7 @@ import { readJsonFile, writeJsonFile } from "../state/json-store.js";
 import { CodeServerInstaller, type IDEInstallerIO } from "./installer.js";
 import type { IDEProfileStatus } from "./profile.js";
 import { runtimeChanges } from "./reconfiguration.js";
+import { workspaceAuthorizationScope } from "./workspace-scope.js";
 
 export type IDEWorkspace = { owner: string; sessionId: string; hostId: string; workspace: string; projectName: string;
   projectId?: string; nativeThreadId?: string; rootPaths?: readonly string[] };
@@ -127,7 +128,7 @@ export class WorkspaceIDEManager {
     throw new Error("项目关系无法确认，IDE 入口失效");
   }
   accountForEntry(id: string): string { this.resolve(id); return this.references[id].accountId; }
-  authorizationScope(id: string): string { return crypto.createHash("sha256").update(JSON.stringify(this.resolve(id))).digest("hex"); }
+  authorizationScope(id: string): string { return workspaceAuthorizationScope(this.resolve(id)); }
   resolve(id: string): IDEWorkspace {
     const { reference, target: resolved } = this.referenceTarget(id);
     // Authorization must not depend on which surviving IM alias was selected.
@@ -155,7 +156,7 @@ export class WorkspaceIDEManager {
     const rootPaths = await Promise.all(target.rootPaths.map(root => root === target.workspace ? workspace
       : this.transport.canonicalDirectory(target.hostId, root)));
     if (new Set(rootPaths).size !== rootPaths.length) throw new Error("项目包含重复的实际目录，请先核对项目配置");
-    return { workspace, rootPaths };
+    return { workspace, rootPaths: [workspace, ...rootPaths.filter(root => root !== workspace).sort()] };
   }
   async canonicalForTrust(id: string): Promise<IDECanonicalWorkspace> {
     const base = this.resolve(id), expected = digest(base);
@@ -185,7 +186,7 @@ export class WorkspaceIDEManager {
     const binary = host.autoInstall && host.binary === "code-server" ? await this.installer.binary(target.hostId) : host.binary;
     check();
     const { workspace, rootPaths } = await this.canonical(target);
-    if (trustWorkspace && (workspace !== trustedDirectory || JSON.stringify(rootPaths) !== JSON.stringify(trustedRootPaths)))
+    if (trustWorkspace && (workspace !== trustedDirectory || JSON.stringify(rootPaths && [...rootPaths].sort()) !== JSON.stringify(trustedRootPaths && [...trustedRootPaths].sort())))
       throw new Error("实际目录与已信任目录不一致，请重新核对授权");
     if (digest(base) !== digest(this.resolve(id))) throw new Error("项目目录已改变，未启动 IDE");
     check();

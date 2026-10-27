@@ -116,6 +116,7 @@ export class CodexExecRunner implements CodexBackendAdapter {
     });
 
     return new Promise((resolve, reject) => {
+      input.assertCurrent?.();
       const child = spawn(codexCommand.command, [...codexCommand.argsPrefix, ...args], {
         cwd: input.cwd,
         ...(this.options.codexHome ? { env: { ...process.env, CODEX_HOME: this.options.codexHome } } : {}),

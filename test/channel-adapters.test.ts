@@ -376,6 +376,9 @@ test("WeCom group actor identity stays separate from the reply target and monito
   });
   const frame = { body: { msgid: "one", chatid: "group", from: { userid: "human" }, text: { content: "hi" } } };
   socket.emit("message.text", frame); socket.emit("message.text", frame);
+  // Admission is contained in a promise so synchronous SDK listener errors
+  // reach Gateway. Let it settle before testing monitor shutdown.
+  await new Promise(resolve => setImmediate(resolve));
   socket.emit("reconnecting"); socket.emit("authenticated");
   controller.abort(); await monitor;
   assert.equal(messages.length, 1);

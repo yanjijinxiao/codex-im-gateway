@@ -45,7 +45,7 @@ export function resolveLocalAppServerTransport(
         "Install Codex with the official standalone installer or set codexAppServerTransport to stdio."
       );
     }
-    await runCodexDaemonCommand(executable, ["app-server", "daemon", "start"], options.commandTimeoutMs);
+    await runCodexDaemonCommand(executable, ["app-server", "daemon", "start"], options.commandTimeoutMs, codexHome);
   };
 
   return {
@@ -57,10 +57,11 @@ export function resolveLocalAppServerTransport(
   };
 }
 
-function runCodexDaemonCommand(command: string, args: readonly string[], timeoutMs = 30_000): Promise<void> {
+function runCodexDaemonCommand(command: string, args: readonly string[], timeoutMs = 30_000, codexHome?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, [...args], {
       stdio: ["ignore", "pipe", "pipe"],
+      ...(codexHome ? { env: { ...process.env, CODEX_HOME: codexHome } } : {}),
       shell: false,
       windowsHide: true
     });

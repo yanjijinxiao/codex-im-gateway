@@ -172,3 +172,16 @@ test("entry-scoped revocation removes every credential phase, persists across re
   const restarted = new IDEAuthorization(Date.now, file, "origin");
   assert.equal(restarted.authenticate(a.token, "a"), undefined); assert.equal(restarted.authenticate(b.token, "b")?.expiresAt, b.session.expiresAt);
 });
+
+test("failed stable-scope migration preserves durable grants and fails closed until storage works", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-auth-migrate-failure-")), file = path.join(root, "auth.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const old = new IDEAuthorization(Date.now, file, "origin"), grant = old.consume(old.grant("entry", "old"), "entry", "old")!;
+  const before = fs.readFileSync(file, "utf8"), scope = "v2:" + "f".repeat(64);
+  const original = fs.renameSync;
+  const mock = t.mock.method(fs, "renameSync", ((from: fs.PathLike, to: fs.PathLike) => { if (to === file) throw Error("injected migration storage failure"); original(from, to); }) as typeof fs.renameSync);
+  assert.throws(() => new IDEAuthorization(Date.now, file, "origin", () => true, () => ({ current: scope, legacy: "old" })), /storage failure/);
+  assert.equal(fs.readFileSync(file, "utf8"), before); mock.mock.restore();
+  const restarted = new IDEAuthorization(Date.now, file, "origin", () => true, () => ({ current: scope, legacy: "old" }));
+  assert.ok(restarted.authenticate(grant.token, "entry", scope)); assert.equal(restarted.authenticate(grant.token, "entry", "different"), undefined);
+});
