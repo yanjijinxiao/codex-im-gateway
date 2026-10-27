@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { addressedCommandText } from "./command-text.js";
 import { turnStatusHeading } from "./turn-status.js";
 import type { TurnActivity } from "./turn-status.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1402,13 +1403,7 @@ export function normalizeDingTalkDownloadUrl(raw: string, allowOfficialHttpUpgra
 function dingTalkCommandText(body: DingTalkRobotMessage, text: string): string {
   const trimmed = text.trim();
   if (body.conversationType !== "2") return trimmed;
-  // Group callbacks can retain the leading @mention (including DWS <@id>
-  // syntax). Strip only mention tokens immediately preceding a slash command;
-  // keep ordinary conversation, quoted examples and command arguments intact.
-  return trimmed.replace(
-    /^(?:(?:<@[^<>\s]+>|@[^@<>/\s]+)[^\S\r\n]+)+(?=\/[a-z][a-z0-9_-]*(?:\s|$))/iu,
-    ""
-  );
+  return addressedCommandText(trimmed);
 }
 
 function uniqueDingTalkInboundPath(rootDir: string, messageId: string, label: string): string {

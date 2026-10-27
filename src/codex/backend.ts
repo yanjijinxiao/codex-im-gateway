@@ -498,7 +498,7 @@ export interface CodexBackendControls {
   deleteThread(threadId: string): Promise<void>;
 }
 
-export type CodexMetadataObservation = { includeTurns: false; timeoutMs: number };
+export type CodexMetadataObservation = { includeTurns: false; timeoutMs: number; purpose?: "status" };
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
   readNativeTurnLifecycle?(threadId: string, turnId: string): Promise<CodexTurnObservation>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
@@ -528,7 +528,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
     input?: CodexHistoryPageInput,
     hostId?: string
   ): Promise<CodexHistoryPage>;
-  getRuntimeInfo(cwd: string, threadId?: string, hostId?: string): Promise<CodexRuntimeInfo>;
+  getRuntimeInfo(cwd: string, threadId?: string, hostId?: string, observation?: Pick<CodexMetadataObservation, "timeoutMs" | "purpose">): Promise<CodexRuntimeInfo>;
   listModels(): Promise<CodexModelOption[]>;
   getAccountRateLimits(): Promise<CodexAccountBalance>;
   getGoal(threadId: string, hostId?: string): Promise<CodexThreadGoal | undefined>;

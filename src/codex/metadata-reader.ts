@@ -1,10 +1,11 @@
-import type { CodexMetadataObservation, CodexThreadState, CodexProjectCatalog } from "./backend.js";
+import type { CodexMetadataObservation, CodexThreadState, CodexProjectCatalog, CodexRuntimeInfo } from "./backend.js";
 import { CodexCommunicationError, isCodexCommunicationFailure } from "./communication-error.js";
 
 /** No execution, resume, queue or approval port is available to this reader. */
 export type MetadataConnection = {
   inspectThread(threadId: string, observation: CodexMetadataObservation): Promise<CodexThreadState>;
   listProjects(): Promise<CodexProjectCatalog>;
+  getRuntimeInfo?(cwd: string, threadId?: string): Promise<CodexRuntimeInfo>;
   close(): void;
 };
 type Connection = { backend: MetadataConnection; retired: boolean; cancellation: AbortController };
@@ -27,10 +28,16 @@ export class CodexMetadataReader {
   projects(hostId: string, timeoutMs: number): Promise<CodexProjectCatalog> {
     return this.observe(hostId, "project/list", undefined, timeoutMs, backend => backend.listProjects());
   }
+  runtime(cwd: string, threadId: string | undefined, hostId: string, timeoutMs: number): Promise<CodexRuntimeInfo> {
+    return this.observe(hostId, "config/read", threadId, timeoutMs, backend => {
+      if (!backend.getRuntimeInfo) throw new Error("Read-only runtime metadata is unavailable");
+      return backend.getRuntimeInfo(cwd, threadId);
+    }, cwd);
+  }
   private observe<T>(hostId: string, operation: string, threadId: string | undefined, timeoutMs: number,
-    read: (backend: MetadataConnection) => Promise<T>): Promise<T> {
+    read: (backend: MetadataConnection) => Promise<T>, discriminator?: string): Promise<T> {
     if (this.closed) return Promise.reject(new Error("Metadata reader closed"));
-    const key = JSON.stringify([hostId, operation, threadId, timeoutMs]);
+    const key = JSON.stringify([hostId, operation, threadId, timeoutMs, discriminator]);
     const existing = this.pending.get(key);
     if (existing) return existing as Promise<T>;
     const work = this.read(hostId, operation, threadId, timeoutMs, read).finally(() => {

@@ -1,3 +1,4 @@
+import { splitCommandText } from "../channels/command-text.js";
 import {
   channelCapabilityHelpLines,
   type ChannelCommandCapability
@@ -131,19 +132,16 @@ export function parseCommand(
   text: string,
   capabilityAliases: Readonly<Record<string, string>> = {}
 ): ChannelCommand | undefined {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("/")) return undefined;
-  const [rawName, ...rest] = trimmed.slice(1).split(/\s+/);
-  const name = rawName.toLowerCase();
-  const canonicalName = COMMAND_ALIASES[name] ?? capabilityAliases[name] ?? name;
+  const parts = splitCommandText(text);
+  if (!parts) return;
+  const { name, argument } = parts;
+  const rest = argument.trim().split(/\s+/).filter(Boolean);
+  const canonicalName = COMMAND_ALIASES[name] ?? (BUILT_IN_COMMAND_NAMES.has(name) ? name : capabilityAliases[name] ?? name);
   // Normalize before authorization and mode checks, including /s new.
   if (canonicalName === "session" && rest[0]?.toLowerCase() === "new") {
     return { name: "new", arg: rest.slice(1).join(" ") };
   }
-  return {
-    name: canonicalName,
-    arg: canonicalName === "answer" ? trimmed.replace(/^\/\S+\s*/, "") : rest.join(" ")
-  };
+  return { name: canonicalName, arg: ["answer", "queue", "steer"].includes(canonicalName) ? argument : rest.join(" ") };
 }
 
 export type ChannelHelpContext = {

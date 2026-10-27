@@ -226,3 +226,18 @@ test("exec cannot borrow native queue from another backend", async t => {
   await assert.rejects(f.journal().enqueue({ ...f.origin, backend: "exec" }, "payload", backend), /does not support nativeQueue/);
   assert.equal(f.adds, 0);
 });
+
+test("interactive queue reconciliation is conversation-scoped, single-flight and backend-specific", async t => {
+  const f = fixture(t), journal = f.journal();
+  await journal.enqueue(f.origin, "one", f.backend);
+  await journal.enqueue({ ...f.origin, conversationId: "other", messageId: "other", threadId: "other-thread" }, "two", f.backend);
+  const release = Promise.withResolvers<void>(), reads: string[] = [];
+  const backend = { ...f.backend, async listQueuedSubmissions(threadId: string) { reads.push(threadId); await release.promise; return { data: f.items }; } } as CodexBridgeBackend;
+  const a = journal.reconcile("ding", backend, { conversationId: "group" });
+  const b = journal.reconcile("ding", backend, { conversationId: "group" });
+  assert.equal(a, b);
+  await new Promise(resolve => setImmediate(resolve)); assert.deepEqual(reads, ["original"]);
+  const replacement = { ...f.backend } as CodexBridgeBackend;
+  const c = journal.reconcile("ding", replacement, { conversationId: "group" }); assert.notEqual(c, a);
+  release.resolve(); await Promise.all([a, c]); assert.deepEqual(reads, ["original"]);
+});

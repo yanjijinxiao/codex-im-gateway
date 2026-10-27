@@ -15,6 +15,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  if(!m.method){decisions++;return;}
  if(m.method==='initialize'){send({id:m.id,result:{}});return;}
  if(m.method==='initialized')return;
+ if(m.method==='config/read'){send({id:m.id,result:{config:{model:'read-only-model',model_reasoning_effort:'high'}}});return;}
  if(m.method==='thread/read'){
   send({id:'foreign-command',method:'item/commandExecution/requestApproval',params:{threadId:'foreign',turnId:'turn',itemId:'item',command:'NEVER_EXECUTE'}});
   send({id:'foreign-mcp',method:'mcpServer/elicitation/request',params:{threadId:'foreign',turnId:'turn',serverName:'tool',mode:'form',message:'Allow?',requestedSchema:{type:'object',properties:{}}}});
@@ -27,6 +28,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   t.after(() => { runner.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const read = () => runner.inspectThread("thread", { includeTurns: false, timeoutMs: 500 });
   assert.equal((await read()).preview, "decisions:0");
+  assert.equal((await runner.getRuntimeInfo("/tmp/project")).model, "read-only-model");
   await assert.rejects(runner.archiveThread("thread"), /Metadata-only/);
   await assert.rejects(runner.getHistory("thread"), /Metadata-only/);
   assert.equal((await read()).preview, "decisions:0", "read-only observation must not even decline foreign approvals");

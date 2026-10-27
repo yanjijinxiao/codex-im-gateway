@@ -25,6 +25,7 @@ const threadKey = (r: QueueOrigin) => JSON.stringify([r.backend, r.hostId, r.thr
  * Shared by accounts so two IM frontends cannot dispatch the same native head.
  */
 export class NativeQueueCoordinator {
+  private readonly reconciling = new WeakMap<CodexBridgeBackend, Map<string, Promise<void>>>();
   private receipts: Record<string, QueueReceipt>;
   private readonly controls = new SessionControlQueue();
   private readonly dispatching = new Set<string>();
@@ -103,10 +104,20 @@ export class NativeQueueCoordinator {
     } while (cursor);
     return items;
   }
-  async reconcile(accountId: string, backend: CodexBridgeBackend): Promise<void> {
+  reconcile(accountId: string, backend: CodexBridgeBackend, scope?: { conversationId: string }): Promise<void> {
+    const key = JSON.stringify([accountId, scope?.conversationId]);
+    const reads = this.reconciling.get(backend) ?? new Map<string, Promise<void>>();
+    this.reconciling.set(backend, reads);
+    const pending = reads.get(key); if (pending) return pending;
+    const work = this.reconcileScope(accountId, backend, scope).finally(() => {
+      if (reads.get(key) === work) reads.delete(key);
+    });
+    reads.set(key, work); return work;
+  }
+  private async reconcileScope(accountId: string, backend: CodexBridgeBackend, scope?: { conversationId: string }): Promise<void> {
     const groups = new Map<string, QueueReceipt[]>();
     for (const r of Object.values(this.receipts)) {
-      if (r.accountId !== accountId || !unsettled.has(r.status)) continue;
+      if (r.accountId !== accountId || scope && r.conversationId !== scope.conversationId || !unsettled.has(r.status)) continue;
       const key = threadKey(r); groups.set(key, [...groups.get(key) ?? [], r]);
     }
     const results = await Promise.allSettled([...groups].map(([key, receipts]) => this.controls.run(key, async () => {

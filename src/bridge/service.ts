@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { sessionExecutionScope } from "./session-execution.js";
+import { observeStatus, STATUS_RPC_BUDGET_MS } from "./status-observation.js";
 import { SessionControlJournal, SessionControlQueue } from "./session-control.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import { TurnAudienceJournal, type TurnParticipantOrigin } from "./turn-audience.js";
@@ -377,8 +378,12 @@ export class BridgeService {
     }
     this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
     this.options.stateStore.recordBindingHumanActivity(replyTargetId);
-    scopedMessage = this.options.inboundReferences?.resolve(scopedMessage) ?? scopedMessage;
-    scopedMessage = await this.channel.resolveReferences(scopedMessage);
+    const directCommand = parseCommand(scopedMessage.text);
+    const diagnosticOnly = directCommand?.name === "status" || directCommand?.name === "queue" && ["", "list"].includes(directCommand.arg.trim());
+    if (!diagnosticOnly) {
+      scopedMessage = this.options.inboundReferences?.resolve(scopedMessage) ?? scopedMessage;
+      scopedMessage = await this.channel.resolveReferences(scopedMessage);
+    }
     if (message.unsupportedMessageType) {
       await this.reply(replyTargetId, `当前渠道适配器尚未实现 ${message.unsupportedMessageType} 消息，请改发文字或支持的附件。`);
       return;
@@ -386,9 +391,13 @@ export class BridgeService {
 
     // Only explicit control syntax enters Gateway routing. Ordinary language
     // belongs to Codex, including text mentioning projects, modes or skills.
-    const channelCapabilities = scopedMessage.text.trimStart().startsWith("/")
+    const builtIn = parseCommand(scopedMessage.text);
+    // Core controls stay available even if installed-skill discovery stalls.
+    // Help includes extension commands; other built-ins need no discovery.
+    const channelCapabilities = builtIn && (builtIn.name === "help" || !isReservedChannelCommandToken(builtIn.name))
       ? await (this.options.channelCapabilities?.() ?? []) : [];
-    const slashCommand = parseCommand(scopedMessage.text, channelCapabilityAliases(channelCapabilities));
+    const slashCommand = builtIn && isReservedChannelCommandToken(builtIn.name) ? builtIn
+      : parseCommand(scopedMessage.text, channelCapabilityAliases(channelCapabilities));
     const commands = slashCommand ? [slashCommand] : undefined;
     if (commands) {
       for (const command of commands) {
@@ -1750,8 +1759,8 @@ export class BridgeService {
     const value = arg.trim();
     if (!value || value === "list") {
       let warning: string | undefined;
-      try { await this.nativeQueue.reconcile(this.options.accountId ?? "standalone", this.runner); }
-      catch { warning = "部分后端暂时无法核对，以下为持久化回执，不代表已确认的当前状态。"; }
+      const checked = await observeStatus(() => this.nativeQueue.reconcile(this.options.accountId ?? "standalone", this.runner, { conversationId: message.senderId }));
+      if (!checked.available) warning = "后端未在查询预算内完成核对，以下为持久化回执，不代表已确认的当前状态。";
       const rows = this.nativeQueue.list(this.options.accountId ?? "standalone", message.senderId);
       const replies = rows.filter(r => r.status === "queued" && (r.actorId === (this.actor.getStore() ?? message.senderId) || this.role(message.senderId) === "controller"))
         .slice(-20).map(r => ({ label: `请求取消待执行消息 ${r.queuedSubmissionId ?? r.clientUserMessageId}`, value: `/queue cancel ${r.queuedSubmissionId ?? r.clientUserMessageId}` }));
@@ -1781,6 +1790,7 @@ export class BridgeService {
       await this.reply(message.senderId, "原生队列需要已绑定且已创建的普通 session；请先绑定会话。QA 和首次创建不支持原生排队。");
       return;
     }
+    const binding = sessionExecutionScope(this.options.stateStore, session, message.senderId);
     const hostId = this.sessionHostId(session) ?? "local";
     const state = await this.runner.inspectThread(session.threadId, hostId);
     assertCodexThreadRunnable(state);
@@ -1794,7 +1804,7 @@ export class BridgeService {
     const assertCurrent = () => {
       this.options.assertRuntimeWritable?.();
       const current = this.executionSession(message.senderId);
-      if (this.audienceSuspended || current?.id !== session.id || current.threadId !== session.threadId || (this.sessionHostId(current) ?? "local") !== hostId)
+      if (this.audienceSuspended || !binding.current() || current?.id !== session.id || current.threadId !== session.threadId || (this.sessionHostId(current) ?? "local") !== hostId)
         throw new CodexInterventionError("渠道或会话绑定已改变，排队消息未提交。");
       if (!this.access.requireAccess(actorId, message.senderId).allowed || !roleAllows(this.role(message.senderId, actorId), "participant"))
         throw new CodexInterventionError("当前准入或角色权限已改变，排队消息未提交。");
@@ -2711,23 +2721,27 @@ export class BridgeService {
     const session = this.executionSession(senderId);
     const workspace = project?.workspace ?? session?.workspace ?? this.options.config.defaultCwd;
     const knowledgeBase = project ? this.resolveQaContext(project) : undefined;
-    let issue: TaskboardIssue | undefined;
-    if (project && session?.threadId && this.options.taskboard) {
-      try {
-        const taskboardProject = await this.options.taskboard.projectForWorkspace(project.workspace);
-        issue = taskboardProject
-          ? await this.options.taskboard.issueForThread(taskboardProject.id, session.threadId)
-          : undefined;
-      } catch (error) {
-        console.warn(`Taskboard context unavailable for ${senderId}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    const runtime = await this.effectiveRuntime(senderId);
+    const binding = session && sessionExecutionScope(this.options.stateStore, session, senderId);
+    const observation = { includeTurns: false as const, timeoutMs: STATUS_RPC_BUDGET_MS, purpose: "status" as const };
+    const [taskResult, runtimeResult, stateResult] = await Promise.all([
+      observeStatus(async () => {
+        if (!project || !session?.threadId || !this.options.taskboard) return;
+        const target = await this.options.taskboard.projectForWorkspace(project.workspace);
+        return target ? this.options.taskboard.issueForThread(target.id, session.threadId) : undefined;
+      }),
+      observeStatus(() => this.runner.getRuntimeInfo(workspace, session?.threadId, this.sessionHostId(session), observation)),
+      observeStatus(async () => session?.threadId && typeof this.runner.inspectThread === "function"
+        ? this.runner.inspectThread(session.threadId, this.sessionHostId(session), observation) : undefined)
+    ]);
+    if (binding ? !binding.current() : Boolean(this.executionSession(senderId)))
+      return "查询期间会话绑定已改变，未展示旧目标的状态。请再次使用 /status 查看当前会话。";
+    const issue = taskResult.available ? taskResult.value : undefined;
+    const runtime = runtimeResult.available ? runtimeResult.value : {};
     let execution = "尚未创建任务";
     let activeTurnId: string | undefined;
-    if (session?.threadId && typeof this.runner.inspectThread === "function") {
-      try {
-        const state = await this.runner.inspectThread(session.threadId, this.sessionHostId(session));
+    if (session?.threadId) {
+      const state = stateResult.available ? stateResult.value : undefined;
+      if (state && state.threadId === session.threadId) {
         activeTurnId = state.activeTurnId;
         execution = state.pendingTurnWithoutId && state.runtimeStatus !== "active"
           ? "状态异常：App 有未确认的运行中消息，但实际后端空闲"
@@ -2735,15 +2749,15 @@ export class BridgeService {
           : state.activeFlags.includes("waitingOnUserInput") ? "等待用户确认"
           : ({ active: "正在执行", idle: "空闲", notLoaded: "未加载（不能据此断言任务已结束）",
             unknown: "未确认", systemError: "系统错误" } as const)[state.runtimeStatus];
-        if (state.executionOwner === "desktop") execution += "（Desktop 实际持有者）";
-      } catch { execution = "运行状态暂不可读取（未按空闲处理）"; }
+        execution += "（只读快照）";
+      } else execution = "暂未确认（状态读取超时或不可用，未按空闲处理）";
     }
     return [
       "当前工作上下文",
       `项目：${project?.name ?? "尚未选择"}`,
       `模式：${formatInteractionMode(mode)}`,
       `问答知识库：${knowledgeBase?.name ?? "未绑定"}`,
-      `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : "尚未绑定 Taskboard Issue"}`,
+      `任务：${issue ? `${issue.identifier} · ${formatTaskboardStatus(issue.status)} · ${issue.title}` : taskResult.available ? "尚未绑定 Taskboard Issue" : "关联信息暂不可读取"}`,
       `会话：${session?.title ?? "未绑定任何 session"}`,
       ...(!session ? ["普通消息不会提交；使用 /sessions 查看，/session 绑定或 /new 新建。"] : []),
       `对话状态：${session?.collaborationMode === "plan" ? "计划协作" : "普通对话（未附加模式）"}`,
@@ -2757,8 +2771,10 @@ export class BridgeService {
       `backend：${this.options.config.codexBackend}`,
       `app-server transport：${this.options.config.codexAppServerTransport}`,
       `exec sandbox：${this.options.config.codexExecSandbox ?? "Codex 默认"}`,
-      `model: ${runtime.model ?? "(Codex default)"}`,
-      `effort: ${runtime.effort ?? "(Codex default)"}`,
+      `model: ${session?.model ?? this.options.config.model ?? runtime.model ?? (runtimeResult.available ? "(Codex default)" : "(暂未读取)")}`,
+      `effort: ${session?.effort ?? this.options.config.effort ?? runtime.effort ?? (runtimeResult.available ? "(Codex default)" : "(暂未读取)")}`,
+      ...(!taskResult.available || !runtimeResult.available || !stateResult.available
+        ? ["部分状态未在查询预算内确认；原任务与绑定未改变。"] : []),
       `过程回复：${(session?.streamReplies ?? this.options.config.streamReplies) ? "开启" : "关闭"}${typeof session?.streamReplies === "boolean" ? "（当前会话）" : "（全局）"}`
     ].join("\n\n");
   }

@@ -1354,7 +1354,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private send(message: WireMessage): void {
-    if (this.options.metadataOnly && (!message.method || !["initialize", "initialized", "thread/read", "thread/list", "project/list"].includes(message.method)
+    if (this.options.metadataOnly && (!message.method || !["initialize", "initialized", "thread/read", "thread/list", "project/list", "config/read"].includes(message.method)
       || message.method === "thread/read" && message.params?.includeTurns !== false)) {
       throw new Error("Metadata-only connection cannot submit task controls or approval decisions");
     }
