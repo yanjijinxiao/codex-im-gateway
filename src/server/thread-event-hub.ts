@@ -58,6 +58,8 @@ type FollowState = {
   /** Legacy observation notices are not model answers or completion receipts. */
   observationNotices?: Record<string, { text: string; checkpoint?: ChannelStreamCheckpoint }>;
   repairTurnId?: string;
+  queueTerminalRepairs?: Record<string, { acknowledged: string[]; complete?: boolean }>;
+  prematureQueueTerminal?: { turnId: string; checkpoint: ChannelStreamCheckpoint };
   presentationInputBaseline?: string[];
 };
 type Options = {
@@ -69,7 +71,8 @@ type Options = {
   turnAudience?: TurnAudienceJournal;
   filePath: string;
   subscriptions: () => ThreadSubscription[];
-  backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot">;
+  backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot"> & Partial<Pick<CodexBridgeBackend, "readTurnLifecycle">>;
+  legacyQueueTerminal?: (sub: ThreadSubscription, turnId: string) => boolean;
   /** Recovery projection of existing native receipts, not an execution queue. */
   acceptedInputs?: () => readonly AcceptedPresentationInput[];
   intervalMs?: number;
@@ -294,6 +297,8 @@ export class ThreadEventHub {
         }
         // Reject a mismatched response before any progress or cursor can be updated.
         if (snapshot.state.threadId !== sub.threadId) throw new Error("Backend returned another thread snapshot");
+        await this.repairQueueTerminals(sub);
+        if (this.stopped || !this.isLive(sub) || this.readVersions.get(sub.key) !== version) return this.changedBinding();
         // Pre-upgrade Gateway shutdown could poison a suspended card with a
         // local transport error. Only a loaded writer confirming the SAME
         // still-running turn may recover an unacknowledged presentation error.
@@ -433,6 +438,73 @@ export class ThreadEventHub {
       })}`);
     }
   }
+  /** Narrow migration for pre-v2 queue terminals. Known cards are updated in
+   * place; only a confirmed still-running CURRENT turn gets a fresh stream. */
+  async repairQueuedTerminal(key: string, turnId: string): Promise<boolean> {
+    const sub = this.options.subscriptions().find(sub => sub.key === key && sub.enabled !== false);
+    if (!sub || !this.options.legacyQueueTerminal?.(sub, turnId)) throw new Error("没有当前绑定对应的旧队列终态，未修改卡片。");
+    return this.queue.run(key, async () => {
+      await this.repairQueueTerminals(sub, turnId);
+      return this.state(sub).queueTerminalRepairs?.[turnId]?.complete === true;
+    });
+  }
+  private async repairQueueTerminals(sub: ThreadSubscription, requestedTurnId?: string): Promise<void> {
+    const read = this.options.backend().readTurnLifecycle;
+    if (!this.options.legacyQueueTerminal || !read || !sub.client.resumableTextStream || !sub.client.updateTextStream) return;
+    const state = this.state(sub);
+    const candidates = [
+      ...(state.checkpoint && state.checkpointTurnId ? [{ id: state.checkpointTurnId, checkpoint: state.checkpoint, current: true }] : []),
+      ...Object.entries(state.pendingTerminals ?? {}).map(([id, pending]) => ({ id, checkpoint: pending.checkpoint, current: false }))
+    ].map(item => ({ ...item, explicit: false })).filter(item => item.checkpoint?.finished && item.checkpoint.terminal?.outcome === "interrupted"
+      && !state.queueTerminalRepairs?.[item.id]?.complete && this.options.legacyQueueTerminal!(sub, item.id)).slice(0, 3);
+    if (requestedTurnId && !candidates.some(item => item.id === requestedTurnId) && !state.queueTerminalRepairs?.[requestedTurnId]?.complete) {
+      const scope = { bindingKey: sub.key, conversationId: sub.recipientId, hostId: sub.hostId, threadId: sub.threadId, turnId: requestedTurnId };
+      // Explicit local recovery can target a known old card whose checkpoint
+      // rotated out. IDs still come exclusively from acknowledged provenance.
+      const messageId = this.options.turnAudience?.originalCorrectionCards(scope)[0];
+      if (messageId && this.options.legacyQueueTerminal(sub, requestedTurnId)) candidates.push({ id: requestedTurnId, current: false, explicit: true,
+        checkpoint: { messageId, startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: true,
+          terminal: { text: "", error: true, outcome: "interrupted" } } });
+    }
+    for (const item of candidates) {
+      const checkpoint = item.checkpoint!, originalId = checkpoint.messageId;
+      if (!originalId) continue;
+      try {
+        const observed = await this.options.backend().readTurnLifecycle!(sub.threadId, item.id, sub.hostId);
+        if (!this.isLive(sub) || observed.source === "unknown" || observed.status === "unknown" || observed.status === "interrupted") continue;
+        if (item.current && state.checkpoint !== checkpoint || !item.current && !item.explicit && state.pendingTerminals?.[item.id]?.checkpoint !== checkpoint) continue;
+        const scope = { bindingKey: sub.key, conversationId: sub.recipientId, hostId: sub.hostId, threadId: sub.threadId, turnId: item.id };
+        const targets = [...new Set([originalId, ...this.options.turnAudience?.correctionTargets(scope, originalId) ?? []])];
+        const repair = (state.queueTerminalRepairs ??= {})[item.id] ??= { acknowledged: [] };
+        const text = observed.status === "inProgress"
+          ? "状态更正：此前“已中断”是 Gateway 判断错误。已确认原任务仍在执行，后续进展继续同步；未重新提交任务。"
+          : `状态更正：此前“已中断”是 Gateway 判断错误。原生任务已确认${observed.status === "completed" ? "完成" : "失败"}。\n\n${visibleText(observed.text ?? "").trim() || (observed.failureCode ? codexFailureSummary(observed.failureCode) : "请用 /history 查看原轮次结果。")}`;
+        this.save();
+        for (const messageId of targets) {
+          if (repair.acknowledged.includes(messageId)) continue;
+          if (!this.isLive(sub)) return;
+          await sub.client.updateTextStream({ toUserId: sub.recipientId, messageId, text, finalize: true, error: false });
+          if (!this.isLive(sub)) return;
+          repair.acknowledged.push(messageId); this.save();
+        }
+        if (item.current && observed.status === "inProgress") {
+          await this.streams.get(sub.key)?.suspend(); this.streams.delete(sub.key);
+          state.prematureQueueTerminal = { turnId: item.id, checkpoint };
+          state.checkpoint = undefined; state.delivered = [];
+          state.completed = state.completed.filter(id => id !== item.id);
+          state.baseline = state.baseline?.filter(id => id !== item.id);
+          state.retired = state.retired?.filter(id => id !== item.id);
+          delete state.terminalPending;
+        } else if (observed.status !== "inProgress") {
+          checkpoint.terminal = { text, error: observed.status === "failed", outcome: observed.status };
+          if (!state.completed.includes(item.id)) state.completed = [...state.completed, item.id].slice(-200);
+          if (!item.current && state.pendingTerminals) delete state.pendingTerminals[item.id];
+        }
+        repair.complete = true; state.sequence++; this.save();
+      } catch { console.warn("[codex-im-gateway] queue terminal correction deferred; original input was not replayed"); }
+    }
+  }
+
   private async reconcile(sub: ThreadSubscription, snapshot: CodexThreadSnapshot, force = false, options: FollowSyncOptions = {}): Promise<void> {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);

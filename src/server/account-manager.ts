@@ -5,7 +5,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { parseActionBlocks } from "../bridge/actions.js";
-import { createCodexChannelIntentResolver } from "../bridge/ai-channel-intent.js";
 import type {
   ChannelCapabilityNavigation,
   ChannelCapabilityProvider
@@ -346,6 +345,10 @@ export class AccountManager {
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
+      legacyQueueTerminal: (sub, turnId) => {
+        const [accountId, sessionId] = JSON.parse(sub.key) as string[];
+        return this.nativeQueue.hasLegacyTerminal({ accountId, sessionId, hostId: sub.hostId, threadId: sub.threadId, turnId });
+      },
       decorateProgress: (sub, text) => {
         let url: string | undefined;
         try {
@@ -520,6 +523,11 @@ export class AccountManager {
     return this.startAccount(account.accountId, false);
   }
 
+  repairQueuedTerminal(accountId: string, sessionId: string, turnId: string): Promise<boolean> {
+    const key = JSON.stringify([loadAccount(this.options.paths, accountId).accountId, sessionId]);
+    return this.threadEvents.repairQueuedTerminal(key, turnId);
+  }
+
   async startAccount(accountId: string, persist = true): Promise<AccountSummary> {
     const account = persist ? setAccountEnabled(this.options.paths, accountId, true) : loadAccount(this.options.paths, accountId);
     const existing = this.entries.get(account.accountId);
@@ -611,11 +619,6 @@ export class AccountManager {
       inboundReferences: new InboundReferenceStore(path.join(statePaths.inboundDir, "references.json")),
       userInputFilePath: path.join(this.options.paths.runtimeDir, account.accountId, "user-input.json"),
       runner,
-      intentResolver: createCodexChannelIntentResolver({
-        runner,
-        cwd: this.options.paths.root,
-        ...(config.model ? { model: config.model } : {})
-      }),
       listCodexModels: () => this.getCodexModels(),
       getCodexBalance: () => this.getCodexBalance(),
       listCodexProjects: () => this.listCodexProjects(runner),

@@ -126,7 +126,7 @@ test("exposes and maps manifest-declared AI actions only with the same capabilit
   assert.match(schemas[1] ?? "", /weekly_collect/);
 });
 
-test("injects installed Skill shortcuts and natural-language commands into a running Bridge service", async (t) => {
+test("installed Skill slash shortcuts execute locally while ordinary requests reach Codex intact", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-skill-bridge-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const codexHome = path.join(root, ".codex");
@@ -185,10 +185,12 @@ test("injects installed Skill shortcuts and natural-language commands into a run
   await send("mail", "/wr mail");
   assert.equal(intentResolverCalls, 0);
   await send("collect", "继续整理本周周报");
-  assert.equal(intentResolverCalls, 1);
-  assert.equal(capabilityProviderCalls, 4);
+  assert.equal(intentResolverCalls, 0);
+  assert.equal(capabilityProviderCalls, 3);
   assert.equal(prompts.length, 2);
-  for (const prompt of prompts) assert.match(prompt, /\$manage-weekly-report/);
+  assert.match(prompts[0], /\$manage-weekly-report/);
+  assert.match(prompts[1], /继续整理本周周报/);
+  assert.doesNotMatch(prompts[1], /\$manage-weekly-report/);
 });
 
 test("keeps installed Skill execution behind the existing project requirement", async (t) => {

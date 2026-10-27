@@ -46,6 +46,15 @@ export class TurnAudienceJournal {
   }
   private save(): void { writeJsonFile(this.filePath, { records: this.records }, { durable: true }); }
 
+  correctionTargets(scope: TurnAudienceScope, originalMessageId: string): string[] {
+    return (this.records[keyOf(scope)]?.notices ?? []).filter(n => n.status === "delivered"
+      && n.completedCardId === originalMessageId && n.messageId).map(n => n.messageId!);
+  }
+  originalCorrectionCards(scope: TurnAudienceScope): string[] {
+    return [...new Set((this.records[keyOf(scope)]?.notices ?? []).filter(n => n.status === "delivered"
+      && n.completedCardId).map(n => n.completedCardId!))];
+  }
+
   hold(scope: TurnAudienceScope): () => void {
     const key = keyOf(scope);
     this.observations.set(key, (this.observations.get(key) ?? 0) + 1);

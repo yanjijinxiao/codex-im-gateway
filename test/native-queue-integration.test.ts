@@ -12,7 +12,7 @@ for (const mode of ["idle", "busy", "busy-restart"] as const) test(`real Codex c
   skip: !process.env.CODEX_NATIVE_QUEUE_TEST_BIN, timeout: 30_000
 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-real-native-queue-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const runners: AppServerCodexRunner[] = [];
   let calls = 0;
   let releaseFirst: (() => void) | undefined;
   let firstRequested!: () => void;
@@ -35,18 +35,22 @@ for (const mode of ["idle", "busy", "busy-restart"] as const) test(`real Codex c
     if (calls === 1 && mode !== "idle") { releaseFirst = respond; firstRequested(); }
     else respond();
   });
+  t.after(async () => {
+    await Promise.all(runners.map(runner => runner.close()));
+    server.closeAllConnections(); server.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => { server.closeAllConnections(); server.close(); });
   const port = (server.address() as { port: number }).port;
   fs.writeFileSync(path.join(dir, "config.toml"), [
     'model_provider = "gateway_mock"', 'model = "mock-model"',
     '[model_providers.gateway_mock]', 'name = "Local isolated test"',
     `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false'
   ].join("\n"));
-  const build = () => new AppServerCodexRunner({ codexHome: dir, requestTimeoutMs: 5_000, transport: {
+  const build = () => { const runner = new AppServerCodexRunner({ codexHome: dir, requestTimeoutMs: 5_000, transport: {
     command: process.env.CODEX_NATIVE_QUEUE_TEST_BIN!, args: ["app-server"], mode: "stdio"
-  } });
-  let runner = build(); t.after(() => runner.close());
+  } }); runners.push(runner); return runner; };
+  let runner = build();
   let threadId: string | undefined;
   const firstRun = runner.run({ prompt: "isolated initialization", cwd: dir,
     onTurnStarted: turn => { threadId = turn.threadId; } });
@@ -74,6 +78,9 @@ for (const mode of ["idle", "busy", "busy-restart"] as const) test(`real Codex c
   const second = await runner.runQueuedSubmission({ threadId, queuedSubmissionId: item.id,
     clientUserMessageId: "isolated-native-client-id", cwd: dir });
   assert.equal(second.text, "LOCAL_MOCK_DONE");
+  const ended = await runner.readNativeTurnLifecycle(threadId, second.turnId!);
+  assert.equal(ended.status, "completed"); assert.equal(ended.source, "native-event");
+  assert.equal(ended.text, "LOCAL_MOCK_DONE");
   if (mode !== "busy-restart") assert.equal(nativeAccepted, second.turnId);
   assert.equal((await runner.listQueuedSubmissions(threadId)).data.length, 0);
   const history = await runner.getHistory(threadId);
@@ -95,8 +102,9 @@ test("real Codex external owner consumes a cross-process queue without a second 
   skip: !process.env.CODEX_NATIVE_QUEUE_TEST_BIN, timeout: 45_000
 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-real-external-queue-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const runners: AppServerCodexRunner[] = [];
   let calls = 0, releaseFirst: (() => void) | undefined, firstRequested!: () => void;
+  const secondRequested = Promise.withResolvers<void>(); let releaseSecond: (() => void) | undefined;
   const requested = new Promise<void>(resolve => { firstRequested = resolve; });
   const server = http.createServer((request, response) => {
     request.resume(); calls++;
@@ -112,20 +120,25 @@ test("real Codex external owner consumes a cross-process queue without a second 
       ] as const) response.write(`event: ${type}\ndata: ${JSON.stringify({type, ...fields})}\n\n`);
       response.end();
     };
-    if (calls === 1) { releaseFirst = respond; firstRequested(); } else respond();
+    if (calls === 1) { releaseFirst = respond; firstRequested(); }
+    else if (calls === 2) { releaseSecond = respond; secondRequested.resolve(); }
+    else respond();
+  });
+  t.after(async () => {
+    await Promise.all(runners.map(runner => runner.close()));
+    server.closeAllConnections(); server.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => { server.closeAllConnections(); server.close(); });
   fs.writeFileSync(path.join(dir, "config.toml"), [
     'model_provider = "gateway_mock"', 'model = "mock-model"', '[model_providers.gateway_mock]',
     'name = "Local isolated test"', `base_url = "http://127.0.0.1:${(server.address() as {port: number}).port}/v1"`,
     'wire_api = "responses"', 'requires_openai_auth = false'
   ].join("\n"));
-  const build = () => new AppServerCodexRunner({ codexHome: dir, requestTimeoutMs: 8_000, transport: {
+  const build = () => { const runner = new AppServerCodexRunner({ codexHome: dir, requestTimeoutMs: 8_000, transport: {
     command: process.env.CODEX_NATIVE_QUEUE_TEST_BIN!, args: ["app-server"], mode: "stdio"
-  } });
+  } }); runners.push(runner); return runner; };
   const owner = build(), peer = build(); let admission = build();
-  t.after(() => Promise.all([owner.close(), admission.close(), peer.close()]));
   let threadId = "";
   const first = owner.run({prompt: "owner first", cwd: dir, onTurnStarted: turn => { threadId = turn.threadId; }});
   void first.catch(() => undefined);
@@ -141,6 +154,14 @@ test("real Codex external owner consumes a cross-process queue without a second 
   await admission.close(); admission = build();
   assert.equal((await admission.listQueuedSubmissions(threadId)).data[0].clientUserMessageId, "external-exact-id", "native storage survives admission restart");
   releaseFirst!(); assert.equal((await first).text, "EXTERNAL_OWNER_DONE");
+  await secondRequested.promise;
+  const foreign = await admission.getHistoryPage(threadId, {limit:10});
+  assert.equal(foreign.messages.find(m=>m.clientUserMessageId==="external-exact-id")?.turnStatus,"interrupted", "reproduce installed native foreign-history behavior");
+  const active = await owner.readThreadSnapshot(threadId);
+  assert.equal(active.state.runtimeStatus,"active");
+  const live = active.turns.find(turn=>turn.status==="inProgress");assert.ok(live);
+  assert.equal((await admission.readNativeTurnLifecycle(threadId,live.id)).status,"unknown", "an unfinished native lifecycle cannot certify interruption");
+  releaseSecond!();
   const deadline = Date.now() + 25_000;
   let history = await owner.getHistory(threadId);
   while (Date.now() < deadline && !history.some(m => m.clientUserMessageId === "external-exact-id" && m.turnStatus === "completed")) {

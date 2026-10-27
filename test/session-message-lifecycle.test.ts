@@ -104,17 +104,21 @@ for (const channel of ["dingtalk", "weixin", "feishu"] as const) {
   }
 }
 
-test("Desktop-owned messages do not offer unsupported actions; an orphan UI tail is not submitted", async t => {
+test("Desktop messages offer supported native queue actions; an orphan UI tail is not submitted", async t => {
   const f = fixture(t);
   f.store.setActiveMessagePolicy(f.session.id, "ask");
   f.setState({ executionOwner: "desktop" });
   await f.send("你是 GPT？");
-  assert.equal(f.cards.length, 0); assert.match(f.texts.at(-1)!, /不支持.*消息未提交/);
+  assert.equal(f.cards.length, 1);
+  const choices = f.cards[0].actionGroups.flat();
+  assert.equal(choices.some(x => x.value.arg.endsWith(" queue")), true);
+  assert.equal(choices.some(x => x.value.arg.endsWith(" steer")), false);
   await f.send("/policy queue");
-  assert.match(f.texts.at(-1)!, /不支持.*原生队列.*策略未改变/);
+  assert.equal(f.store.getSession(f.session.id)?.activeMessagePolicy, "queue");
   await f.send("/policy steer");
   assert.match(f.texts.at(-1)!, /不支持安全介入.*策略未改变/);
-  assert.equal(f.store.getSession(f.session.id)?.activeMessagePolicy ?? "ask", "ask");
+  assert.equal(f.store.getSession(f.session.id)?.activeMessagePolicy, "queue");
+  await f.send("/policy ask");
   await f.send("补充一条");
   assert.equal(f.runs.length, 0);
   assert.equal(f.steers, 0);

@@ -1,9 +1,10 @@
-import { assertQueueAdmissionCurrent, CodexQueueAdmissionError } from "./backend.js";
+import { assertQueueAdmissionCurrent, CodexQueueAdmissionError, CodexInterventionError } from "./backend.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
+import { readNativeTurnLifecycle, observeOwnerTurn } from "./native-turn-lifecycle.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { parseUserInputRequest } from "./user-input.js";
 import { parseMcpForm, mcpFormResponse, safeElicitationUrl, type McpForm } from "./elicitation.js";
@@ -855,6 +856,20 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
   }
 
+  async readNativeTurnLifecycle(threadId: string, turnId: string): Promise<import("./backend.js").CodexTurnObservation> {
+    // A remote daemon's path belongs to that remote filesystem. Never read a
+    // same-named local file or invent an SSH route for this observation.
+    if (this.options.transport?.mode === "remote-daemon") return { status: "unknown", source: "unknown" };
+    this.operationLeases++;
+    try {
+      await this.ensureConnected();
+      const response = await this.request("thread/read", { threadId, includeTurns: false }) as { thread?: { id?: string; path?: string } };
+      if (response.thread?.id !== threadId || !response.thread.path || !path.isAbsolute(response.thread.path))
+        return { status: "unknown", source: "unknown" };
+      return await readNativeTurnLifecycle(response.thread.path, threadId, turnId);
+    } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+  }
+
   async getHistoryPage(
     threadId: string,
     input: CodexHistoryPageInput = {}
@@ -999,9 +1014,20 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.operationLeases++;
     try {
       await this.ensureConnected();
+      if (input.observeOnly) {
+        const turnId = input.acceptedTurnId;
+        if (!turnId) throw new CodexInterventionError("只读恢复缺少原生轮次，未启动任务。");
+        let observed = observeOwnerTurn(await this.readThreadSnapshot(input.threadId), input.threadId, turnId);
+        if (observed.source === "unknown") observed = await this.readNativeTurnLifecycle(input.threadId, turnId);
+        if (observed.status === "unknown" || observed.status === "inProgress" || observed.source === "unknown")
+          throw new CodexCommunicationError("observation", "queue/observe", input.threadId, turnId);
+        await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+        if (observed.status !== "completed") throw new CodexTurnExecutionError(observed.status, "原生轮次已确认结束", observed.failureCode);
+        return { threadId: input.threadId, turnId, text: observed.text || "任务已完成。", raw: "" };
+      }
       const existing = await this.findQueuedTurn(input.threadId, input.clientUserMessageId, input.acceptedTurnId);
       if (existing) {
-        if (input.observeOnly && existing.status === "inProgress") throw new Error("轮次仍在执行；只读恢复不会接管任务。");
+        if (existing.status !== "inProgress") return await this.runQueuedSubmission({ ...input, observeOnly: true, acceptedTurnId: String(existing.id) });
         if (existing.status === "inProgress" && !this.subscribedThreads.has(input.threadId)) {
           if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
           this.bindUserInputHandlers(input.threadId, input);
@@ -1013,7 +1039,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         }
         return await this.observeQueuedTurn(input, existing);
       }
-      if (input.observeOnly) throw new Error("只读恢复未找到原轮次，未启动任务。");
       if (input.acceptedTurnId) throw new Error("已接收的原生队列轮次暂时无法核对，未重复启动。");
       if (!input.queuedSubmissionId) throw new Error("缺少待执行项 ID，未启动任务。");
       return await this.runWithLease({ ...input, prompt: "" });

@@ -73,12 +73,12 @@ test("historical native registration cannot make the current App project name am
   assert.equal(f.cards.at(-1)!.table!.rows[0][1], "Same");
 });
 
-for (const bound of [false, true]) test(`failed project selection terminates friendly intent, including ordinary prompt continuation (bound=${bound})`, async t => {
+for (const bound of [false, true]) test(`explicit ambiguous project selection preserves the current binding (bound=${bound})`, async t => {
   const f = fixture(t, [candidate("one", "Same"), candidate("two", "Same", "remote")]);
   if (bound) { const p = f.store.createProject("Current", "/current"); f.store.activateProject("room", p.id); f.store.createSession("room", p.workspace, undefined, p.id); }
   const before = f.store.getActiveSession("room")?.id;
   f.setIntent({ kind: "command_sequence", commands: [{ name: "project", arg: "Same" }, { name: "new", arg: "" }, { name: "plan", arg: "on" }] });
-  await f.send("在 Same 项目创建一个 session 并审查代码");
+  await f.send("/project Same");
   assert.equal(f.texts.length, 1);
   assert.match(f.texts[0], /多个同名项目/);
   assert.equal(f.cards.length, 0);
@@ -86,10 +86,10 @@ for (const bound of [false, true]) test(`failed project selection terminates fri
   assert.equal(f.runs.length, 0, "never runs the instruction on an old/default session");
 });
 
-test("new-session failure stops subsequent friendly commands without a second missing-project response", async t => {
+test("explicit new-session failure leaves the current state intact", async t => {
   const f = fixture(t);
   f.setIntent({ kind: "command_sequence", commands: [{ name: "new", arg: "missing" }, { name: "mode", arg: "task" }] });
-  await f.send("在 missing 中新建会话并创建任务");
+  await f.send("/new missing");
   assert.equal(f.texts.length, 1); assert.match(f.texts[0], /没有找到/);
   assert.equal(f.store.listSessions().length, 0); assert.equal(f.runs.length, 0);
 });

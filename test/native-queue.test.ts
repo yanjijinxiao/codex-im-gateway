@@ -31,6 +31,10 @@ function fixture(t: test.TestContext) {
       const i = items.findIndex(x => x.id === id); if (i < 0) return false; items.splice(i, 1); return true;
     },
     async inspectThread() { return { threadId: "original", persistence: "active", runtimeStatus: "idle", activeFlags: [] }; },
+    async readTurnLifecycle(_thread: string, turnId: string) {
+      const turn = history.find(message => message.turnId === turnId);
+      return { status: turn?.turnStatus ?? "unknown", source: "owner" };
+    },
     async getHistoryPage(_thread: string, input: { cursor?: string }) {
       return input.cursor ? { messages: history } : { messages: [], nextCursor: "older" };
     }
@@ -83,6 +87,24 @@ test("absence in queue/history is uncertain, not permission to replay", async t 
   await restored.enqueue(f.origin, "payload", f.backend);
   await restored.dispatch("ding", f.backend, async () => { assert.fail("must not dispatch uncertain records"); });
   assert.equal(f.adds, 1);
+});
+
+for (const status of ["inProgress", "unknown", "completed"] as const) test(`foreign interrupted history is identity only; authoritative observation=${status}`, async t => {
+  const f = fixture(t), journal = f.journal(), receipt = await journal.enqueue(f.origin, "payload", f.backend);
+  f.items.length = 0;
+  f.setHistory([{id:"input",role:"user",text:"payload",clientUserMessageId:receipt.clientUserMessageId,turnId:"accepted",turnStatus:"interrupted"}]);
+  const backend = {...f.backend,
+    async readTurnLifecycle() { return {status, source: status === "unknown" ? "unknown" as const : "owner" as const}; },
+    async inspectThread() { return {threadId:"original",persistence:"active" as const,runtimeStatus:"active" as const,executionOwner:"desktop" as const,activeFlags:[],activeTurnId:"accepted"}; }
+  } as CodexBridgeBackend;
+  const restored = f.journal();
+  await restored.reconcile("ding", backend);
+  const updated = restored.list("ding")[0];
+  assert.equal(updated.turnId,"accepted");
+  assert.equal(updated.status,status === "inProgress" ? "running" : status === "completed" ? "completed" : "uncertain");
+  await restored.dispatch("ding",backend,async()=>{assert.fail("live owner prevents terminal dispatch even after an observation race");});
+  assert.equal(f.adds,1);
+  assert.equal(restored.list("ding")[0].delivered,undefined);
 });
 
 test("lost add acknowledgement after consumption can observe its exact turn without a queue id", async t => {

@@ -347,7 +347,7 @@ test("keeps project mode, plan mode, and goals on the selected project's thread"
   );
 });
 
-test("natural plan and goal actions continue the original message while slash controls stay card-only", async (t) => {
+test("ordinary plan and goal requests are transparent while explicit slash controls stay local", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-channel-conversational-controls-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(root, "state")));
@@ -413,10 +413,10 @@ test("natural plan and goal actions continue the original message while slash co
 
   assert.equal(runs.length, 2);
   assert.match(runs[0]?.prompt ?? "", /先规划一下渠道交互/);
-  assert.equal(runs[0]?.collaborationMode, "plan");
+  assert.equal(runs[0]?.collaborationMode, undefined);
   assert.match(runs[1]?.prompt ?? "", /目标是完成渠道交互/);
   assert.equal(runs[1]?.collaborationMode, undefined);
-  assert.deepEqual(goals, ["完成渠道交互"]);
+  assert.deepEqual(goals, []);
   assert.deepEqual(replies, ["正常回复 1", "正常回复 2"]);
 
   stateStore.resetSession(session.id);
@@ -425,7 +425,7 @@ test("natural plan and goal actions continue the original message while slash co
   assert.equal(runs.length, 3);
   assert.equal(runs[2]?.collaborationMode, undefined);
   assert.equal(stateStore.getActiveSession("oc_test")?.threadId, "thread-existing");
-  assert.deepEqual(goals, ["完成渠道交互", "完成渠道交互"]);
+  assert.deepEqual(goals, []);
   assert.deepEqual(replies, ["正常回复 1", "正常回复 2", "正常回复 3"]);
 });
 

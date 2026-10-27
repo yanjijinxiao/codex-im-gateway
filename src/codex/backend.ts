@@ -390,6 +390,15 @@ export type CodexThreadSnapshot = {
   }>;
 };
 
+/** A lifecycle observation carries its authority; persisted RPC history alone
+ * cannot certify that an external owner's turn stopped. */
+export type CodexTurnObservation = {
+  status: CodexTurnStatus | "unknown";
+  source: "owner" | "native-event" | "unknown";
+  text?: string;
+  failureCode?: CodexFailureCode;
+};
+
 export type CodexRuntimeInfo = {
   model?: string;
   effort?: string;
@@ -488,6 +497,7 @@ export interface CodexBackendControls {
 
 export type CodexMetadataObservation = { includeTurns: false; timeoutMs: number };
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
+  readNativeTurnLifecycle?(threadId: string, turnId: string): Promise<CodexTurnObservation>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   /** Read metadata without loading the complete turn history for message preflight. */
   inspectThread(threadId: string, observation?: CodexMetadataObservation): Promise<CodexThreadState>;
@@ -500,6 +510,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   stageAttachments?: import("./inbound-files.js").StageInboundFiles;
   backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };
   readThreadSnapshot(threadId: string, hostId?: string): Promise<CodexThreadSnapshot>;
+  readTurnLifecycle?(threadId: string, turnId: string, hostId?: string): Promise<CodexTurnObservation>;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
   steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult>;
   /** Thread-scoped ordinary input; never falls back to starting or queuing a task. */

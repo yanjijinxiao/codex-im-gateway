@@ -13,6 +13,25 @@ import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { SessionBindingConflictError } from "../src/state/runtime-state.js";
 import { saveAccount } from "../src/weixin/accounts.js";
 
+test("queue result repair requires same-origin mutation credentials and an exact turn only", async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-queue-repair-api-"));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const calls: unknown[]=[];
+  const server=await startLocalHttpServer({paths:resolveStatePaths(root),port:0,accountManager:{
+    async repairQueuedTerminal(accountId:string,sessionId:string,turnId:string){calls.push({accountId,sessionId,turnId});return true;}
+  } as never});t.after(()=>server.close());
+  const endpoint=`${server.url}/api/sessions/account/managed-record/repair-queue-result`;
+  const headers={"Content-Type":"application/json",Origin:server.url,"X-Codex-Im-Gateway-Token":server.requestToken};
+  assert.equal((await fetch(endpoint,{method:"POST",body:JSON.stringify({turnId:"turn"})})).status,403);
+  assert.equal((await fetch(endpoint,{method:"POST",headers:{...headers,Origin:"https://evil.invalid"},body:JSON.stringify({turnId:"turn"})})).status,403);
+  for(const invalid of [{},{turnId:""},{turnId:"turn",messageId:"arbitrary-card"}])
+    assert.equal((await fetch(endpoint,{method:"POST",headers,body:JSON.stringify(invalid)})).status,400);
+  assert.deepEqual(calls,[]);
+  const response=await fetch(endpoint,{method:"POST",headers,body:JSON.stringify({turnId:"turn"})});
+  assert.equal(response.status,200);assert.deepEqual(await response.json(),{corrected:true});
+  assert.deepEqual(calls,[{accountId:"account",sessionId:"managed-record",turnId:"turn"}]);
+});
+
 test("busy runtime configuration returns 409 before persistence or Taskboard side effects", async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-http-config-busy-")),paths=resolveStatePaths(root);
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));

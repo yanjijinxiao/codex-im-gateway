@@ -752,6 +752,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { session: context.accountManager.resetSession(sessionAction.accountId, sessionAction.sessionId) });
     return;
   }
+  if (method === "POST" && sessionAction?.action === "repair-queue-result") {
+    const input = z.object({ turnId: z.string().min(1).max(200) }).strict().parse(await readJsonBody(request));
+    sendJson(response, 200, { corrected: await context.accountManager.repairQueuedTerminal(sessionAction.accountId, sessionAction.sessionId, input.turnId) });
+    return;
+  }
   const sessionMatch = matchPath(url.pathname, "/api/sessions/:accountId/:sessionId");
   if (method === "PATCH" && sessionMatch) {
     const body = sessionPatchSchema.parse(await readJsonBody(request));

@@ -1,5 +1,6 @@
-import { assertQueueAdmissionCurrent, CodexQueueAdmissionError } from "./backend.js";
+import { assertQueueAdmissionCurrent, CodexQueueAdmissionError, CodexTurnExecutionError, type CodexTurnObservation } from "./backend.js";
 import { AppServerCodexRunner } from "./app-server-runner.js";
+import { observeOwnerTurn } from "./native-turn-lifecycle.js";
 import path from "node:path";
 import {
   resolveLocalAppServerTransport,
@@ -242,8 +243,25 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     const backend = this.nativeQueue(input.hostId);
     const state = await this.inspectThread(input.threadId, input.hostId);
     if (!input.observeOnly) assertCodexThreadRunnable(state);
-    if (state.executionOwner === "desktop" && !input.observeOnly) throw new Error("Desktop 正在持有此会话，原生队列等待实际持有者消费；Gateway 不接管任务。");
+    if (input.observeOnly) {
+      const turnId = input.acceptedTurnId;
+      if (!turnId) throw new CodexInterventionError("只读结果恢复缺少已接收轮次，未启动任务。");
+      const observed = await this.readTurnLifecycle(input.threadId, turnId, input.hostId);
+      if (observed.status === "unknown" || observed.status === "inProgress" || observed.source === "unknown")
+        throw new CodexCommunicationError("observation", "queue/observe", input.threadId, turnId);
+      await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+      if (observed.status !== "completed") throw new CodexTurnExecutionError(observed.status, "原生轮次已确认结束", observed.failureCode);
+      return { threadId: input.threadId, turnId, text: observed.text || "任务已完成。", raw: "" };
+    }
+    if (state.executionOwner === "desktop") throw new Error("Desktop 正在持有此会话，原生队列等待实际持有者消费；Gateway 不接管任务。");
     return backend.runQueuedSubmission(input);
+  }
+
+  async readTurnLifecycle(threadId: string, turnId: string, hostId?: string): Promise<CodexTurnObservation> {
+    const observed = observeOwnerTurn(await this.readThreadSnapshot(threadId, hostId), threadId, turnId);
+    if (observed.source !== "unknown") return observed;
+    const backend = this.appServerFor(hostId);
+    return backend.readNativeTurnLifecycle ? backend.readNativeTurnLifecycle(threadId, turnId) : { status: "unknown", source: "unknown" };
   }
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {

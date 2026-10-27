@@ -224,7 +224,7 @@ test("keeps disabled channel modes out of native choices and command routing", a
   await service.handleMessage({
     id: "compound-task-disabled",
     senderId: "alice@im.wechat",
-    text: "先打开任务，再查看状态",
+    text: "/mode task",
     attachments: [],
     raw: {}
   });
@@ -564,7 +564,7 @@ test("routes Taskboard workflow mutations through Codex and the manage-taskboard
   assert.match(prompts[0] ?? "", /开始处理/);
 });
 
-test("uses friendly Chinese workbench intents with direct Taskboard creation, current-issue context, and cards", async (t) => {
+test("explicit commands retain Taskboard creation, current-issue context, and cards without AI routing", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-friendly-taskboard-"));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
   const stateStore = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
@@ -670,40 +670,28 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
     id, senderId: "alice@im.wechat", text, attachments: [], raw: {}
   });
 
-  await send("list", "把现在手头在忙的事情给我捋一遍");
+  await send("list", "/task list");
   assert.deepEqual(cards.at(-1), { identifier: "overview:project-one", projectName: "Project One" });
-  const directContext = classifiedContexts[0];
-  assert.ok(directContext);
-  assert.deepEqual({
-    ...directContext,
-    projectNames: [...directContext.projectNames].sort()
-  }, {
-    text: "把现在手头在忙的事情给我捋一遍",
-    actorId: "alice@im.wechat",
-    conversationId: "alice@im.wechat",
-    conversationKind: "direct",
-    currentProjectName: "Project One",
-    projectNames: ["Project One", "Project Two"]
-  });
+  assert.equal(classifiedContexts.length, 0);
   assert.equal(prompts.length, 0);
 
-  await send("todo", "记到待办：补充操作文档");
+  await send("todo", "/task todo 补充操作文档");
   assert.deepEqual(createdTitles, ["补充操作文档"]);
   assert.equal(prompts.length, 0);
   assert.equal(cards.at(-1)?.identifier, "PROJECT-2");
 
-  await send("new", "新任务：完成飞书按钮回调");
+  await send("new", "/task new 完成飞书按钮回调");
   assert.deepEqual(createdTitles, ["补充操作文档", "完成飞书按钮回调"]);
   assert.match(prompts.at(-1) ?? "", /领取并开始处理刚创建的 PROJECT-2/);
 
-  await send("comment", "记录：测试和构建均通过");
+  await send("comment", "/task comment current 测试和构建均通过");
   assert.deepEqual(comments, ["测试和构建均通过"]);
 
-  await send("return", "退回：缺少飞书真机点击验证");
+  await send("return", "/task return current 缺少飞书真机点击验证");
   assert.match(prompts.at(-1) ?? "", /退回处理中/);
   assert.match(prompts.at(-1) ?? "", /缺少飞书真机点击验证/);
 
-  await send("status", "查看当前项目");
+  await send("status", "/status");
   assert.match(replies.at(-1) ?? "", /项目：Project One/);
   assert.match(replies.at(-1) ?? "", /任务：PROJECT-1 · 待验收 · Ship integration/);
 
@@ -712,22 +700,12 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
     id: "shared-compound",
     senderId: "alice@im.wechat",
     replyTargetId: "chat-team",
-    text: "先切到 Project Two，再查看任务",
+    text: "/project switch Project Two",
     attachments: [],
     raw: {}
   });
-  const sharedContext = classifiedContexts.at(-1);
-  assert.ok(sharedContext);
-  assert.deepEqual({
-    ...sharedContext,
-    projectNames: [...sharedContext.projectNames].sort()
-  }, {
-    text: "先切到 Project Two，再查看任务",
-    actorId: "alice@im.wechat",
-    conversationId: "chat-team",
-    conversationKind: "shared",
-    projectNames: ["Project One", "Project Two"]
-  });
+  await service.handleMessage({id:"shared-list",senderId:"alice@im.wechat",replyTargetId:"chat-team",text:"/task list",raw:{}});
+  assert.equal(classifiedContexts.length, 0);
   assert.equal(stateStore.getActiveProject("chat-team")?.id, secondProject.id);
   assert.equal(taskboardWorkspaces.at(-1), secondWorkspace);
   assert.equal(cards.at(-1)?.identifier, "overview:project-two");
@@ -740,7 +718,7 @@ test("uses friendly Chinese workbench intents with direct Taskboard creation, cu
 });
 
 for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
-  test(`${channel}: unsolicited AI help stays in the bound conversation while explicit help still works`, async (t) => {
+  test(`${channel}: ordinary language bypasses AI controls while explicit help still works`, async (t) => {
     t.mock.method(console, "info", () => {});
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-help-routing-"));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -802,15 +780,16 @@ for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
     for (const command of ["/help", "/h", "/help session"]) {
       const start = replies.length;
       await send(command, command);
-      assert.equal(classificationCount, 2, "slash commands bypass AI classification");
+      assert.equal(classificationCount, 0, "control dispatch does not invoke AI classification");
       assert.equal(runs.length, 2);
       assert.match(replies.slice(start).map((reply) => reply.text).join("\n"), /会话介入与跟随/);
     }
     const start = replies.length;
     await send("natural-help", "查看帮助");
-    assert.equal(classificationCount, 3);
-    assert.equal(runs.length, 2);
-    assert.match(replies.slice(start).map((reply) => reply.text).join("\n"), /Codex 渠道工作台/);
+    assert.equal(classificationCount, 0);
+    assert.equal(runs.length, 3);
+    assert.ok(runs.at(-1)?.prompt.includes("查看帮助"));
+    assert.match(replies.slice(start).map((reply) => reply.text).join("\n"), /正常回答/);
   });
 }
 

@@ -14,6 +14,8 @@ export type QueueReceipt = QueueOrigin & {
   updatedAt: string; reason?: string;
   delivered?: boolean;
   deliveryUnconfirmed?: boolean;
+  /** v2 terminal status was verified against an owner or native lifecycle event. */
+  lifecycleVersion?: 2;
 };
 const unsettled = new Set<QueueReceipt["status"]>(["submitting", "queued", "starting", "running", "uncertain"]);
 const threadKey = (r: QueueOrigin) => JSON.stringify([r.backend, r.hostId, r.threadId]);
@@ -48,6 +50,11 @@ export class NativeQueueCoordinator {
   hasUnsettledThread(threadId: string, hostId: string): boolean {
     return Object.values(this.receipts).some(r => r.threadId === threadId && r.hostId === hostId
       && (unsettled.has(r.status) || r.status === "completed" && !r.delivered));
+  }
+  hasLegacyTerminal(scope: { accountId: string; sessionId: string; hostId: string; threadId: string; turnId: string }): boolean {
+    return Object.values(this.receipts).some(r => r.accountId === scope.accountId && r.sessionId === scope.sessionId
+      && r.hostId === scope.hostId && r.threadId === scope.threadId && r.turnId === scope.turnId
+      && r.status === "completed" && r.lifecycleVersion !== 2);
   }
   async enqueue(origin: QueueOrigin, prompt: string, backend: CodexBridgeBackend,
     handlers: Pick<CodexQueueAddInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult" | "assertCurrent"> = {}): Promise<QueueReceipt> {
@@ -122,9 +129,15 @@ export class NativeQueueCoordinator {
         for (const r of missing.slice()) {
           const user = page.messages.find(m => m.role === "user"
             && (m.clientUserMessageId === r.clientUserMessageId || (r.turnId && m.turnId === r.turnId)));
-          if (!user?.turnId || !user.turnStatus) continue;
+          if (!user?.turnId) continue;
+          // History locates identity only. A foreign unloaded reader can report
+          // interrupted while the actual owner is still executing this turn.
+          const observed = await backend.readTurnLifecycle?.(r.threadId, user.turnId, r.hostId);
+          const confirmed = observed && observed.source !== "unknown" && observed.status !== "unknown";
           this.update(r, { turnId: user.turnId,
-            status: user.turnStatus === "inProgress" ? "running" : "completed", reason: undefined });
+            status: confirmed ? observed.status === "inProgress" ? "running" : "completed" : "uncertain",
+            ...(confirmed ? { lifecycleVersion: 2 as const } : {}),
+            reason: confirmed ? undefined : "已定位原生轮次，执行终态仍待实际持有者或原生结束事件确认；未重发输入。" });
           missing.splice(missing.indexOf(r), 1);
         }
         cursor = page.nextCursor;
@@ -162,6 +175,7 @@ export class NativeQueueCoordinator {
         if (!observing && (items[0]?.id !== r.queuedSubmissionId || items[0]?.clientUserMessageId !== r.clientUserMessageId)) continue;
         const state = await backend.inspectThread(r.threadId, r.hostId);
         const terminalObservation = r.status === "completed" && observing;
+        if (terminalObservation && (state.activeTurnId === r.turnId && state.runtimeStatus === "active" || r.lifecycleVersion !== 2)) continue;
         if (!terminalObservation && (state.executionOwner === "desktop" || (!observing && state.runtimeStatus === "active") || state.pendingTurnWithoutId
           || state.runtimeStatus === "unknown" || state.runtimeStatus === "systemError" || state.persistence !== "active")) continue;
         await execute(structuredClone(r), () => {

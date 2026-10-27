@@ -32,14 +32,10 @@ import {
 } from "./channel-commands.js";
 import {
   commandProjectRequirement,
-  friendlyCommandsContinueConversation,
-  isGoalSetCommand,
   requiredModeForCommand
 } from "./channel-command-policy.js";
 import {
-  commandsFromFriendlyChannelIntent,
-  type ChannelCommand,
-  type FriendlyChannelIntent
+  type ChannelCommand
 } from "./channel-intent.js";
 import type { ChannelIntentResolver } from "./ai-channel-intent.js";
 import { buildPromptParts, buildPromptPreview, parsePrompt } from "./format.js";
@@ -387,27 +383,12 @@ export class BridgeService {
       return;
     }
 
-    const channelCapabilities = await (this.options.channelCapabilities?.() ?? []);
+    // Only explicit control syntax enters Gateway routing. Ordinary language
+    // belongs to Codex, including text mentioning projects, modes or skills.
+    const channelCapabilities = scopedMessage.text.trimStart().startsWith("/")
+      ? await (this.options.channelCapabilities?.() ?? []) : [];
     const slashCommand = parseCommand(scopedMessage.text, channelCapabilityAliases(channelCapabilities));
-    const friendlyIntent = slashCommand
-      ? undefined
-      : await this.resolveFriendlyChannelIntent(
-          message.senderId,
-          replyTargetId,
-          scopedMessage.text,
-          channelCapabilities
-        );
-    if (friendlyIntent?.kind === "clarification") {
-      await this.reply(replyTargetId, friendlyIntent.text);
-      return;
-    }
-    const commands = slashCommand
-      ? [slashCommand]
-      : commandsFromFriendlyChannelIntent(friendlyIntent);
-    const continueAsConversation = Boolean(
-      !slashCommand && commands && friendlyCommandsContinueConversation(commands)
-    );
-    const deferredCommands: ChannelCommand[] = [];
+    const commands = slashCommand ? [slashCommand] : undefined;
     if (commands) {
       for (const command of commands) {
         if (!await this.requireRole(replyTargetId, requiredCommandRole(command.name, command.arg))) return;
@@ -428,17 +409,9 @@ export class BridgeService {
           await this.replyProjectRequired(replyTargetId);
           return;
         }
-        if (
-          continueAsConversation
-          && isGoalSetCommand(command)
-          && !this.executionSession(replyTargetId)?.threadId
-        ) {
-          deferredCommands.push(command);
-          continue;
-        }
         if (await this.handleCommand(scopedMessage, command, channelCapabilities) === false) return;
       }
-      if (!continueAsConversation) return;
+      return;
     }
 
     if (!this.executionSession(replyTargetId)) {
@@ -465,45 +438,6 @@ export class BridgeService {
 
     if (await this.handleActiveMessage(scopedMessage, items)) return;
     await this.runCodexTurn(scopedMessage, "", items);
-    for (const command of deferredCommands) {
-      if (await this.handleCommand(scopedMessage, command, channelCapabilities) === false) return;
-    }
-  }
-
-  private async resolveFriendlyChannelIntent(
-    actorId: string,
-    conversationId: string,
-    text: string,
-    availableCapabilities: readonly ChannelCommandCapability[]
-  ): Promise<FriendlyChannelIntent | undefined> {
-    const resolver = this.options.intentResolver;
-    if (!resolver || !text.trim()) return undefined;
-    const projects = this.options.stateStore.listProjects();
-    const activeProject = this.options.stateStore.getActiveProject(conversationId);
-    const knowledgeBaseName = activeProject ? this.resolveQaContext(activeProject)?.name : undefined;
-    const currentProjectName = activeProject?.name;
-    const currentMode = this.options.stateStore.getInteractionMode(conversationId);
-    try {
-      return await resolver.resolve({
-        text,
-        actorId,
-        conversationId,
-        conversationKind: actorId === conversationId ? "direct" : "shared",
-        ...(currentProjectName ? { currentProjectName } : {}),
-        ...(currentMode !== "session" ? { currentMode } : {}),
-        ...(knowledgeBaseName ? { knowledgeBaseName } : {}),
-        ...(availableCapabilities.length ? { availableCapabilities } : {}),
-        projectNames: projects.map((project) => project.name)
-      });
-    } catch (error) {
-      if (error instanceof Error) {
-        console.warn("[codex-im-gateway] AI intent classification unavailable; using ordinary chat", {
-          error: error.message
-        });
-        return undefined;
-      }
-      throw error;
-    }
   }
 
   private async handleCommand(
@@ -1657,9 +1591,7 @@ export class BridgeService {
     }
     if (arg === "queue") {
       const hostId = this.sessionHostId(session);
-      const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
-        && (await this.runner.inspectThread(session.threadId, hostId)).executionOwner === "desktop";
-      if (desktopOwned || this.runner.backendInfo?.(hostId).capabilities.nativeQueue === false
+      if (this.runner.backendInfo?.(hostId).capabilities.nativeQueue === false
         || typeof this.runner.addQueuedSubmission !== "function") {
         await this.reply(senderId, "当前后端不支持可靠的原生队列，处理策略未改变。请在实际持有会话的 Codex 中排队。");
         return;
@@ -1696,8 +1628,7 @@ export class BridgeService {
     }
     const canSteer = Boolean(state.activeTurnId)
       && state.executionOwner !== "desktop" && this.runner.backendInfo?.(hostId).capabilities.turnSteering !== false;
-    const canQueue = state.executionOwner !== "desktop"
-      && this.runner.backendInfo?.(hostId).capabilities.nativeQueue !== false
+    const canQueue = this.runner.backendInfo?.(hostId).capabilities.nativeQueue !== false
       && typeof this.runner.addQueuedSubmission === "function";
     const policy = session.activeMessagePolicy ?? this.options.config.activeMessagePolicy ?? "steer";
     if (policy === "queue") {
@@ -1755,12 +1686,18 @@ export class BridgeService {
 
   private async submitActiveThreadMessage(message: ChannelMessage, session: ManagedSession, prompt: string, expectedTurnId?: string): Promise<void> {
     const hostId = this.sessionHostId(session);
+    const actorId = this.actor.getStore() ?? message.senderId;
     const assertCurrent = () => {
+      this.options.assertRuntimeWritable?.();
       const current = this.executionSession(message.senderId);
       if (current?.id !== session.id || current.threadId !== session.threadId
+        || current.projectId !== session.projectId || current.projectBinding !== session.projectBinding || current.workspace !== session.workspace
         || (this.sessionHostId(current) ?? "local") !== (hostId ?? "local")) {
         throw new CodexInterventionError("绑定已切换，未向旧会话提交消息，请重新发送。");
       }
+      if (this.audienceSuspended || !this.access.requireAccess(actorId, message.senderId).allowed
+        || !roleAllows(this.role(message.senderId, actorId), "participant"))
+        throw new CodexInterventionError("当前准入或角色权限已改变，消息未提交。");
     };
     assertCurrent();
     this.options.inputReceipts?.submitting({ sessionId: session.id, hostId: hostId ?? "local", threadId: session.threadId });
@@ -2346,7 +2283,26 @@ export class BridgeService {
       catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
-    const stillBound = () => !this.audienceSuspended && this.executionSession(message.senderId)?.id === session.id;
+    const preparedHostId = this.sessionHostId(session) ?? "local";
+    const preparedActorId = origin?.actorId ?? this.actor.getStore() ?? message.senderId;
+    const identityCurrent = () => {
+      const current = this.options.stateStore.getSession(session.id);
+      return current && current.threadId === session.threadId && current.projectId === session.projectId
+        && current.projectBinding === session.projectBinding && current.workspace === session.workspace
+        && (this.sessionHostId(current) ?? "local") === preparedHostId;
+    };
+    const stillBound = () => !this.audienceSuspended && this.executionSession(message.senderId)?.id === session.id && Boolean(identityCurrent());
+    const saveNativeThread = (threadId: string) => {
+      if (!identityCurrent()) return false;
+      this.options.stateStore.setSessionThread(session.id, threadId); session.threadId = threadId; return true;
+    };
+    const assertInputCurrent = () => {
+      this.options.assertRuntimeWritable?.();
+      if (!stillBound()) throw new CodexInterventionError("绑定已改变，消息未提交。");
+      if (!this.access.requireAccess(preparedActorId, message.senderId).allowed
+        || !roleAllows(this.role(message.senderId, preparedActorId), "participant"))
+        throw new CodexInterventionError("当前准入或角色权限已改变，消息未提交。");
+    };
     const wantsProgress = () => stillBound()
       && (this.options.stateStore.getSession(session.id)?.streamReplies ?? this.options.config.streamReplies);
     const sentProgress = new Set<string>();
@@ -2398,14 +2354,13 @@ export class BridgeService {
             if (wantsProgress()) await replyStream?.waitForRecovery(codexRecoverySummary(recovery));
           },
           onThreadCreated: (createdThreadId) => {
-            this.options.stateStore.setSessionThread(session.id, createdThreadId);
+            saveNativeThread(createdThreadId);
             return this.options.onSubscriptionsChanged?.();
           },
           onTurnStarted: async ({ threadId: startedThreadId, turnId }: { threadId: string; turnId: string }) => {
             acceptedTurnId = turnId;
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
-            session.threadId = startedThreadId;
-            this.options.stateStore.setSessionThread(session.id, startedThreadId);
+            saveNativeThread(startedThreadId);
             recordParticipant(startedThreadId, turnId);
             if (queued) { await prepareReplyStream(turnId); markActive(); }
             const presentation = this.activePresentations.get(session.id);
@@ -2456,10 +2411,10 @@ export class BridgeService {
             // settings. Do not silently apply later Bridge setting changes.
             model: undefined, effort: undefined, collaborationMode: undefined,
             projectId: undefined, projectName: undefined, threadTitle: undefined })
-          : await submission.run(this.runner, runInput, () => { if (!stillBound()) throw new CodexInterventionError("绑定已改变，消息未提交。"); });
+          : await submission.run(this.runner, runInput, assertInputCurrent);
         console.log(`[codex-im-gateway] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
-          this.options.stateStore.setSessionThread(session.id, result.threadId);
+          saveNativeThread(result.threadId);
         }
         if (result.threadId && result.turnId) recordParticipant(result.threadId, result.turnId);
         const parsed = parseActionBlocks(result.text);
