@@ -13,6 +13,59 @@ function createStore(t: test.TestContext): RuntimeStateStore {
   return new RuntimeStateStore(resolveStatePaths(root));
 }
 
+for (const standalone of [true, false]) test(`legacy project drift preserves the explicit ${standalone ? "independent" : "project"} session binding`, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-binding-context-")), paths = resolveStatePaths(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(paths), p = store.createProject("Correct project", "/work/correct"), other = store.createProject("Unrelated", "/work/unrelated");
+  const session = store.createSession("chat", "/work/correct", "Original session", standalone ? undefined : p.id, "session", undefined, { standalone });
+  store.setSessionThread(session.id, "original-native-thread"); store.recordBindingHumanActivity("chat");
+  const before = store.snapshot, legacy = structuredClone(before); legacy.activeProjectIds.chat = other.id;
+  fs.writeFileSync(paths.statePath, JSON.stringify(legacy));
+  const restored = new RuntimeStateStore(paths);
+  assert.equal(restored.getBoundSession("chat")?.id, session.id); assert.equal(restored.getBoundSession("chat")?.threadId, "original-native-thread");
+  assert.equal(restored.getActiveProject("chat")?.id, standalone ? undefined : p.id);
+  assert.deepEqual(restored.snapshot.activeSessionIds, before.activeSessionIds);
+  assert.deepEqual(restored.snapshot.bindingActivity, before.bindingActivity);
+  assert.deepEqual(restored.snapshot.detachedSessionSenders, before.detachedSessionSenders);
+  assert.equal(restored.listSessions().length, 1);
+  restored.reconcileThreadProject("original-native-thread", "local", undefined, "/work/correct");
+  assert.equal(restored.getActiveProject("chat"), undefined); assert.equal(restored.getBoundSession("chat")?.id, session.id);
+});
+
+test("explicit project switching ends an incompatible edge and cannot revive it on a later project switch", t => {
+  const store = createStore(t), first = store.createProject("First", "/work/first"), next = store.createProject("Next", "/work/next");
+  const session = store.createSession("chat", first.workspace, "Bound", first.id);
+  store.activateProject("chat", next.id);
+  assert.equal(store.getBoundSession("chat"), undefined); assert.equal(store.getActiveSession("chat"), undefined);
+  assert.equal(store.getSession(session.id)?.follow, false); assert.equal(store.getActiveProject("chat")?.id, next.id);
+  store.activateProject("chat", first.id);
+  assert.equal(store.getBoundSession("chat"), undefined); assert.equal(store.listSessions().length, 1);
+});
+
+test("project selection retains a compatible QA edge while retiring an incompatible inactive normal slot", t => {
+  const store = createStore(t), p = store.createProject("Normal project", "/work/normal"), q = store.createProject("QA project", "/work/qa");
+  const normal = store.createSession("chat", p.workspace, "Normal", p.id);
+  const qa = store.createSession("chat", q.workspace, "QA", q.id, "qa");
+  store.setInteractionMode("chat", "qa"); store.activateProject("chat", q.id);
+  assert.equal(store.getBoundSession("chat")?.id, qa.id); assert.equal(store.getActiveSession("chat"), undefined);
+  assert.equal(store.getSession(normal.id)?.follow, false);
+  store.setInteractionMode("chat", "session");
+  assert.equal(store.getBoundSession("chat"), undefined); assert.equal(store.getActiveProject("chat")?.id, q.id);
+});
+
+test("legacy detached receipts are never repaired into active bindings", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-detached-context-")), paths = resolveStatePaths(root);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(paths), p = store.createProject("Project", "/work/project");
+  const session = store.createSession("chat", "/work/independent", "Standalone", undefined, "session", undefined, { standalone: true });
+  store.leaveSession("chat"); const disk = store.snapshot;
+  disk.activeSessionIds.chat = session.id; disk.activeProjectIds.chat = p.id;
+  fs.writeFileSync(paths.statePath, JSON.stringify(disk));
+  const restored = new RuntimeStateStore(paths);
+  assert.equal(restored.getBoundSession("chat"), undefined); assert.equal(restored.isSessionDetached("chat"), true);
+  assert.equal(restored.getSession(session.id)?.follow, false);
+});
+
 test("Taskboard selects a new binding without rewriting the previous session", t => {
   const store = createStore(t);
   const project = store.createProject("Project", "/work/project");

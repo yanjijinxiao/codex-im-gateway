@@ -146,7 +146,12 @@ export class RuntimeStateStore {
   constructor(private readonly paths: StatePaths) {
     this.state = normalizeRuntimeState(readJsonFile<Partial<RuntimeState>>(paths.statePath, {}));
     for (const sender of new Set([...Object.keys(this.state.activeSessionIds), ...Object.keys(this.state.activeQaSessionIds)])) {
-      if (this.getBoundSession(sender) && (!this.state.bindingActivity[sender] || this.state.bindingActivity[sender].endedAt)) {
+      const bound = this.getBoundSession(sender);
+      // The selected native edge owns its project projection. Repair legacy
+      // context drift without selecting a session or reviving detached chats.
+      if (bound?.projectId) this.state.activeProjectIds[sender] = bound.projectId;
+      else if (bound?.projectBinding === "none") delete this.state.activeProjectIds[sender];
+      if (bound && (!this.state.bindingActivity[sender] || this.state.bindingActivity[sender].endedAt)) {
         this.renewBindingActivity(sender);
       }
     }
@@ -207,6 +212,11 @@ export class RuntimeStateStore {
   }
 
   leaveSession(senderId: string, reason: "manual" | "idle" = "manual"): void {
+    this.detachSessionSelection(senderId, reason);
+    this.save();
+  }
+
+  private detachSessionSelection(senderId: string, reason: "manual" | "idle"): void {
     const endedSessionId = this.getBoundSession(senderId)?.id;
     for (const session of [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]) {
       if (session) session.follow = false;
@@ -216,7 +226,6 @@ export class RuntimeStateStore {
     this.state.detachedSessionSenders = [...new Set([...this.state.detachedSessionSenders, senderId])];
     const activity = this.state.bindingActivity[senderId];
     if (activity) Object.assign(activity, { generation: crypto.randomUUID(), endedAt: new Date().toISOString(), endedReason: reason, endedSessionId });
-    this.save();
   }
 
   isSessionDetached(senderId: string): boolean {
@@ -227,8 +236,7 @@ export class RuntimeStateStore {
     if (this.isSessionDetached(senderId)) return undefined;
     const session = this.getInteractionMode(senderId) === "qa"
       ? this.getActiveQaSession(senderId) : this.getActiveSession(senderId);
-    const project = this.getActiveProject(senderId);
-    return session && (project ? session.projectId === project.id : session.projectBinding === "none") ? session : undefined;
+    return session && (session.projectId ? Boolean(this.getProject(session.projectId)) : session.projectBinding === "none") ? session : undefined;
   }
 
   sessionBindingTarget(session: ManagedSession): SessionBindingTarget {
@@ -701,17 +709,27 @@ export class RuntimeStateStore {
 
   activateProject(senderId: string, projectId: string): ManagedProject {
     const project = this.mutableProject(projectId);
+    const bound = this.getBoundSession(senderId);
+    // Explicit project selection ends an incompatible edge. Getters must not
+    // silently hide it while leaving it selected for a future accidental return.
+    const incompatible = [this.mutableActiveSession(senderId), this.mutableActiveQaSession(senderId)]
+      .filter((session): session is ManagedSession => Boolean(session && session.projectId !== project.id));
+    if (incompatible.length && (!bound || incompatible.some(session => session.id === bound.id))) {
+      this.detachSessionSelection(senderId, "manual");
+    } else for (const session of incompatible) {
+      session.follow = false;
+      if (this.state.activeSessionIds[senderId] === session.id) delete this.state.activeSessionIds[senderId];
+      if (this.state.activeQaSessionIds[senderId] === session.id) delete this.state.activeQaSessionIds[senderId];
+    }
     this.state.activeProjectIds[senderId] = project.id;
     this.save();
     return structuredClone(project);
   }
 
   getActiveProject(senderId: string): ManagedProject | undefined {
-    if (!this.state.activeProjectIds[senderId] && this.mutableActiveSession(senderId)?.projectBinding === "none"
-      && this.getInteractionMode(senderId) !== "qa") return undefined;
-    const projectId = this.state.activeProjectIds[senderId]
-      ?? this.mutableActiveSession(senderId)?.projectId
-      ?? this.mutableActiveQaSession(senderId)?.projectId;
+    const bound = this.getBoundSession(senderId);
+    if (bound) return bound.projectId ? this.getProject(bound.projectId) : undefined;
+    const projectId = this.state.activeProjectIds[senderId];
     const project = this.state.projects.find((candidate) => candidate.id === projectId);
     return project ? structuredClone(project) : undefined;
   }
@@ -894,16 +912,20 @@ export class RuntimeStateStore {
         || (session.hostId ?? this.getProject(session.projectId ?? "")?.hostId ?? "local") !== hostId) continue;
       const bound = this.getBoundSession(session.senderId)?.id === session.id;
       const workspace = cwd && path.isAbsolute(cwd) ? cwd : session.workspace;
-      if (session.projectId === projectId && session.workspace === workspace
-        && (projectId ? session.projectBinding !== "none" : session.projectBinding === "none")) continue;
-      session.hostId = hostId; session.workspace = workspace;
-      if (projectId) { session.projectId = projectId; delete session.projectBinding; }
-      else { delete session.projectId; session.projectBinding = "none"; }
-      if (bound) {
-        if (projectId) this.state.activeProjectIds[session.senderId] = projectId;
-        else delete this.state.activeProjectIds[session.senderId];
+      if (session.projectId !== projectId || session.workspace !== workspace
+        || (projectId ? session.projectBinding === "none" : session.projectBinding !== "none")) {
+        session.hostId = hostId; session.workspace = workspace;
+        if (projectId) { session.projectId = projectId; delete session.projectBinding; }
+        else { delete session.projectId; session.projectBinding = "none"; }
+        changed = true;
       }
-      changed = true;
+      if (bound) {
+        if (this.state.activeProjectIds[session.senderId] !== projectId) {
+          if (projectId) this.state.activeProjectIds[session.senderId] = projectId;
+          else delete this.state.activeProjectIds[session.senderId];
+          changed = true;
+        }
+      }
     }
     if (changed) this.save();
   }

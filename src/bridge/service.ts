@@ -684,6 +684,7 @@ export class BridgeService {
   }
 
   private ensureBoundProjectContext(senderId: string): boolean {
+    if (this.options.stateStore.getBoundSession(senderId)?.projectBinding === "none") return false;
     const projects = this.options.stateStore.listProjects();
     const activeProject = this.options.stateStore.getActiveProject(senderId);
     if (activeProject && projects.some((project) => project.id === activeProject.id)) {
@@ -1172,13 +1173,11 @@ export class BridgeService {
   }
 
   private executionSession(senderId: string): ManagedSession | undefined {
+    const session = this.options.stateStore.getBoundSession(senderId);
+    if (!session) return undefined;
     const project = this.options.stateStore.getActiveProject(senderId);
-    const standalone = this.options.stateStore.getBoundSession(senderId);
-    if (!project) return standalone?.projectBinding === "none" ? standalone : undefined;
     const mode = this.options.stateStore.getInteractionMode(senderId);
-    const session = standalone;
-    if (session?.projectId !== project.id) return undefined;
-    if (mode === "qa" && session.knowledgeBaseId !== this.resolveQaContext(project)?.id) return undefined;
+    if (mode === "qa" && (!project || session.knowledgeBaseId !== this.resolveQaContext(project)?.id)) return undefined;
     return session;
   }
 

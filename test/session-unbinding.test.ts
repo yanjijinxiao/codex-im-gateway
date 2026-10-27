@@ -16,6 +16,7 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
   const store = new RuntimeStateStore(paths);
   const project = store.createProject("Same directory", root, { hostId: "remote-a" });
   const texts: string[] = [];
+  const runThreads: Array<string | undefined> = [];
   let runs = 0, stops = 0, changes = 0, downloads = 0;
   const client = createChannelClient(channel, { ...TEXT_CAPABILITIES, inbound: { ...TEXT_CAPABILITIES.inbound, image: "available" } }, {
     async sendText(input) { texts.push(input.text); return { messageId: `reply-${texts.length}` }; },
@@ -23,11 +24,11 @@ function fixture(t: test.TestContext, channel: "dingtalk" | "weixin" | "feishu" 
   });
   const options = { config: { ...defaultConfig(root), allowedSenderIds: ["actor", "viewer"], streamReplies: false },
     stateStore: store, channel: client, onSubscriptionsChanged: async () => { changes++; },
-    runner: { async run() { runs++; return { raw: "", text: "done", threadId: "new-thread" }; }, async stop() { stops++; } } as never };
+    runner: { async run(input: { threadId?: string }) { runs++; runThreads.push(input.threadId); return { raw: "", text: "done", threadId: input.threadId ?? "new-thread" }; }, async stop() { stops++; } } as never };
   const service = new BridgeService(options);
   t.after(() => { service.suspendUserInputs(); fs.rmSync(root, { recursive: true, force: true }); });
   let sequence = 0;
-  return { root, paths, store, project, texts, service,
+  return { root, paths, store, project, texts, service, runThreads,
     get runs() { return runs; }, get stops() { return stops; }, get changes() { return changes; }, get downloads() { return downloads; },
     send(text: string, senderId = "actor", replyTargetId = "chat") {
       return service.handleMessage({ id: String(++sequence), senderId, replyTargetId, text, attachments: [], raw: {} });
@@ -49,6 +50,17 @@ test("only authorized inbound human messages renew the binding idle clock", asyn
 });
 
 for (const channel of ["dingtalk", "weixin", "feishu", "wecom"] as const) {
+  test(`${channel}: project-only commands cannot silently select a project over an independent native binding`, async t => {
+    const f = fixture(t, channel), session = f.store.createSession("chat", f.root, "Independent", undefined, "session", undefined, { standalone: true });
+    f.store.setSessionThread(session.id, "independent-native");
+    await f.send("/mode");
+    assert.equal(f.store.getActiveProject("chat"), undefined); assert.equal(f.store.getBoundSession("chat")?.id, session.id);
+    assert.equal(f.store.isSessionDetached("chat"), false); assert.equal(f.runs, 0); assert.equal(f.stops, 0);
+    await f.send("继续原任务");
+    assert.equal(f.runs, 1); assert.equal(f.store.listSessions().length, 1);
+    assert.deepEqual(f.runThreads, ["independent-native"]); assert.equal(f.store.getBoundSession("chat")?.threadId, "independent-native");
+  });
+
   test(`${channel}: unbound ordinary messages only explain binding, without creating tasks or sessions`, async t => {
     const f = fixture(t, channel);
     await f.send("帮我执行一下");
