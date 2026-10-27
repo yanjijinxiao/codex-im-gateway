@@ -1,4 +1,4 @@
-import { assertQueueAdmissionCurrent } from "./backend.js";
+import { assertQueueAdmissionCurrent, CodexQueueAdmissionError } from "./backend.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -952,7 +952,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }) as { queuedSubmission?: CodexQueuedSubmission };
     }
     catch (error) {
-      if (error instanceof CodexBackendCapabilityError) {
+      if (error instanceof CodexBackendCapabilityError || error instanceof CodexQueueAdmissionError) {
         this.nativeQueueOrigins.delete(input.clientUserMessageId);
         if (this.subscribedThreads.has(input.threadId) && !this.activeTurns.has(input.threadId)
           && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)) {

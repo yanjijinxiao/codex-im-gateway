@@ -220,11 +220,13 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     this.options.onThreadMutation?.(input.threadId, hostId ?? "local");
     const backend = this.nativeQueue(hostId);
     const state = await this.inspectThread(input.threadId, hostId);
-    assertCodexThreadRunnable(state);
     // Selection is based on the fresh native owner, never a project name or
     // an old queue receipt. External ownership only changes admission, not the
     // selected backend or the native FIFO/receipt format.
-    if (state.threadId !== input.threadId) throw new CodexQueueAdmissionError(new Error("队列目标身份不匹配，消息未提交。"));
+    try {
+      assertCodexThreadRunnable(state);
+      if (state.threadId !== input.threadId) throw new Error("队列目标身份不匹配，消息未提交。");
+    } catch (error) { throw new CodexQueueAdmissionError(error); }
     assertQueueAdmissionCurrent(input);
     return backend.addQueuedSubmission({ ...input, ...(state.executionOwner === "desktop" ? { enqueueOnly: true } : {}) });
   }

@@ -90,3 +90,18 @@ test("close confirms a delayed client exit before permitting a replacement lifec
  assert.match(fs.readFileSync(file,"utf8"),/process-exited/);
  await assert.rejects(runner.listQueuedSubmissions("native"),/closed/);
 });
+
+test("a rejected owned admission releases its subscription and origin before retrying other work",async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-owned-rejection-")),file=path.join(dir,"methods");t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const runner=new AppServerCodexRunner({codexHome:dir,transport:{command:process.execPath,args:[path.resolve("test/fixtures/fake-external-queue.mjs"),file,"--owned"],mode:"stdio"},requestTimeoutMs:1000});t.after(()=>runner.close());
+ await assert.rejects(runner.addQueuedSubmission({threadId:"native",prompt:"next",clientUserMessageId:"im",assertCurrent(){throw Error("binding changed");}}),CodexQueueAdmissionError);
+ assert.deepEqual(fs.readFileSync(file,"utf8").trim().split("\n"),["initialize","thread/resume","thread/unsubscribe"]);
+});
+
+test("fresh non-runnable queue target is a definite admission rejection with no native mutation",async t=>{
+ let writes=0;
+ const app={capabilities:APP_SERVER_BACKEND_CAPABILITIES,async inspectThread(threadId:string){return{threadId,persistence:"archived",runtimeStatus:"notLoaded",activeFlags:[]};},async addQueuedSubmission(){writes++;throw Error("must not run");},async listQueuedSubmissions(){return{data:[]};},async deleteQueuedSubmission(){return false;},async runQueuedSubmission(){throw Error("must not run");},close(){}};
+ const router=new CodexBackendRouter({backend:"app-server",appServerBackend:app as never});t.after(()=>router.close());
+ await assert.rejects(router.addQueuedSubmission({threadId:"native",prompt:"next",clientUserMessageId:"im"}),CodexQueueAdmissionError);
+ assert.equal(writes,0);
+});
