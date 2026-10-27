@@ -190,6 +190,28 @@ test("rejects non-loopback Taskboard origins", () => {
     /loopback/i
   );
 });
+test("accepts IPv6 loopback consistently with the embedded Taskboard listener policy", () => {
+  assert.equal(new TaskboardClient({ baseUrl: "http://[::1]:4876" }).baseUrl, "http://[::1]:4876");
+});
+for (const ending of ["\n", "\r\n"]) test(`Taskboard SSE handles split ${JSON.stringify(ending)} delimiters and cancels after a consumer failure`, async () => {
+  let cancelled = false;
+  const payload = `event: updated${ending}data: {"type":"updated"}${ending}${ending}`;
+  const client = new TaskboardClient({ baseUrl: "http://127.0.0.1:4876", fetch: async () => new Response(new ReadableStream({
+    start(stream) { for (const char of payload) stream.enqueue(new TextEncoder().encode(char)); },
+    cancel() { cancelled = true; }
+  })) });
+  const events: string[] = [];
+  await assert.rejects(client.subscribe(new AbortController().signal, event => { events.push(event.type); throw Error("consumer failed"); }), /consumer failed/);
+  assert.deepEqual(events, ["updated"]); assert.equal(cancelled, true);
+});
+test("Taskboard SSE bounds incomplete frames and releases the connection on overflow", async () => {
+  let cancelled = false;
+  const client = new TaskboardClient({ baseUrl: "http://127.0.0.1:4876", fetch: async () => new Response(new ReadableStream({
+    start(stream) { stream.enqueue(new TextEncoder().encode("data: " + "x".repeat(2 * 1024 * 1024))); stream.close(); },
+    cancel() { cancelled = true; }
+  })) });
+  await assert.rejects(client.subscribe(new AbortController().signal, () => { throw Error("must not emit"); }), /frame.*size|帧.*大小/i);
+});
 
 test("parses Taskboard status events from the SSE stream", async () => {
   const controller = new AbortController();

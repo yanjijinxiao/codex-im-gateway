@@ -1351,6 +1351,20 @@ function noEmotionClient(): DingTalkEmotionClient {
   };
 }
 
+for (const failure of ["routing", "claim"] as const) test(`DingTalk ${failure} persistence failure reaches the Gateway error handler without escaping the SDK callback`, async t => {
+  let listener: ((message: DWClientDownStream) => void) | undefined;
+  const routes = new DingTalkCardRouting("ding-client"), errors: unknown[] = []; let handled = 0;
+  if (failure === "routing") t.mock.method(routes, "remember", () => { throw Error("route journal unavailable"); });
+  const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "ding-client", clientSecret: "synthetic", savedAt: "", enabled: true }, {
+    cardRouting: routes, emotionClient: noEmotionClient(), streamClient: streamClientThatCaptures(callback => { listener = callback; }) });
+  const abort = new AbortController(); const monitoring = adapter.monitor({ signal: abort.signal,
+    claimMessage() { if (failure === "claim") throw Error("receipt journal unavailable"); return true; },
+    async onMessage() { handled++; }, async onMessageError(error) { errors.push(error); } });
+  t.after(async () => { abort.abort(); await monitoring; });
+  assert.doesNotThrow(() => listener!(frame(robotMessage())));
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(errors.length, 1); assert.equal(handled, 0);
+});
+
 test("DingTalk callback exposes group title as public display identity without confusing it with the sender", async () => {
   let listener: ((message: DWClientDownStream) => void) | undefined;
   const adapter = new DingTalkChannelAdapter({ channel: "dingtalk", accountId: "test", clientId: "fake", clientSecret: "fake", savedAt: "", enabled: true }, {

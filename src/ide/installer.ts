@@ -154,6 +154,7 @@ const sha=async file=>{const h=crypto.createHash('sha256');for await(const data 
  throw Error('Unknown operation');
 })().catch(()=>{process.stderr.write('IDE tool preparation failed\n');process.exitCode=1;});
 `;
+const assetDownloads = new Map<string, Promise<string>>();
 export class ProcessIDEInstallerIO implements IDEInstallerIO {
   constructor(private readonly cache: string) {}
   private input(value: object) { return { ...value, version: CODE_SERVER_VERSION, pins: ASSET_PINS }; }
@@ -162,6 +163,17 @@ export class ProcessIDEInstallerIO implements IDEInstallerIO {
   async remoteDownload(hostId: string, stage: string, asset: IDEAsset, signal: AbortSignal) { await runIDEHost(hostId, HOST, this.input({ op: "download", stage, asset }), signal, 60_000); }
   async download(asset: IDEAsset, progress: (bytes: number) => void, signal: AbortSignal): Promise<string> {
     fs.mkdirSync(this.cache, { recursive: true, mode: 0o700 }); fs.chmodSync(this.cache, 0o700);
+    const key = path.join(fs.realpathSync(this.cache), asset.name);
+    const previous = assetDownloads.get(key) ?? Promise.resolve("");
+    const pending = previous.catch(() => "").then(() => {
+      signal.throwIfAborted();
+      return this.downloadExclusive(asset, progress, signal);
+    });
+    assetDownloads.set(key, pending);
+    try { return await pending; }
+    finally { if (assetDownloads.get(key) === pending) assetDownloads.delete(key); }
+  }
+  private async downloadExclusive(asset: IDEAsset, progress: (bytes: number) => void, signal: AbortSignal): Promise<string> {
     const file = path.join(this.cache, asset.name);
     if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) throw new Error("缓存不能是符号链接");
     if (await verified(file, asset)) { progress(asset.size); return file; }

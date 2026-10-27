@@ -54,3 +54,25 @@ test("configuration restart failure restores the old configuration and connectin
   assert.equal(rollbacks, 1); assert.equal(variant, "old"); assert.equal(f.signal?.aborted, false);
   assert.equal(manager.entries.get("one").status, "starting"); assert.equal(manager.runtimeConfigurationChanging, false);
 });
+
+test("shutdown cleans every resource after an observer or question journal fails", async t => {
+  const f = fixture(t, false); await f.manager.startAccount("one", false);
+  const manager = f.manager as any, entry = manager.entries.get("one");
+  const suspend = entry.service.suspendUserInputs;
+  entry.service.suspendUserInputs = () => { throw Error("question journal unavailable"); };
+  manager.codexSessionMonitor = { async stop() { throw Error("observer unavailable"); } };
+  try {
+    await assert.rejects(f.manager.stopAll(), /关闭|停止|shutdown/i);
+    assert.equal(f.signal?.aborted, true); assert.equal(entry.status, "stopped");
+    assert.ok(f.closes > 0); assert.equal(manager.stoppingAll, false);
+  } finally { entry.service.suspendUserInputs = suspend; manager.codexSessionMonitor = undefined; }
+});
+test("external interrupted completion is not described as execution failure", async t => {
+  const f = fixture(t), manager = f.manager as any, events: any[] = [];
+  const original = manager.threadEvents.completion;
+  manager.threadEvents.completion = async (...args: any[]) => { events.push(args); };
+  try {
+    await manager.finalizeExternalActivityStreams({ sessionId: "thread", turnId: "turn", text: "原任务已中断", success: false, outcome: "interrupted" });
+    assert.equal(events[0][4], "interrupted"); assert.doesNotMatch(events[0][3], /执行失败/);
+  } finally { manager.threadEvents.completion = original; }
+});

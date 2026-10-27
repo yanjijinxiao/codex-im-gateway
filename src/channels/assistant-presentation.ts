@@ -36,31 +36,46 @@ export function presentAssistantText(source: string): string {
 }
 
 export function projectAssistantProse(source: string, transform: (text: string) => string, directivesOnly = false): string {
+  const input = markdownSource(source);
   let output = "", cursor = 0;
   const protectedCode = (token: Token): boolean => token.type === "code" || token.type === "codespan"
     || "tokens" in token && Array.isArray(token.tokens) && token.tokens.some(protectedCode)
     || token.type === "list" && token.items.some((item: { tokens: Token[] }) => item.tokens.some(protectedCode));
-  for (const token of Lexer.lex(source, { gfm: true })) {
-    const offset = source.indexOf(token.raw, cursor);
+  for (const token of Lexer.lex(input.text, { gfm: true })) {
+    const offset = input.text.indexOf(token.raw, cursor);
     if (offset < 0) continue;
-    output += transform(source.slice(cursor, offset));
+    output += transform(input.original(cursor, offset));
     // Inline code is protected individually in paragraphs; containing blocks
     // keep indentation/fences exactly, including literal directive examples.
-    if (token.type === "code" || token.type === "blockquote" || token.type === "html" || token.type === "list" && protectedCode(token)) output += token.raw;
+    if (token.type === "code" || token.type === "blockquote" || token.type === "html" || token.type === "list" && protectedCode(token)) output += input.original(offset, offset + token.raw.length);
     else if ("tokens" in token && Array.isArray(token.tokens) && protectedCode(token)) {
       let inner = 0;
       for (const child of token.tokens) {
         if (!protectedCode(child) || directivesOnly && !child.raw.includes(marker)) continue;
         const at = token.raw.indexOf(child.raw, inner);
         if (at < 0) continue;
-        output += transform(token.raw.slice(inner, at)) + child.raw;
+        output += transform(input.original(offset + inner, offset + at)) + input.original(offset + at, offset + at + child.raw.length);
         inner = at + child.raw.length;
       }
-      output += transform(token.raw.slice(inner));
-    } else output += transform(token.raw);
+      output += transform(input.original(offset + inner, offset + token.raw.length));
+    } else output += transform(input.original(offset, offset + token.raw.length));
     cursor = offset + token.raw.length;
   }
-  return output + transform(source.slice(cursor));
+  return output + transform(input.original(cursor));
+}
+
+/** marked normalizes CRLF/CR before producing token.raw. Keep token positions
+ * in that coordinate system while splicing literal bytes from the original. */
+export function markdownSource(source: string): { text: string; original(start: number, end?: number): string } {
+  if (!source.includes("\r")) return { text: source, original: (start, end) => source.slice(start, end) };
+  const offsets: number[] = [];
+  for (let index = 0; index < source.length; index++) {
+    offsets.push(index);
+    if (source[index] === "\r" && source[index + 1] === "\n") index++;
+  }
+  offsets.push(source.length);
+  return { text: source.replace(/\r\n?/g, "\n"),
+    original: (start, end) => source.slice(offsets[start], end === undefined ? undefined : offsets[end]) };
 }
 
 function annotation(source: string, offset: number): { end: number; value?: Annotation } | undefined {

@@ -466,6 +466,12 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         console.warn(`[codex-im-gateway] ignored malformed DingTalk message: ${errorDetail(error)}`);
         return;
       }
+      if (!body || typeof body !== "object" || Array.isArray(body)
+        || ["senderStaffId", "senderId", "conversationId", "sessionWebhook", "robotCode", "msgId", "senderNick", "conversationTitle", "msgtype"]
+          .some(key => { const value = (body as unknown as Record<string, unknown>)[key]; return value !== undefined && typeof value !== "string"; })) {
+        console.warn("[codex-im-gateway] ignored malformed DingTalk message shape");
+        return;
+      }
       const actorId = body.senderStaffId?.trim() || body.senderId?.trim();
       const conversationId = body.conversationId?.trim();
       const webhookUrl = body.sessionWebhook?.trim();
@@ -488,8 +494,6 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       };
       this.replyTargets.set(conversationId, replyTarget);
       this.replyTargets.set(actorId, replyTarget);
-      this.cardRouting.remember(conversationId, body.conversationType, body.senderStaffId?.trim(), replyTarget.robotCode,
-        { conversationName: body.conversationTitle, actorName: body.senderNick });
       const message: ChannelMessage = {
         id: body.msgId || frame.headers.messageId,
         senderId: actorId,
@@ -504,7 +508,16 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
         references: decoded.references,
         raw: { channel: "dingtalk", event: body }
       };
-      if (options.claimMessage && !options.claimMessage(message)) return;
+      try {
+        this.cardRouting.remember(conversationId, body.conversationType, body.senderStaffId?.trim(), replyTarget.robotCode,
+          { conversationName: body.conversationTitle, actorName: body.senderNick });
+        if (options.claimMessage && !options.claimMessage(message)) return;
+      } catch (error) {
+        // SDK callbacks are synchronous. Journal failures must reach the one
+        // application error boundary, never escape or submit without a claim.
+        void this.replyContext.run(replyTarget, () => this.reportMessageError(error, message, options));
+        return;
+      }
       if (!callbackIdentityReported) {
         callbackIdentityReported = true;
         // Diagnose the wire value, not ReplyTarget's Client ID fallback. Never log
@@ -555,6 +568,14 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
     }
   }
 
+  private async reportMessageError(error: unknown, message: ChannelMessage, options: ChannelMonitorOptions): Promise<void> {
+    console.error(`[codex-im-gateway] DingTalk message handling failed for ${message.senderId}: ${errorDetail(error)}`);
+    try { await options.onMessageError?.(error, message); }
+    catch (reportError) {
+      console.error(`[codex-im-gateway] failed to report DingTalk message error: ${errorDetail(reportError)}`);
+    }
+  }
+
   private async handleMessageWithEmotion(
     message: ChannelMessage,
     target: ReplyTarget,
@@ -571,14 +592,7 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
       // Download only after the application has checked actor/conversation ACL.
       await options.onMessage(message);
     } catch (error) {
-      console.error(
-        `[codex-im-gateway] DingTalk message handling failed for ${message.senderId}: ${errorDetail(error)}`
-      );
-      try {
-        await options.onMessageError?.(error, message);
-      } catch (reportError) {
-        console.error(`[codex-im-gateway] failed to report DingTalk message error: ${errorDetail(reportError)}`);
-      }
+      await this.reportMessageError(error, message, options);
     } finally {
       if (await thinking) {
         await this.sendThinkingEmotion("recall", target).catch((error) => {
@@ -1382,7 +1396,7 @@ class DingTalkRestInboundMediaClient implements DingTalkInboundMediaClient {
     }
 
     const parsedUrl = normalizeDingTalkDownloadUrl(downloadUrl, Boolean(input.downloadCode && !input.downloadUrl));
-    const response = await this.transport.request(lifecycleId, parsedUrl);
+    const response = await this.transport.request(lifecycleId, parsedUrl, { maxResponseBytes: input.maxBytes, timeoutMs: 60_000 });
     if (!response.ok) throw new Error(`钉钉图片文件下载失败：HTTP ${response.status}`);
     const buffer = await responseBytes(response, input.maxBytes);
     const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim();

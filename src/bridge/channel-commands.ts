@@ -65,7 +65,7 @@ const SESSION_HELP_LINES = [
   "/history（/hist）[1-20] - 查看最近对话，例如 /history 10",
   "/history more - 继续查看更早的对话",
   "/ide [status] - 获取当前项目的 Web IDE 入口；不会提交任务，浏览器另行鉴权",
-  "/ide identity - 私聊或群聊查看本人身份，首次在本机 Web IDE 页登记授权管理员",
+  "/ide identity - 查看本人身份；Web IDE 复用个人准入，未获准时由准入审批管理员通过 /access 处理",
   "/ide auth 六位识别码 - 兼容核对流程（私聊或群聊）；优先复制原授权页生成的完整命令",
   "/follow [on|off|sync] - 查看同步健康；on 开启并同步，sync 强制同步当前绑定（App 后端）",
   "/follow sync --retry-delivery - 控制者明确重试原实例的未知投递，可能重复通知，不创建新卡",
@@ -93,7 +93,7 @@ const BUILT_IN_HELP_LINES = [
   "项目与工作模式",
   "/status（/st）- 查看当前任务、项目、模型和运行状态",
   "/balance（/bal）- 查看当前 Codex 账号剩余用量",
-  "/memory（/mem）[on|off|f K编号|c] - 管理账号个人记忆（与 llm-wiki 分开）",
+  "/memory（/mem）[on|off|f 条目ID|c] - 管理账号个人记忆（与 llm-wiki 分开）",
   "/project（/p）[l|P编号|C编号] - 查看或切换项目；不自动绑定 session，使用 /new 或 /session 绑定",
   "/project add（/p a）[C编号] - /project 的兼容别名",
   "/project rename（/p rn）P1|新名称 - 仅修改 Gateway 显示名称，不重命名 Codex App 项目",
@@ -167,7 +167,7 @@ export function channelHelpText(capabilities: readonly ChannelCommandCapability[
     const token = /^\/(\w+)/.exec(line)?.[1];
     const command = CHANNEL_COMMAND_REGISTRY.find(item => item.name === token);
     if (token === "task" && context.taskboardAvailable === false) return `${line}【需启用 Taskboard】`;
-    if ((token === "steer" || token === "queue") && context.desktopOwned) return `${line}【当前 Desktop 转发不支持此操作，请在 App 中操作或使用共享 App Server】`;
+    if (token === "steer" && context.desktopOwned) return `${line}【当前 Desktop 转发不支持此操作，请在 App 中操作或使用共享 App Server】`;
     if (command && "capability" in command && context.backendCapabilities?.[command.capability] === false) {
       return `${line}【当前后端不支持】`;
     }

@@ -79,10 +79,10 @@ test('regression: origin history growth retains the live older turn destination'
 test('regression: an older Web refresh cannot overwrite a newer snapshot',async()=>{
  const all=fs.readFileSync(new URL('../src/web/app.js',import.meta.url),'utf8');
  const fn=all.slice(all.indexOf('let refreshGeneration ='),all.indexOf('\nfunction renderAll(',all.indexOf('async function refreshData(')));
- const release=Promise.withResolvers<void>();let calls=0;
+ const release=Promise.withResolvers<void>();let version=1;
  const state:any={};const context:any={state,selectedSession:()=>undefined,isTaskboardEditing:()=>false,document:{querySelector:()=>({hidden:true})},window:{},bindingOverview:{render(){}},
-  async api(url:string){const version=Math.floor(calls++/5)+1;if(version===1)await release.promise;const name=url.split('/').at(-1);return{[name!]:[{version}],version};},async loadTaskboardIssues(){},renderMetrics(){},renderAccounts(){},renderSessions(){},renderTaskboardStatus(){},renderTaskboardWorkbench(){},drawIcons(){},toast(){}};
- vm.createContext(context);vm.runInContext(fn,context);const first=context.refreshData(false);await context.refreshData(false);assert.equal(state.sessions[0].version,2);
+  async api(url:string){const observed=version;if(observed===1)await release.promise;const name=url.split('/').at(-1);return{[name!]:[{version:observed}],version:observed};},async refreshTaskboardIssues(){},async loadTaskboardIssues(){},renderMetrics(){},renderAccounts(){},renderSessions(){},renderTaskboardStatus(){},renderTaskboardWorkbench(){},drawIcons(){},toast(){}};
+ vm.createContext(context);vm.runInContext(fn,context);const first=context.refreshData(false);version=2;await context.refreshData(false);assert.equal(state.sessions[0].version,2);
  release.resolve();await first;assert.equal(state.sessions[0].version,2);
 });
 

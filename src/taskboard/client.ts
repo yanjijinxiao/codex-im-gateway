@@ -67,7 +67,7 @@ export class TaskboardClient {
 
   constructor(options: { baseUrl: string; fetch?: TaskboardFetch; timeoutMs?: number }) {
     const url = new URL(options.baseUrl);
-    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(url.hostname)) {
+    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
       throw new Error("Taskboard URL must use an HTTP loopback origin");
     }
     url.pathname = url.pathname.replace(/\/+$/, "");
@@ -215,15 +215,21 @@ export class TaskboardClient {
     });
     if (!response.ok || !response.body) throw await taskboardHttpError(response);
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    const cancel = () => { void reader.cancel().catch(() => undefined); };
+    signal.addEventListener("abort", cancel, { once: true });
+    if (signal.aborted) cancel();
     let buffer = "";
+    const maxFrameBytes = 1024 * 1024;
+    try {
     while (!signal.aborted) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += value;
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary).replace(/\r/g, "");
-        buffer = buffer.slice(boundary + 2);
+      let boundary = /\r?\n\r?\n/.exec(buffer);
+      while (boundary) {
+        const frame = buffer.slice(0, boundary.index).replace(/\r/g, "");
+        if (Buffer.byteLength(frame) > maxFrameBytes) throw new Error("Taskboard SSE frame exceeds size limit");
+        buffer = buffer.slice(boundary.index + boundary[0].length);
         const data = frame.split("\n").filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).trim()).join("\n");
         if (data) {
@@ -236,9 +242,16 @@ export class TaskboardClient {
             at: z.string().optional().parse(raw.at)
           };
           await onEvent(event);
+          if (signal.aborted) return;
         }
-        boundary = buffer.indexOf("\n\n");
+        boundary = /\r?\n\r?\n/.exec(buffer);
       }
+      if (Buffer.byteLength(buffer) > maxFrameBytes) throw new Error("Taskboard SSE frame exceeds size limit");
+    }
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      try { await reader.cancel(); } catch { /* Connection may already be closed. */ }
+      reader.releaseLock();
     }
   }
 

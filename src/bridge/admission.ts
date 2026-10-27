@@ -61,9 +61,14 @@ export class AdmissionService {
     do { requestId = crypto.randomBytes(6).toString("hex"); } while (this.state.observations.some(r => r.id === requestId));
     const record = observationSchema.parse({ id: requestId, version: crypto.randomBytes(32).toString("hex"),
       principal, conversationId, kind, createdAt: this.now(), expiresAt: this.now() + 24 * 60 * 60_000, phase: "pending" });
-    const observations = this.state.observations.filter(r => this.current(r));
-    if (observations.length >= 500 || observations.filter(r => key(r.principal) === key(principal)).length >= 8) throw Error("准入申请已达上限，请管理员先处理");
-    this.save({ ...this.state, observations: [...observations, record] }); return structuredClone(record);
+    const current = this.state.observations.filter(r => this.current(r));
+    const open = current.filter(r => r.phase !== "dismissed");
+    if (open.length >= 500 || open.filter(r => key(r.principal) === key(principal)).length >= 8) throw Error("准入申请已达上限，请管理员先处理");
+    // Completed tickets are revocation tombstones, not active capacity. Evict
+    // only these when space is needed; applying/unknown grants remain retained.
+    const room = 499 - open.length;
+    const completed = room > 0 ? current.filter(r => r.phase === "dismissed").slice(-room) : [];
+    this.save({ ...this.state, observations: [...completed, ...open, record] }); return structuredClone(record);
   }
   private request(requestId: string, version: string) {
     this.assertReady(); const r = this.state.observations.find(r => r.id === requestId && r.version === version && this.current(r));

@@ -29,7 +29,7 @@ export class NativeQueueCoordinator {
   private receipts: Record<string, QueueReceipt>;
   private readonly controls = new SessionControlQueue();
   private readonly dispatching = new Set<string>();
-  constructor(private readonly filePath: string) {
+  constructor(private readonly filePath: string, private readonly options: { observationTimeoutMs?: number } = {}) {
     const data = readJsonFile<unknown>(filePath, { receipts: {} });
     if (!record(data) || !record(data.receipts) || Object.entries(data.receipts).some(([id, value]) =>
       !record(value) || !/^[a-f0-9]{64}$/.test(id) || value.id !== id || value.clientUserMessageId !== `gateway-${id}`
@@ -92,12 +92,22 @@ export class NativeQueueCoordinator {
       return structuredClone(r);
     });
   }
-  private async nativeItems(r: QueueOrigin, backend: CodexBridgeBackend): Promise<CodexQueuedSubmission[]> {
+  private async readObservation<T>(read: () => Promise<T>, deadline: number): Promise<T> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Native queue observation timed out; receipts preserved");
+    let timer: NodeJS.Timeout | undefined;
+    try { return await Promise.race([Promise.resolve().then(read), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Native queue observation timed out; receipts preserved")), remaining);
+    })]); } finally { if (timer) clearTimeout(timer); }
+  }
+  private observationDeadline(): number { return Date.now() + (this.options.observationTimeoutMs ?? 3_000); }
+  private async nativeItems(r: QueueOrigin, backend: CodexBridgeBackend, deadline = this.observationDeadline()): Promise<CodexQueuedSubmission[]> {
     if (!backend.listQueuedSubmissions) throw new CodexBackendCapabilityError("nativeQueue", backend.backendInfo(r.hostId).id);
     const items: CodexQueuedSubmission[] = [], cursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      const page = await backend.listQueuedSubmissions(r.threadId, cursor, r.hostId);
+      if (cursors.size >= 100) throw new Error("Native queue observation page budget exceeded; receipts preserved");
+      const page = await this.readObservation(() => backend.listQueuedSubmissions!(r.threadId, cursor, r.hostId), deadline);
       items.push(...page.data); cursor = page.nextCursor;
       if (cursor && cursors.has(cursor)) throw new Error("Native queue pagination repeated a cursor");
       if (cursor) cursors.add(cursor);
@@ -120,15 +130,24 @@ export class NativeQueueCoordinator {
       if (r.accountId !== accountId || scope && r.conversationId !== scope.conversationId || !unsettled.has(r.status)) continue;
       const key = threadKey(r); groups.set(key, [...groups.get(key) ?? [], r]);
     }
-    const results = await Promise.allSettled([...groups].map(([key, receipts]) => this.controls.run(key, async () => {
+    const results = await Promise.allSettled([...groups].map(([key, receipts]) => {
+      // Observations never own the mutation lane. A delayed catalog/history
+      // read must not block /queue or cancellation, nor overwrite a newer write.
+      const versions = new Map(receipts.map(r => [r, JSON.stringify(r)]));
+      const update = (r: QueueReceipt, changes: Partial<QueueReceipt>) => {
+        if (JSON.stringify(r) !== versions.get(r)) return;
+        this.update(r, changes); versions.set(r, JSON.stringify(r));
+      };
+      return (async () => {
+      const deadline = this.observationDeadline();
       const origin = receipts[0];
       if (backend.backendInfo(origin.hostId).id !== origin.backend) return;
-      const items = await this.nativeItems(origin, backend);
+      const items = await this.nativeItems(origin, backend, deadline);
       const missing: QueueReceipt[] = [];
       for (const r of receipts) {
         if (this.dispatching.has(key) && (r.status === "starting" || r.status === "running")) continue;
         const item = items.find(x => x.clientUserMessageId === r.clientUserMessageId);
-        if (item) this.update(r, { status: "queued", queuedSubmissionId: item.id, reason: undefined });
+        if (item) update(r, { status: "queued", queuedSubmissionId: item.id, reason: undefined });
         else missing.push(r);
       }
       if (!missing.length) return;
@@ -136,16 +155,17 @@ export class NativeQueueCoordinator {
       // Missing queue entries may already have started: absence is NOT rejection.
       let cursor: string | undefined; const cursors = new Set<string>();
       do {
-        const page = await backend.getHistoryPage(origin.threadId, { cursor, limit: 100 }, origin.hostId);
+        if (cursors.size >= 100) throw new Error("History observation page budget exceeded; receipts preserved");
+        const page = await this.readObservation(() => backend.getHistoryPage(origin.threadId, { cursor, limit: 100 }, origin.hostId), deadline);
         for (const r of missing.slice()) {
           const user = page.messages.find(m => m.role === "user"
             && (m.clientUserMessageId === r.clientUserMessageId || (r.turnId && m.turnId === r.turnId)));
           if (!user?.turnId) continue;
           // History locates identity only. A foreign unloaded reader can report
           // interrupted while the actual owner is still executing this turn.
-          const observed = await backend.readTurnLifecycle?.(r.threadId, user.turnId, r.hostId);
+          const observed = backend.readTurnLifecycle ? await this.readObservation(() => backend.readTurnLifecycle!(r.threadId, user.turnId!, r.hostId), deadline) : undefined;
           const confirmed = observed && observed.source !== "unknown" && observed.status !== "unknown";
-          this.update(r, { turnId: user.turnId,
+          update(r, { turnId: user.turnId,
             status: confirmed ? observed.status === "inProgress" ? "running" : "completed" : "uncertain",
             ...(confirmed ? { lifecycleVersion: 2 as const } : {}),
             reason: confirmed ? undefined : "已定位原生轮次，执行终态仍待实际持有者或原生结束事件确认；未重发输入。" });
@@ -155,14 +175,14 @@ export class NativeQueueCoordinator {
         if (cursor && cursors.has(cursor)) throw new Error("History pagination repeated a cursor");
         if (cursor) cursors.add(cursor);
       } while (cursor && missing.length);
-      for (const r of missing) this.update(r, { status: "uncertain",
+      for (const r of missing) update(r, { status: "uncertain",
         reason: "原生队列和历史未能确认接收状态，未自动重发；请核对 Codex 历史。" });
-    }).catch(error => {
-      for (const r of receipts) if (!r.delivered) this.update(r, {
+    })().catch(error => {
+      for (const r of receipts) if (!r.delivered) update(r, {
         reason: "无法读取原生队列或历史；回执已保留，未重发消息，等待后端恢复。"
       });
       throw error;
-    })));
+    }); }));
     rethrowFailures(results);
   }
   async dispatch(accountId: string, backend: CodexBridgeBackend, execute: (receipt: QueueReceipt,
@@ -209,7 +229,7 @@ export class NativeQueueCoordinator {
     rethrowFailures(results);
   }
   async cancel(accountId: string, conversationId: string, actorId: string, queueId: string,
-    backend: CodexBridgeBackend, controller = false): Promise<boolean> {
+    backend: CodexBridgeBackend, controller = false, assertCurrent?: () => void): Promise<boolean> {
     const r = Object.values(this.receipts).find(x => x.accountId === accountId
       && x.conversationId === conversationId && x.queuedSubmissionId === queueId && (controller || x.actorId === actorId));
     if (!r || !backend.deleteQueuedSubmission) throw new Error("这条队列记录不属于当前账号、聊天或用户。");
@@ -217,7 +237,8 @@ export class NativeQueueCoordinator {
       if (r.status !== "queued") throw new Error("该消息已开始或接收状态未确认，不能按待执行消息取消。");
       const items = await this.nativeItems(r, backend);
       if (!items.some(x => x.id === queueId && x.clientUserMessageId === r.clientUserMessageId)) return false;
-      const deleted = await backend.deleteQueuedSubmission!(r.threadId, queueId, r.hostId);
+      assertCurrent?.();
+      const deleted = await backend.deleteQueuedSubmission!(r.threadId, queueId, r.hostId, assertCurrent);
       if (deleted) this.update(r, { status: "cancelled", reason: undefined });
       return deleted;
     });

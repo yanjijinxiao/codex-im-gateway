@@ -391,6 +391,11 @@ test("exposes and manages only workspace-mapped Taskboard issues", async (t) => 
     async moveIssue(taskId: string, status: string, version: number, threadId: string) {
       moves.push({ taskId, status, version, threadId });
       return { ...issue, status, version: version + 1 };
+    },
+    async moveIssueWithComment(taskId: string, status: string, version: number, threadId: string, body: string) {
+      moves.push({ taskId, status, version, threadId }); comments.push({ body, threadId });
+      return { task: { ...issue, status, version: version + 1 },
+        comment: { id: "comment-atomic", taskId, body, threadId, createdAt: issue.updatedAt, updatedAt: issue.updatedAt } };
     }
   };
   const { manager, root } = setup(t, { taskboardClient });

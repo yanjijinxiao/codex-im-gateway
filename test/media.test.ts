@@ -288,3 +288,26 @@ test("rejects inbound media beyond the configured plain size", async (t) => {
     return true;
   });
 });
+test("Weixin download enforces the byte budget while receiving an unbounded body", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "weixin-stream-budget-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true })); let cancelled = false;
+  const response = new Response(new ReadableStream({ pull(stream) { stream.enqueue(new Uint8Array(1024)); }, cancel() { cancelled = true; } }));
+  // The old all-at-once read is made finite so the failure is a bounded assertion, not an OOM.
+  response.arrayBuffer = async () => new ArrayBuffer(2048);
+  await assert.rejects(downloadInboundAttachments({ rootDir: root, senderId: "actor", messageId: "m", maxBytes: 100,
+    attachments: [{ kind: "file", label: "file.txt", item: { type: 4, file_item: { media: { full_url: "https://example.test/file" } } } }],
+    fetch: async () => response }), InboundMediaTooLargeError);
+  assert.equal(cancelled, true);
+});
+test("dot-segment sender identities cannot write outside the inbound root", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "weixin-path-budget-")), inbound = path.join(root, "inbound");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true })); fs.mkdirSync(inbound);
+  for (const senderId of [".", ".."]) {
+    const files = await downloadInboundAttachments({ rootDir: inbound, senderId, messageId: "m", maxBytes: 100,
+      attachments: [{ kind: "file", label: "file.txt", item: { type: 4, file_item: { media: { full_url: "https://example.test/file" } } } }],
+      fetch: async () => new Response("fixture") });
+    const relative = path.relative(inbound, files[0].path);
+    assert.ok(!relative.startsWith("..") && !path.isAbsolute(relative));
+    assert.notEqual(path.dirname(files[0].path), inbound, "each sender still owns a child directory");
+  }
+});

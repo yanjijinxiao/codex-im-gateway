@@ -28,3 +28,11 @@ test("limits buffered prompt size", () => {
     /too many/i
   );
 });
+
+test("expired conversations are evicted when another conversation uses the buffer", () => {
+  let now = 0; const buffers = new PromptBuffer({ maxItems: 5, ttlMs: 10, now: () => now });
+  for (let i = 0; i < 100; i++) buffers.start(`inactive-${i}`);
+  now = 11; buffers.start("new");
+  assert.equal((buffers as any).buffers.size, 1);
+  assert.equal(buffers.isActive("new"), true); assert.equal(buffers.done("inactive-1").status, "empty");
+});

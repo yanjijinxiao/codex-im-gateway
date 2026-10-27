@@ -470,7 +470,8 @@ test("automatically declines unanswered channel approvals after the timeout", as
   });
 
   assert.equal(decision, "decline");
-  assert.ok(replies.some((reply) => /审批 A1 已超时.*自动拒绝/.test(reply)));
+  assert.ok(replies.some((reply) => /审批 A1 已超时.*已选择拒绝.*Codex 回执/.test(reply)));
+  assert.ok(replies.every(reply => !reply.includes("已自动拒绝")), "choosing denial is not a confirmed native receipt");
 });
 
 test("only a controller in the approval's original group can confirm it", async (t) => {

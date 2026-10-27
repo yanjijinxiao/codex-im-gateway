@@ -22,6 +22,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelector("#knowledgeBindingList").addEventListener("change", async (event) => {
     await handleKnowledgeBaseBinding(event);
   });
+  document.querySelector("#knowledgeBindingList").addEventListener("focusout", () => {
+    window.setTimeout(() => renderKnowledgeBasesPage(), 0);
+  });
 });
 
 function renderKnowledgeBasesPage() {
@@ -41,7 +44,7 @@ function renderKnowledgeBasesPage() {
   const projects = [...state.projects].sort((left, right) => (
     `${left.accountId}:${left.name}`.localeCompare(`${right.accountId}:${right.name}`, "zh-CN")
   ));
-  bindings.innerHTML = projects.length
+  if (!bindings.contains?.(document.activeElement) && !bindings.querySelector?.("[data-knowledge-binding]:disabled")) bindings.innerHTML = projects.length
     ? projects.map(renderKnowledgeBinding).join("")
     : emptyState("folder", "还没有 Codex 项目", "先在消息渠道页添加项目，再绑定问答知识库。");
   drawIcons();
@@ -63,7 +66,7 @@ function renderKnowledgeBaseRow(knowledgeBase) {
     <div class="knowledge-base-main">
       <div class="knowledge-base-title"><strong>${kbEscape(knowledgeBase.name)}</strong>${status}</div>
       <code title="${kbEscape(knowledgeBase.rootPath)}">${kbEscape(knowledgeBase.rootPath)}</code>
-      <p>${kbEscape(account?.displayName || account?.name || knowledgeBase.accountId)} · ${knowledgeBase.channelDefault ? "渠道问答默认" : "非渠道默认"} · ${boundProjects.length ? `已绑定 ${boundProjects.map((project) => project.name).join("、")}` : "尚未绑定项目"}</p>
+      <p>${kbEscape(account?.displayName || account?.name || knowledgeBase.accountId)} · ${knowledgeBase.channelDefault ? "渠道问答默认" : "非渠道默认"} · ${boundProjects.length ? `已绑定 ${boundProjects.map((project) => kbEscape(project.name)).join("、")}` : "尚未绑定项目"}</p>
     </div>
     <div class="knowledge-base-actions">
       <button class="icon-button" type="button" data-knowledge-action="inspect" data-account-id="${kbEscape(knowledgeBase.accountId)}" data-knowledge-id="${kbEscape(knowledgeBase.id)}" title="重新检查 ${kbEscape(knowledgeBase.name)}" aria-label="重新检查 ${kbEscape(knowledgeBase.name)}"><i data-lucide="activity"></i></button>
@@ -340,6 +343,7 @@ async function handleKnowledgeBaseBinding(event) {
     await refreshData(false);
   } finally {
     select.disabled = false;
+    renderKnowledgeBasesPage();
   }
 }
 

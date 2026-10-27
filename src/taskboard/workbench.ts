@@ -1,4 +1,5 @@
 import path from "node:path";
+import { localProjectsAtWorkspace } from "../state/project-identity.js";
 
 import type {
   TaskboardClient,
@@ -14,6 +15,8 @@ export type TaskboardManagedProject = {
   readonly projectId: string;
   readonly projectName: string;
   readonly workspace: string;
+  readonly hostId?: string;
+  readonly sourceProjectId?: string;
 };
 
 export type TaskboardIssueSummary = TaskboardIssue & {
@@ -97,7 +100,7 @@ export class TaskboardWorkbench {
         `Taskboard transition to ${status} requires a comment`
       );
     }
-    if (note) await client.addComment(issue.id, note, threadId);
+    if (note) return (await client.moveIssueWithComment(issue.id, status, version, threadId, note)).task;
     return client.moveIssue(issue.id, status, version, threadId);
   }
 
@@ -112,7 +115,7 @@ export class TaskboardWorkbench {
     return (await client.listProjects()).flatMap((taskboardProject) => {
       if (!taskboardProject.workspacePath) return [];
       const workspace = path.resolve(taskboardProject.workspacePath);
-      const matches = managedProjects.filter((project) => path.resolve(project.workspace) === workspace);
+      const matches = localProjectsAtWorkspace(workspace, managedProjects);
       return matches.length ? [{ taskboardProject, managedProjects: matches }] : [];
     });
   }

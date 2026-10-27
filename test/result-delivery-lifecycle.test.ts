@@ -192,6 +192,21 @@ test("legacy native-text acknowledgements are not mistaken for failed cards or r
   assert.equal(f.hub.status(f.sub.key).resultDelivery?.pending, 0);
 });
 
+for (const cards of [true, false]) test(`unacknowledged delivery-error notices are not replayed across restart (cards=${cards})`, async () => {
+  let notices = 0, checkpoint: any;
+  const client = { resumableTextStream: cards,
+    async sendText() { throw Error("unconfirmed answer"); },
+    async sendProgressText() { notices++; throw Error("notice accepted but response lost"); },
+    ...(cards ? { async startTextStream() { throw Error("card unconfirmed"); }, async updateTextStream() {} } : {}) };
+  const first = new ChannelTurnTextStream(client, "room", { save(value) { checkpoint = structuredClone(value); } });
+  assert.equal(await first.finalize("final answer"), false);
+  await assert.rejects(first.reportTerminalFailure(), /response lost/); await first.suspend();
+  const restored = new ChannelTurnTextStream(client, "room", { restore: checkpoint, save(value) { checkpoint = structuredClone(value); } });
+  assert.equal(await restored.finalize("final answer"), false);
+  assert.equal(await restored.reportTerminalFailure(), false); assert.equal(notices, 1);
+  assert.notEqual(checkpoint.terminalNoticeSent, true); await restored.suspend();
+});
+
 for (const channel of ["dingtalk", "feishu", "weixin"] as const) {
   test(`${channel}: managed execution and following share final acknowledgements and do not resend`, async t => {
     const f = fixture(t, channel === "dingtalk");

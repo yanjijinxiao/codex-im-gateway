@@ -37,6 +37,8 @@ export type ChannelStreamCheckpoint = {
   activity?: TurnActivity;
   /** A delivery-error notice is not a replacement answer/card. Persist its receipt. */
   terminalNoticeSent?: boolean;
+  /** Attempt is durable before non-idempotent notice delivery; uncertainty is not retried. */
+  terminalNoticeAttempted?: boolean;
   /** Pinned layout and acknowledged pages survive a restart/partial failure. */
   resultPageBytes?: number;
   resultPresentation?: "card" | "native-text";
@@ -72,6 +74,7 @@ export class ChannelTurnTextStream {
   private finalizing?: Promise<boolean>;
   private terminalBlocked = false;
   private terminalNoticeSent = false;
+  private terminalNoticeAttempted = false;
   private resultPageBytes?: number;
   private resultPresentation?: "card" | "native-text";
   private terminalPages: NonNullable<ChannelStreamCheckpoint["terminalPages"]> = [];
@@ -140,6 +143,7 @@ export class ChannelTurnTextStream {
       this.terminal = saved.terminal;
       this.activity = saved.activity ?? "running";
       this.terminalNoticeSent = saved.terminalNoticeSent ?? false;
+      this.terminalNoticeAttempted = saved.terminalNoticeAttempted ?? this.terminalNoticeSent;
       this.resultPageBytes = saved.resultPageBytes;
       this.resultPresentation = saved.resultPresentation;
       this.terminalPages = saved.terminalPages?.map(page => ({ ...page, ...(page.bootstrap ? { bootstrap: restoredBootstrap(page.bootstrap) } : {}) })) ?? [];
@@ -161,7 +165,8 @@ export class ChannelTurnTextStream {
       ...(this.terminal ? { terminal: this.terminal } : {}),
       ...(this.resultPageBytes ? { resultPageBytes: this.resultPageBytes, resultPresentation: this.resultPresentation,
         terminalPages: this.terminalPages.map(page => ({ ...page })) } : {}),
-      ...(this.terminalNoticeSent ? { terminalNoticeSent: true } : {}) };
+      ...(this.terminalNoticeSent ? { terminalNoticeSent: true } : {}),
+      ...(this.terminalNoticeAttempted ? { terminalNoticeAttempted: true } : {}) };
   }
 
   deliveryState(): "active" | "pending" | "unavailable" | "finished" {
@@ -458,7 +463,11 @@ export class ChannelTurnTextStream {
     // update to an existing card. Background recovery will retry it safely.
     if (canRetryUnsentCreation(this.bootstrap)) return false;
     if (this.notifying) return this.notifying;
+    if (this.terminalNoticeAttempted) return false;
     this.notifying = (async () => {
+      this.terminalNoticeAttempted = true;
+      try { this.persistence?.save(this.checkpoint()); }
+      catch (error) { this.terminalNoticeAttempted = false; throw error; }
       await this.sendPlainText(!this.supported
         ? "最终答复有页面未确认送达，未自动重发以避免重复。可用 /history 查看完整结果。"
         : !this.messageId
@@ -513,7 +522,7 @@ export class ChannelTurnTextStream {
     const delay = Math.max(0, 500 - (Date.now() - this.lastUpdateAt));
     this.updateTimer = setTimeout(() => {
       this.updateTimer = undefined;
-      void this.updateNow();
+      this.background(() => this.updateNow());
     }, delay);
     this.updateTimer.unref?.();
   }
@@ -684,10 +693,11 @@ export class ChannelTurnTextStream {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
       if (!this.canUpdate()) return;
-      this.latestText = this.render();
-      this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
-      if (this.messageId) void this.updateNow();
-      else void this.openNow();
+      this.background(() => {
+        this.latestText = this.render();
+        this.latestActivity = this.activityMetadata ? this.visibleActivity() : undefined;
+        return this.messageId ? this.updateNow() : this.openNow();
+      });
     }, delay);
     this.retryTimer.unref?.();
     this.reportRecovery(probe ? "recovery_probe_scheduled" : "retry_scheduled", delay);
@@ -696,6 +706,14 @@ export class ChannelTurnTextStream {
   private recordFailure(error: unknown): void {
     const diagnostic = channelProgressError(error).diagnostic;
     if (diagnostic) { this.presentationFailure = diagnostic; this.persistence?.save(this.checkpoint()); }
+  }
+
+  private background(operation: () => Promise<unknown>): void {
+    void Promise.resolve().then(operation).catch(() => {
+      this.phase = "unavailable";
+      this.stopTimers();
+      this.reportRecovery("background_failed");
+    });
   }
 
   private reportRecovery(event: string, delayMs?: number): void {

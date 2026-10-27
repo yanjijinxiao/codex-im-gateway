@@ -395,26 +395,27 @@ function delay(ms) {
 }
 
 let refreshGeneration = 0;
+let taskboardRefreshGeneration = 0;
+let taskboardListGeneration = 0;
+let taskboardDetailGeneration = 0;
+let taskboardRefreshPending = 0;
 async function refreshData(notify) {
   const generation = ++refreshGeneration;
   try {
     const previousSession = selectedSession();
     const taskboardEditing = isTaskboardEditing();
-    const [accounts, projects, knowledgeBases, sessions, taskboard] = await Promise.all([
+    const [accounts, projects, knowledgeBases, sessions] = await Promise.all([
       api("/api/accounts"),
       api("/api/projects"),
       api("/api/knowledge-bases"),
-      api("/api/sessions"),
-      api("/api/taskboard")
+      api("/api/sessions")
     ]);
     if (generation !== refreshGeneration) return;
     state.accounts = accounts.accounts;
     state.projects = projects.projects;
     state.knowledgeBases = knowledgeBases.knowledgeBases;
     state.sessions = sessions.sessions;
-    state.taskboard = taskboard;
-    await loadTaskboardIssues(!taskboardEditing && !document.querySelector("#taskboardView").hidden);
-    if (generation !== refreshGeneration) return;
+    void refreshTaskboardIssues(false, { background: true, loadDetail: !taskboardEditing && !document.querySelector("#taskboardView").hidden });
     renderMetrics();
     renderAccounts();
     renderSessions();
@@ -792,42 +793,62 @@ function renderTaskboardStatus() {
 }
 
 async function loadTaskboardIssues(loadDetail = true) {
+  const generation = ++taskboardListGeneration;
   if (!state.taskboard?.available) {
+    ++taskboardDetailGeneration;
     state.taskboardIssues = [];
     state.taskboardIssueDetail = null;
     state.taskboardIssueError = state.taskboard?.error || (state.taskboard?.enabled ? "Taskboard 暂不可用" : "请先在设置中启用 Taskboard");
     return;
   }
   try {
-    const result = await api("/api/taskboard/issues");
+    const result = await api("/api/taskboard/issues", { signal: AbortSignal.timeout(5_000) });
+    if (generation !== taskboardListGeneration) return;
     state.taskboardIssues = Array.isArray(result.issues) ? result.issues : [];
     state.taskboardIssueError = "";
     if (!state.taskboardIssues.some((issue) => issue.identifier === state.selectedTaskboardIssue)) {
       state.selectedTaskboardIssue = state.taskboardIssues[0]?.identifier || "";
+      ++taskboardDetailGeneration;
       state.taskboardIssueDetail = null;
     }
     if (loadDetail && state.selectedTaskboardIssue) await loadTaskboardIssueDetail(state.selectedTaskboardIssue, false);
   } catch (error) {
+    if (generation !== taskboardListGeneration) return;
+    ++taskboardDetailGeneration;
     state.taskboardIssues = [];
     state.taskboardIssueDetail = null;
     state.taskboardIssueError = error.message || "无法读取 Taskboard 任务";
   }
 }
 
-async function refreshTaskboardIssues(notify = false) {
+async function refreshTaskboardIssues(notify = false, options = {}) {
+  if (options.background && taskboardRefreshPending) return;
+  const generation = ++taskboardRefreshGeneration;
+  taskboardRefreshPending = generation;
   const button = document.querySelector("#taskboardReconnect") || document.querySelector("#refreshTaskboardButton");
-  if (button) button.disabled = true;
+  if (button && !options.background) button.disabled = true;
   try {
-    state.taskboard = await api("/api/taskboard");
-    await loadTaskboardIssues();
+    const status = await api("/api/taskboard", { signal: AbortSignal.timeout(5_000) });
+    if (generation !== taskboardRefreshGeneration) return;
+    state.taskboard = status;
+    await loadTaskboardIssues(options.loadDetail ?? true);
+    if (generation !== taskboardRefreshGeneration) return;
     renderTaskboardStatus();
-    renderTaskboardWorkbench();
+    if (!isTaskboardEditing()) renderTaskboardWorkbench();
     if (notify) toast("任务面板已刷新");
   } catch (error) {
-    toast(error.message || "无法读取任务面板状态", true);
+    if (generation !== taskboardRefreshGeneration) return;
+    state.taskboard = { ...state.taskboard, available: false, error: error.message || "无法读取任务面板状态" };
+    await loadTaskboardIssues(false);
+    renderTaskboardStatus();
+    if (!isTaskboardEditing()) renderTaskboardWorkbench();
+    if (!options.background) toast(error.message || "无法读取任务面板状态", true);
   } finally {
-    if (button) button.disabled = false;
-    drawIcons();
+    if (generation === taskboardRefreshGeneration) {
+      taskboardRefreshPending = 0;
+      if (button) button.disabled = false;
+      drawIcons();
+    }
   }
 }
 
@@ -864,12 +885,17 @@ function renderTaskboardFrame() {
 }
 
 async function loadTaskboardIssueDetail(identifier, render = true) {
+  const generation = ++taskboardDetailGeneration;
   state.selectedTaskboardIssue = identifier;
   state.taskboardIssueDetail = null;
+  state.taskboardIssueError = "";
   if (render) renderTaskboardWorkbench();
   try {
-    state.taskboardIssueDetail = await api(`/api/taskboard/issues/${encodeURIComponent(identifier)}`);
+    const detail = await api(`/api/taskboard/issues/${encodeURIComponent(identifier)}`, { signal: AbortSignal.timeout(5_000) });
+    if (generation !== taskboardDetailGeneration || state.selectedTaskboardIssue !== identifier) return;
+    state.taskboardIssueDetail = detail;
   } catch (error) {
+    if (generation !== taskboardDetailGeneration || state.selectedTaskboardIssue !== identifier) return;
     state.taskboardIssueError = error.message || "无法读取任务详情";
   }
   if (render) {
@@ -1877,18 +1903,25 @@ function scrollChatToEnd() {
   });
 }
 
+let loginGeneration = 0;
+let activeLoginId = null;
+let loginPollPending = null;
 async function beginLogin() {
   stopLoginPoll();
+  const generation = loginGeneration;
   els.qrFrame.innerHTML = `<div class="spinner" aria-label="正在生成二维码"></div>`;
   setQrStatus("正在生成二维码");
   if (!els.qrDialog.open) els.qrDialog.showModal();
   drawIcons();
   try {
     const login = await api("/api/logins", { method: "POST" });
+    if (generation !== loginGeneration || !els.qrDialog.open) return;
+    activeLoginId = login.id;
     els.qrFrame.innerHTML = `<img src="${escapeAttr(login.qrDataUrl)}" alt="微信登录二维码">`;
     setQrStatus("等待微信扫码");
     state.loginPoll = window.setInterval(() => void pollLogin(login.id), 1800);
   } catch (error) {
+    if (generation !== loginGeneration || !els.qrDialog.open) return;
     setQrStatus(error.message, "error");
   }
 }
@@ -2046,8 +2079,12 @@ async function saveProjectNotifications(event) {
 }
 
 async function pollLogin(id) {
+  const generation = loginGeneration;
+  if (id !== activeLoginId || !els.qrDialog.open || loginPollPending === id) return;
+  loginPollPending = id;
   try {
     const result = await api(`/api/logins/${encodeURIComponent(id)}`, { token: false });
+    if (generation !== loginGeneration || id !== activeLoginId || !els.qrDialog.open) return;
     if (result.status === "waiting") setQrStatus("等待微信扫码");
     if (result.status === "scanned") setQrStatus("已扫码，请在微信中确认");
     if (result.retryPending) setQrStatus(result.message);
@@ -2057,17 +2094,24 @@ async function pollLogin(id) {
     }
     if (result.status === "confirmed") {
       stopLoginPoll();
+      const completedGeneration = loginGeneration;
       setQrStatus("账号已连接", "success");
       await refreshData(false);
-      window.setTimeout(() => els.qrDialog.close(), 900);
+      window.setTimeout(() => { if (completedGeneration === loginGeneration) els.qrDialog.close(); }, 900);
     }
   } catch (error) {
+    if (generation !== loginGeneration || id !== activeLoginId || !els.qrDialog.open) return;
     stopLoginPoll();
     setQrStatus(error.message, "error");
+  } finally {
+    if (generation === loginGeneration && loginPollPending === id) loginPollPending = null;
   }
 }
 
 function stopLoginPoll() {
+  ++loginGeneration;
+  activeLoginId = null;
+  loginPollPending = null;
   if (state.loginPoll) window.clearInterval(state.loginPoll);
   state.loginPoll = null;
 }
@@ -2079,12 +2123,20 @@ function setQrStatus(text, kind = "") {
 
 function openNewSessionDialog(preselectedProject) {
   const options = state.accounts.flatMap((account) => {
-    const sender = authorizedConversationId(account);
     const hasProject = state.projects.some((project) => project.accountId === account.accountId);
-    return sender && hasProject ? [{ account, sender }] : [];
+    if (!hasProject) return [];
+    const conversations = new Map();
+    for (const session of state.sessions.filter(item => item.accountId === account.accountId)) {
+      const sender = session.binding?.conversationId || session.senderId;
+      if (sender) conversations.set(sender, session.binding?.conversationName || "");
+    }
+    const recent = authorizedConversationId(account);
+    if (recent && !conversations.has(recent)) conversations.set(recent, "");
+    for (const sender of account.pairedSenderIds) if (!conversations.has(sender)) conversations.set(sender, "联系人");
+    return [...conversations].map(([sender, name]) => ({ account, sender, name }));
   });
   if (!options.length) {
-    toast("请先授权微信联系人，并从 Codex 历史中添加项目", true);
+    toast("请先授权 IM 联系人，并添加 Codex 项目", true);
     showView("accounts");
     return;
   }
@@ -2094,12 +2146,14 @@ function openNewSessionDialog(preselectedProject) {
   document.querySelector("#senderField").hidden = false;
   const senderInput = document.querySelector("#sessionSenderInput");
   senderInput.disabled = false;
-  senderInput.innerHTML = options.map(({ account, sender }) => `<option value="${escapeAttr(`${account.accountId}\n${sender}`)}">${escapeHtml(accountDisplayName(account.accountId))}</option>`).join("");
+  senderInput.innerHTML = '<option value="" disabled>请选择要绑定的 IM 对话</option>' + options.map(({ account, sender, name }) => `<option value="${escapeAttr(`${account.accountId}\n${sender}`)}">${escapeHtml(accountDisplayName(account.accountId))} · ${escapeHtml(name || "对话")} · ${escapeHtml(sender)}</option>`).join("");
   const selectedOption = options.find(({ account }) => account.accountId === state.selectedAccountId) ?? options[0];
   const accountOption = preselectedProject
     ? options.find(({ account }) => account.accountId === preselectedProject.accountId) ?? selectedOption
     : selectedOption;
-  senderInput.value = `${accountOption.account.accountId}\n${accountOption.sender}`;
+  const sameAccount = options.filter(option => option.account.accountId === accountOption.account.accountId);
+  senderInput.value = sameAccount.length === 1 ? `${accountOption.account.accountId}\n${accountOption.sender}` : "";
+  state.newSessionPreferredProjectId = preselectedProject?.id || "";
   updateNewSessionDefaultTitle();
   updateSessionProjectOptions(preselectedProject?.id);
   els.sessionDialog.showModal();
@@ -2125,7 +2179,7 @@ function updateNewSessionDefaultTitle() {
   const [accountId] = document.querySelector("#sessionSenderInput").value.split("\n");
   const accountSessionCount = state.sessions.filter((session) => session.accountId === accountId).length;
   document.querySelector("#sessionTitleInput").value = `会话 ${accountSessionCount + 1}`;
-  updateSessionProjectOptions();
+  updateSessionProjectOptions(state.newSessionPreferredProjectId || "");
 }
 
 function updateSessionProjectOptions(preferredProjectId = "") {
@@ -2186,29 +2240,27 @@ async function openNewProjectDialog(preselectedAccountId = "") {
 
 function renderCodexProjectOptions() {
   const accountId = document.querySelector("#projectAccountInput").value;
-  const managedWorkspaces = new Set(
-    state.projects
-      .filter((project) => project.accountId === accountId)
-      .map((project) => project.workspace)
-  );
+  const managedProjects = state.projects.filter(project => project.accountId === accountId);
+  const isManaged = candidate => managedProjects.some(project => (project.hostId || "local") === (candidate.hostId || "local")
+    && (candidate.projectId ? project.sourceProjectId === candidate.projectId : !project.sourceProjectId && project.workspace === candidate.workspace));
   const input = document.querySelector("#projectWorkspaceInput");
   const available = state.codexProjects.filter((project) => (
-    project.available !== false && !managedWorkspaces.has(project.workspace)
+    project.available !== false && !isManaged(project)
   ));
   input.innerHTML = state.codexProjects.length
-    ? state.codexProjects.map((project) => {
-      const managed = managedWorkspaces.has(project.workspace);
+    ? state.codexProjects.map((project, index) => {
+      const managed = isManaged(project);
       const remote = project.projectKind === "remote";
       const unavailable = project.available === false;
       const suffix = remote
         ? `（远程：${project.hostId || "未知主机"}）`
         : unavailable ? "（当前不可用）"
         : managed ? "（已添加）" : `（${project.sessionCount} 个 Codex 会话）`;
-      return `<option value="${escapeAttr(project.workspace)}"${managed || unavailable ? " disabled" : ""}>${escapeHtml(project.name)} — ${escapeHtml(project.workspace)} ${escapeHtml(suffix)}</option>`;
+      return `<option value="${index}"${managed || unavailable ? " disabled" : ""}>${escapeHtml(project.name)} — ${escapeHtml(project.workspace)} ${escapeHtml(suffix)}</option>`;
     }).join("")
     : `<option value="">Codex 暂无项目记录</option>`;
   input.disabled = !available.length;
-  input.value = available[0]?.workspace || "";
+  input.value = available.length ? String(state.codexProjects.indexOf(available[0])) : "";
   document.querySelector("#saveProjectButton").disabled = !available.length;
   document.querySelector("#projectWorkspaceHint").textContent = available.length
     ? `已从 Codex Desktop 读取 ${state.codexProjects.length} 个项目；远程项目将通过 Desktop hostId 路由到对应主机。`
@@ -2219,8 +2271,8 @@ function renderCodexProjectOptions() {
 }
 
 function updateProjectNameFromSelection() {
-  const workspace = document.querySelector("#projectWorkspaceInput").value;
-  const project = state.codexProjects.find((candidate) => candidate.workspace === workspace);
+  const value = document.querySelector("#projectWorkspaceInput").value;
+  const project = value === "" ? undefined : state.codexProjects[Number(value)];
   if (project) document.querySelector("#projectNameInput").value = project.name;
 }
 
@@ -2253,12 +2305,17 @@ async function saveProject(event) {
       });
     } else {
       const accountId = document.querySelector("#projectAccountInput").value;
+      const choice = document.querySelector("#projectWorkspaceInput").value;
+      const selected = choice === "" ? undefined : state.codexProjects[Number(choice)];
+      if (!selected || selected.available === false) throw new Error("请刷新并重新选择项目。");
       await api("/api/projects", {
         method: "POST",
         body: {
           accountId,
           name,
-          workspace: document.querySelector("#projectWorkspaceInput").value,
+          workspace: selected.workspace,
+          hostId: selected.hostId || "local",
+          sourceProjectId: selected.projectId,
           source: "codex-history"
         }
       });
@@ -2297,6 +2354,7 @@ async function saveSession(event) {
     } else {
       const [accountId, senderId] = document.querySelector("#sessionSenderInput").value.split("\n");
       const projectId = document.querySelector("#sessionProjectInput").value;
+      if (!accountId || !senderId || !projectId) throw new Error("请选择要绑定的 IM 对话和 Codex 项目");
       const created = await api("/api/sessions", {
         method: "POST",
         body: {
@@ -2388,6 +2446,7 @@ async function api(url, options = {}) {
   if (options.token !== false && state.requestToken) headers["X-Codex-IM-Gateway-Token"] = state.requestToken;
   const response = await fetchWithRequestContext(url, {
     method: options.method || "GET", headers,
+    signal: options.signal,
     body: options.body ? (isFormData ? options.body : JSON.stringify(options.body)) : undefined
   }, options.token !== false);
   const data = await response.json().catch(() => { throw Object.assign(new Error("响应内容不完整，请核对状态。"), { submission: !["GET", "HEAD"].includes(options.method || "GET") ? "unconfirmed" : undefined }); });
@@ -2414,7 +2473,9 @@ async function streamApi(url, options, onEvent) {
   let buffer = "";
   let result;
   let terminal = false;
+  const maxLineChars = 8 * 1024 * 1024;
   const consumeLine = (line) => {
+    if (line.length > maxLineChars) throw Object.assign(new Error("响应进度过大，请查看任务历史。"), { submission: "unconfirmed" });
     if (!line.trim()) return;
     let streamEvent;
     try { streamEvent = JSON.parse(line); }
@@ -2423,18 +2484,26 @@ async function streamApi(url, options, onEvent) {
     onEvent(streamEvent);
     if (streamEvent.type === "done") { result = streamEvent.result; terminal = true; }
   };
-  while (true) {
-    const { value, done } = await reader.read().catch(error => { error.submission = "unconfirmed"; throw error; });
-    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-    for (const line of lines) { consumeLine(line); if (terminal) break; }
-    if (terminal) { void reader.cancel?.().catch(() => {}); return result; }
-    if (done) break;
+  try {
+    while (true) {
+      const { value, done } = await reader.read().catch(error => {
+        throw Object.assign(error instanceof Error ? error : new Error("响应连接读取失败，请核对历史。"), { submission: "unconfirmed" });
+      });
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) { consumeLine(line); if (terminal) break; }
+      if (terminal) return result;
+      if (buffer.length > maxLineChars) throw Object.assign(new Error("响应进度过大，请查看任务历史。"), { submission: "unconfirmed" });
+      if (done) break;
+    }
+    if (buffer) consumeLine(buffer);
+    if (!terminal) throw Object.assign(new Error("响应连接已结束，但任务结果未确认；请查看历史，未重新提交。"), { submission: "unconfirmed" });
+    return result;
+  } finally {
+    try { await reader.cancel?.(); } catch { /* Preserve the original read/parse failure. */ }
+    reader.releaseLock?.();
   }
-  if (buffer) consumeLine(buffer);
-  if (!terminal) throw Object.assign(new Error("响应连接已结束，但任务结果未确认；请查看历史，未重新提交。"), { submission: "unconfirmed" });
-  return result;
 }
 
 let requestContextRefresh;

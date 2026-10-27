@@ -31,10 +31,25 @@ export function listCodexCliProjects(
     ...listJsonlFiles(path.join(codexHome, "sessions")),
     ...listJsonlFiles(path.join(codexHome, "archived_sessions"))
   ].sort((left, right) => right.modifiedAt - left.modifiedAt);
+  return projectsFromSessions(files.map(file => ({ ...file, meta: readSessionMeta(file.path) })));
+}
+
+/** Runtime catalogs use async filesystem operations so IM controls can continue
+ * while scanning a large CLI store. The synchronous adapter remains for legacy
+ * callers that explicitly request a synchronous offline projection. */
+export async function listCodexCliProjectsAsync(codexHome = path.join(os.homedir(), ".codex")): Promise<CodexProject[]> {
+  const groups = await Promise.all([listJsonlFilesAsync(path.join(codexHome, "sessions")), listJsonlFilesAsync(path.join(codexHome, "archived_sessions"))]);
+  const files = groups.flat().sort((left, right) => right.modifiedAt - left.modifiedAt);
+  const records: Array<{ modifiedAt: number; meta: SessionMetaLine | undefined }> = [];
+  for (const file of files) records.push({ modifiedAt: file.modifiedAt, meta: await readSessionMetaAsync(file.path) });
+  return projectsFromSessions(records);
+}
+
+function projectsFromSessions(files: Array<{ modifiedAt: number; meta: SessionMetaLine | undefined }>): CodexProject[] {
   const projects = new Map<string, CodexProject>();
 
   for (const file of files) {
-    const meta = readSessionMeta(file.path);
+    const meta = file.meta;
     if (rolloutIdentity(meta?.payload ?? {}).internal) continue;
     const workspace = typeof meta?.payload?.cwd === "string"
       ? resolveDirectory(meta.payload.cwd)
@@ -109,6 +124,10 @@ export function readSessionMeta(file: string): SessionMetaLine | undefined {
   } catch {
     return undefined;
   }
+  return parseSessionMeta(content);
+}
+
+function parseSessionMeta(content: string): SessionMetaLine | undefined {
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
     try {
@@ -144,4 +163,37 @@ function normalizeTimestamp(value: string | undefined, fallbackMs: number): stri
     if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
   }
   return new Date(fallbackMs).toISOString();
+}
+
+export async function listJsonlFilesAsync(root: string): Promise<Array<{ path: string; modifiedAt: number }>> {
+  const result: Array<{ path: string; modifiedAt: number }> = [], pending = [root];
+  while (pending.length) {
+    const directory = pending.pop()!;
+    let entries: fs.Dirent[];
+    try { entries = await fs.promises.readdir(directory, { withFileTypes: true }); }
+    catch (error) { if (isRotatedPath(error)) continue; throw error; }
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(target);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        try { result.push({ path: target, modifiedAt: (await fs.promises.stat(target)).mtimeMs }); }
+        catch (error) { if (!isRotatedPath(error)) throw error; }
+      }
+    }
+  }
+  return result;
+}
+
+export async function readSessionMetaAsync(file: string): Promise<SessionMetaLine | undefined> {
+  try {
+    const descriptor = await fs.promises.open(file, "r");
+    try {
+      const buffer = Buffer.alloc(128 * 1024), { bytesRead } = await descriptor.read(buffer, 0, buffer.length, 0);
+      return parseSessionMeta(buffer.subarray(0, bytesRead).toString("utf8"));
+    } finally { await descriptor.close(); }
+  } catch (error) { if (isRotatedPath(error)) return undefined; throw error; }
+}
+
+function isRotatedPath(error: unknown): boolean {
+  return ["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException)?.code ?? "");
 }

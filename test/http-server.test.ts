@@ -465,7 +465,7 @@ test("directory picker API returns an absolute path and preserves cancellation",
   assert.deepEqual(defaults, [root, undefined]);
 });
 
-test("Codex project API lists session-derived projects and authorizes the selected workspace", async (t) => {
+test("Codex project API registers catalog projects without widening arbitrary workspace permission", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-codex-projects-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const allowedRoot = path.join(root, "allowed");
@@ -563,11 +563,11 @@ test("Codex project API lists session-derived projects and authorizes the select
     })
   });
 
-  // Then that exact project is managed and added to the allowlist
+  // That exact project is managed; arbitrary workspace permission stays scoped.
   assert.equal(createResponse.status, 201);
   const created = await createResponse.json() as { project: { workspace: string } };
   assert.equal(created.project.workspace, existingProject);
-  assert.equal(loadConfig(paths).allowedWorkspaces.includes(existingProject), true);
+  assert.equal(loadConfig(paths).allowedWorkspaces.includes(existingProject), false);
 
   // Requests that do not prove the workspace came from the Codex picker are rejected.
   const nonCandidate = path.join(allowedRoot, "not-in-codex-history");

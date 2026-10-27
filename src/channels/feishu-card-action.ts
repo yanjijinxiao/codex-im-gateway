@@ -14,10 +14,10 @@ export function formValueFromRawCardAction(rawEvent: unknown): unknown {
   return parsed.success ? parsed.data.action?.form_value : undefined;
 }
 
-export function cardActionIdentity(event: Lark.CardActionEvent): string {
-  const value = JSON.stringify(event.action.value ?? "");
+export function cardActionIdentity(event: Lark.CardActionEvent, command?: string): string {
+  const value = command ?? JSON.stringify(event.action.value ?? "");
   return crypto.createHash("sha256")
-    .update(`${event.messageId}\n${event.operator.openId}\n${value}`)
+    .update(JSON.stringify([event.chatId, event.messageId, event.operator.openId, value]))
     .digest("hex")
     .slice(0, 32);
 }

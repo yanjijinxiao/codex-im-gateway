@@ -1,8 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Lexer } from "marked";
 
 import { KNOWLEDGE_KINDS, type KnowledgeInput } from "../state/knowledge.js";
-import { presentAssistantText, compactSourceLocation, projectAssistantProse } from "../channels/assistant-presentation.js";
+import { presentAssistantText, compactSourceLocation, projectAssistantProse, markdownSource } from "../channels/assistant-presentation.js";
 
 export type SendAction = {
   type: "image" | "file" | "video";
@@ -25,7 +26,7 @@ export type ParsedActionBlocks = {
   actions: BridgeActions;
 };
 
-const ACTION_BLOCK_RE = /```(?:codex-im-gateway|codex-channel-bridge|codex-weixin(?:-server)?)-actions\s*([\s\S]*?)```/gi;
+const ACTION_LANGUAGE = /^(?:codex-im-gateway|codex-channel-bridge|codex-weixin(?:-server)?)-actions$/i;
 const MARKDOWN_LINK_RE = /(!)?\[([^\]]*)]\((<[^>\r\n]+>|[^)\r\n]+)\)/g;
 
 function isAbsoluteLocalPath(value: string): boolean {
@@ -149,33 +150,51 @@ function tryNormalizeKnowledgeAction(raw: unknown): KnowledgeInput | undefined {
   }
 }
 
-export function parseActionBlocks(text: string): ParsedActionBlocks {
+export function parseActionBlocks(text: string, options: { strict?: boolean } = {}): ParsedActionBlocks {
   const actions: BridgeActions = { send: [], control: [], remember: [] };
-  const visibleTextWithoutBlocks = text.replace(ACTION_BLOCK_RE, (_match, body: string) => {
-    const parsed = JSON.parse(String(body).trim()) as {
+  const source = markdownSource(text);
+  let visible = "", cursor = 0, invalid = false;
+  // Only explicit, closed, top-level Markdown fences are executable. Quoted
+  // source, lists and longer outer example fences remain ordinary content.
+  for (const token of Lexer.lex(source.text, { gfm: true })) {
+    const offset = source.text.indexOf(token.raw, cursor);
+    if (offset < 0 || token.type !== "code" || !ACTION_LANGUAGE.test(token.lang ?? "")) continue;
+    visible += source.original(cursor, offset);
+    cursor = offset + token.raw.length;
+    try {
+    const opening = /^ {0,3}(`{3,}|~{3,})[^\n]*\n/.exec(token.raw)?.[1];
+    const closing = /(?:^|\n) {0,3}(`+|~+)[ \t]*\n*$/.exec(token.raw)?.[1];
+    if (!opening || !closing || opening[0] !== closing[0] || closing.length < opening.length) throw Error("Action fence is incomplete");
+    const parsed = JSON.parse(token.text.trim()) as {
       send?: unknown;
       control?: unknown;
       remember?: unknown;
     };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw Error("Action payload must be an object");
+    for (const field of ["send", "control", "remember"] as const)
+      if (parsed[field] !== undefined && !Array.isArray(parsed[field])) throw Error(`Action ${field} must be an array`);
 
-    if (Array.isArray(parsed.send)) {
-      const seen = new Set(actions.send.map((action) => action.path));
-      for (const action of parsed.send.map(normalizeSendAction)) {
-        appendSendAction(actions, seen, action);
-      }
-    }
-    if (Array.isArray(parsed.control)) {
-      actions.control.push(...parsed.control.map(normalizeControlAction));
-    }
+    const sends = Array.isArray(parsed.send) ? parsed.send.map(normalizeSendAction) : [];
+    const controls = Array.isArray(parsed.control) ? parsed.control.map(normalizeControlAction) : [];
+    const seen = new Set(actions.send.map((action) => action.path));
+    for (const action of sends) appendSendAction(actions, seen, action);
+    actions.control.push(...controls);
     if (Array.isArray(parsed.remember)) {
-      for (const raw of parsed.remember.slice(0, 3)) {
+      for (const raw of parsed.remember.slice(0, Math.max(0, 3 - actions.remember.length))) {
         const action = tryNormalizeKnowledgeAction(raw);
         if (action) actions.remember.push(action);
       }
     }
-
-    return "";
-  }).trim();
-
+    } catch (error) {
+      if (options.strict !== false) throw error;
+      invalid = true;
+    }
+  }
+  visible += source.original(cursor);
+  if (invalid) {
+    actions.send = []; actions.control = []; actions.remember = [];
+    visible += "\n\n回复中的附加动作格式无效，未执行附件发送、会话变更或记忆保存。";
+  }
+  const visibleTextWithoutBlocks = visible.trim();
   return { visibleText: renderLocalMarkdownReferences(presentAssistantText(visibleTextWithoutBlocks)), actions };
 }

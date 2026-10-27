@@ -146,7 +146,9 @@ export class ChannelTurnPresentation implements TurnReplyStream {
         }
         this.save();
       }
-    })().finally(() => this.closing.delete(segment.inputId));
+    })().catch(() => {
+      console.warn("[codex-im-gateway] retired summary journal unavailable; original task remains unchanged");
+    }).finally(() => this.closing.delete(segment.inputId));
     this.closing.set(segment.inputId, work);
   }
   private retrySummaries(force = false): void {

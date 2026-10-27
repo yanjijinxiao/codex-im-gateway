@@ -26,7 +26,7 @@ export class PromptBuffer {
   }
 
   start(key: string): { status: "started" | "already-started" } {
-    this.expire(key);
+    this.expire();
     if (this.buffers.has(key)) {
       return { status: "already-started" };
     }
@@ -36,7 +36,7 @@ export class PromptBuffer {
   }
 
   append(key: string, item: PromptBufferItem): void {
-    this.expire(key);
+    this.expire();
     const state = this.buffers.get(key);
     if (!state) {
       throw new Error("prompt buffer is not active");
@@ -49,7 +49,7 @@ export class PromptBuffer {
   }
 
   done(key: string): { status: "empty"; items: [] } | { status: "flushed"; items: PromptBufferItem[] } {
-    this.expire(key);
+    this.expire();
     const state = this.buffers.get(key);
     this.buffers.delete(key);
     if (!state || state.items.length === 0) {
@@ -63,17 +63,14 @@ export class PromptBuffer {
   }
 
   isActive(key: string): boolean {
-    this.expire(key);
+    this.expire();
     return this.buffers.has(key);
   }
 
-  private expire(key: string): void {
-    const state = this.buffers.get(key);
-    if (!state) {
-      return;
-    }
-    if (this.now() - state.updatedAt > this.options.ttlMs) {
-      this.buffers.delete(key);
+  private expire(): void {
+    const now = this.now();
+    for (const [key, state] of this.buffers) {
+      if (now - state.updatedAt > this.options.ttlMs) this.buffers.delete(key);
     }
   }
 }

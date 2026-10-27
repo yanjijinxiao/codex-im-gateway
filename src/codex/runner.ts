@@ -237,8 +237,9 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   async listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string) {
     return this.nativeQueue(hostId).listQueuedSubmissions(threadId, cursor);
   }
-  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string) {
-    return this.nativeQueue(hostId).deleteQueuedSubmission(threadId, queuedSubmissionId);
+  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string, assertCurrent?: () => void) {
+    assertCurrent?.();
+    return this.nativeQueue(hostId).deleteQueuedSubmission(threadId, queuedSubmissionId, undefined, assertCurrent);
   }
   async runQueuedSubmission(input: CodexQueuedRunInput) {
     // Queue metadata can be read without owning the thread. Consumption is a
@@ -349,22 +350,24 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     } finally { this.appServerRuns--; }
   }
 
-  async stop(threadId?: string, hostId?: string): Promise<CodexStopResult> {
+  async stop(threadId?: string, hostId?: string, assertCurrent?: () => void): Promise<CodexStopResult> {
+    assertCurrent?.();
     if (threadId) this.options.onThreadMutation?.(threadId, hostId ?? "local");
     if (isRemoteHost(hostId)) {
-      return this.appServerFor(hostId).stop(threadId);
+      return this.appServerFor(hostId).stop(threadId, assertCurrent);
     }
-    if (this.selectedBackend === "exec") return this.exec.stop(threadId);
+    if (this.selectedBackend === "exec") return this.exec.stop(threadId, assertCurrent);
     if (threadId) {
       const owner = await this.inspectThread(threadId);
+      assertCurrent?.();
       if (owner.executionOwner === "desktop") {
         // Never use an unguarded interrupt to clear an optimistic UI tail.
         if (owner.runtimeStatus !== "active" || !owner.activeTurnId) return "not-active";
-        return this.desktop.stop(threadId, owner.activeTurnId);
+        return this.desktop.stop(threadId, owner.activeTurnId, assertCurrent);
       }
-      return this.appServer.stop(threadId);
+      return this.appServer.stop(threadId, assertCurrent);
     }
-    const results = await Promise.all([this.appServer.stop(threadId), this.desktop.stop(threadId)]);
+    const results = await Promise.all([this.appServer.stop(threadId, assertCurrent), this.desktop.stop(threadId, undefined, assertCurrent)]);
     return results.includes("interrupted") ? "interrupted" : "not-active";
   }
 
@@ -480,13 +483,16 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   async setGoal(
     threadId: string,
     input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number },
-    hostId?: string
+    hostId?: string,
+    assertCurrent?: () => void
   ): Promise<CodexThreadGoal | undefined> {
-    return this.backendForSharedOperation(hostId).setGoal(threadId, input);
+    assertCurrent?.();
+    return this.backendForSharedOperation(hostId).setGoal(threadId, input, assertCurrent);
   }
 
-  async clearGoal(threadId: string, hostId?: string): Promise<void> {
-    await this.backendForSharedOperation(hostId).clearGoal(threadId);
+  async clearGoal(threadId: string, hostId?: string, assertCurrent?: () => void): Promise<void> {
+    assertCurrent?.();
+    await this.backendForSharedOperation(hostId).clearGoal(threadId, assertCurrent);
   }
 
   inspectThread(threadId: string, hostId?: string, observation?: CodexMetadataObservation): Promise<CodexThreadState> {

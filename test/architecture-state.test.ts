@@ -68,6 +68,27 @@ test("losing a live state file never silently initializes an empty account", t =
   fs.unlinkSync(accountStatePaths(f.paths, "one").statePath);
   assert.throws(() => f.manager.listSessions(), /未初始化为空状态/);
 });
+test("a stopped account cannot report removal of a configured identity as successful", t => {
+  const f = fixture(t), manager = f.manager as any;
+  const config = { ...defaultConfig(f.root), taskboardEnabled: false, allowedSenderIds: ["fixed"] };
+  manager.configProvider = () => config;
+  const store = manager.storeFor("one") as RuntimeStateStore; store.setPairedSenderIds(["fixed"]);
+  assert.throws(() => f.manager.removeSender("one", "fixed"), /allowedSenderIds/);
+  assert.deepEqual(store.listPairedSenderIds(), ["fixed"]);
+});
+for (const sourceProjectId of ["selected", "missing", undefined]) test(`managed project synchronization preserves explicit identity and rejects ambiguous roots (${sourceProjectId})`, t => {
+  const f = fixture(t); t.mock.method(os, "homedir", () => f.root);
+  fs.mkdirSync(path.join(f.root, ".codex"));
+  fs.writeFileSync(path.join(f.root, ".codex", ".codex-global-state.json"), JSON.stringify({ "local-projects": {
+    first: { id: "first", rootPaths: [f.root] },
+    selected: { id: "selected", rootPaths: [f.root, path.join(f.root, "sibling")] }
+  } }));
+  const manager = f.manager as any, store = manager.storeFor("one") as RuntimeStateStore;
+  const project = store.createProject("Project", f.root, { sourceProjectId });
+  manager.synchronizeManagedProject(store, project);
+  assert.equal(store.getProject(project.id)?.sourceProjectId, sourceProjectId);
+  if (sourceProjectId === "selected") assert.equal(store.getProject(project.id)?.rootPaths?.length, 2);
+});
 
 for (const follow of [true, false]) test(`rebind preserves follow preference ${follow} across restart`, t => {
   const f = fixture(t), s = f.manager.createSession("one", "chat", f.root, "Bound");

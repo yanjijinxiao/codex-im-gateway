@@ -3,20 +3,20 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import crypto from "node:crypto";
-import { canonicalCliWorkspace, cliProjectId, listJsonlFiles, readSessionMeta } from "./cli-projects.js";
+import { canonicalCliWorkspace, cliProjectId, listJsonlFilesAsync, readSessionMetaAsync } from "./cli-projects.js";
 import { rolloutIdentity } from "./rollout-identity.js";
 import type { CodexHistoryPage, CodexHistoryPageInput, CodexThreadListInput, CodexThreadSnapshot, CodexThreadState } from "./backend.js";
 /** Local, read-only rollout adapter. Never loads Desktop or starts app-server. */
 export class CliSessionStore {
   constructor(readonly codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) { }
-  private catalog() {
+  private async catalog() {
     const entries = new Map<string, {
       file: string;
       state: CodexThreadState;
     }>();
     for(const archived of [true, false]) {
-      for(const file of listJsonlFiles(path.join(this.codexHome, archived ? "archived_sessions" : "sessions"))) {
-        const meta = readSessionMeta(file.path);
+      for(const file of await listJsonlFilesAsync(path.join(this.codexHome, archived ? "archived_sessions" : "sessions"))) {
+        const meta = await readSessionMetaAsync(file.path);
         const identity = rolloutIdentity(meta?.payload ?? {});
         if(!identity.threadId || identity.internal)
           continue;
@@ -51,7 +51,7 @@ export class CliSessionStore {
   async list(input: CodexThreadListInput = {}): Promise<CodexThreadState[]> {
     const names = await this.titles();
     // CLI has no native project registry. Its workspace catalog is a derived view.
-    return [...this.catalog().values()].map(({ state }) => ({ ...state, title: names.get(state.threadId) }))
+    return [...(await this.catalog()).values()].map(({ state }) => ({ ...state, title: names.get(state.threadId) }))
       .filter(x => (!input.cwd || Boolean(x.cwd && canonicalCliWorkspace(x.cwd) === canonicalCliWorkspace(input.cwd)))
         && (!input.projectId || Boolean(x.cwd && cliProjectId(x.cwd) === input.projectId))
         && (!input.persistence || input.persistence === "all" || x.persistence === input.persistence))
@@ -59,12 +59,12 @@ export class CliSessionStore {
       .slice(0, input.limit ?? Infinity);
   }
   async inspect(threadId: string): Promise<CodexThreadState> {
-    const state = this.catalog().get(threadId)?.state;
+    const state = (await this.catalog()).get(threadId)?.state;
     return state ? { ...state, title: (await this.titles()).get(threadId) }
       : { threadId, persistence: "missing", runtimeStatus: "unknown", activeFlags: [] };
   }
   async snapshot(threadId: string): Promise<CodexThreadSnapshot> {
-    const entry = this.catalog().get(threadId);
+    const entry = (await this.catalog()).get(threadId);
     if(!entry)
       return { state: await this.inspect(threadId), turns: [] };
     const turns: CodexThreadSnapshot["turns"] = [];
@@ -88,7 +88,8 @@ export class CliSessionStore {
       catch {
         continue;
       }
-      const p = record.payload ?? {};
+      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+      const p = record.payload && typeof record.payload === "object" && !Array.isArray(record.payload) ? record.payload : {};
       if(record.type === "event_msg") {
         if(p.type === "task_started" && typeof p.turn_id === "string") {
           turn = { id: p.turn_id, status: "inProgress", messages: [] };
@@ -109,7 +110,7 @@ export class CliSessionStore {
         // Tool results, developer prompts and private reasoning are never history messages.
         const content = Array.isArray(p.content) ? p.content.filter((c: {
           type?: string;
-        }) => c.type === "input_text" || c.type === "output_text") : [];
+        } | null) => c && (c.type === "input_text" || c.type === "output_text")) : [];
         add(p.role, content.map((c: {
           text?: string;
         }) => c.text ?? "").join("\n"), record.timestamp, p.phase === "commentary");
@@ -138,7 +139,8 @@ export class CliSessionStore {
       catch {
         throw new Error("Invalid CLI history cursor");
       }
-      if(cursor.key !== fingerprint || !Number.isSafeInteger(cursor.position) || cursor.position < 0 || cursor.position > messages.length)
+      if(!cursor || typeof cursor !== "object" || Array.isArray(cursor)
+        || cursor.key !== fingerprint || !Number.isSafeInteger(cursor.position) || cursor.position < 0 || cursor.position > messages.length)
         throw new Error("Invalid CLI history cursor");
       position = cursor.position;
     }

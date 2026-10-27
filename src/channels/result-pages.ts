@@ -39,12 +39,15 @@ export function resultPages(text: string, maxBytes = DEFAULT_RESULT_PAGE_BYTES, 
   maxBytes -= reservedBytes;
   if (Buffer.byteLength(text) <= maxBytes) return [{ text, source: text }];
   const chunks: Array<{ source: string; start: number; end: number }> = [];
+  // Every valid budget must admit one complete Unicode code point. A tiny
+  // payload allowance otherwise leaves end === start and loops forever.
+  const payloadBytes = Math.max(4, maxBytes - 512);
   let start = 0;
   while (start < text.length) {
     let bytes = 0, end = start;
     for (const point of text.slice(start)) {
       const size = Buffer.byteLength(point);
-      if (bytes + size > maxBytes - 512) break;
+      if (bytes + size > payloadBytes) break;
       bytes += size; end += point.length;
     }
     if (end < text.length) {

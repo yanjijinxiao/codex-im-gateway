@@ -1,10 +1,10 @@
 import type { TaskboardSubmission } from "./taskboard-channel-command.js";
+import { createHash } from "node:crypto";
 
 type ProcessedSubmission = {
   readonly createdAt: number;
   readonly projectId: string;
-  readonly operation: TaskboardSubmission["operation"];
-  readonly identifier?: string;
+  readonly payloadHash: string;
   readonly completion: SubmissionCompletion;
   completedAt?: number;
 };
@@ -33,11 +33,8 @@ export class TaskboardSubmissionDeduplicator {
     const entry: ProcessedSubmission = {
       createdAt: Date.now(),
       projectId,
-      operation: submission.operation,
-      completion: new SubmissionCompletion(),
-      ...(submission.operation === "create_todo" || submission.operation === "create_start"
-        ? {}
-        : { identifier: submission.identifier })
+      payloadHash: submissionHash(submission),
+      completion: new SubmissionCompletion()
     };
     this.processed.set(requestId, entry);
     return {
@@ -81,10 +78,10 @@ function sameSubmission(
   submission: TaskboardSubmission
 ): boolean {
   return existing.projectId === projectId
-    && existing.operation === submission.operation
-    && existing.identifier === (
-      submission.operation === "create_todo" || submission.operation === "create_start"
-        ? undefined
-        : submission.identifier
-    );
+    && existing.payloadHash === submissionHash(submission);
+}
+
+function submissionHash(submission: TaskboardSubmission): string {
+  return createHash("sha256").update(JSON.stringify(Object.entries(submission)
+    .filter(([key]) => key !== "request_id").sort(([left], [right]) => left.localeCompare(right)))).digest("hex");
 }

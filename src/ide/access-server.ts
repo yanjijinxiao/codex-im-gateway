@@ -366,7 +366,13 @@ export class IDEAccessServer {
     upstream.setTimeout(15_000, () => upstream.destroy());
     upstream.on("upgrade", (res, remote, remoteHead) => {
       remote.setTimeout(0);
-      if (!this.authorization.active(session)) { remote.destroy(); socket.destroy(); return; }
+      try {
+        const current = this.manager.endpoint(match[1], session.trustWorkspace === true);
+        if (!this.authorization.active(session) || (session.securityScope ?? session.scope) !== this.scope(session.entryId)
+          || current?.instanceId !== endpoint.instanceId || current.socketPath !== endpoint.socketPath) {
+          remote.destroy(); socket.destroy(); return;
+        }
+      } catch { remote.destroy(); socket.destroy(); return; }
       const headers = Object.entries(res.headers).filter(([key]) => !["set-cookie", "authorization"].includes(key))
         .flatMap(([key, value]) => Array.isArray(value) ? value.map(v => `${key}: ${v}`) : [`${key}: ${value}`]);
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${headers.join("\r\n")}\r\n\r\n`);

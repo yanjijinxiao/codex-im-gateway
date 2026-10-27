@@ -1,7 +1,7 @@
 import { Lexer, type Token, type Tokens } from "marked";
 import { closeMarkdownFence } from "./result-pages.js";
 import { markdownPreview } from "./markdown-preview.js";
-import { presentAssistantText } from "./assistant-presentation.js";
+import { presentAssistantText, markdownSource } from "./assistant-presentation.js";
 
 /** The client's native cursor must end in a normal paragraph, never inside a
  * code/list/table block. Display-only: the stored task/command is unchanged. */
@@ -22,19 +22,21 @@ export function dingTalkProgressContent(source: string): string {
  * wrappers, never rewrite the literal reply/command inside them. */
 export function dingTalkPlainText(source: string): string {
   source = presentAssistantText(source);
+  const input = markdownSource(source);
   let result = "", cursor = 0;
-  for (const token of Lexer.lex(source, { gfm: true })) {
-    const offset = source.indexOf(token.raw, cursor);
+  for (const token of Lexer.lex(input.text, { gfm: true })) {
+    const offset = input.text.indexOf(token.raw, cursor);
     if (offset < 0 || !token.raw) continue;
-    let replacement = token.raw;
+    const original = input.original(offset, offset + token.raw.length);
+    let replacement = original;
     if (token.type === "code" && /^ {0,3}(?:`{3,}|~{3,})/.test(token.raw))
-      replacement = (token as Tokens.Code).text + trailingNewlines(token.raw);
+      replacement = (token as Tokens.Code).text + trailingNewlines(original);
     else if (token.type === "blockquote")
       replacement = dingTalkPlainText((token as Tokens.Blockquote).text).split("\n").map(line => `> ${line}`).join("\n") + trailingNewlines(token.raw);
-    result += source.slice(cursor, offset) + replacement;
+    result += input.original(cursor, offset) + replacement;
     cursor = offset + token.raw.length;
   }
-  return result + source.slice(cursor);
+  return result + input.original(cursor);
 }
 
 /** One presentation boundary for initial/static, streaming and terminal card

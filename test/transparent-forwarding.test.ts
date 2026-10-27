@@ -35,7 +35,8 @@ for(const change of ["thread","role","access"] as const)test(`ordinary IM rechec
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-transparent-guard-"));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
  const store=new RuntimeStateStore(resolveStatePaths(dir)),p=store.createProject("Remote",dir,{hostId:"remote:test",projectKind:"remote"});store.activateProject("actor",p.id);
  const s=store.createSession("actor",dir,"Current",p.id);store.setSessionThread(s.id,"native");const entered=Promise.withResolvers<void>(),release=Promise.withResolvers<void>();let writes=0;
- const service=new BridgeService({config:{...defaultConfig(dir),allowedSenderIds:["actor"],streamReplies:false},inboundDir:dir,stateStore:store,
+ store.setPairedSenderIds(["actor"]);
+ const service=new BridgeService({config:{...defaultConfig(dir),allowedSenderIds:[],streamReplies:false},inboundDir:dir,stateStore:store,
   channel:createChannelClient("generic",{...TEXT_CAPABILITIES,inbound:{...TEXT_CAPABILITIES.inbound,file:"available"}},{async sendText(){return{messageId:"sent"};},async resolveAttachments(m){return m.attachments??[];}}),
   runner:{async inspectThread(){return{threadId:"native",persistence:"active",runtimeStatus:"idle",activeFlags:[]};},
    async stageAttachments(files:any[]){entered.resolve();await release.promise;return files.map(f=>({...f,path:"/remote/file"}));},

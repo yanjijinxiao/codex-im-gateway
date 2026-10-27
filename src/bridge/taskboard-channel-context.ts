@@ -1,5 +1,6 @@
 import type { ManagedProject, ManagedSession, RuntimeStateStore } from "../state/runtime-state.js";
 import type { TaskboardClient, TaskboardIssue, TaskboardProject } from "../taskboard/client.js";
+import { localProjectsAtWorkspace } from "../state/project-identity.js";
 
 export type TaskboardChannelContext = {
   readonly session?: ManagedSession;
@@ -24,6 +25,10 @@ export async function resolveTaskboardChannelContext(
   const session = activeSession?.projectId === managedProject?.id ? activeSession : undefined;
   if (!managedProject) {
     await options.replyText(senderId, "请先在渠道工作台中选择一个 Codex 项目，再打开任务面板。");
+    return undefined;
+  }
+  if (!localProjectsAtWorkspace(managedProject.workspace, options.stateStore.listProjects()).some(project => project.id === managedProject.id)) {
+    await options.replyText(senderId, "当前 Taskboard 仅支持身份明确的本地项目。该项目位于远程主机，或与其他原生项目共用目录，尚不能按目录自动关联任务面板。");
     return undefined;
   }
   const taskboardProject = await client.ensureProjectForWorkspace({

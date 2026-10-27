@@ -1,6 +1,7 @@
 import { DEFAULT_BASE_URL, DEFAULT_CDN_BASE_URL, saveScannedAccount, type WeixinAccount } from "./accounts.js";
 import type { FetchLike } from "./api.js";
 import type { StatePaths } from "../state/paths.js";
+import { fetchWithBudget } from "../channels/network-request.js";
 
 export type LoginOptions = {
   paths: StatePaths;
@@ -58,11 +59,17 @@ export class WeixinQrLoginSession {
     if (Date.now() >= this.deadline) {
       return { status: "expired" };
     }
-    const status = await get<QrStatusResponse>(
+    let status: QrStatusResponse;
+    try { status = await get<QrStatusResponse>(
       this.fetchImpl,
       this.pollBaseUrl,
-      `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(this.qrToken)}`
-    );
+      `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(this.qrToken)}`,
+      Math.max(1, Math.min(30_000, this.deadline - Date.now()))
+    ); } catch (error) {
+      if (Date.now() >= this.deadline) return { status: "expired" };
+      throw error;
+    }
+    if (Date.now() >= this.deadline) return { status: "expired" };
     if (status.status === "scaned_but_redirect" && status.redirect_host?.trim()) {
       this.pollBaseUrl = normalizeRedirectHost(status.redirect_host);
       return { status: "waiting" };
@@ -142,14 +149,15 @@ function normalizeRedirectHost(host: string): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
-async function get<T>(fetchImpl: FetchLike, baseUrl: string, endpoint: string): Promise<T> {
-  const response = await fetchImpl(`${baseUrl}/${endpoint}`, {
+async function get<T>(fetchImpl: FetchLike, baseUrl: string, endpoint: string, timeoutMs = 30_000): Promise<T> {
+  const response = await fetchWithBudget(fetchImpl, `${baseUrl}/${endpoint}`, {
     method: "GET",
+    timeoutMs,
     headers: { "iLink-App-ClientVersion": "1" }
   });
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`${endpoint} failed with HTTP ${response.status}: ${text}`);
+    throw new Error(`${endpoint.split("?")[0]} failed with HTTP ${response.status}`);
   }
   return JSON.parse(text) as T;
 }

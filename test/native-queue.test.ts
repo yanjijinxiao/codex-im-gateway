@@ -241,3 +241,37 @@ test("interactive queue reconciliation is conversation-scoped, single-flight and
   const c = journal.reconcile("ding", replacement, { conversationId: "group" }); assert.notEqual(c, a);
   release.resolve(); await Promise.all([a, c]); assert.deepEqual(reads, ["original"]);
 });
+
+test("read-only queue history reconciliation cannot hold up a new native queue submission", async t => {
+  const f = fixture(t), journal = f.journal(); await journal.enqueue(f.origin, "first", f.backend); f.items.length = 0;
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const backend = { ...f.backend, async getHistoryPage() { entered.resolve(); await release.promise; return { messages: [] }; } } as CodexBridgeBackend;
+  const reading = journal.reconcile("ding", backend); await entered.promise;
+  let accepted = false;
+  const next = journal.enqueue({ ...f.origin, messageId: "im-2" }, "second", f.backend).then(() => { accepted = true; });
+  try { await new Promise(r => setTimeout(r, 30)); assert.equal(accepted, true); }
+  finally { release.resolve(); await Promise.all([reading, next]); }
+  assert.equal(journal.list("ding").find(r => r.messageId === "im-2")?.status, "queued");
+});
+test("a late queue observation cannot restore a cancelled native input", async t => {
+  const f = fixture(t), journal = f.journal(), receipt = await journal.enqueue(f.origin, "first", f.backend);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), snapshot = structuredClone(f.items);
+  const backend = { ...f.backend, async listQueuedSubmissions() { entered.resolve(); await release.promise; return { data: snapshot }; } } as CodexBridgeBackend;
+  const reading = journal.reconcile("ding", backend); await entered.promise;
+  let cancelled = false; const cancellation = journal.cancel("ding", "group", "alice", receipt.queuedSubmissionId!, f.backend).then(() => { cancelled = true; });
+  try { await new Promise(r => setTimeout(r, 30)); assert.equal(cancelled, true); }
+  finally { release.resolve(); await Promise.all([reading, cancellation]); }
+  assert.equal(journal.list("ding")[0].status, "cancelled"); assert.equal(f.items.length, 0);
+});
+test("queue observation deadlines preserve uncertainty and ignore late read results", async t => {
+  const f = fixture(t), journal = new NativeQueueCoordinator(f.file, { observationTimeoutMs: 20 });
+  await journal.enqueue(f.origin, "first", f.backend); f.items.length = 0;
+  const release = Promise.withResolvers<void>();
+  const backend = { ...f.backend, async getHistoryPage() { await release.promise; return { messages: [] }; } } as CodexBridgeBackend;
+  let settled = false;
+  const read = journal.reconcile("ding", backend).then(() => { settled = true; }, () => { settled = true; });
+  await new Promise(r => setTimeout(r, 40));
+  try { assert.equal(settled, true); }
+  finally { release.resolve(); await read; }
+  assert.equal(journal.list("ding")[0].status, "queued", "a read deadline is not evidence of native rejection or completion");
+});

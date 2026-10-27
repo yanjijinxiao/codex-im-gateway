@@ -75,7 +75,10 @@ test("builds getupdates requests with iLink cursor field", async () => {
   await client.getUpdates("cursor-1", controller.signal);
 
   assert.equal(calls[0].url, "https://ilink.example/ilink/bot/getupdates");
-  assert.equal(calls[0].init.signal, controller.signal);
+  assert.equal(calls[0].init.signal?.aborted, false);
+  controller.abort(new Error("poll cancelled"));
+  assert.equal(calls[0].init.signal?.aborted, true, "the total deadline signal must still follow caller cancellation");
+  assert.equal(calls[0].init.signal?.reason, controller.signal.reason);
   assert.deepEqual(JSON.parse(String(calls[0].init.body)), {
     get_updates_buf: "cursor-1",
     base_info: { channel_version: "0.1.0" }

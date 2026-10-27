@@ -109,6 +109,8 @@ const projectCreateSchema = z.object({
   accountId: z.string().min(1),
   name: z.string().trim().min(1).max(60),
   workspace: z.string().min(1),
+  hostId: z.string().trim().min(1).optional(),
+  sourceProjectId: z.string().trim().min(1).optional(),
   source: z.literal("codex-history")
 });
 const projectPatchSchema = z.object({
@@ -520,28 +522,19 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (method === "POST" && url.pathname === "/api/projects") {
     const body = projectCreateSchema.parse(await readJsonBody(request));
     const workspace = path.resolve(body.workspace);
-    const candidate = (await readCodexProjects(context))
-      .find((project) => project.workspace === workspace);
-    if (!candidate) {
-      throw new Error(`Invalid Codex project workspace: ${workspace}`);
+    const candidates = (await readCodexProjects(context)).filter(project => path.resolve(project.workspace) === workspace
+      && (!body.hostId || (project.hostId ?? "local") === body.hostId)
+      && (!body.sourceProjectId || project.projectId === body.sourceProjectId));
+    if (candidates.length !== 1 || candidates[0].available === false) {
+      sendJson(response, 400, { error: "Codex 项目不存在、不可用或目录对应多个项目，请刷新项目列表后重新选择。" });
+      return;
     }
+    const candidate = candidates[0];
     if (candidate.projectKind === "remote" && !candidate.hostId) {
       throw new Error(`Remote Codex Desktop project has no routable host id: ${workspace}`);
     }
-    const config = loadConfig(context.paths);
-    if (!config.allowedWorkspaces.some((allowed) => path.resolve(allowed) === workspace)) {
-      saveConfig(context.paths, {
-        ...config,
-        allowedWorkspaces: [...config.allowedWorkspaces, workspace]
-      });
-    }
     sendJson(response, 201, {
-      project: context.accountManager.createProject(body.accountId, body.name, workspace, {
-        sourceProjectId: candidate.projectId,
-        rootPaths: candidate.rootPaths,
-        projectKind: candidate.projectKind,
-        hostId: candidate.hostId
-      })
+      project: context.accountManager.registerCodexProject(body.accountId, body.name, candidate)
     });
     return;
   }
@@ -1139,7 +1132,12 @@ function serveSessionAttachment(
     return;
   }
   const stream = fs.createReadStream(attachment.path, { start, end });
+  const closeReader = () => { stream.destroy(); };
+  response.once("close", closeReader);
+  stream.once("close", () => response.removeListener("close", closeReader));
+  if (response.destroyed) { stream.destroy(); return; }
   stream.on("error", (error) => {
+    if (response.destroyed) return;
     if (!response.headersSent) {
       sendJson(response, 500, { error: error.message });
     } else {

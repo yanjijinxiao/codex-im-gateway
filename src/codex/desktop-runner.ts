@@ -305,7 +305,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       acceptedTurnId = turnId;
       await input.onTurnStarted?.({ threadId: input.threadId, turnId });
       const completion = await this.waitForCompletion(input.threadId, turnId, input.onProgress);
-      if (!completion.success) throw new CodexTurnExecutionError("failed", completion.text, completion.failureCode);
+      if (!completion.success) throw new CodexTurnExecutionError(completion.outcome === "interrupted" ? "interrupted" : "failed", completion.text, completion.failureCode);
       return {
         threadId: input.threadId,
         turnId,
@@ -320,7 +320,7 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     }
   }
 
-  async stop(threadId?: string, expectedTurnId?: string): Promise<CodexStopResult> {
+  async stop(threadId?: string, expectedTurnId?: string, assertCurrent?: () => void): Promise<CodexStopResult> {
     const target = threadId
       ? (expectedTurnId || this.activeThreads.has(threadId) ? threadId : undefined)
       : [...this.activeThreads].at(-1);
@@ -329,7 +329,8 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
       socketPath: this.socketPath,
       timeoutMs: Math.min(this.requestTimeoutMs, 30_000),
       threadId: target,
-      expectedTurnId
+      expectedTurnId,
+      assertCurrent
     });
     return "interrupted";
   }
@@ -590,10 +591,11 @@ async function sendFollowerStartTurn(input: FollowerRequest): Promise<unknown> {
   }
 }
 
-async function sendFollowerInterrupt(input: { socketPath: string; timeoutMs: number; threadId: string; expectedTurnId?: string }): Promise<void> {
+async function sendFollowerInterrupt(input: { socketPath: string; timeoutMs: number; threadId: string; expectedTurnId?: string; assertCurrent?: () => void }): Promise<void> {
   const connection = new DesktopIpcConnection(input.socketPath, input.timeoutMs);
   try {
     await connection.initialize();
+    input.assertCurrent?.();
     // Protocol v3 is the compatibility form used when no expected turn id is
     // available. V4 requires a concrete expectedTurnId.
     await connection.request("thread-follower-interrupt-turn", input.expectedTurnId ? 4 : 3, {
@@ -748,6 +750,7 @@ class DesktopIpcConnection {
       let message: IpcMessage;
       try { message = JSON.parse(payload.toString("utf8")) as IpcMessage; }
       catch { return; }
+      if (!recordValue(message)) return;
       this.handleMessage(message);
     }); } catch (error) {
       if (!(error instanceof IpcFrameSizeError)) throw error;

@@ -5,6 +5,8 @@ import path from "node:path";
 import type { FetchLike, WeixinApiClient } from "./api.js";
 import type { WeixinInboundAttachment } from "./messages.js";
 import { InboundMediaTooLargeError } from "../channels/errors.js";
+import { responseBytes } from "../channels/inbound-bytes.js";
+import { fetchWithBudget } from "../channels/network-request.js";
 export { InboundMediaTooLargeError } from "../channels/errors.js";
 
 const DEFAULT_WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -170,19 +172,17 @@ async function downloadMediaBuffer(input: {
   plainMaxBytes: number;
   fetch?: FetchLike;
 }): Promise<Buffer> {
-  const response = await (input.fetch ?? globalThis.fetch.bind(globalThis))(input.url);
+  const response = await fetchWithBudget(input.fetch ?? globalThis.fetch.bind(globalThis), input.url,
+    { timeoutMs: 60_000, maxResponseBytes: Number.MAX_SAFE_INTEGER });
   if (!response.ok) {
     throw new Error(`CDN download failed: ${response.status} ${response.statusText}`);
   }
-  const contentLength = response.headers.get("content-length");
-  if (contentLength && Number(contentLength) > input.maxBytes) {
-    throw new InboundMediaTooLargeError(input.plainMaxBytes, Number(contentLength));
+  try { return await responseBytes(response, input.maxBytes); }
+  catch (error) {
+    if (error instanceof InboundMediaTooLargeError)
+      throw new InboundMediaTooLargeError(input.plainMaxBytes, error.actualBytes);
+    throw error;
   }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > input.maxBytes) {
-    throw new InboundMediaTooLargeError(input.plainMaxBytes, buffer.length);
-  }
-  return buffer;
 }
 
 function downloadUrlFromParam(encryptQueryParam?: string, cdnBaseUrl = DEFAULT_WEIXIN_CDN_BASE_URL): string {
@@ -244,7 +244,8 @@ function uniqueInboundPath(input: {
 }
 
 function sanitizePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "_") || "unknown";
+  const cleaned = value.replace(/[^a-zA-Z0-9._-]+/g, "_") || "unknown";
+  return cleaned === "." || cleaned === ".." ? `identity_${Buffer.from(value).toString("hex")}` : cleaned;
 }
 
 export async function sendLocalMediaFile(input: {
@@ -253,9 +254,10 @@ export async function sendLocalMediaFile(input: {
   contextToken?: string;
   filePath: string;
   kind?: "image" | "file" | "video";
+  maxBytes?: number;
   fetch?: FetchLike;
 }): Promise<{ messageId: string; kind: "image" | "file" | "video" }> {
-  const plaintext = fs.readFileSync(input.filePath);
+  const plaintext = await readOutboundFile(input.filePath, input.maxBytes ?? 100 * 1024 * 1024);
   const rawSize = plaintext.length;
   const rawFileMd5 = crypto.createHash("md5").update(plaintext).digest("hex");
   const cipherSize = aesEcbPaddedSize(rawSize);
@@ -327,11 +329,13 @@ async function uploadBufferToCdn(input: {
   fetch?: FetchLike;
 }): Promise<string> {
   const ciphertext = encryptAesEcb(input.plaintext, input.aesKey);
-  const response = await (input.fetch ?? globalThis.fetch.bind(globalThis))(resolveUploadUrl(input), {
+  const response = await fetchWithBudget(input.fetch ?? globalThis.fetch.bind(globalThis), resolveUploadUrl(input), {
     method: "POST",
+    timeoutMs: 60_000,
     headers: { "Content-Type": "application/octet-stream" },
     body: new Uint8Array(ciphertext)
   });
+  void response.body?.cancel().catch(() => undefined);
   if (!response.ok) {
     throw new Error(`CDN upload failed: ${response.status} ${response.statusText}`);
   }
@@ -340,6 +344,26 @@ async function uploadBufferToCdn(input: {
     throw new Error("CDN upload response missing encrypted query param header");
   }
   return encryptedParam;
+}
+
+async function readOutboundFile(filePath: string, maxBytes: number): Promise<Buffer> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new RangeError("Outbound file byte budget must be a positive integer");
+  const file = await fs.promises.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) throw new Error("Outbound media must be a regular file");
+    if (stat.size > maxBytes) throw new RangeError(`Outbound media exceeds byte limit (${maxBytes})`);
+    const parts: Buffer[] = [];
+    let bytes = 0;
+    while (true) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes - bytes + 1));
+      const read = await file.read(chunk, 0, chunk.length, null);
+      if (!read.bytesRead) return Buffer.concat(parts, bytes);
+      bytes += read.bytesRead;
+      if (bytes > maxBytes) throw new RangeError(`Outbound media exceeds byte limit (${maxBytes})`);
+      parts.push(chunk.subarray(0, read.bytesRead));
+    }
+  } finally { await file.close(); }
 }
 
 function resolveUploadUrl(input: {

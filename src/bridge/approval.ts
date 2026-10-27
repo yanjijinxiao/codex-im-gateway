@@ -62,13 +62,13 @@ export class ChannelApprovalController {
     {
       const timer = setTimeout(() => {
         if (!this.settle(senderId, id, denial(snapshot))) return;
-        this.send(senderId, { text: `审批 ${id} 已超时，已自动拒绝。` }).catch((error: unknown) => {
+        this.sendNotice(senderId, { text: `审批 ${id} 已超时，已选择拒绝；是否生效以 Codex 回执为准。` }).catch((error: unknown) => {
           console.warn(`Unable to send approval timeout ${id}: ${errorDetail(error)}`);
         });
       }, this.timeoutMs);
       this.pending.set(this.key(senderId, id), { id, senderId, resolve, timer, request: snapshot,
         promise, version, createdAt, expiresAt });
-      this.send(senderId, approvalNotice(id, snapshot, this.timeoutMs)).catch((error: unknown) => {
+      this.sendNotice(senderId, approvalNotice(id, snapshot, this.timeoutMs)).catch((error: unknown) => {
         console.warn(`Unable to send approval ${id}: ${errorDetail(error)}`);
         this.settle(senderId, id, denial(snapshot));
       });
@@ -84,7 +84,7 @@ export class ChannelApprovalController {
     const pending = this.pending.get(this.key(senderId, id))!;
     if (Date.now() >= pending.expiresAt) {
       this.settle(senderId, id, denial(pending.request));
-      return "审批已过期，已自动拒绝，请等待新的原生请求。";
+      return "审批已过期，已选择拒绝，等待 Codex 确认；请等待新的原生请求。";
     }
     const selected = approvalOptions(pending.request).find(o => o.id === (parts[1] ?? decision));
     if (!selected) return "该请求不支持这个授权范围；请使用审批卡当前提供的选项。";
@@ -97,6 +97,11 @@ export class ChannelApprovalController {
       hostId: p.request.hostId ?? "local", version: p.version, createdAt: p.createdAt, expiresAt: p.expiresAt,
       kind: p.request.kind, body: approvalDetails(p.request).filter(Boolean).join("\n"),
       options: approvalOptions(p.request).map(({ id, label, description }) => ({ id, label, description })) }));
+  }
+
+  private sendNotice(senderId: string, notice: ChannelApprovalNotice): Promise<void> {
+    try { return Promise.resolve(this.send(senderId, notice)); }
+    catch (error) { return Promise.reject(error); }
   }
   decideCurrent(senderId: string, id: string, choice: string, version: string): string {
     const pending = this.pending.get(this.key(senderId, id));
@@ -146,7 +151,13 @@ export class ChannelApprovalController {
     const pending = this.pending.get(key);
     if (!pending) return false;
     const option = approvalOptions(pending.request).find(o => o.id === decision);
-    this.journal.update(id, { phase: "unconfirmed", choice: decision, label: option?.label ?? decision });
+    try { this.journal.update(id, { phase: "unconfirmed", choice: decision, label: option?.label ?? decision }); }
+    catch (error) {
+      // Never authorize without the audit commit. Denial must still release a
+      // native waiter on timeout/shutdown even if the disk has become unavailable.
+      if (decision !== denial(pending.request)) throw error;
+      console.warn(`[codex-im-gateway] approval ${id} denied; audit write unavailable`);
+    }
     this.pending.delete(key);
     clearTimeout(pending.timer);
     pending.resolve(decision);

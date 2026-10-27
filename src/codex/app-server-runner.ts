@@ -181,7 +181,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly reasoningSummariesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
   private readonly threadStates = new Map<string, CodexThreadState>();
-  private readonly projectIdsByRoot = new Map<string, string>();
   private operationLeases = 0;
   private projectCatalogSupported?: boolean;
   private modelOptions?: CodexModelOption[];
@@ -291,7 +290,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         await this.request("thread/metadata/update", { threadId, projectId: nativeProjectId });
       } catch (error) {
         if (!isMissingProjectError(error)) throw error;
-        this.projectIdsByRoot.delete(path.normalize(input.cwd));
         const refreshedProjectId = await this.resolveProjectId(input.cwd, undefined, input.projectName, input.assertCurrent);
         if (!refreshedProjectId || refreshedProjectId === currentProjectId) throw error;
         input.assertCurrent?.();
@@ -400,11 +398,14 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         input.assertCurrent?.();
         turnResponse = await this.request("turn/start", turnParams) as Record<string, unknown>;
       } catch (retryError) {
-        this.approvalHandlersByThread.delete(threadId);
-        this.approvalResults.delete(threadId);
-        this.dynamicToolHandlersByThread.delete(threadId);
-        this.userInputHandlersByThread.delete(threadId);
-        this.userInputResultHandlersByThread.delete(threadId);
+        if (isCodexCommunicationFailure(retryError)) this.unconfirmedStarts.add(threadId);
+        else {
+          this.approvalHandlersByThread.delete(threadId);
+          this.approvalResults.delete(threadId);
+          this.dynamicToolHandlersByThread.delete(threadId);
+          this.userInputHandlersByThread.delete(threadId);
+          this.userInputResultHandlersByThread.delete(threadId);
+        }
         throw retryError;
       }
     }
@@ -536,18 +537,22 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       return state;
     } catch (error) {
       if (isCodexCommunicationFailure(error)) throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId });
-      const archived = await this.findListedThread(threadId, true);
+      const lookups = await Promise.allSettled([this.findListedThread(threadId, true), this.findListedThread(threadId, false)]);
+      const archived = lookups[0].status === "fulfilled" ? lookups[0].value : undefined;
       if (archived) {
         const state = membership(parseThreadState(archived, "archived"));
         this.threadStates.set(threadId, state);
         return state;
       }
-      const active = await this.findListedThread(threadId, false);
+      const active = lookups[1].status === "fulfilled" ? lookups[1].value : undefined;
       if (active) {
         const state = membership(parseThreadState(active, persistenceFromThread(active)));
         this.threadStates.set(threadId, state);
         return state;
       }
+      // A failed catalog read is not evidence that the native thread vanished.
+      const unavailable = lookups.find(result => result.status === "rejected");
+      if (unavailable?.status === "rejected") throw unavailable.reason;
       if (isMissingOrArchivedThreadError(error)) {
         const state: CodexThreadState = {
           threadId,
@@ -698,7 +703,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private async findListedThread(threadId: string, archived: boolean): Promise<Record<string, unknown> | undefined> {
     let cursor: string | undefined;
     const seenCursors = new Set<string>();
-    try {
       do {
         const response = await this.request("thread/list", compactObject({
           cursor,
@@ -706,7 +710,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           sourceKinds: ["cli", "vscode", "exec", "appServer", "unknown"],
           archived
         })) as Record<string, unknown>;
-        for (const value of Array.isArray(response.data) ? response.data : []) {
+        if (!isRecord(response) || !Array.isArray(response.data)) throw new Error("Invalid Codex thread catalog response");
+        for (const value of response.data) {
           if (isRecord(value) && value.id === threadId) return value;
         }
         const nextCursor = typeof response.nextCursor === "string" && response.nextCursor
@@ -716,16 +721,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         seenCursors.add(nextCursor);
         cursor = nextCursor;
       } while (cursor);
-    } catch {
-      return undefined;
-    }
     return undefined;
   }
 
   private async resolveProjectId(cwd: string, projectId?: string, projectName?: string, assertCurrent?: () => void): Promise<string | undefined> {
     const root = path.normalize(cwd);
-    const cached = this.projectIdsByRoot.get(root);
-    if (cached) return cached;
     if (this.projectCatalogSupported === false) return undefined;
 
     let projects: AppServerProject[];
@@ -739,11 +739,15 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       this.projectCatalogSupported = false;
       return undefined;
     }
-    const match = projects.find((project) => (
-      project.id === projectId || project.roots.some((candidate) => path.normalize(candidate) === root)
-    ));
+    const select = (catalog: AppServerProject[]) => {
+      const explicit = projectId ? catalog.find(project => project.id === projectId) : undefined;
+      if (explicit) return explicit;
+      const candidates = catalog.filter(project => project.roots.some(candidate => path.normalize(candidate) === root));
+      if (candidates.length > 1) throw new Error("此目录属于多个 Codex 项目，请指定准确的项目身份。");
+      return candidates[0];
+    };
+    const match = select(projects);
     if (match) {
-      this.projectIdsByRoot.set(root, match.id);
       return match.id;
     }
     if (!projectName) return undefined;
@@ -759,15 +763,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       }) as Record<string, unknown>;
       const project = parseAppServerProject(response.project);
       if (!project) throw new Error("Codex app-server did not return the created project");
-      this.projectIdsByRoot.set(root, project.id);
       return project.id;
     } catch (error) {
       // A concurrent client may have registered the same root after our list.
-      const retry = (await this.requestProjects()).find((project) => (
-        project.roots.some((candidate) => path.normalize(candidate) === root)
-      ));
+      const retry = select(await this.requestProjects());
       if (!retry) throw error;
-      this.projectIdsByRoot.set(root, retry.id);
       return retry.id;
     }
   }
@@ -1002,7 +1002,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return { data: result.data, ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}) };
   }
 
-  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string): Promise<boolean> {
+  async deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, _hostId?: string, assertCurrent?: () => void): Promise<boolean> {
     let item: CodexQueuedSubmission | undefined, cursor: string | undefined;
     const cursors = new Set<string>();
     do {
@@ -1011,7 +1011,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (cursor && cursors.has(cursor)) throw new Error("Native queue pagination repeated cursor");
       if (cursor) cursors.add(cursor);
     } while (!item && cursor);
-    const result = await this.queueOperation("thread/queue/delete", { threadId, queuedSubmissionId }) as { deleted?: boolean };
+    const result = await this.queueOperation("thread/queue/delete", { threadId, queuedSubmissionId }, assertCurrent) as { deleted?: boolean };
     if (result.deleted && item) this.nativeQueueOrigins.delete(item.clientUserMessageId);
     if (result.deleted && this.subscribedThreads.has(threadId) && !this.activeTurns.has(threadId)
       && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)) {
@@ -1190,9 +1190,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   async setGoal(
     threadId: string,
-    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number }
+    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number },
+    assertCurrent?: () => void
   ): Promise<CodexThreadGoal | undefined> {
     await this.ensureConnected();
+    assertCurrent?.();
     const response = await this.request("thread/goal/set", {
       threadId,
       ...(input.objective !== undefined ? { objective: input.objective } : {}),
@@ -1202,12 +1204,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return parseThreadGoal(response.goal);
   }
 
-  async clearGoal(threadId: string): Promise<void> {
+  async clearGoal(threadId: string, assertCurrent?: () => void): Promise<void> {
     await this.ensureConnected();
+    assertCurrent?.();
     await this.request("thread/goal/clear", { threadId });
   }
 
-  async stop(threadId?: string): Promise<CodexStopResult> {
+  async stop(threadId?: string, assertCurrent?: () => void): Promise<CodexStopResult> {
     if (threadId) await this.ensureConnected();
     if (!this.initialized || !this.child || this.child.exitCode !== null) {
       return "not-active";
@@ -1234,6 +1237,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       return "not-active";
     }
 
+    assertCurrent?.();
     await this.request("turn/interrupt", target);
     return "interrupted";
   }
@@ -1282,7 +1286,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.observedApprovalIds.clear();
     this.stderr = "";
     this.lines = readline.createInterface({ input: child.stdout });
-    this.lines.on("line", (line) => this.handleMessage(line));
+    this.lines.on("line", (line) => { if (this.child === child) this.handleMessage(line); });
     child.stderr.on("data", (chunk: Buffer) => {
       this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
     });
@@ -1371,6 +1375,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     } catch {
       return;
     }
+    if (!isRecord(message) || message.method !== undefined && typeof message.method !== "string"
+      || message.params !== undefined && !isRecord(message.params)) return;
 
     if (message.method && message.id !== undefined) {
       this.handleServerRequest(message);
@@ -1573,7 +1579,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (!threadId || !turnId) {
       return;
     }
-    this.unconfirmedStarts.delete(threadId);
+    const cachedState = this.threadStates.get(threadId);
+    const currentTurn = this.activeTurns.get(threadId)
+      ?? (cachedState?.runtimeStatus === "active" ? cachedState.activeTurnId : undefined);
+    const ownsThreadState = !currentTurn || currentTurn === turnId;
+    if (ownsThreadState) this.unconfirmedStarts.delete(threadId);
     for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId
       && pending.request.turnId === turnId) this.resolveUserInput(key, pending.submitted ? "failed" : "withdrawn");
     const key = turnKey(threadId, turnId);
@@ -1593,26 +1603,30 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const nativeClientId = this.nativeTurnClients.get(key);
     if (nativeClientId) { this.nativeQueueOrigins.delete(nativeClientId); this.nativeTurnClients.delete(key); }
     const previousState = this.threadStates.get(threadId);
-    this.threadStates.set(threadId, {
-      threadId,
-      persistence: previousState?.persistence ?? "active",
-      runtimeStatus: status === "failed" && previousState?.runtimeStatus === "systemError" ? "systemError" : "idle",
-      activeFlags: [],
-      ...(normalizeTurnStatus(status) ? { latestTurnStatus: normalizeTurnStatus(status) } : {}),
-      ...(status === "failed" ? { lastTurnFailure: { turnId, code: completion.failureCode! } } : {}),
-      ...(previousState?.cwd ? { cwd: previousState.cwd } : {}),
-      ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
-      ...(previousState?.title ? { title: previousState.title } : {}),
-      ...(previousState?.preview ? { preview: previousState.preview } : {})
-    });
-    this.approvalHandlersByThread.delete(threadId);
-    this.approvalResults.delete(threadId);
-    for (const [approvalKey, pending] of this.approvalRequests) {
-      if (pending.request.threadId === threadId) this.resolveApproval(approvalKey, pending.submitted ? "failed" : "withdrawn");
+    if (ownsThreadState) {
+      this.threadStates.set(threadId, {
+        threadId,
+        persistence: previousState?.persistence ?? "active",
+        runtimeStatus: status === "failed" && previousState?.runtimeStatus === "systemError" ? "systemError" : "idle",
+        activeFlags: [],
+        ...(normalizeTurnStatus(status) ? { latestTurnStatus: normalizeTurnStatus(status) } : {}),
+        ...(status === "failed" ? { lastTurnFailure: { turnId, code: completion.failureCode! } } : {}),
+        ...(previousState?.cwd ? { cwd: previousState.cwd } : {}),
+        ...(previousState?.projectId ? { projectId: previousState.projectId } : {}),
+        ...(previousState?.title ? { title: previousState.title } : {}),
+        ...(previousState?.preview ? { preview: previousState.preview } : {})
+      });
+      this.approvalHandlersByThread.delete(threadId);
+      this.approvalResults.delete(threadId);
+      this.dynamicToolHandlersByThread.delete(threadId);
+      this.userInputHandlersByThread.delete(threadId);
+      this.userInputResultHandlersByThread.delete(threadId);
     }
-    this.dynamicToolHandlersByThread.delete(threadId);
-    this.userInputHandlersByThread.delete(threadId);
-    this.userInputResultHandlersByThread.delete(threadId);
+    for (const [approvalKey, pending] of this.approvalRequests) {
+      if (pending.request.threadId === threadId && (pending.request.turnId === turnId
+        || ownsThreadState && pending.request.turnId === undefined))
+        this.resolveApproval(approvalKey, pending.submitted ? "failed" : "withdrawn");
+    }
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
@@ -1783,7 +1797,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       request.nativeKey = JSON.stringify(["app-server", owner?.pid, request.hostId, method, key]);
       const pending = { request, submitted: false, notify: this.approvalResults.get(request.threadId) };
       this.approvalRequests.set(key, pending);
-      Promise.resolve().then(() => handler(request))
+      Promise.resolve().then(() => this.child === owner && this.approvalRequests.get(key) === pending ? handler(request) : "decline" as const)
         .then((decision) => {
           if (this.child !== owner || this.approvalRequests.get(key) !== pending) return;
           pending.submitted = true;
@@ -1830,6 +1844,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private handleDynamicToolRequest(id: JsonRpcId, params: Record<string, unknown>): void {
+    const owner = this.child;
     const call = parseDynamicToolCall(params);
     const handler = call ? this.dynamicToolHandlersByThread.get(call.threadId) : undefined;
     if (!call || !handler) {
@@ -1842,18 +1857,14 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       });
       return;
     }
-    Promise.resolve(handler(call))
-      .then((text) => this.send({
-        id,
-        result: { contentItems: [{ type: "inputText", text }], success: true }
-      }))
-      .catch((error) => this.send({
-        id,
-        result: {
-          contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
-          success: false
-        }
-      }));
+    const respond = (text: string, success: boolean) => {
+      if (this.child !== owner) return;
+      try { this.send({ id, result: { contentItems: [{ type: "inputText", text }], success } }); }
+      catch { console.warn("[codex-im-gateway] dynamic tool response transport unavailable; response not replayed"); }
+    };
+    Promise.resolve().then(() => this.child === owner ? handler(call) : undefined)
+      .then(text => { if (text !== undefined) respond(text, true); },
+        error => respond(error instanceof Error ? error.message : String(error), false));
   }
 
   private handleUserInputRequest(id: JsonRpcId, params: Record<string, unknown>, form?: McpForm): void {
@@ -1868,7 +1879,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (this.userInputRequests.has(key)) return;
     const pending = { request, submitted: false, notify: this.userInputResultHandlersByThread.get(request.threadId) };
     this.userInputRequests.set(key, pending);
-    Promise.resolve(handler(request)).then(answers => {
+    Promise.resolve().then(() => this.userInputRequests.get(key) === pending ? handler(request) : undefined).then(answers => {
       if (answers === undefined || this.userInputRequests.get(key) !== pending) return;
       pending.submitted = true;
       this.send({ id, result: form ? mcpFormResponse(form, answers) : { answers } });
@@ -1894,7 +1905,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const pending = this.userInputRequests.get(key);
     if (!pending) return;
     this.userInputRequests.delete(key);
-    void Promise.resolve(pending.notify?.(pending.request, result)).catch(() => {
+    void Promise.resolve().then(() => pending.notify?.(pending.request, result)).catch(() => {
       console.warn("[codex-im-gateway] user-input resolution notice failed");
     });
   }
@@ -1947,7 +1958,6 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     this.reasoningSummariesByTurn.clear();
     this.runtimeInfoByThread.clear();
     this.threadStates.clear();
-    this.projectIdsByRoot.clear();
     this.projectCatalogSupported = undefined;
     this.modelOptions = undefined;
   }
@@ -2293,7 +2303,7 @@ function parseThreadState(
   const runtimeStatus = parsedRuntime.runtimeStatus === "unknown"
     ? latestTurnStatus === "inProgress"
       ? "active"
-      : "idle"
+      : latestTurnStatus === "completed" || latestTurnStatus === "failed" || latestTurnStatus === "interrupted" ? "idle" : "unknown"
     : parsedRuntime.runtimeStatus;
   const updatedAt = unixTimestampToIso(
     thread.updatedAt ?? latestTurn?.completedAt ?? latestTurn?.startedAt ?? thread.createdAt
@@ -2402,12 +2412,14 @@ export function parseThreadHistory(thread: Record<string, unknown> | undefined):
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   const messages: CodexHistoryMessage[] = [];
   for (const rawTurn of turns) {
-    const turn = rawTurn as Record<string, unknown>;
+    if (!isRecord(rawTurn)) continue;
+    const turn = rawTurn;
     const items = Array.isArray(turn.items) ? turn.items : [];
     const userCreatedAt = unixSecondsToIso(turn.startedAt);
     const assistantCreatedAt = unixSecondsToIso(turn.completedAt ?? turn.startedAt);
     for (const rawItem of items) {
-      const item = rawItem as Record<string, unknown>;
+      if (!isRecord(rawItem)) continue;
+      const item = rawItem;
       const id = typeof item.id === "string" ? item.id : `${String(turn.id ?? "turn")}:${messages.length}`;
       if (item.type === "userMessage") {
         const text = extractUserMessageText(item.content);
@@ -2444,7 +2456,8 @@ function extractUserMessageText(value: unknown): string {
     return "";
   }
   return value.map((raw) => {
-    const item = raw as Record<string, unknown>;
+    if (!isRecord(raw)) return "";
+    const item = raw;
     if (item.type === "text" && typeof item.text === "string") {
       return item.text;
     }
@@ -2462,7 +2475,8 @@ function unixSecondsToIso(value: unknown): string | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return undefined;
   }
-  return new Date(value * 1_000).toISOString();
+  const date = new Date(value * 1_000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
 
 /** A replacement executor must not race the previous process's writer lock. */

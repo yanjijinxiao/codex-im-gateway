@@ -38,17 +38,36 @@ export class PollRetryBackoff {
 
 export async function monitorWeixin(options: MonitorOptions): Promise<void> {
   let syncKey = options.initialSyncKey;
+  const handling = new Map<string, Promise<void>>();
+  const checkpoints: Array<{ key: string; ready: boolean }> = [];
+  let flushing: Promise<void> | undefined;
+  let committing: typeof checkpoints[number] | undefined;
+  const flushCheckpoints = (): Promise<void> => {
+    if (flushing) return flushing;
+    let failed = false;
+    flushing = (async () => {
+      while (checkpoints[0]?.ready) {
+        const checkpoint = checkpoints[0];
+        committing = checkpoint;
+        try { await options.onSyncKey?.(checkpoint.key); }
+        catch { failed = true; console.error("[codex-im-gateway] checkpoint persistence failed; cursor retained for retry"); return; }
+        finally { committing = undefined; }
+        if (checkpoints[0] === checkpoint) checkpoints.shift();
+      }
+    })().finally(() => {
+      flushing = undefined;
+      if (!failed && checkpoints[0]?.ready) void flushCheckpoints();
+    });
+    return flushing;
+  };
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const retryBackoff = new PollRetryBackoff(pollIntervalMs, options.maxPollRetryMs ?? 30_000);
   while (!options.signal?.aborted) {
+    void flushCheckpoints();
     let batch: { syncKey?: string; messages: WeixinRawMessage[] };
     try {
       batch = parseUpdateBatch(await options.client.getUpdates(syncKey, options.signal));
       options.onStatus?.({ state: "connected" });
-      if (batch.syncKey && batch.syncKey !== syncKey) {
-        syncKey = batch.syncKey;
-        await options.onSyncKey?.(syncKey);
-      }
     } catch (error) {
       if (options.signal?.aborted) break;
       options.onStatus?.({ state: "reconnecting", detail: "Polling failed; retrying" });
@@ -62,6 +81,8 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
     if (messages.length) {
       console.log(`[codex-im-gateway] received ${messages.length} update(s)`);
     }
+    const work: Promise<void>[] = [];
+    let claimFailed = false;
     for (const raw of messages) {
       let normalized: NormalizedWeixinMessage | undefined;
       try {
@@ -73,28 +94,55 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
       if (!normalized) {
         continue;
       }
-      if (options.claimMessage && !options.claimMessage(normalized)) {
-        console.log(`[codex-im-gateway] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
-        continue;
+      const existing = handling.get(normalized.id);
+      if (existing) { work.push(existing); continue; }
+      try {
+        if (options.claimMessage && !options.claimMessage(normalized)) {
+          console.log(`[codex-im-gateway] skipped duplicate message ${normalized.id}`);
+          continue;
+        }
+      } catch {
+        claimFailed = true;
+        console.error("[codex-im-gateway] inbound receipt persistence failed; source cursor retained");
+        break;
       }
       const message = normalized;
       console.log(`[codex-im-gateway] handling message ${message.id} from ${message.senderId}`);
-      void options.onMessage(message).then(() => {
+      const pending = Promise.resolve().then(() => options.onMessage(message)).then(() => {
         console.log(`[codex-im-gateway] handled message ${message.id} from ${message.senderId}`);
       }).catch(async (error) => {
         console.error(`[codex-im-gateway] message handling failed for ${message.senderId}: ${errorDetail(error)}`);
-        try {
-          await options.onMessageError?.(error, message);
-        } catch (reportError) {
+        try { await options.onMessageError?.(error, message); }
+        catch (reportError) {
           console.error(`[codex-im-gateway] failed to report message error for ${message.senderId}: ${errorDetail(reportError)}`);
         }
+      }).finally(() => { if (handling.get(message.id) === pending) handling.delete(message.id); });
+      handling.set(message.id, pending);
+      work.push(pending);
+    }
+    if (!claimFailed && batch.syncKey && batch.syncKey !== syncKey) {
+      syncKey = batch.syncKey; // Volatile poll cursor; never an execution queue.
+      const checkpoint = { key: syncKey, ready: work.length === 0 };
+      checkpoints.push(checkpoint);
+      // Coalesce adjacent finished cursors behind a pending batch. This stores
+      // neither payloads nor native work and cannot re-submit anything.
+      void Promise.all(work).then(() => {
+        checkpoint.ready = true;
+        for (let i = checkpoints.length - 2; i >= 0; i--) {
+          if (checkpoints[i] !== committing && checkpoints[i].ready && checkpoints[i + 1].ready) checkpoints.splice(i, 1);
+        }
+        return flushCheckpoints();
       });
     }
+    if (claimFailed) await delay(retryBackoff.next(), options.signal);
     await Promise.resolve();
     if (!messages.length) {
       await delay(pollIntervalMs, options.signal);
     }
   }
+  // Let already-resolved handlers settle; never wait for outstanding work.
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await flushCheckpoints();
 }
 
 function parseUpdateBatch(value: unknown): { syncKey?: string; messages: WeixinRawMessage[] } {

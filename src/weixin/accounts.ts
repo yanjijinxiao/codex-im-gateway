@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 
 import {
   normalizeChannelModeSettings,
@@ -8,7 +9,7 @@ import {
 import type { NetworkFamilyPolicy } from "../channels/network-family.js";
 import { ensureDir, readJsonFile, writeJsonFile } from "../state/json-store.js";
 import type { StatePaths } from "../state/paths.js";
-import { resolveWebhookProvider, type WebhookProvider } from "../webhooks/webhook-provider.js";
+import { resolveWebhookProvider, WEBHOOK_PROVIDERS, type WebhookProvider } from "../webhooks/webhook-provider.js";
 
 export type WeixinAccount = {
   channel?: "weixin";
@@ -93,9 +94,37 @@ export function accountChannel(account: ChannelAccount): ChannelKind {
   return account.channel ?? "weixin";
 }
 
+const commonAccountFields = {
+  accountId: z.string().min(1).max(512), displayName: z.string().optional(),
+  webhookUrl: z.string().optional(), webhookProvider: z.enum(WEBHOOK_PROVIDERS).optional(),
+  modeSettings: z.unknown().optional(), savedAt: z.string().default(""), enabled: z.boolean().default(true)
+};
+const credential = z.string().min(1);
+const accountSchema = z.union([
+  z.object({ ...commonAccountFields, channel: z.literal("weixin").optional(), token: credential,
+    baseUrl: credential, cdnBaseUrl: z.string().default(DEFAULT_CDN_BASE_URL), botId: z.string().optional(), userId: z.string().optional() }),
+  z.object({ ...commonAccountFields, channel: z.literal("dingtalk"), clientId: credential, clientSecret: credential,
+    cardTemplateId: z.string().optional(), cardContentKey: z.string().optional(), networkFamily: z.enum(["auto", "ipv4", "ipv6"]).optional() }),
+  z.object({ ...commonAccountFields, channel: z.literal("feishu"), appId: credential, appSecret: credential }),
+  z.object({ ...commonAccountFields, channel: z.literal("wecom"), botId: credential, secret: credential })
+]);
+function parseStoredAccount(value: unknown): ChannelAccount {
+  const parsed = accountSchema.safeParse(value);
+  if (!parsed.success) throw new Error("Invalid channel account record");
+  return { ...parsed.data, modeSettings: normalizeChannelModeSettings(parsed.data.modeSettings as ChannelModeSettings | undefined) } as ChannelAccount;
+}
+const invalidAccountWarnings = new Map<string, string>();
+
 export function saveAccount(paths: StatePaths, account: ChannelAccount): void {
   ensureDir(paths.accountsDir);
-  writeJsonFile(path.join(paths.accountsDir, `${normalizeAccountId(account.accountId)}.json`), account);
+  const validated = parseStoredAccount(account), file = path.join(paths.accountsDir, `${normalizeAccountId(validated.accountId)}.json`);
+  if (fs.existsSync(file)) {
+    if (!fs.lstatSync(file).isFile()) throw new Error("Account identity file is not a regular file");
+    const existing = parseStoredAccount(readJsonFile<unknown>(file, undefined));
+    if (existing.accountId !== validated.accountId) throw new Error("Account identity normalization 冲突，未覆盖已有账号");
+  }
+  writeJsonFile(file, validated);
+  invalidAccountWarnings.delete(file);
 }
 
 export type SaveScannedAccountResult = {
@@ -198,12 +227,25 @@ export function listAccounts(paths: StatePaths): ChannelAccount[] {
   ensureDir(paths.accountsDir);
   return fs.readdirSync(paths.accountsDir)
     .filter((name) => name.endsWith(".json"))
-    .map((name) => readJsonFile<ChannelAccount>(path.join(paths.accountsDir, name), undefined as never))
-    .map((account) => ({
-      ...account,
-      enabled: account.enabled !== false,
-      modeSettings: normalizeChannelModeSettings(account.modeSettings)
-    }))
+    .flatMap((name) => {
+      const file = path.join(paths.accountsDir, name);
+      try {
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("Invalid account file");
+        const account = parseStoredAccount(readJsonFile<unknown>(file, undefined));
+        if (name !== `${normalizeAccountId(account.accountId)}.json`) throw new Error("Account filename identity mismatch");
+        invalidAccountWarnings.delete(file);
+        return [account];
+      } catch {
+        let fingerprint = "unreadable";
+        try { const stat = fs.lstatSync(file); fingerprint = `${stat.ino}:${stat.size}:${stat.mtimeMs}`; } catch {}
+        if (invalidAccountWarnings.get(file) !== fingerprint) {
+          invalidAccountWarnings.set(file, fingerprint);
+          console.warn("[codex-im-gateway] invalid account record ignored; original file preserved:", name);
+        }
+        return [];
+      }
+    })
     .sort((a, b) => a.accountId.localeCompare(b.accountId));
 }
 
@@ -363,8 +405,7 @@ export function loadAccount(paths: StatePaths, accountId?: string): ChannelAccou
     }
     return accounts[0];
   }
-  const normalized = normalizeAccountId(accountId);
-  const found = accounts.find((account) => normalizeAccountId(account.accountId) === normalized || account.accountId === accountId);
+  const found = accounts.find((account) => account.accountId === accountId);
   if (!found) {
     throw new Error(`WeChat account not found: ${accountId}`);
   }

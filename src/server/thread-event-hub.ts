@@ -88,6 +88,9 @@ type Options = {
 export class ThreadEventHub {
   private readonly states: Record<string, FollowState>;
   private readonly streams = new Map<string, ChannelTurnPresentation>();
+  private readonly streamOwners = new WeakMap<ChannelTurnPresentation, ThreadSubscription>();
+  private readonly retiringStreams = new Map<string, Promise<void>>();
+  private readonly closingPresentations = new WeakSet<ChannelTurnPresentation>();
   private readonly queue = new SessionControlQueue();
   private timer?: NodeJS.Timeout;
   private scan?: Promise<void>;
@@ -182,7 +185,8 @@ export class ThreadEventHub {
     await this.scan;
     await Promise.allSettled(this.manualSyncs.values());
     await Promise.allSettled(this.previousRecoveries.values());
-    await Promise.all([...this.streams.values()].map((stream) => stream.suspend()));
+    const cleanup = await Promise.allSettled([...this.streams.values()].map(stream => stream.suspend()).concat([...this.retiringStreams.values()]));
+    for (const result of cleanup) if (result.status === "rejected") report(result.reason);
     this.streams.clear();
   }
   async refresh(): Promise<void> {
@@ -242,7 +246,11 @@ export class ThreadEventHub {
       const state = this.states[key];
       const changed = sub && state && (sub.hostId !== state.hostId || sub.threadId !== state.threadId);
       if (!live.has(key) || changed) {
-        await stream.finalize(changed ? "已切换绑定的会话；原任务继续运行。" : "已停止跟随此会话；任务继续运行。", false, { outcome: "detached" });
+        // Only this explicit neutral closure may update a retired binding's
+        // existing card. It cannot publish a model result or create a new card.
+        this.closingPresentations.add(stream);
+        try { await stream.finalize(changed ? "已切换绑定的会话；原任务继续运行。" : "已停止跟随此会话；任务继续运行。", false, { outcome: "detached", existingOnly: true }); }
+        finally { this.closingPresentations.delete(stream); }
         await stream.suspend();
         this.streams.delete(key);
       } else if (sub?.progressEnabled === false) {
@@ -908,7 +916,7 @@ export class ThreadEventHub {
       if (this.previousRecoveries.has(recoveryKey) || !force && Date.now() < (this.previousRetryAt.get(recoveryKey) ?? 0)) continue;
       if (pending.checkpoint?.messageId && !sub.client.resumableTextStream) continue;
       const work = (async () => {
-      const stream = new ChannelTurnPresentation(sub.client, sub.recipientId, {
+      const stream = new ChannelTurnPresentation(this.presentationClient(sub), sub.recipientId, {
         restore: pending.checkpoint, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
         save: checkpoint => {
           if (this.stopped || !this.isLive(sub) || state.pendingTerminals?.[turnId] !== pending) throw new Error("Old result binding changed");
@@ -933,16 +941,30 @@ export class ThreadEventHub {
   }
   private stream(sub: ThreadSubscription): ChannelTurnPresentation {
     let stream = this.streams.get(sub.key);
+    const owner = stream && this.streamOwners.get(stream);
+    if (stream && owner && (owner.client !== sub.client || owner.recipientId !== sub.recipientId
+      || owner.hostId !== sub.hostId || owner.threadId !== sub.threadId)) {
+      const previous = stream;
+      const retiring = (this.retiringStreams.get(sub.key) ?? Promise.resolve()).then(() => previous.suspend()).catch(report);
+      this.retiringStreams.set(sub.key, retiring);
+      void retiring.finally(() => { if (this.retiringStreams.get(sub.key) === retiring) this.retiringStreams.delete(sub.key); });
+      this.streams.delete(sub.key);
+      stream = undefined;
+    }
     if (stream) return stream;
     const state = this.state(sub);
     const saved = state.checkpoint;
     // Only transports explicitly supporting persisted handles may resume.
     const restore = saved && (sub.client.resumableTextStream || !saved.messageId)
       ? saved : undefined;
-    stream = new ChannelTurnPresentation(sub.client, sub.recipientId, {
+    const captured = { ...sub }, barrier = this.retiringStreams.get(sub.key) ?? Promise.resolve();
+    const client = this.presentationClient(captured, barrier, (method, args) => method === "updateTextStream"
+      && this.closingPresentations.has(stream!) && Boolean((args[0] as { finalize?: boolean } | undefined)?.finalize));
+    stream = new ChannelTurnPresentation(client, sub.recipientId, {
       restore, contextToken: sub.contextToken, onTextDelivered: sub.onTextDelivered, progressEnabled: sub.progressEnabled,
       ...(this.options.decorateProgress ? { decorateProgress: (text: string) => this.isLive(sub) ? this.options.decorateProgress!(sub, text) : text } : {}),
       save: (checkpoint) => {
+        if (!this.isLive(captured) && !this.closingPresentations.has(stream!)) return;
         // A retired stream's late HTTP acknowledgement cannot poison the new
         // turn. The streamId is the transport-neutral presentation identity.
         if (this.streams.get(sub.key) !== stream) {
@@ -954,7 +976,22 @@ export class ThreadEventHub {
       }
     });
     this.streams.set(sub.key, stream);
+    this.streamOwners.set(stream, captured);
     return stream;
+  }
+  private presentationClient(sub: ThreadSubscription, barrier = Promise.resolve(), closing?: (method: string, args: unknown[]) => boolean): ThreadSubscription["client"] {
+    const client = Object.create(sub.client) as ThreadSubscription["client"];
+    for (const method of ["sendText", "sendProgressText", "startTextStream", "updateTextStream"] as const) {
+      if (typeof sub.client[method] !== "function") continue;
+      Object.defineProperty(client, method, { value: async (...args: unknown[]) => {
+        await barrier;
+        if (!closing?.(method, args) && (this.stopped || !this.isLive(sub))) throw new Error("Channel presentation owner changed; no write attempted");
+        const send = Reflect.get(sub.client, method);
+        if (typeof send !== "function") throw new Error("Channel presentation transport is unavailable");
+        return Reflect.apply(send, sub.client, args);
+      } });
+    }
+    return client;
   }
   private async selectTurn(sub: ThreadSubscription, turnId: string, allowSwitch = false): Promise<FollowState | undefined> {
     const state = this.state(sub);
@@ -1065,10 +1102,12 @@ export class ThreadEventHub {
 
   private currentSubscription(sub: ThreadSubscription): ThreadSubscription | undefined {
     return this.options.subscriptions().find(current => current.enabled !== false && current.key === sub.key
-      && current.hostId === sub.hostId && current.threadId === sub.threadId);
+      && current.hostId === sub.hostId && current.threadId === sub.threadId
+      && current.recipientId === sub.recipientId && current.client === sub.client);
   }
 
   private async sendText(sub: ThreadSubscription, text: string): Promise<void> {
+      if (this.stopped || !this.isLive(sub)) throw new Error("Channel presentation owner changed; no write attempted");
       await sub.client.sendText({
         toUserId: sub.recipientId, text,
         ...(sub.contextToken ? { contextToken: sub.contextToken } : {})
@@ -1077,7 +1116,7 @@ export class ThreadEventHub {
 }
 
 function visibleText(text: string): string {
-  return parseActionBlocks(text).visibleText;
+  return parseActionBlocks(text, { strict: false }).visibleText;
 }
 function hasDeliveredCard(checkpoint?: ChannelStreamCheckpoint): boolean {
   return Boolean(checkpoint?.messageId || checkpoint?.bootstrap?.stage === "delivered" && checkpoint.bootstrap.messageId);

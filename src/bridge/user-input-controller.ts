@@ -175,38 +175,64 @@ export class ChannelUserInputController {
   }
 
   private settle(record: QuestionRecord, answer: string | undefined, origin?: TurnParticipantOrigin): void {
-    if (origin?.conversationId === record.senderId) {
-      record.origin = origin;
-      const release = this.options.holdAudience?.(origin, record);
-      if (release) this.audienceHolds.set(record.id, release);
-    }
+    const previous = structuredClone(record);
+    if (origin?.conversationId === record.senderId) record.origin = origin;
     record.status = "answered"; record.skipped = answer === undefined; record.answer = answer;
     if (record.kind === "async" && !record.question.isSecret) record.answerDigest = asyncAnswerDigest(record.question.id, record.question.question, answer ?? "");
-    this.save(); this.release(record.id, answer);
+    try { this.save(); }
+    catch (error) {
+      for (const key of Object.keys(record)) delete (record as unknown as Record<string, unknown>)[key];
+      Object.assign(record, previous);
+      throw error;
+    }
+    if (origin?.conversationId === record.senderId) {
+      try {
+        const release = this.options.holdAudience?.(origin, record);
+        if (release) this.audienceHolds.set(record.id, release);
+      } catch { console.warn("[codex-im-gateway] answer committed; optional audience hold unavailable"); }
+    }
+    this.release(record.id, answer);
   }
 
   private async ask(record: QuestionRecord, index: number, total: number): Promise<string | undefined> {
+    const deliver = !record.deliveryAttempted;
+    if (deliver) {
+      record.deliveryAttempted = true;
+      try { this.save(); } catch (error) { delete record.deliveryAttempted; throw error; }
+    }
     const answer = new Promise<string | undefined>(resolve => {
       const waiter: Waiter = { resolve };
       if (record.deadline !== undefined) {
-        waiter.timer = setTimeout(() => this.expire(record), Math.max(0, record.deadline - Date.now()));
-        waiter.timer.unref?.();
+        const schedule = () => {
+          waiter.timer = setTimeout(() => {
+            if (this.closed || this.waiters.get(record.id) !== waiter) return;
+            if (record.deadline! > Date.now()) schedule(); else this.expire(record);
+          }, Math.min(2_147_483_647, Math.max(0, record.deadline! - Date.now())));
+          waiter.timer.unref?.();
+        };
+        schedule();
       }
       this.waiters.set(record.id, waiter);
     });
-    if (!record.deliveryAttempted) {
-      record.deliveryAttempted = true; this.save();
+    if (deliver) void (async () => {
       try {
         const sent = await this.sendCard(record.senderId, questionCard(record, index, total), record.mentions);
+        if (this.closed) return;
         if (sent?.messageId) record.messageId = sent.messageId;
         this.save();
+        // Native resolution may have arrived before the send receipt. Replace
+        // that exact late card, without sending another question or answer.
+        if (record.messageId && record.noticeOutcome && this.options.updateCard) {
+          record.noticeDelivery = "pending"; this.save(); await this.deliverResolution(record);
+        }
       } catch (error) {
+        if (this.closed) return;
         if (error instanceof ChannelPartialDeliveryError && error.delivered[0]?.messageId) {
           record.messageId = error.delivered[0].messageId; this.save();
         }
         console.warn("[codex-im-gateway] user-input notice unconfirmed; original native request retained");
       }
-    }
+    })().catch(() => { console.warn("[codex-im-gateway] question delivery receipt could not be persisted"); });
     return answer;
   }
 
@@ -306,7 +332,7 @@ export class ChannelUserInputController {
         .map(record => this.deliverResolution(record))).catch(() => {
         console.warn("[codex-im-gateway] question resolution retry failed");
       }).finally(() => this.scheduleResolutionRetry());
-    }, Math.max(0, at - Date.now()));
+    }, Math.min(2_147_483_647, Math.max(0, at - Date.now())));
     this.resolutionRetryTimer.unref?.();
   }
 
@@ -362,11 +388,24 @@ export class ChannelUserInputController {
     if (this.resolutionRetryTimer) clearTimeout(this.resolutionRetryTimer);
     this.resolutionRetryTimer = undefined;
     for (const id of this.audienceHolds.keys()) this.releaseAudience(id);
-    for (const id of this.waiters.keys()) this.release(id); this.liveRequests.clear(); this.save();
+    // Every transition was already committed before publication. Closing adds
+    // no durable state and must not depend on another journal write.
+    for (const id of this.waiters.keys()) this.release(id); this.liveRequests.clear();
   }
-  private expire(record: QuestionRecord): void { record.status = "expired"; this.save(); this.release(record.id); }
+  private expire(record: QuestionRecord): void {
+    record.status = "expired";
+    try { this.save(); }
+    catch {
+      // No answer/skip may be submitted without a durable transition. End the
+      // in-memory waiter safely; restart requires observing the native request.
+      record.status = "withdrawn";
+      console.warn("[codex-im-gateway] question expiry journal unavailable; no answer submitted");
+    }
+    finally { this.release(record.id); }
+  }
   private releaseAudience(id: string): void {
-    const release = this.audienceHolds.get(id); this.audienceHolds.delete(id); release?.();
+    const release = this.audienceHolds.get(id); this.audienceHolds.delete(id);
+    try { release?.(); } catch { console.warn("[codex-im-gateway] question audience cleanup unavailable"); }
   }
   private release(id: string, answer?: string): void {
     const waiter = this.waiters.get(id); if (!waiter) return;

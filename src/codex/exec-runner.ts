@@ -15,7 +15,7 @@ import {
   type CodexStopResult,
   type CodexBackendAdapter
 } from "./backend.js";
-import { listCodexCliProjects } from "./cli-projects.js";
+import { listCodexCliProjectsAsync } from "./cli-projects.js";
 import { CliSessionStore } from "./cli-sessions.js";
 import type { CodexHistoryPageInput, CodexThreadListInput } from "./backend.js";
 import type { CodexExecSandbox } from "./sandbox.js";
@@ -164,11 +164,12 @@ export class CodexExecRunner implements CodexBackendAdapter {
     throw new CodexBackendCapabilityError("turnSteering", this.id);
   }
 
-  async stop(threadId?: string): Promise<CodexStopResult> {
+  async stop(threadId?: string, assertCurrent?: () => void): Promise<CodexStopResult> {
     const target = threadId
       ? [...this.activeRuns].reverse().find((run) => run.threadId === threadId)
       : this.activeRuns.at(-1);
     if (!target) return "not-active";
+    assertCurrent?.();
     target.child.kill();
     return "interrupted";
   }
@@ -180,7 +181,7 @@ export class CodexExecRunner implements CodexBackendAdapter {
   async listProjects(): Promise<CodexProjectCatalog> {
     return {
       backend: "exec",
-      projects: listCodexCliProjects(this.sessions.codexHome)
+      projects: await listCodexCliProjectsAsync(this.sessions.codexHome)
     };
   }
 

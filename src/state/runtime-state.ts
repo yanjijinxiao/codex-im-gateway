@@ -155,7 +155,9 @@ export class RuntimeStateStore {
   }
 
   /** Reconcile external administrative edits without constructing another writer. */
-  refresh(): void {
+  refresh(): void { this.reload(true); }
+
+  private reload(persistMigration: boolean): void {
     const revision = stateRevision(this.paths.statePath);
     if (this.state && revision === this.revision) return;
     if (this.state && this.revision && !revision) throw Error("账号状态文件丢失，未初始化为空状态。");
@@ -166,9 +168,11 @@ export class RuntimeStateStore {
     for (const key of ["sessions", "projects", "knowledgeBases", "pairedSenderIds"] as const) {
       if (loaded[key] !== undefined && !Array.isArray(loaded[key])) throw new Error(`Invalid runtime ${key}; original state preserved`);
     }
-    this.revision = revision;
     const before = structuredClone(loaded);
-    this.state = normalizeRuntimeState(loaded);
+    const normalized = normalizeRuntimeState(loaded);
+    // Failed normalization must not acknowledge the new file revision.
+    this.state = normalized;
+    this.revision = revision;
     for (const sender of new Set([...Object.keys(this.state.activeSessionIds), ...Object.keys(this.state.activeQaSessionIds)])) {
       const bound = this.getBoundSession(sender);
       // The selected native edge owns its project projection. Repair legacy
@@ -180,7 +184,7 @@ export class RuntimeStateStore {
       }
     }
     // Persist actual initialization/migration, never a no-op read.
-    if (!isDeepStrictEqual(this.state, before)) this.save();
+    if (persistMigration && !isDeepStrictEqual(this.state, before)) this.save();
   }
 
   get snapshot(): RuntimeState {
@@ -361,7 +365,7 @@ export class RuntimeStateStore {
     try { writeJsonFile(this.paths.statePath, this.state); }
     catch (error) {
       // A failed commit must not leave the live owner advertising an unsaved mutation.
-      if (this.revision) { this.revision = undefined; this.refresh(); }
+      if (this.revision) { this.revision = undefined; this.reload(false); }
       throw error;
     }
     this.revision = stateRevision(this.paths.statePath);
@@ -580,7 +584,7 @@ export class RuntimeStateStore {
     knowledgeBaseId: string,
     input: { name?: string; rootPath?: string; engineRoot?: string | null; stateDir?: string | null }
   ): ManagedKnowledgeBase {
-    const knowledgeBase = this.mutableKnowledgeBase(knowledgeBaseId);
+    const knowledgeBase = { ...this.mutableKnowledgeBase(knowledgeBaseId) };
     if (input.name !== undefined) knowledgeBase.name = cleanProjectName(input.name);
     if (input.rootPath !== undefined) {
       const resolvedRoot = path.resolve(input.rootPath);
@@ -599,6 +603,7 @@ export class RuntimeStateStore {
       else delete knowledgeBase.stateDir;
     }
     knowledgeBase.updatedAt = new Date().toISOString();
+    this.state.knowledgeBases = this.state.knowledgeBases.map(item => item.id === knowledgeBaseId ? knowledgeBase : item);
     this.save();
     return structuredClone(knowledgeBase);
   }
@@ -682,11 +687,12 @@ export class RuntimeStateStore {
   ): ManagedProject {
     const resolvedWorkspace = path.resolve(workspace);
     const existing = this.state.projects.find((project) => (
-      project.workspace === resolvedWorkspace
-      && (project.hostId ?? "local") === (metadata.hostId ?? "local")
+      (project.hostId ?? "local") === (metadata.hostId ?? "local")
+      && (metadata.sourceProjectId ? project.sourceProjectId === metadata.sourceProjectId
+        : !project.sourceProjectId && project.workspace === resolvedWorkspace)
     ));
     if (existing) {
-      throw new Error(`Project workspace already exists: ${resolvedWorkspace}`);
+      throw new Error(`Project identity already exists: ${metadata.sourceProjectId ?? resolvedWorkspace}`);
     }
     const now = new Date().toISOString();
     const project: ManagedProject = {
@@ -719,6 +725,13 @@ export class RuntimeStateStore {
     metadata: { sourceProjectId?: string; projectKind?: "local" | "remote"; hostId?: string; rootPaths?: readonly string[] }
   ): ManagedProject {
     const project = this.mutableProject(projectId);
+    if (project.sourceProjectId && metadata.sourceProjectId && project.sourceProjectId !== metadata.sourceProjectId
+      || metadata.hostId && (project.hostId ?? "local") !== metadata.hostId) {
+      throw new Error("Project identity cannot be reassigned by metadata refresh");
+    }
+    if (metadata.sourceProjectId && this.state.projects.some(other => other.id !== project.id
+      && other.sourceProjectId === metadata.sourceProjectId && (other.hostId ?? "local") === (project.hostId ?? "local")))
+      throw new Error("Project identity already exists in another record");
     if (metadata.sourceProjectId) project.sourceProjectId = metadata.sourceProjectId;
     if (metadata.projectKind) project.projectKind = metadata.projectKind;
     if (metadata.hostId) project.hostId = metadata.hostId;
@@ -782,7 +795,16 @@ export class RuntimeStateStore {
 
   setInteractionMode(senderId: string, mode: ProjectInteractionMode): void {
     const previous = this.getInteractionMode(senderId);
+    const previousTarget = this.getBoundSession(senderId);
     this.state.interactionModes[senderId] = mode;
+    const nextTarget = this.getBoundSession(senderId);
+    // Q&A has a separate native target. A mode round trip cannot revive a
+    // request prepared under the earlier selection, even when IDs match again.
+    if (previousTarget?.id !== nextTarget?.id) {
+      for (const id of new Set([previousTarget?.id, nextTarget?.id])) {
+        if (id) this.mutableSession(id).executionGeneration = crypto.randomUUID();
+      }
+    }
     if (previous !== mode && this.getBoundSession(senderId)) this.renewBindingActivity(senderId);
     this.save();
   }
@@ -1106,9 +1128,10 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
       ))
       : [];
   }
+  const legacyKey = (workspace: string, hostId = "local") => JSON.stringify([hostId, workspace]);
   const projectsByWorkspace = new Map(projects
-    .filter((project) => project.projectKind !== "remote")
-    .map((project) => [project.workspace, project]));
+    .filter(project => !project.sourceProjectId)
+    .map(project => [legacyKey(project.workspace, project.hostId), project]));
   for (const session of sessions) {
     if (session.projectBinding === "none") {
       delete session.projectId;
@@ -1119,7 +1142,7 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
     const workspace = path.resolve(session.workspace);
     let project = session.projectId ? projects.find((candidate) => candidate.id === session.projectId) : undefined;
     if (!project) {
-      project = projectsByWorkspace.get(workspace);
+      project = projectsByWorkspace.get(legacyKey(workspace, session.hostId));
     }
     if (!project) {
       const now = session.createdAt || new Date().toISOString();
@@ -1127,11 +1150,12 @@ function normalizeRuntimeState(value: Partial<RuntimeState>): RuntimeState {
         id: crypto.randomUUID(),
         name: path.basename(workspace) || workspace,
         workspace,
+        ...(session.hostId ? { hostId: session.hostId, projectKind: session.hostId === "local" ? "local" as const : "remote" as const } : {}),
         createdAt: now,
         updatedAt: session.updatedAt || now
       };
       projects.push(project);
-      projectsByWorkspace.set(workspace, project);
+      projectsByWorkspace.set(legacyKey(workspace, session.hostId), project);
     }
     session.projectId = project.id;
     session.mode = session.mode === "qa" ? "qa" : "session";

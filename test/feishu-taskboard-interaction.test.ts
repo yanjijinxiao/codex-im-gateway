@@ -189,3 +189,19 @@ test("renders required Taskboard inputs as a native Feishu form", () => {
   assert.equal(formatChannelActionCommand(card.submitActions[0].value, {}), undefined);
   assert.match(formatChannelActionCommand(card.submitActions[0].value, { body: "等待权限" }) ?? "", /^\/task submit /);
 });
+
+test("tokenless Feishu form callbacks deduplicate the same answer but retain a corrected answer", async () => {
+  let dispatcher: any; const messages: NormalizedWeixinMessage[] = [], claimed = new Set<string>();
+  const adapter = new FeishuChannelAdapter(account(), { apiClient: { im: { v1: { message: {} } } } as never,
+    wsClient: { async start(input) { dispatcher = input.eventDispatcher; }, close() {} } });
+  const abort = new AbortController(); const monitoring = adapter.monitor({ signal: abort.signal,
+    claimMessage(message) { if (claimed.has(message.id)) return false; claimed.add(message.id); return true; },
+    async onMessage(message) { messages.push(message); } });
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    for (const answer of ["first", "first", "corrected"]) await dispatcher.handles.get("card.action.trigger")({
+      context: { open_message_id: "om_question", open_chat_id: "oc_group" }, operator: { open_id: "ou_actor" },
+      action: { tag: "button", name: "submit_answer", value: { version: 4, command: "answer", arg: "submit", questionId: "Q1" }, form_value: { answer } } });
+    assert.deepEqual(messages.map(message => message.text), ["/answer Q1 first", "/answer Q1 corrected"]);
+  } finally { abort.abort(); await monitoring; }
+});

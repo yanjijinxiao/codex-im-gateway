@@ -49,6 +49,7 @@ type DesktopRequest = CodexDesktopApproval | CodexDesktopUserInput;
 export type CodexDesktopRequestMonitorOptions = {
   socketPath?: string;
   reconnectDelayMs?: number;
+  connectionTimeoutMs?: number;
   decisionTimeoutMs?: number;
   /** Read-only fresh-snapshot probes for interactions not yet routed to IM. */
   deferredRetryDelayMs?: number;
@@ -88,6 +89,8 @@ export class CodexDesktopRequestMonitor {
   private socket?: net.Socket;
   private reconnectTimer?: NodeJS.Timeout;
   private clientId?: string;
+  private initializeRequestId?: string;
+  private connectionTimer?: NodeJS.Timeout;
   private readonly frames = new IpcFrameDecoder(IPC_MESSAGE_MAX_BYTES);
   private started = false;
 
@@ -110,6 +113,9 @@ export class CodexDesktopRequestMonitor {
     this.socket?.destroy();
     this.socket = undefined;
     this.clientId = undefined;
+    this.initializeRequestId = undefined;
+    if (this.connectionTimer) clearTimeout(this.connectionTimer);
+    this.connectionTimer = undefined;
     this.frames.reset();
     this.failPendingDecisions();
     for (const [key, approval] of this.activeRequests) this.withdraw(key, approval, true);
@@ -150,17 +156,24 @@ export class CodexDesktopRequestMonitor {
     if (!this.started || this.socket) return;
     const socket = net.createConnection(this.socketPath);
     this.socket = socket;
-    socket.on("connect", () => this.initialize());
-    socket.on("data", (chunk) => this.receive(chunk));
+    this.connectionTimer = setTimeout(() => {
+      if (this.socket === socket && !this.clientId) socket.destroy();
+    }, this.options.connectionTimeoutMs ?? 15_000);
+    this.connectionTimer.unref();
+    socket.on("connect", () => { if (this.socket === socket) this.initialize(); });
+    socket.on("data", (chunk) => { if (this.socket === socket) this.receive(chunk); });
     socket.on("error", (error) => {
       if (!isMissingSocketError(error)) {
         console.warn(`[codex-im-gateway] Codex Desktop request IPC error: ${error.message}`);
       }
     });
     socket.on("close", () => {
-      if (this.socket !== socket && this.socket) return;
-      if (this.socket === socket) this.socket = undefined;
+      if (this.socket !== socket) return;
+      this.socket = undefined;
       this.clientId = undefined;
+      this.initializeRequestId = undefined;
+      if (this.connectionTimer) clearTimeout(this.connectionTimer);
+      this.connectionTimer = undefined;
       this.frames.reset();
       this.clearDeferred();
       this.failPendingDecisions();
@@ -171,9 +184,10 @@ export class CodexDesktopRequestMonitor {
   }
 
   private initialize(): void {
+    this.initializeRequestId = crypto.randomUUID();
     this.send({
       type: "request",
-      requestId: crypto.randomUUID(),
+      requestId: this.initializeRequestId,
       sourceClientId: "initializing-client",
       version: 0,
       method: "initialize",
@@ -207,10 +221,15 @@ export class CodexDesktopRequestMonitor {
       return;
     }
     if (message.type === "response" && message.method === "initialize") {
+      if (!this.initializeRequestId || message.requestId !== this.initializeRequestId) return;
+      if (message.resultType !== "success" || message.error) { this.socket?.destroy(); return; }
       const result = recordValue(message.result);
       const clientId = stringValue(result?.clientId);
       if (!clientId) return;
       this.clientId = clientId;
+      this.initializeRequestId = undefined;
+      if (this.connectionTimer) clearTimeout(this.connectionTimer);
+      this.connectionTimer = undefined;
       console.log("[codex-im-gateway] connected to Codex Desktop pending-request stream");
       for (const { threadId, hostId } of this.followedThreads.values()) this.sendFollow(threadId, true, hostId);
       return;
@@ -231,7 +250,7 @@ export class CodexDesktopRequestMonitor {
       }
       return;
     }
-    if (message.type !== "broadcast" || message.method !== "thread-stream-state-changed") return;
+    if (!this.clientId || message.type !== "broadcast" || message.method !== "thread-stream-state-changed") return;
     const params = recordValue(message.params);
     const threadId = stringValue(params?.conversationId);
     const hostId = stringValue(params?.hostId) ?? "local";
@@ -279,7 +298,7 @@ export class CodexDesktopRequestMonitor {
         && actual.questionId === expected.questionId && actual.digest === expected.digest))) {
       clearTimeout(pending.timer); this.pendingDecisions.delete(id); pending.resolve();
     }
-    if (receipts.length) void Promise.resolve(this.options.onObservedUserInputAnswers?.(receipts)).catch(() => {
+    if (receipts.length) void Promise.resolve().then(() => this.options.onObservedUserInputAnswers?.(receipts)).catch(() => {
       console.warn("[codex-im-gateway] native question receipt reconciliation failed");
     });
     const asyncRequests = desktopAsyncUserInputs(threadId, snapshot as unknown as Record<string, unknown>, hostId);
@@ -313,9 +332,9 @@ export class CodexDesktopRequestMonitor {
             this.unsupportedNotices.set(noticeKey, { delivered: false, retryAt: Date.now() + 60_000 });
             while (this.unsupportedNotices.size > 500) this.unsupportedNotices.delete(this.unsupportedNotices.keys().next().value!);
             const url = safeElicitationUrl(params);
-            void this.options.onUnsupportedInteraction?.({ hostId, threadId, turnId, requestId, method,
+            void Promise.resolve().then(() => this.options.onUnsupportedInteraction?.({ hostId, threadId, turnId, requestId, method,
               ...(params.mode === "url" ? { reason: "authentication" as const, ...(url ? { safeUrl: url } : {}) }
-                : params.mode === "form" || params.mode === "openai/form" ? { reason: "schema-unsupported" as const } : {}) })
+                : params.mode === "form" || params.mode === "openai/form" ? { reason: "schema-unsupported" as const } : {}) }))
               .then(delivered => { if (delivered !== false) this.unsupportedNotices.set(noticeKey, { delivered: true, retryAt: 0 }); })
               .catch(() => { console.warn("[codex-im-gateway] unsupported Desktop interaction notice unconfirmed; retry pending"); });
           }

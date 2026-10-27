@@ -45,6 +45,7 @@ import type {
 } from "../codex/backend.js";
 import type { CodexThreadState } from "../codex/backend.js";
 import { desktopSessionMembership } from "../codex/desktop-session-membership.js";
+import { localProjectsAtWorkspace, nativeProjectForManaged } from "../state/project-identity.js";
 import { assertCodexThreadRunnable, capacityFailureScope, CodexTurnExecutionError } from "../codex/backend.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
@@ -202,6 +203,8 @@ export type TaskboardIntegrationStatus = {
     projectId: string;
     projectName: string;
     workspace: string;
+    hostId?: string;
+    sourceProjectId?: string;
     taskboardProjectId?: string;
     taskboardProjectName?: string;
     issueCount?: number;
@@ -417,9 +420,9 @@ export class AccountManager {
         }
       }),
       terminal: async (scope, text, outcome) => {
-        await this.threadEvents.capacityTerminal(scope, parseActionBlocks(text).visibleText.trim() || "处理完成。", outcome);
+        await this.threadEvents.capacityTerminal(scope, parseActionBlocks(text, { strict: false }).visibleText.trim() || "处理完成。", outcome);
         const route = this.interactionRouting.resolve(scope.hostId, scope.threadId, this.interactionDestinations(), scope.turnId).destination;
-        if (route) await this.entries.get(route.accountId)?.service?.applyRecoveredOutput(route.sessionId, text);
+        if (route) await this.entries.get(route.accountId)?.service?.applyRecoveredOutput(route.sessionId, text, scope);
       }
     });
     this.configProvider = options.configProvider ?? (() => loadConfig(options.paths));
@@ -475,26 +478,31 @@ export class AccountManager {
 
   async stopAll(): Promise<void> {
     this.stoppingAll = true;
+    const errors: unknown[] = [];
+    const attempt = async (cleanup: () => unknown) => { try { await cleanup(); } catch (error) { errors.push(error); } };
     try {
-      this.bindingExpiry.stop();
-      this.capacityRecovery.stop();
-      this.codexDesktopRequestMonitor?.stop();
+      await attempt(() => this.bindingExpiry.stop());
+      await attempt(() => this.capacityRecovery.stop());
+      // Abort all ingress before waiting for any observer or journal cleanup.
+      const accounts = [...this.entries.keys()].map(id => attempt(() => this.accountOperations.run(id, () => this.stopRuntime(id))));
+      this.taskboardController?.abort();
+      await attempt(() => this.codexDesktopRequestMonitor?.stop());
       this.codexDesktopRequestMonitor = undefined;
-      await this.codexSessionMonitor?.stop();
+      await attempt(() => this.codexSessionMonitor?.stop());
       this.codexSessionMonitor = undefined;
       this.externalCodexTasks.clear();
       this.unresolvedInteractions.clear();
       this.managedTurnCompletions.clear();
-      await this.threadEvents.stop();
-      this.taskboardController?.abort();
-      await this.taskboardTask;
+      await attempt(() => this.threadEvents.stop());
+      await attempt(() => this.taskboardTask);
       this.taskboardController = undefined;
       this.taskboardTask = undefined;
       this.taskboard = undefined;
       this.recentTaskboardNotifications.clear();
-      await Promise.all([...this.entries.keys()].map(id => this.accountOperations.run(id, () => this.stopRuntime(id))));
-      await this.closeRunner();
-      this.llmWiki.close();
+      await Promise.all(accounts);
+      await attempt(() => this.closeRunner());
+      await attempt(() => this.llmWiki.close());
+      if (errors.length) throw new AggregateError(errors, "Gateway 停止时部分资源清理失败；其余资源已继续清理。");
     } finally { this.stoppingAll = false; }
   }
 
@@ -762,14 +770,14 @@ export class AccountManager {
   }
   private async stopRuntime(accountId: string): Promise<void> {
     const entry = this.entries.get(accountId);
+    const errors: unknown[] = [];
     if (entry) {
-      entry.service?.suspendUserInputs?.();
-      entry.controller?.abort();
-      await entry.task;
-      entry.status = "stopped";
-      entry.connection = { state: "stopped" };
+      try { entry.service?.suspendUserInputs?.(); } catch (error) { errors.push(error); }
+      try { entry.controller?.abort(); await entry.task; } catch (error) { errors.push(error); }
+      finally { entry.status = "stopped"; entry.connection = { state: "stopped" }; }
     }
-    if (!this.stoppingAll) this.refreshDesktopRequestSubscriptions();
+    try { if (!this.stoppingAll) this.refreshDesktopRequestSubscriptions(); } catch (error) { errors.push(error); }
+    if (errors.length) throw new AggregateError(errors, "渠道账号停止时部分清理失败，其余资源已继续清理。");
   }
 
   async removeAccount(accountId: string, options: { retainHistory?: boolean } = {}): Promise<void> {
@@ -1141,6 +1149,17 @@ export class AccountManager {
     return this.projectSummary(accountId, project, store);
   }
 
+  /** Called only after the management boundary validates an exact live catalog
+   * choice. Registration authorizes this project, without widening the global
+   * arbitrary-workspace allowlist or requiring a two-file config transaction. */
+  registerCodexProject(accountId: string, name: string, candidate: CodexProjectCandidate): AccountProject {
+    const store = this.storeFor(accountId);
+    const project = store.createProject(name, candidate.workspace, { sourceProjectId: candidate.projectId,
+      rootPaths: candidate.rootPaths, projectKind: candidate.projectKind, hostId: candidate.hostId });
+    this.ensureCodexSessionMonitor();
+    return this.projectSummary(accountId, project, store);
+  }
+
   setProjectNotifications(
     accountId: string,
     projectId: string,
@@ -1206,7 +1225,7 @@ export class AccountManager {
       throw new Error(`Managed project not found: ${projectId}`);
     }
     const targetWorkspace = project?.workspace ?? workspace ?? config.defaultCwd;
-    if (!isWorkspaceAllowed(targetWorkspace, config.allowedWorkspaces)) {
+    if (!project && !isWorkspaceAllowed(targetWorkspace, config.allowedWorkspaces)) {
       throw new Error(`Workspace is not allowed: ${targetWorkspace}`);
     }
     const session = this.storeFor(accountId).createSession(senderId, targetWorkspace, title, project?.id);
@@ -1395,7 +1414,7 @@ export class AccountManager {
         return parsed.text || attachments.length ? [{ ...message, text: parsed.text, attachments }] : [];
       }
       const parsed = parseAssistantMessage(message.text);
-      const attachments = parsed.actions.send.map((action, index) => sessionAttachment(action, index));
+      const attachments = parsed.actions.send.map((action, index) => sessionAttachment(action, index, session.hostId ?? project?.hostId));
       const text = parsed.visibleText.trim();
       return text || attachments.length ? [{ ...message, text, attachments }] : [];
     });
@@ -1505,7 +1524,7 @@ export class AccountManager {
           text: parsed.visibleText.trim(),
           createdAt: new Date().toISOString(),
           attachments: parsed.actions.send.map((action, index) => {
-            const { path: _path, ...attachment } = sessionAttachment(action, index);
+            const { path: _path, ...attachment } = sessionAttachment(action, index, session.hostId ?? project?.hostId);
             return attachment;
           })
         }
@@ -1540,10 +1559,7 @@ export class AccountManager {
 
   private synchronizeManagedProject(store: RuntimeStateStore, project: ManagedProject): ManagedProject {
     if (this.configProvider().codexBackend === "exec" || this.runner?.backendInfo?.().id === "exec") return project;
-    const candidate = readCodexDesktopProjects().find((item) => (
-      path.resolve(item.workspace) === path.resolve(project.workspace)
-      && (item.hostId ?? "local") === (project.hostId ?? "local")
-    ));
+    const candidate = nativeProjectForManaged(project, readCodexDesktopProjects(), store.listProjects());
     if (!candidate?.projectId) return project;
     if (
       project.sourceProjectId === candidate.projectId
@@ -1596,6 +1612,8 @@ export class AccountManager {
   }
 
   removeSender(accountId: string, senderId: string): void {
+    if (this.configProvider().allowedSenderIds.includes(senderId))
+      throw new Error("此身份还在固定准入配置 allowedSenderIds 中；请先从该配置移除，再撤销个人准入。");
     this.ideApprovals.revokePersonalAccess(loadAccount(this.options.paths, accountId).accountId, senderId);
     const entry = this.entries.get(loadAccount(this.options.paths, accountId).accountId);
     if (entry?.service) {
@@ -1720,7 +1738,7 @@ export class AccountManager {
       ? ownerStore.listProjects().find((candidate) => candidate.id === session.projectId)
       : undefined;
     if (!session || !project) return;
-    if (session.threadId && turnId) {
+    if (session.threadId && turnId && localManagedSession(session, ownerStore)) {
       this.managedTurnCompletions.add(taskRuntimeKey(session.threadId, turnId));
     }
     await this.sendProjectCompletion(project, session.title, resultText, success, session.threadId);
@@ -2051,22 +2069,24 @@ export class AccountManager {
     return entry?.service ? { service: entry.service, recipientId: target.recipientId } : undefined;
   }
 
+  private externalProjectContexts(threadId: string, workspace?: string): Array<{ accountId: string; project: ManagedProject }> {
+    const stores = listAccounts(this.options.paths).map(account => ({ accountId: account.accountId, store: this.storeFor(account.accountId) }));
+    const bound = stores.flatMap(({ accountId, store }) => store.listSessions()
+      .filter(session => session.threadId === threadId && localManagedSession(session, store))
+      .map(session => ({ accountId, project: session.projectId ? store.getProject(session.projectId) : undefined })));
+    // An explicit independent binding must not be converted to a project by cwd.
+    if (bound.length) return bound.filter((entry): entry is { accountId: string; project: ManagedProject } => Boolean(entry.project)
+      && (entry.project!.hostId ?? "local") === "local");
+    if (!workspace) return [];
+    const candidates = stores.flatMap(({ accountId, store }) => store.listProjects().map(project => ({ accountId, project })));
+    const eligible = new Set(localProjectsAtWorkspace(workspace, candidates.map(entry => entry.project)));
+    return candidates.filter(entry => eligible.has(entry.project));
+  }
+
   private projectForExternalThread(threadId: string, workspace?: string): ManagedProject | undefined {
-    const contexts = listAccounts(this.options.paths).flatMap((account) => {
-      const store = this.storeFor(account.accountId);
-      const projects = new Map(store.listProjects().map((project) => [project.id, project]));
-      return store.listSessions().flatMap((session) => {
-        const project = session.projectId ? projects.get(session.projectId) : undefined;
-        return project && (session.hostId ?? project.hostId ?? "local") === "local" ? [{ session, project }] : [];
-      });
-    });
-    const exact = contexts.find(({ session }) => session.threadId === threadId)?.project;
-    if (exact) return exact;
-    if (!workspace) return undefined;
-    const canonical = canonicalWorkspace(workspace);
-    return contexts.find(({ project }) => canonicalWorkspace(project.workspace) === canonical)?.project
-      ?? listAccounts(this.options.paths).flatMap((account) => this.storeFor(account.accountId).listProjects())
-        .find((project) => (project.hostId ?? "local") === "local" && canonicalWorkspace(project.workspace) === canonical);
+    const contexts = this.externalProjectContexts(threadId, workspace);
+    // Approval fallback needs one destination, never the first registration.
+    return contexts.length === 1 ? contexts[0].project : undefined;
   }
 
   private projectSummary(
@@ -2082,15 +2102,11 @@ export class AccountManager {
       hasThread: Boolean(session.threadId),
       updatedAt: session.updatedAt
     }));
-    const respondingThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
-      this.storeFor(account.accountId).listSessions().flatMap((session) =>
-        session.threadId && this.isSessionResponding(account.accountId, session.id) ? [session.threadId] : []
-      )
-    ));
-    const boundThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) =>
-      this.storeFor(account.accountId).listSessions().flatMap((session) => session.threadId ? [session.threadId] : [])
-    ));
-    const projectThreadIds = new Set(sessions.flatMap((session) => session.threadId ? [session.threadId] : []));
+    const respondingThreadIds = new Set(listAccounts(this.options.paths).flatMap((account) => {
+      const accountStore = this.storeFor(account.accountId);
+      return accountStore.listSessions().flatMap(session => session.threadId && localManagedSession(session, accountStore)
+        && this.isSessionResponding(account.accountId, session.id) ? [session.threadId] : []);
+    }));
     const managedTasks: AccountProjectTask[] = sessions
       .filter((session) => this.isSessionResponding(accountId, session.id))
       .map((session) => ({
@@ -2100,13 +2116,9 @@ export class AccountManager {
         startedAt: session.updatedAt,
         updatedAt: session.updatedAt
       }));
-    const workspace = canonicalWorkspace(project.workspace);
     const externalTasks: AccountProjectTask[] = [...this.externalCodexTasks.values()]
-      .filter((task) =>
-        canonicalWorkspace(task.workspace) === workspace
-        && !respondingThreadIds.has(task.sessionId)
-        && (!boundThreadIds.has(task.sessionId) || projectThreadIds.has(task.sessionId))
-      )
+      .filter((task) => !respondingThreadIds.has(task.sessionId)
+        && this.externalProjectContexts(task.sessionId, task.workspace).some(entry => entry.accountId === accountId && entry.project.id === project.id))
       .map((task) => ({
         id: `codex:${task.sessionId}:${task.turnId}`,
         title: task.title,
@@ -2134,41 +2146,22 @@ export class AccountManager {
     const stores = accounts.map((account) => ({ account, store: this.storeFor(account.accountId) }));
     const managedByService = stores.some(({ account, store }) =>
       store.listSessions().some((session) =>
-        session.threadId === completion.sessionId
+        session.threadId === completion.sessionId && localManagedSession(session, store)
         && this.isSessionResponding(account.accountId, session.id)
       )
     );
     const completionKey = taskRuntimeKey(completion.sessionId, completion.turnId);
     if (managedByService || this.managedTurnCompletions.delete(completionKey)) return;
     await this.finalizeExternalActivityStreams(completion);
-    const workspace = path.resolve(completion.workspace);
-    const boundProjects = new Set(stores.flatMap(({ account, store }) =>
-      store.listSessions().flatMap((session) =>
-        session.threadId === completion.sessionId && session.projectId
-          ? [`${account.accountId}\n${session.projectId}`]
-          : []
-      )
-    ));
-    await Promise.all(stores.flatMap(({ account, store }) =>
-      store.listProjects()
-        .filter((project) =>
-          path.resolve(project.workspace) === workspace
-          && (!boundProjects.size || boundProjects.has(`${account.accountId}\n${project.id}`))
-        )
-        .map((project) => this.sendProjectCompletion(
-          project,
-          completion.taskTitle,
-          completion.text,
-          completion.success,
-          completion.sessionId
-        ))
-    ));
+    await Promise.all(this.externalProjectContexts(completion.sessionId, completion.workspace)
+      .map(({ project }) => this.sendProjectCompletion(project, completion.taskTitle, completion.text,
+        completion.success, completion.sessionId, completion.outcome)));
   }
 
   private async finalizeExternalActivityStreams(completion: CodexSessionCompletion): Promise<void> {
     const finalText = completion.success
       ? completion.text
-      : `Codex 任务执行失败：${completion.text}`;
+      : completion.outcome === "interrupted" ? completion.text : `Codex 任务执行失败：${completion.text}`;
     await this.threadEvents.completion("local", completion.sessionId, completion.turnId, finalText,
       completion.outcome ?? (completion.success ? "completed" : "failed"));
   }
@@ -2178,23 +2171,26 @@ export class AccountManager {
     taskTitle: string,
     resultText: string,
     success: boolean,
-    threadId?: string
+    threadId?: string,
+    outcome?: CodexSessionCompletion["outcome"]
   ): Promise<void> {
     const targets = (project.notifications ?? []).filter((target) => target.enabled);
     if (!targets.length) return;
     const issue = threadId ? await this.issueForProjectThread(project, threadId) : undefined;
     if (success && issue && this.wasRecentlyNotified(issue)) return;
     const excerpt = resultText.replace(/\s+/g, " ").trim().slice(0, 500);
+    const title = success ? "Codex 任务已完成" : outcome === "interrupted" ? "Codex 任务已中断" : "Codex 任务执行失败";
+    const label = success ? "结果" : outcome === "interrupted" ? "说明" : "错误";
     const text = [
-      success ? "【Codex 任务已完成】" : "【Codex 任务执行失败】",
+      `【${title}】`,
       `项目：${project.name}`,
       ...(issue ? [`Issue：${issue.identifier} · ${formatTaskboardStatus(issue.status)}`] : []),
       `任务：${taskTitle.replace(/\s+/g, " ").trim().slice(0, 100) || "Codex 会话"}`,
-      ...(excerpt ? [`${success ? "结果" : "错误"}：${excerpt}`] : [])
+      ...(excerpt ? [`${label}：${excerpt}`] : [])
     ].join("\n");
     const card = issue ? createTaskCard(project.name, issue, {
-      title: success ? "Codex 任务已完成" : "Codex 任务执行失败",
-      note: excerpt ? `${success ? "结果" : "错误"}：${excerpt}` : undefined,
+      title,
+      note: excerpt ? `${label}：${excerpt}` : undefined,
       template: success ? "green" : "red",
       taskboardBaseUrl: this.taskboardFor()?.baseUrl ?? this.configProvider().taskboardUrl
     }) : undefined;
@@ -2220,7 +2216,7 @@ export class AccountManager {
         url: client.baseUrl,
         projects: managed.map((project) => {
           const match = projects.find((candidate) => candidate.workspacePath !== null
-            && canonicalWorkspace(candidate.workspacePath) === canonicalWorkspace(project.workspace));
+            && localProjectsAtWorkspace(candidate.workspacePath, managed).some(item => item.accountId === project.accountId && item.id === project.id));
           return {
             ...taskboardProjectBase(project),
             ...(match ? {
@@ -2314,11 +2310,12 @@ export class AccountManager {
     const taskboardProject = taskboardProjects.find((project) => project.id === issue.projectId);
     if (!taskboardProject?.workspacePath) return;
     const latestComment = (await taskboard.listComments(issue.id)).at(-1)?.body;
-    const workspace = canonicalWorkspace(taskboardProject.workspacePath);
+    const eligible = new Set(localProjectsAtWorkspace(taskboardProject.workspacePath, this.listProjects())
+      .map(project => JSON.stringify([project.accountId, project.id])));
     await Promise.all(listAccounts(this.options.paths).flatMap((account) => {
       const store = this.storeFor(account.accountId);
       return store.listProjects()
-        .filter((project) => canonicalWorkspace(project.workspace) === workspace)
+        .filter((project) => eligible.has(JSON.stringify([account.accountId, project.id])))
         .map((project) => this.sendTaskboardStatusNotification(project, issue, latestComment));
     }));
   }
@@ -2367,6 +2364,7 @@ export class AccountManager {
 
   private async issueForProjectThread(project: ManagedProject, threadId: string): Promise<TaskboardIssue | undefined> {
     try {
+      if (!localProjectsAtWorkspace(project.workspace, this.listProjects()).some(item => item.id === project.id)) return undefined;
       const taskboard = this.taskboardFor();
       const taskboardProject = await taskboard?.projectForWorkspace(project.workspace);
       return taskboard && taskboardProject
@@ -2449,7 +2447,7 @@ function requireSession(store: RuntimeStateStore, sessionId: string): ManagedSes
 
 function parseAssistantMessage(text: string): ReturnType<typeof parseActionBlocks> {
   try {
-    return parseActionBlocks(text);
+    return parseActionBlocks(text, { strict: false });
   } catch {
     return { visibleText: text.trim(), actions: { send: [], control: [], remember: [] } };
   }
@@ -2457,14 +2455,17 @@ function parseAssistantMessage(text: string): ReturnType<typeof parseActionBlock
 
 function sessionAttachment(
   action: { type: "image" | "file" | "video"; path: string },
-  index: number
+  index: number,
+  hostId = "local"
 ): SessionAttachmentFile {
   let size: number | undefined;
   let available = false;
   try {
-    const stat = fs.statSync(action.path);
-    available = stat.isFile();
-    if (available) size = stat.size;
+    if (hostId === "local") {
+      const stat = fs.statSync(action.path);
+      available = stat.isFile();
+      if (available) size = stat.size;
+    }
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     // Keep historical attachments visible even after their local file is moved.
@@ -2534,7 +2535,9 @@ function taskboardProjectBase(project: AccountProject): TaskboardIntegrationStat
     accountId: project.accountId,
     projectId: project.id,
     projectName: project.name,
-    workspace: project.workspace
+    workspace: project.workspace,
+    hostId: project.hostId,
+    sourceProjectId: project.sourceProjectId
   };
 }
 
@@ -2609,4 +2612,8 @@ function addProviderModelFamily(models: CodexModelOption[], provider?: string): 
     ...family.filter((option) => !models.some((model) => model.model === option.model)),
     ...models
   ];
+}
+
+function localManagedSession(session: ManagedSession, store: RuntimeStateStore): boolean {
+  return (session.hostId ?? (session.projectId ? store.getProject(session.projectId)?.hostId : undefined) ?? "local") === "local";
 }

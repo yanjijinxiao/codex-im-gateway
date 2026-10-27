@@ -22,6 +22,7 @@ export class InboundReceiptJournal {
   private readonly processing = new Set<string>();
   private readonly receipts: Record<string, Receipt>;
   private writes = 0;
+  private appendUnavailable = false;
   constructor(private readonly filePath: string, legacyIds: readonly string[] = []) {
     this.receipts = {};
     let raw: Buffer | undefined;
@@ -65,17 +66,26 @@ export class InboundReceiptJournal {
   private save(receipt: Receipt): void {
     // Append only the changed fact; do not rewrite an ever-growing ID history
     // for every incoming message. No ID is evicted by message count.
+    if (this.appendUnavailable) throw Error("Inbound receipt journal needs restart recovery; no further append attempted");
     const id = receipt.clientUserMessageId.slice("gateway-".length);
     const fd = fs.openSync(this.filePath, "r+");
+    let position: number | undefined;
     try {
+      position = fs.fstatSync(fd).size;
       const body = Buffer.from(JSON.stringify({ id, receipt }) + "\n");
-      let offset = 0, position = fs.fstatSync(fd).size;
+      let offset = 0;
       while (offset < body.length) {
         const written = fs.writeSync(fd, body, offset, body.length - offset, position + offset);
         if (!written) throw Error("Inbound receipt append incomplete");
         offset += written;
       }
       fs.fsyncSync(fd);
+    } catch (error) {
+      // A failed append must not become a broken middle line when the next
+      // message arrives. If repair fails, stop all appends until restart recovery.
+      try { if (position !== undefined) { fs.ftruncateSync(fd, position); fs.fsyncSync(fd); } }
+      catch { this.appendUnavailable = true; }
+      throw error;
     } finally { fs.closeSync(fd); }
     if (++this.writes >= 1024) { this.writes = 0; if (fs.statSync(this.filePath).size > 1024 * 1024) this.compact(); }
   }

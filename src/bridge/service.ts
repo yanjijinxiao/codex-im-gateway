@@ -2,6 +2,7 @@ import { AdmissionService, admissionPrincipal } from "./admission.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import path from "node:path";
+import { localProjectsAtWorkspace, managedProjectForNative, nativeProjectForManaged } from "../state/project-identity.js";
 
 import { AccessController, requiredCommandRole, roleAllows, type SessionRole } from "./access.js";
 import { sessionExecutionScope } from "./session-execution.js";
@@ -219,7 +220,14 @@ export class BridgeService {
   private readonly historyPages = new Map<string, {
     threadId: string; hostId: string; cursor?: string; exhausted: boolean; pending: CodexHistoryMessage[];
   }>();
-  private readonly access: AccessController;
+  private readonly historyRequests = new Map<string, symbol>();
+  private get access(): AccessController {
+    // Durable personal admission is the authority, including at the final
+    // native-write fence. Never resurrect an externally revoked cached grant.
+    this.options.stateStore.refresh();
+    return new AccessController({ allowedSenderIds: this.options.config.allowedSenderIds,
+      pairedSenderIds: this.options.stateStore.listPairedSenderIds() });
+  }
   private readonly buffers: PromptBuffer;
   private readonly runner: CodexBridgeBackend;
   private readonly approvals: ChannelApprovalController;
@@ -240,10 +248,6 @@ export class BridgeService {
       path.join(path.dirname(options.stateStore.controlJournalPath), "turn-audience.json"));
     this.nativeQueue = options.nativeQueue ?? new NativeQueueCoordinator(
       path.join(path.dirname(options.stateStore.controlJournalPath), "native-submissions.json"));
-    this.access = new AccessController({
-      allowedSenderIds: options.config.allowedSenderIds,
-      pairedSenderIds: options.stateStore.listPairedSenderIds()
-    });
     this.buffers = new PromptBuffer({
       maxItems: options.config.maxBufferItems,
       ttlMs: options.config.promptBufferTtlMs
@@ -394,7 +398,6 @@ export class BridgeService {
       await this.reply(replyTargetId, access.message);
       return;
     }
-    this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
     this.options.stateStore.recordBindingHumanActivity(replyTargetId);
     const directCommand = parseCommand(scopedMessage.text);
     const diagnosticOnly = directCommand?.name === "status" || directCommand?.name === "queue" && ["", "list"].includes(directCommand.arg.trim());
@@ -616,13 +619,16 @@ export class BridgeService {
         await this.reply(message.senderId, this.approvals.decide(message.senderId, command.arg, "decline"));
         return;
       case "stop":
+        {
+        const session = this.executionSession(message.senderId);
+        const assertCurrent = this.controlGuard(message.senderId, session, "controller");
+        assertCurrent();
         this.approvals.declineAll(message.senderId);
         this.userInputs.cancelSender(message.senderId);
         let stopResult: "interrupted" | "not-active";
         {
-          const session = this.executionSession(message.senderId);
           stopResult = session?.threadId
-            ? await this.runner.stop(session.threadId, this.sessionHostId(session))
+            ? await this.runner.stop(session.threadId, this.sessionHostId(session), assertCurrent)
             : "not-active";
         }
         await this.reply(
@@ -630,6 +636,7 @@ export class BridgeService {
           stopResult === "interrupted" ? "已停止当前会话正在执行的任务。" : "当前会话没有正在执行的任务。"
         );
         return;
+        }
       default:
         await this.replyActionCard(message.senderId, createMainMenuCard(
           `未知命令：/${command.name}。发送 /help 查看可用命令。`
@@ -658,6 +665,7 @@ export class BridgeService {
   /** Local conversation state only; never resolve native approvals/questions. */
   clearConversationBindingState(senderId: string): void {
     this.historyPages.delete(senderId);
+    this.historyRequests.delete(senderId);
     this.buffers.cancel(senderId);
   }
 
@@ -1085,6 +1093,10 @@ export class BridgeService {
       return;
     }
     const input = arg.trim().toLowerCase();
+    if (input && !["on", "plan", "off", "default", "toggle"].includes(input)) {
+      await this.reply(senderId, "用法：/plan [on|off|toggle]。未更改当前计划模式。");
+      return;
+    }
     const mode = input === "on" || input === "plan"
       ? "plan"
       : input === "off" || input === "default"
@@ -1122,13 +1134,15 @@ export class BridgeService {
       return;
     }
     const input = arg.trim();
+    const assertCurrent = this.controlGuard(senderId, session, "participant");
     if (/^(?:new|form|set)$/i.test(input)) {
       const project = this.options.stateStore.getActiveProject(senderId);
       await this.replyTaskCard(message, createGoalFormCard(project?.name ?? "当前项目"));
       return;
     }
     if (/^clear$/i.test(input)) {
-      await this.runner.clearGoal(session.threadId, this.sessionHostId(session));
+      assertCurrent();
+      await this.runner.clearGoal(session.threadId, this.sessionHostId(session), assertCurrent);
       await this.reply(senderId, "已清除当前 Codex 目标。");
       return;
     }
@@ -1137,17 +1151,20 @@ export class BridgeService {
       const status = ({ pause: "paused", resume: "active", complete: "complete" } as const)[
         statusMatch[1].toLowerCase() as "pause" | "resume" | "complete"
       ];
-      const goal = await this.runner.setGoal(session.threadId, { status }, this.sessionHostId(session));
+      assertCurrent();
+      const goal = await this.runner.setGoal(session.threadId, { status }, this.sessionHostId(session), assertCurrent);
       await this.replyGoalCard(message, goal);
       return;
     }
     const setMatch = /^(?:set\s+)?(.+)$/is.exec(input);
     if (setMatch && input) {
       const objective = setMatch[1].trim();
+      assertCurrent();
       const goal = await this.runner.setGoal(
         session.threadId,
         { objective, status: "active" },
-        this.sessionHostId(session)
+        this.sessionHostId(session),
+        assertCurrent
       );
       await this.replyGoalCard(message, goal);
       return;
@@ -1194,6 +1211,18 @@ export class BridgeService {
     const mode = this.options.stateStore.getInteractionMode(senderId);
     if (mode === "qa" && (!project || session.knowledgeBaseId !== this.resolveQaContext(project)?.id)) return undefined;
     return session;
+  }
+
+  private controlGuard(conversationId: string, session: ManagedSession | undefined, required: SessionRole): () => void {
+    const actorId = this.actor.getStore() ?? conversationId;
+    const binding = session && sessionExecutionScope(this.options.stateStore, session, conversationId);
+    return () => {
+      this.options.assertRuntimeWritable?.();
+      if (this.audienceSuspended || (binding ? !binding.current() : !!this.executionSession(conversationId))
+        || !this.access.requireAccess(actorId, conversationId).allowed
+        || !roleAllows(this.role(conversationId, actorId), required))
+        throw new CodexInterventionError("会话绑定、准入或角色权限已改变，控制操作未提交。");
+    };
   }
 
   private assertSessionCapability(senderId: string, capability: "liveFollow" | "collaborationModes" | "goals" | "progress"): void {
@@ -1406,9 +1435,15 @@ export class BridgeService {
     if (!state.cwd || !path.isAbsolute(state.cwd)) { await this.reply(senderId, "该会话没有可确认的工作目录，未建立绑定。"); return; }
     const store = this.options.stateStore;
     const existing = store.listSessions().find(s => s.senderId === senderId && s.mode !== "qa" && s.threadId === threadId && this.sessionHostId(s) === hostId);
-    let project = state.projectId ? store.listProjects().find(p => (p.hostId ?? "local") === hostId && (p.sourceProjectId === state.projectId || p.workspace === state.cwd)) : undefined;
+    let project = state.projectId ? managedProjectForNative({ projectId: state.projectId, hostId, workspace: state.cwd }, store.listProjects()) : undefined;
     if (!project && state.projectId) {
       project = store.createProject(path.basename(state.cwd), state.cwd, { sourceProjectId: state.projectId, hostId, projectKind: hostId === "local" ? "local" : "remote" });
+    }
+    if (existing) {
+      // Explicit native membership supersedes old edges even with follow off.
+      // Unknown membership preserves the edge; cwd itself is still observed.
+      const observedProjectId = state.projectId || state.projectMembership === "none" ? project?.id : existing.projectId;
+      store.reconcileThreadProject(threadId, hostId, observedProjectId, state.cwd);
     }
     const session = existing ? store.activateSession(existing.id) : store.createSession(senderId, state.cwd, state.title || `会话 ${threadId.slice(0,8)}`, project?.id, "session", undefined, { standalone: !project, hostId });
     if (!existing) store.setSessionThread(session.id, threadId);
@@ -1433,17 +1468,24 @@ export class BridgeService {
       return;
     }
     const hostId = this.sessionHostId(session) ?? "local";
+    const token = Symbol("history");
+    this.historyRequests.set(senderId, token);
+    const assertCurrent = this.controlGuard(senderId, session, "viewer");
+    const current = () => {
+      if (this.historyRequests.get(senderId) !== token) return false;
+      try { assertCurrent(); return true; } catch { return false; }
+    };
     let page = this.historyPages.get(senderId);
     if (!more || !page || page.threadId !== session.threadId || page.hostId !== hostId) {
       page = { threadId: session.threadId, hostId, exhausted: false, pending: [] };
-      this.historyPages.set(senderId, page);
-    }
+    } else page = structuredClone(page);
     for (let reads = 0; page.pending.length < requested && !page.exhausted && reads < 10; reads++) {
       if (typeof this.runner.getHistoryPage === "function") {
         try {
           const response = await this.runner.getHistoryPage(session.threadId, {
             cursor: page.cursor, limit: 10, sortDirection: "desc"
           }, hostId);
+          if (!current()) return;
           page.pending.push(...visibleConversationHistory(response.messages).reverse());
           page.exhausted = !response.nextCursor || response.nextCursor === page.cursor;
           page.cursor = response.nextCursor;
@@ -1452,10 +1494,14 @@ export class BridgeService {
           if (!/unsupported|method not found|unknown method|not implemented/i.test(String(error))) throw error;
         }
       }
-      page.pending.push(...visibleConversationHistory(await this.runner.getHistory(session.threadId, hostId)).reverse());
+      const messages = await this.runner.getHistory(session.threadId, hostId);
+      if (!current()) return;
+      page.pending.push(...visibleConversationHistory(messages).reverse());
       page.exhausted = true;
     }
+    if (!current()) return;
     const visible = page.pending.splice(0, requested).reverse();
+    this.historyPages.set(senderId, page);
     await this.reply(senderId, visible.length
       ? [`会话“${session.title}”${more ? "更早的" : "最近"} ${visible.length} 条对话：`,
           formatConversationHistory(visible),
@@ -1792,8 +1838,10 @@ export class BridgeService {
     if (/^cancel(?:\s|$)/.test(value)) {
       const [, id, extra] = value.split(/\s+/);
       if (!id || extra) { await this.reply(message.senderId, "用法：/queue cancel <队列ID>"); return; }
+      const controller = this.role(message.senderId) === "controller";
+      const assertCurrent = this.controlGuard(message.senderId, this.executionSession(message.senderId), controller ? "controller" : "participant");
       const cancelled = await this.nativeQueue.cancel(this.options.accountId ?? "standalone", message.senderId,
-        this.actor.getStore() ?? message.senderId, id, this.runner, this.role(message.senderId) === "controller");
+        this.actor.getStore() ?? message.senderId, id, this.runner, controller, assertCurrent);
       await this.reply(message.senderId, cancelled ? "已从 Codex 原生队列取消待执行消息。" : copyableChoices("队列项已不在待执行列表中，未停止任务、未重发消息。", [{ label: "核对队列回执", value: "/queue list" }]));
       return;
     }
@@ -2138,14 +2186,14 @@ export class BridgeService {
       return;
     }
     const entries = this.options.stateStore.listKnowledge();
-    const forgetMatch = /^(?:forget|f)\s+k([1-9]\d*)$/i.exec(input);
+    const forgetMatch = /^(?:forget|f)\s+(\S+)$/i.exec(input);
     if (forgetMatch) {
-      const entry = entries[Number(forgetMatch[1]) - 1];
+      const entry = entries.find(candidate => candidate.id === forgetMatch[1]);
       if (!entry) {
         await this.replyActionCard(senderId, createChoiceCard({
           title: "知识条目不存在",
-          body: "该条目可能已经被删除，请刷新知识库。",
-          fallbackText: "没有这个知识编号。发送 /memory 查看当前知识库。",
+          body: "该条目可能已经被删除，或使用了会随排序变化的旧编号，请刷新知识库后选择删除。",
+          fallbackText: "未删除任何内容。请发送 /memory 刷新后使用该条目的删除操作。",
           choices: [{ label: "刷新知识库", command: "memory", arg: "", style: "primary" }]
         }));
         return;
@@ -2158,7 +2206,7 @@ export class BridgeService {
       await this.replyActionCard(senderId, createChoiceCard({
         title: "个人知识库",
         body: "请选择要进行的知识库操作。",
-        fallbackText: "用法：/memory、/memory on、/memory off、/memory forget K编号、/memory clear",
+        fallbackText: "用法：/memory、/memory on、/memory off、/memory forget 条目ID、/memory clear",
         choices: [{ label: "查看知识库", command: "memory", arg: "", style: "primary" }]
       }));
       return;
@@ -2187,7 +2235,7 @@ export class BridgeService {
       ...visibleEntries.map((entry, index) =>
         `[K${index + 1}] ${formatKnowledgeKind(entry.kind)} · ${entry.scope === "project" ? `项目：${projectNames.get(entry.projectId ?? "") ?? "已移除项目"}` : "账号"}\n标题：${entry.title}\n内容：${entry.content}`
       ),
-      "删除单条：/memory forget K编号"
+      "删除单条：使用下方对应的删除操作，操作固定指向该条目。"
     ].join("\n\n");
     const choices: ChannelChoice[] = [{
       label: knowledgeEnabled ? "关闭自动沉淀" : "开启自动沉淀",
@@ -2198,7 +2246,7 @@ export class BridgeService {
     choices.push(...visibleEntries.map((entry, index): ChannelChoice => ({
       label: conciseButtonLabel(`删除 K${index + 1} · ${entry.title}`),
       command: "memory",
-      arg: `forget K${index + 1}`,
+      arg: `forget ${entry.id}`,
       style: "danger",
       confirm: `确认删除“${entry.title}”？`
     })));
@@ -2452,7 +2500,7 @@ export class BridgeService {
           saveNativeThread(result.threadId);
         }
         if (result.threadId && result.turnId) recordParticipant(result.threadId, result.turnId);
-        const parsed = parseActionBlocks(result.text);
+        const parsed = parseActionBlocks(result.text, { strict: false });
         for (const memory of parsed.actions.remember) {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
@@ -2487,7 +2535,7 @@ export class BridgeService {
         }
         for (const action of parsed.actions.send) {
           if (!stillBound()) break;
-          await this.sendLocalMedia(message.senderId, action);
+          await this.sendLocalMedia(message.senderId, action, this.sessionHostId(session));
         }
         await this.options.onTurnCompleted?.({
           senderId: message.senderId,
@@ -2557,14 +2605,20 @@ export class BridgeService {
   /** Explicit recovery finalization only, not arbitrary history replay. The
    * coordinator journals completion before invoking this once; ambiguous media
    * sends are not replayed after restart. */
-  async applyRecoveredOutput(sessionId: string, text: string): Promise<void> {
+  async applyRecoveredOutput(sessionId: string, text: string, native: { hostId: string; threadId: string }): Promise<void> {
+    this.options.stateStore.refresh();
     const session = this.options.stateStore.getSession(sessionId);
-    if (!session || this.options.stateStore.getBoundSession(session.senderId)?.id !== session.id) return;
-    const parsed = parseActionBlocks(text);
-    for (const memory of parsed.actions.remember) this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
+    if (!session || session.threadId !== native.threadId || this.sessionHostId(session) !== native.hostId) return;
+    const binding = sessionExecutionScope(this.options.stateStore, session);
+    if (!binding.current()) return;
+    const parsed = parseActionBlocks(text, { strict: false });
+    for (const memory of parsed.actions.remember) {
+      if (!binding.current()) break;
+      this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
+    }
     for (const action of parsed.actions.send) {
-      if (this.options.stateStore.getBoundSession(session.senderId)?.id !== session.id) break;
-      await this.sendLocalMedia(session.senderId, action);
+      if (!binding.current()) break;
+      await this.sendLocalMedia(session.senderId, action, native.hostId);
     }
   }
 
@@ -2576,14 +2630,7 @@ export class BridgeService {
     candidate: CodexProjectCandidate,
     projects: readonly ManagedProject[] = this.options.stateStore.listProjects()
   ): ManagedProject | undefined {
-    const candidateHost = candidate.hostId ?? "local";
-    return projects.find((project) => (
-      Boolean(candidate.projectId && project.sourceProjectId === candidate.projectId)
-      && (project.hostId ?? "local") === candidateHost
-    )) ?? projects.find((project) => (
-      path.resolve(project.workspace) === path.resolve(candidate.workspace)
-      && (project.hostId ?? "local") === candidateHost
-    ));
+    return managedProjectForNative(candidate, projects);
   }
 
   private synchronizeManagedProjects(candidates: readonly CodexProjectCandidate[]): void {
@@ -2596,10 +2643,7 @@ export class BridgeService {
     project: ManagedProject,
     candidates: readonly CodexProjectCandidate[]
   ): ManagedProject {
-    const candidate = candidates.find((item) => (
-        path.resolve(item.workspace) === path.resolve(project.workspace)
-        && (item.hostId ?? "local") === (project.hostId ?? "local")
-      ));
+    const candidate = nativeProjectForManaged(project, candidates, this.options.stateStore.listProjects());
     if (!candidate?.projectId) return project;
     if (
       project.sourceProjectId === candidate.projectId
@@ -2682,8 +2726,14 @@ export class BridgeService {
     );
   }
 
-  private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }): Promise<void> {
+  private async sendLocalMedia(senderId: string, action: { type: "image" | "file" | "video"; path: string }, hostId = "local"): Promise<void> {
     try {
+      // File paths belong to the execution host. There is no outbound remote
+      // transfer port yet; never substitute a same-path Gateway-local file.
+      if (hostId !== "local") {
+        await this.reply(senderId, `文件位于远程主机，当前无法回传：${path.basename(action.path)}。请通过该项目的 Web IDE 下载。`);
+        return;
+      }
       if (this.channel.capabilities.outbound[action.type] !== "available") {
         await this.reply(senderId, `当前渠道暂不支持直接发送 ${action.type} 文件：${path.basename(action.path)}`);
         return;
@@ -2743,7 +2793,8 @@ export class BridgeService {
     const observation = { includeTurns: false as const, timeoutMs: STATUS_RPC_BUDGET_MS, purpose: "status" as const };
     const [taskResult, runtimeResult, stateResult] = await Promise.all([
       observeStatus(async () => {
-        if (!project || !session?.threadId || !this.options.taskboard) return;
+        if (!project || !session?.threadId || !this.options.taskboard
+          || !localProjectsAtWorkspace(project.workspace, this.options.stateStore.listProjects()).some(item => item.id === project.id)) return;
         const target = await this.options.taskboard.projectForWorkspace(project.workspace);
         return target ? this.options.taskboard.issueForThread(target.id, session.threadId) : undefined;
       }),
@@ -2937,13 +2988,14 @@ export class BridgeService {
   }
 
   allowSender(senderId: string): void {
-    this.access.allow(senderId);
-    this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
+    this.options.stateStore.refresh();
+    this.options.stateStore.setPairedSenderIds([...this.options.stateStore.listPairedSenderIds(), senderId]);
   }
 
   removeSender(senderId: string): void {
-    this.access.remove(senderId);
-    this.options.stateStore.setPairedSenderIds(this.access.listPairedSenderIds());
+    this.options.stateStore.refresh();
+    if (this.options.config.allowedSenderIds.includes(senderId)) throw new Error("此身份还在固定准入配置 allowedSenderIds 中；请先从该配置移除，再撤销个人准入。");
+    this.options.stateStore.setPairedSenderIds(this.options.stateStore.listPairedSenderIds().filter(id => id !== senderId));
   }
 
   listAllowedSenders(): string[] {
@@ -3149,7 +3201,7 @@ function visibleHistoryUserText(value: string): string {
 
 function visibleHistoryAssistantText(value: string): string {
   try {
-    return parseActionBlocks(value).visibleText.trim();
+    return parseActionBlocks(value, { strict: false }).visibleText.trim();
   } catch {
     // A malformed action block in old history must not make the whole history
     // command fail. Hide the block and retain the user-visible answer around it.

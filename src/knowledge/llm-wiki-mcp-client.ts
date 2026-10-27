@@ -170,12 +170,26 @@ async function callLegacyLlmWiki(
   const { stdout } = await execLlmWiki(command, commandArgs, "trace");
   const trace = jsonObject(stdout, "trace");
   const relativePath = requiredString(trace.relative_path, "relative_path");
-  const documentPath = path.resolve(knowledgeBase.rootPath, relativePath);
-  const rootPrefix = `${path.resolve(knowledgeBase.rootPath)}${path.sep}`;
-  if (!documentPath.startsWith(rootPrefix)) {
+  const rootPath = await fs.promises.realpath(knowledgeBase.rootPath);
+  const documentPath = await fs.promises.realpath(path.resolve(rootPath, relativePath));
+  const relative = path.relative(rootPath, documentPath);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error("llm-wiki trace 返回了知识库外部路径");
   }
-  const content = await fs.promises.readFile(documentPath, "utf8");
+  const handle = await fs.promises.open(documentPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+  let content: string;
+  try {
+    const stat = await handle.stat(), maximum = 2 * 1024 * 1024;
+    if (!stat.isFile() || stat.size > maximum) throw new Error("知识库文档不是普通文件或超过 2 MiB 大小上限");
+    const bytes = Buffer.alloc(stat.size + 1); let size = 0;
+    while (size < bytes.length) {
+      const read = await handle.read(bytes, size, bytes.length - size, null);
+      if (!read.bytesRead) break;
+      size += read.bytesRead;
+    }
+    if (size !== stat.size || (await handle.stat()).mtimeMs !== stat.mtimeMs) throw new Error("知识库文档正在变化，请重新读取");
+    content = bytes.subarray(0, size).toString("utf8");
+  } finally { await handle.close(); }
   return JSON.stringify({ ...trace, content }, null, 2);
 }
 
@@ -269,6 +283,8 @@ class StdioMcpSession {
   private nextId = 1;
   private stderr = "";
   private startPromise?: Promise<void>;
+  private ready = false;
+  private closed = false;
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
 
   constructor(private readonly knowledgeBase: ManagedKnowledgeBase) {}
@@ -290,8 +306,14 @@ class StdioMcpSession {
   }
 
   close(): void {
+    this.closed = true;
+    this.stopChild();
+  }
+
+  private stopChild(): void {
     const child = this.child;
     this.child = undefined;
+    this.ready = false;
     this.lines?.close();
     this.lines = undefined;
     if (child?.exitCode === null) child.kill();
@@ -299,7 +321,9 @@ class StdioMcpSession {
   }
 
   private async start(): Promise<void> {
-    if (this.child?.exitCode === null && !this.child.stdin.destroyed) return;
+    if (this.closed) throw new Error("llm-wiki MCP client closed");
+    if (this.startPromise) return this.startPromise;
+    if (this.ready && this.child?.exitCode === null && !this.child.stdin.destroyed) return;
     if (!this.startPromise) {
       this.startPromise = this.startChild().finally(() => {
         this.startPromise = undefined;
@@ -320,9 +344,9 @@ class StdioMcpSession {
     this.child = child;
     this.stderr = "";
     this.lines = readline.createInterface({ input: child.stdout });
-    this.lines.on("line", (line) => this.handleLine(line));
+    this.lines.on("line", (line) => { if (this.child === child) this.handleLine(line); });
     child.stderr.on("data", (chunk: Buffer) => {
-      this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
+      if (this.child === child) this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-20_000);
     });
     child.once("error", (error) => this.handleFailure(child, error));
     child.once("exit", (code, signal) => {
@@ -332,17 +356,23 @@ class StdioMcpSession {
         new Error(`llm-wiki MCP 已退出（${code ?? "unknown"}${signal ? `/${signal}` : ""}）${suffix}`)
       );
     });
+    try {
     await this.request("initialize", {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: { name: "codex-im-gateway", version: "0.4.0" }
     });
     this.notify("notifications/initialized", {});
-    const tools = await this.request("tools/list", {}) as { tools?: Array<{ name?: string }> };
-    const names = new Set((tools.tools ?? []).map((item) => item.name));
+    const tools = await this.request("tools/list", {}) as { tools?: Array<{ name?: string }> } | null;
+    const names = new Set((Array.isArray(tools?.tools) ? tools.tools : []).map((item) => item?.name));
     if (!names.has("search") || !names.has("get_document")) {
-      this.close();
       throw new Error("该 llm-wiki MCP 未提供 search/get_document 只读工具");
+    }
+    if (this.closed || this.child !== child) throw new Error("llm-wiki MCP client closed during initialization");
+    this.ready = true;
+    } catch (error) {
+      if (this.child === child) this.stopChild();
+      throw error;
     }
   }
 
@@ -383,6 +413,7 @@ class StdioMcpSession {
     } catch {
       return;
     }
+    if (!message || typeof message !== "object" || Array.isArray(message)) return;
     if (message.id === undefined) return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
@@ -398,6 +429,7 @@ class StdioMcpSession {
   private handleFailure(child: ChildProcessWithoutNullStreams, error: Error): void {
     if (this.child !== child) return;
     this.child = undefined;
+    this.ready = false;
     this.lines?.close();
     this.lines = undefined;
     this.rejectPending(error);

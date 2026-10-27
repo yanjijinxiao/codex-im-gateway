@@ -73,11 +73,10 @@ export class WorkspaceIDEManager {
     const id = identity ?? digest([accountId, sessionId]);
     const reference = this.references[id];
     if (!reference) {
-      this.references[id] = { accountId, sessionId, ...(identity ? { identity, sessionIds: [sessionId] } : {}) };
-      writeJsonFile(this.referencePath, this.references);
+      this.saveReference(id, { accountId, sessionId, ...(identity ? { identity, sessionIds: [sessionId] } : {}) });
     } else if (identity && !reference.sessionIds?.includes(sessionId)) {
-      reference.sessionIds = [...new Set([reference.sessionId, ...(reference.sessionIds ?? []), sessionId])];
-      writeJsonFile(this.referencePath, this.references);
+      this.saveReference(id, { ...reference,
+        sessionIds: [...new Set([reference.sessionId, ...(reference.sessionIds ?? []), sessionId])] });
     }
     return { id, url: `${new URL(origin).origin}/workspace/${id}` };
   }
@@ -89,17 +88,23 @@ export class WorkspaceIDEManager {
   private entryIdentity(accountId: string, target: IDEWorkspace): string {
     return digest(["project-entry-v1", accountId, target.owner, target.hostId, target.projectId, target.workspace]);
   }
+  private saveReference(id: string, reference: Reference): Reference {
+    // A failed commit must not make the next lookup publish a memory-only link
+    // or skip a required legacy identity pin. No old references are discarded.
+    writeJsonFile(this.referencePath, { ...this.references, [id]: reference }, { durable: true });
+    this.references[id] = reference;
+    return reference;
+  }
   private referenceTarget(id: string): { reference: Reference; sessionId: string; target: IDEWorkspace } {
     if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("IDE 入口不存在");
-    const reference = this.references[id];
+    let reference = this.references[id];
     if (reference) for (const sessionId of new Set([reference.sessionId, ...(reference.sessionIds ?? [])])) {
       const target = this.options.resolve(reference.accountId, sessionId);
       if (target && (!reference.identity || this.entryIdentity(reference.accountId, target) === reference.identity)) {
         // Pin legacy references on their first validated use. Keep their old
         // authorization shape, but never follow a later session/project move.
         if (!reference.identity && target.projectId) {
-          reference.identity = this.entryIdentity(reference.accountId, target);
-          writeJsonFile(this.referencePath, this.references);
+          reference = this.saveReference(id, { ...reference, identity: this.entryIdentity(reference.accountId, target) });
         }
         return { reference, sessionId, target };
       }
@@ -120,7 +125,7 @@ export class WorkspaceIDEManager {
       const fresh = this.options.resolve(reference.accountId, candidate);
       if (!fresh || reference.identity && this.entryIdentity(reference.accountId, fresh) !== reference.identity) continue;
       if (reference.identity === id && reference.sessionId !== candidate) {
-        reference.sessionId = candidate; writeJsonFile(this.referencePath, this.references);
+        this.saveReference(id, { ...reference, sessionId: candidate });
       }
       const latest = this.resolve(id);
       return reference.identity === id ? latest : current;

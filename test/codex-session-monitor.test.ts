@@ -347,6 +347,38 @@ test("does not emit restored task state after the monitor is stopped", async (t)
   assert.deepEqual(taskChanges, []);
 });
 
+test("a failed progress or task callback cannot drop the later completion in the same log chunk", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-callback-failure-"));
+  const dir = path.join(root, "sessions"); fs.mkdirSync(dir);
+  const file = path.join(dir, "session.jsonl"), completions: CodexSessionCompletion[] = [];
+  writeLines(file, [sessionMeta("session", root)]);
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60000,
+    now: () => Date.parse("2026-08-01T09:00:00Z"),
+    onActivity() { throw Error("progress journal unavailable"); },
+    onTaskChanged() { throw Error("task observer unavailable"); },
+    onCompletion(completion) { completions.push(completion); } });
+  monitor.start(); t.after(async () => { await monitor.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await monitor.ready();
+  appendLines(file, [taskStarted("turn"), responseCommentary("first progress"), taskComplete("turn", "finished")]);
+  await monitor.scanNow(); await monitor.scanNow();
+  assert.equal(completions.length, 1); assert.equal(completions[0].text, "finished");
+  const cursor = [...(monitor as any).cursors.values()][0];
+  assert.equal(cursor.activeTurnId, undefined);
+});
+test("a string-shaped native error has the same failed outcome live and after restart", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-string-error-"));
+  const dir = path.join(root, "sessions"); fs.mkdirSync(dir);
+  const file = path.join(dir, "session.jsonl"), completions: CodexSessionCompletion[] = [];
+  writeLines(file, [sessionMeta("session", root)]);
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60000,
+    now: () => Date.parse("2026-08-01T09:00:00Z"), onCompletion(e) { completions.push(e); } });
+  monitor.start(); t.after(async () => { await monitor.stop(); fs.rmSync(root, { recursive: true, force: true }); });
+  await monitor.ready(); appendLines(file, [taskStarted("turn"),
+    { type: "event_msg", payload: { type: "task_complete", turn_id: "turn", error: "upstream failed" } }]);
+  await monitor.scanNow(); assert.equal(completions[0].outcome, "failed");
+  assert.equal(completions[0].success, false);
+});
+
 function sessionMeta(sessionId: string, cwd: string): object {
   return { timestamp: "2026-08-01T08:00:00.000Z", type: "session_meta", payload: { session_id: sessionId, cwd } };
 }

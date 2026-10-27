@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { fetchWithBudget } from "../channels/network-request.js";
 
 export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -211,9 +212,10 @@ export class WeixinApiClient {
   }
 
   private async post(endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const response = await this.fetchImpl(`${this.baseUrl}/${endpoint}`, {
+    const response = await fetchWithBudget(this.fetchImpl, `${this.baseUrl}/${endpoint}`, {
       method: "POST",
       signal,
+      timeoutMs: shortEndpoint(endpoint) === "getupdates" ? 120_000 : 30_000,
       headers: {
         "Content-Type": "application/json",
         AuthorizationType: "ilink_bot_token",

@@ -401,3 +401,17 @@ test("patching a question never mutates the request already presented to the hum
   assert.equal(f.inputs[1].request.questions[0].question, "新问题");
   assert.equal(f.writes().length, 0);
 });
+
+test("a synchronous receipt observer failure does not discard new questions from the same snapshot", async t => {
+  const f = await fixture(t, { onUserInput: async () => undefined, onObservedUserInputAnswers() { throw Error("observer failure"); } });
+  f.snapshot(asyncState()); await waitFor(() => f.inputs.length === 1);
+  const answered = { ...asyncTurn, items: [...asyncTurn.items, { type: "userMessage", content: [{ type: "text",
+    text: asyncUserInputReply(f.inputs[0].request, { [f.inputs[0].request.questions[0].id]: { answers: ["App answer"] } }) }] }] };
+  f.snapshot({ requests: [native], turns: [answered], threadRuntimeStatus: { type: "active" } });
+  await waitFor(() => f.inputs.length === 2); assert.equal(f.inputs[1].request.questions[0].id, "native-question");
+});
+test("a synchronous unsupported-notice failure does not discard other supported requests", async t => {
+  const f = await fixture(t, { onUserInput: async () => undefined, onUnsupportedInteraction: (() => { throw Error("notice failure"); }) as any });
+  f.snapshot({ requests: [{ id: "unknown", method: "future/request", params: { threadId: "thread" } }, native] });
+  await waitFor(() => f.inputs.length === 1); assert.equal(f.inputs[0].request.questions[0].id, "native-question");
+});

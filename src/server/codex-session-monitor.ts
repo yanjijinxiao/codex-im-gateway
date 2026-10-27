@@ -154,7 +154,7 @@ export class CodexSessionCompletionMonitor {
         ...initialContext
       };
       this.cursors.set(filePath, cursor);
-      if (cursor.recoveredCompletion) await this.options.onRecoveredCompletion?.(cursor.recoveredCompletion);
+      if (cursor.recoveredCompletion) await this.notify("recovered completion", () => this.options.onRecoveredCompletion?.(cursor.recoveredCompletion!));
       if (replayStartupWrite) await this.processFile(filePath, runId);
       if (!this.isActiveRun(runId)) return;
       const task = taskFromCursor(cursor, "running", cursor.activeStartedAt);
@@ -163,7 +163,7 @@ export class CodexSessionCompletionMonitor {
         && activeStartedAt < startedAt
         && startedAt - activeStartedAt <= RESTORED_TASK_MAX_AGE_MS;
       if (task && (!replayStartupWrite || shouldRestoreReplayedTask)) {
-        await this.options.onTaskChanged?.(task);
+        await this.notify("restored task", () => this.options.onTaskChanged?.(task));
       }
     }
   }
@@ -313,7 +313,7 @@ export class CodexSessionCompletionMonitor {
     if (payload.type !== "task_complete" && payload.type !== "turn_aborted") return;
     if (!cursor.workspace || !cursor.sessionId || typeof payload.turn_id !== "string") return;
     if (cursor.activeTurnId && payload.turn_id !== cursor.activeTurnId) return;
-    const error = recordValue(payload.error);
+    const error = payload.error;
     const status: CodexSessionTaskStatus = payload.type === "turn_aborted"
       ? "interrupted"
       : error
@@ -333,7 +333,7 @@ export class CodexSessionCompletionMonitor {
       : status === "failed"
         ? codexFailureSummary(failureCode!)
         : `Codex 任务已中断${typeof payload.reason === "string" ? `：${payload.reason}` : ""}`;
-    await this.options.onCompletion({
+    const completion: CodexSessionCompletion = {
       sessionId: cursor.sessionId,
       turnId: payload.turn_id,
       workspace: cursor.workspace,
@@ -343,7 +343,8 @@ export class CodexSessionCompletionMonitor {
       outcome: status,
       ...(failureCode ? { failureCode } : {}),
       completedAt: timestamp
-    });
+    };
+    await this.notify("completion", () => this.options.onCompletion(completion));
     cursor.activeTurnId = undefined;
     cursor.activeStartedAt = undefined;
     cursor.toolNames = undefined;
@@ -414,7 +415,7 @@ export class CodexSessionCompletionMonitor {
     updatedAt: string
   ): Promise<void> {
     const task = taskFromCursor(cursor, status, updatedAt);
-    if (task) await this.options.onTaskChanged?.(task);
+    if (task) await this.notify("task", () => this.options.onTaskChanged?.(task));
   }
 
   private async emitActivity(
@@ -440,12 +441,20 @@ export class CodexSessionCompletionMonitor {
     if (cursor.lastActivityByTurn.size > 20) {
       cursor.lastActivityByTurn.delete(cursor.lastActivityByTurn.keys().next().value as string);
     }
-    await this.options.onActivity({
+    const activity: CodexSessionActivity = {
       sessionId: cursor.sessionId,
       turnId: targetTurnId,
       text: content,
       updatedAt
-    });
+    };
+    await this.notify("activity", () => this.options.onActivity!(activity));
+  }
+
+  private async notify(kind: string, callback: () => void | Promise<void>): Promise<void> {
+    // Delivery may have happened before an acknowledgement failed. Continue
+    // consuming native evidence without replaying an uncertain notification.
+    try { await callback(); }
+    catch { console.warn(`[codex-im-gateway] Codex session ${kind} observer failed; later native events remain observable`); }
   }
 }
 

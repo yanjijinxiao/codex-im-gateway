@@ -245,7 +245,10 @@ async function ensureSuccess<T extends FeishuMutationResponse>(
   } catch (error) {
     throw new Error(`${action}失败：${describeFeishuRequestError(error)}`);
   }
-  if (result.code && result.code !== 0) {
+  if (!result || typeof result !== "object" || typeof result.code !== "number") {
+    throw new Error(`${action}未返回有效业务回执，未继续后续发布步骤`);
+  }
+  if (result.code !== 0) {
     throw new Error(`${action}失败（${result.code}）：${result.msg ?? "飞书未返回错误说明"}`);
   }
   return result;

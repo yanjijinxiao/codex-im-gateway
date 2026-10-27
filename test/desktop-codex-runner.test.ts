@@ -395,6 +395,20 @@ test("a confirmed failed Desktop turn retains its public failure code without re
   assert.equal(received.filter(m => /steer-turn|interrupt-turn/.test(String(m.method))).length, 0);
 });
 
+test("a confirmed interrupted Desktop turn keeps its native outcome without replay", async t => {
+  const { runner, root, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "idle" }, turns: [] }),
+    { result: { turnId: "interrupted-turn" } });
+  await assert.rejects(runner.run({ threadId: "thread", prompt: "new", cwd: root, onTurnStarted() {
+    const timestamp = new Date().toISOString();
+    fs.writeFileSync(path.join(root, "sessions", "interrupted.jsonl"), [
+      { timestamp, type: "session_meta", payload: { id: "thread", cwd: root } },
+      { timestamp, type: "event_msg", payload: { type: "task_started", turn_id: "interrupted-turn" } },
+      { timestamp, type: "event_msg", payload: { type: "turn_aborted", turn_id: "interrupted-turn", reason: "interrupted" } }
+    ].map(e => JSON.stringify(e)).join("\n") + "\n");
+  } }), error => error instanceof CodexTurnExecutionError && error.status === "interrupted");
+  assert.equal(received.filter(m => m.method === "thread-follower-start-turn").length, 1);
+});
+
 test("ordinary Desktop input uses one native thread-scoped write, without changing guarded steering", async t => {
   const { runner, received } = await desktopOwnerFixture(t, () => ({ threadRuntimeStatus: { type: "active" },
     turns: [{ turnId: "observed-turn", status: "inProgress", items: [] }] }));

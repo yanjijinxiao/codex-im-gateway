@@ -191,7 +191,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         if (!command) return;
         const token = typeof rawEvent.token === "string" && rawEvent.token.trim()
           ? rawEvent.token.trim()
-          : cardActionIdentity(event);
+          : cardActionIdentity(event, command);
         const pendingMessage: ChannelMessage = {
           id: `feishu-card:${token}`,
           senderId: event.operator.openId,

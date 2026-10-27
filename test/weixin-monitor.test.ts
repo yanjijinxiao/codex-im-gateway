@@ -161,7 +161,7 @@ test("skips duplicate message ids and persists the latest sync key", async (t) =
   });
 
   assert.deepEqual(handled, ["duplicate"]);
-  assert.deepEqual(syncKeys, ["sync-next", "sync-final"]);
+  assert.equal(syncKeys.at(-1), "sync-final", "adjacent completed cursors may coalesce; pending work must not be skipped");
 });
 
 test("keeps polling while a previous message waits for channel approval", async () => {

@@ -157,7 +157,7 @@ export type CodexQueuedRunInput = Omit<CodexRunnerInput, "prompt" | "threadId"> 
 export interface CodexNativeQueue {
   addQueuedSubmission(input: CodexQueueAddInput, hostId?: string): Promise<CodexQueuedSubmission>;
   listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string): Promise<CodexQueuePage>;
-  deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string): Promise<boolean>;
+  deleteQueuedSubmission(threadId: string, queuedSubmissionId: string, hostId?: string, assertCurrent?: () => void): Promise<boolean>;
   runQueuedSubmission(input: CodexQueuedRunInput): Promise<CodexRunResult>;
 }
 
@@ -454,7 +454,7 @@ export interface CodexBackendAdapter extends CodexBackendControls {
   readonly capabilities: CodexBackendCapabilities;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
   steer(input: CodexSteerInput): Promise<CodexSteerResult>;
-  stop(threadId?: string): Promise<CodexStopResult>;
+  stop(threadId?: string, assertCurrent?: () => void): Promise<CodexStopResult>;
   warmUp(cwd: string): Promise<void>;
   listProjects(): Promise<CodexProjectCatalog>;
   close(): void | Promise<void>;
@@ -487,9 +487,10 @@ export interface CodexBackendControls {
   getGoal(threadId: string): Promise<CodexThreadGoal | undefined>;
   setGoal(
     threadId: string,
-    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number }
+    input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number },
+    assertCurrent?: () => void
   ): Promise<CodexThreadGoal | undefined>;
-  clearGoal(threadId: string): Promise<void>;
+  clearGoal(threadId: string, assertCurrent?: () => void): Promise<void>;
   inspectThread(threadId: string): Promise<CodexThreadState>;
   listThreads(input?: CodexThreadListInput): Promise<CodexThreadState[]>;
   listSessionCatalog(input?: CodexThreadListInput): Promise<CodexSessionCatalog>;
@@ -518,7 +519,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   steer(input: CodexSteerInput, hostId?: string): Promise<CodexSteerResult>;
   /** Thread-scoped ordinary input; never falls back to starting or queuing a task. */
   submitThreadMessage?(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt>;
-  stop(threadId?: string, hostId?: string): Promise<CodexStopResult>;
+  stop(threadId?: string, hostId?: string, assertCurrent?: () => void): Promise<CodexStopResult>;
   runEphemeral(input: EphemeralCodexRunnerInput): Promise<CodexRunResult>;
   warmUp(cwd: string, hostId?: string): Promise<void>;
   listProjects(hostId?: string, observation?: Pick<CodexMetadataObservation, "timeoutMs">): Promise<CodexProjectCatalog>;
@@ -535,9 +536,10 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   setGoal(
     threadId: string,
     input: { objective?: string; status?: CodexThreadGoalStatus; tokenBudget?: number },
-    hostId?: string
+    hostId?: string,
+    assertCurrent?: () => void
   ): Promise<CodexThreadGoal | undefined>;
-  clearGoal(threadId: string, hostId?: string): Promise<void>;
+  clearGoal(threadId: string, hostId?: string, assertCurrent?: () => void): Promise<void>;
   inspectThread(threadId: string, hostId?: string, observation?: CodexMetadataObservation): Promise<CodexThreadState>;
   listThreads(input?: CodexThreadListInput, hostId?: string): Promise<CodexThreadState[]>;
   listSessionCatalog(input?: CodexThreadListInput, hostId?: string): Promise<CodexSessionCatalog>;
