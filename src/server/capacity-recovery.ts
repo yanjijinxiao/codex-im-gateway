@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { readJsonObjectFile, isJsonObject, writeJsonFile } from "../state/json-store.js";
 import { assertCapacityResume, CodexTurnExecutionError, type CodexThreadSnapshot, type CodexBridgeBackend, type CodexCapacityResumeInput } from "../codex/backend.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { codexRecoverySummary } from "../codex/turn-recovery.js";
@@ -55,7 +55,10 @@ export class CapacityRecoveryCoordinator {
   private generation = 0;
 
   constructor(private readonly options: Options) {
-    this.records = readJsonFile(options.filePath, { records: {} as Record<string, RecordState> }).records;
+    const loaded = readJsonObjectFile(options.filePath, { records: {} as Record<string, RecordState> });
+    if (!isJsonObject(loaded.records) || Object.values(loaded.records).some(value => !isJsonObject(value)))
+      throw new Error("Invalid capacity recovery journal; original file preserved");
+    this.records = loaded.records;
     this.delays = options.delaysMs ?? [10_000, 30_000, 120_000, 300_000];
     this.now = options.now ?? Date.now;
     for (const record of Object.values(this.records)) {
@@ -64,7 +67,7 @@ export class CapacityRecoveryCoordinator {
     }
     this.save();
   }
-  private save(): void { writeJsonFile(this.options.filePath, { records: this.records }); }
+  private save(): void { writeJsonFile(this.options.filePath, { records: this.records }, { durable: true }); }
   private announce(scope: CapacityFailure, text: string): void {
     void this.options.notice(scope, text).catch(() => console.warn("[codex-im-gateway] capacity recovery notice unavailable"));
   }

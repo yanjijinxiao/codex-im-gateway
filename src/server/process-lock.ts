@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { ensureDir } from "../state/json-store.js";
 
 type LockRecord = {
   pid: number;
   startedAt: string;
+  token?: string;
 };
 
 export type ServiceProcessLock = {
@@ -18,10 +20,11 @@ export function acquireServiceProcessLock(stateRoot: string): ServiceProcessLock
   const lockPath = path.join(stateRoot, "service.lock");
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const descriptor = fs.openSync(lockPath, "wx");
-      const record: LockRecord = { pid: process.pid, startedAt: new Date().toISOString() };
-      fs.writeFileSync(descriptor, `${JSON.stringify(record)}\n`, "utf8");
-      fs.closeSync(descriptor);
+      const descriptor = fs.openSync(lockPath, "wx", 0o600);
+      const token = randomUUID();
+      const record: LockRecord = { pid: process.pid, startedAt: new Date().toISOString(), token };
+      try { fs.writeFileSync(descriptor, `${JSON.stringify(record)}\n`, "utf8"); }
+      finally { fs.closeSync(descriptor); }
       let released = false;
       return {
         path: lockPath,
@@ -29,7 +32,7 @@ export function acquireServiceProcessLock(stateRoot: string): ServiceProcessLock
           if (released) return;
           released = true;
           const current = readLockRecord(lockPath);
-          if (current?.pid === process.pid) {
+          if (current?.pid === process.pid && current.token === token) {
             fs.rmSync(lockPath, { force: true });
           }
         }
@@ -38,14 +41,28 @@ export function acquireServiceProcessLock(stateRoot: string): ServiceProcessLock
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
       }
-      const existing = readLockRecord(lockPath);
-      if (!existing) {
-        throw new Error(`codex-im-gateway lock is unreadable: ${lockPath}`);
+      // Serialize stale-file removal. Without this second exclusive claim,
+      // two starters can both read a dead PID; the slower one then deletes the
+      // faster starter's NEW lock and both become writers of the same state.
+      const recoveryPath = `${lockPath}.recovery`, recoveryToken = randomUUID();
+      let recovery: number;
+      try { recovery = fs.openSync(recoveryPath, "wx", 0o600); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST")
+          throw new Error(`Gateway lock recovery is already claimed: ${recoveryPath}; check its owner before removing a stale recovery record`);
+        throw error;
       }
-      if (isProcessRunning(existing.pid)) {
-        throw new Error(`codex-im-gateway is already running for ${stateRoot} (PID ${existing.pid})`);
+      try {
+        try { fs.writeFileSync(recovery, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), token: recoveryToken })); }
+        finally { fs.closeSync(recovery); }
+        const existing = readLockRecord(lockPath);
+        if (!existing) throw new Error(`codex-im-gateway lock is unreadable: ${lockPath}`);
+        if (isProcessRunning(existing.pid))
+          throw new Error(`codex-im-gateway is already running for ${stateRoot} (PID ${existing.pid})`);
+        fs.rmSync(lockPath, { force: true });
+      } finally {
+        if (readLockRecord(recoveryPath)?.token === recoveryToken) fs.rmSync(recoveryPath, { force: true });
       }
-      fs.rmSync(lockPath, { force: true });
     }
   }
   throw new Error(`Unable to acquire codex-im-gateway lock: ${lockPath}`);
@@ -66,10 +83,9 @@ function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    // The gateway runs as the current account. EPERM means that the PID now
-    // belongs to another account (most commonly after a stale PID was reused),
-    // so it cannot be the process that created this lock.
-    return false;
+  } catch (error) {
+    // A sandbox/security policy can also deny inspection of a live same-user
+    // process. Only a definite missing PID permits stale-lock removal.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }

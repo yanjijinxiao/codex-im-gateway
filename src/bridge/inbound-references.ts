@@ -1,13 +1,33 @@
 import type { ChannelAttachment, ChannelMessage } from "../channels/message.js";
 import fs from "node:fs";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { randomUUID } from "node:crypto";
+import { isJsonObject, readJsonFile, writeJsonFile } from "../state/json-store.js";
 
 type Entry = { conversationId: string; messageId: string; text: string; attachments: ChannelAttachment[]; at: number };
 
 /** Account-scoped, conversation-guarded cache of resolved files, never provider credentials. */
 export class InboundReferenceStore {
   private entries: Entry[];
-  constructor(private readonly filePath: string) { this.entries = readJsonFile(filePath, []); }
+  constructor(private readonly filePath: string) {
+    // This is optional reference material, never binding/permission/replay
+    // evidence. Preserve a corrupt cache separately rather than taking down
+    // the account or treating unvalidated data as a quoted attachment.
+    try {
+      const value = readJsonFile<unknown>(filePath, []);
+      if (!Array.isArray(value) || value.some(entry => !isJsonObject(entry)
+        || typeof entry.conversationId !== "string" || typeof entry.messageId !== "string"
+        || typeof entry.text !== "string" || typeof entry.at !== "number" || !Number.isFinite(entry.at)
+        || !Array.isArray(entry.attachments) || entry.attachments.some(item => !isJsonObject(item)
+          || !["image", "video", "audio", "file"].includes(String(item.kind)) || typeof item.label !== "string"
+          || typeof item.path !== "string"))) throw new SyntaxError("Invalid inbound reference cache");
+      this.entries = value as Entry[];
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      fs.renameSync(filePath, `${filePath}.${randomUUID()}.corrupt`);
+      this.entries = [];
+      console.warn("[codex-im-gateway] invalid optional reference cache preserved separately; quoted content unavailable until received again");
+    }
+  }
   resolve(message: ChannelMessage): ChannelMessage {
     const conversationId = message.replyTargetId ?? message.senderId;
     const references = message.references?.map(reference => {

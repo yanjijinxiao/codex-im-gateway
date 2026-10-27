@@ -1,3 +1,4 @@
+import { writeJsonFile } from "../state/json-store.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -380,10 +381,7 @@ export class ChannelUserInputController {
   }
   private save(): void {
     if (!this.options.filePath) return;
-    fs.mkdirSync(path.dirname(this.options.filePath), { recursive: true, mode: 0o700 });
-    const temporary = `${this.options.filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(this.state), { mode: 0o600 });
-    fs.renameSync(temporary, this.options.filePath);
+    writeJsonFile(this.options.filePath, this.state, { durable: true });
   }
 }
 

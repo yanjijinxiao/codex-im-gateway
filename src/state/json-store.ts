@@ -31,10 +31,23 @@ export function writeAtomicTextFile(filePath: string, text: string, options: { d
       if (options.durable) fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, filePath);
-    if (options.durable) {
+    // Windows does not support opening a directory handle through fs.openSync.
+    // The file itself is still flushed before the atomic rename on every OS.
+    if (options.durable && process.platform !== "win32") {
       const dir = fs.openSync(path.dirname(filePath), "r");
       try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
     }
   } finally { fs.rmSync(tmp, { force: true }); }
 }
 
+
+/** JSON syntax is insufficient for map-like state: arrays silently discard
+ * named properties during stringify, destroying receipts/binding keys. */
+export function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+export function readJsonObjectFile<T extends object>(filePath: string, fallback: T): T {
+  const value = readJsonFile<unknown>(filePath, fallback);
+  if (!isJsonObject(value)) throw new Error(`Invalid object state file: ${path.basename(filePath)}; original file preserved`);
+  return value as T;
+}

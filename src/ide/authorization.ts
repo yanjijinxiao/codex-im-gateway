@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { writeJsonFile } from "../state/json-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { ideAccessSubjectSchema, type IDEAccessSubject } from "./access-subject.js";
@@ -48,14 +49,12 @@ export class IDEAuthorization {
     this.persistenceDirty = true;
     const directory = path.dirname(this.filePath);
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700);
-    const temporary = `${this.filePath}.${crypto.randomBytes(8).toString("hex")}.tmp`;
     // Old binaries must fail closed instead of ignoring the new personal ACL.
     // Never downgrade a file, even after all tagged sessions were revoked.
     if ([...this.sessions.values()].some(session => session.subject)) this.persistenceVersion = 2;
     const data = { version: this.persistenceVersion, audience: this.audience,
       sessions: [...this.sessions].filter(([, session]) => session.expiresAt > this.now()).map(([hash, session]) => ({ hash, session })) };
-    fs.writeFileSync(temporary, JSON.stringify(data), { mode: 0o600, flag: "wx" });
-    fs.renameSync(temporary, this.filePath);
+    writeJsonFile(this.filePath, data, { durable: true });
     this.persistenceDirty = false;
   }
   setAudience(audience: string): void { if (this.audience !== audience) { this.audience = audience; this.revoke(); } }

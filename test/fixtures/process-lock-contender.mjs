@@ -1,0 +1,3 @@
+import fs from 'node:fs';import path from 'node:path';import {acquireServiceProcessLock} from '../../src/server/process-lock.ts';
+const root=process.argv[2],remove=fs.rmSync;let paused=false;fs.rmSync=(file,...rest)=>{if(file===path.join(root,'service.lock')&&!paused){paused=true;fs.writeFileSync(path.join(root,'paused'),'yes');const d=Date.now()+5000;while(!fs.existsSync(path.join(root,'proceed'))&&Date.now()<d)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}return remove(file,...rest);};
+try{const lock=acquireServiceProcessLock(root);process.send?.({acquired:true});process.on('message',()=>{lock.release();process.exit(0);});}catch(e){process.send?.({acquired:false,error:e.message});process.exit(0);}

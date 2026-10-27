@@ -179,6 +179,7 @@ export type BridgeServiceOptions = {
   intentResolver?: ChannelIntentResolver;
   channelCapabilities?: ChannelCapabilityProvider;
   approvalTimeoutMs?: number;
+  assertRuntimeWritable?: () => void;
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
   onTurnCompleted?: (result: {
     senderId: string;
@@ -313,7 +314,13 @@ export class BridgeService {
     }
   }
 
+  hasInFlightWork(): boolean {
+    return this.conversationWork.size > 0 || this.runningSessions.size > 0 || this.recoveringQueue;
+  }
+
   async handleMessage(message: ChannelMessage): Promise<void> {
+    this.options.assertRuntimeWritable?.();
+    if (this.audienceSuspended) throw new CodexInterventionError("渠道正在停止或重新配置，消息未提交，请稍后重试。");
     const conversationId = message.replyTargetId ?? message.senderId;
     const binding = () => {
       const session = this.executionSession(conversationId);
@@ -336,8 +343,7 @@ export class BridgeService {
     }
   }
 
-  private role(conversationId: string): SessionRole {
-    const actorId = this.actor.getStore() ?? conversationId;
+  private role(conversationId: string, actorId = this.actor.getStore() ?? conversationId): SessionRole {
     return this.options.stateStore.roleFor(conversationId, actorId)
       ?? (this.access.isAllowed(actorId) ? "controller" : this.options.stateStore.roleFor(conversationId, "*") ?? "participant");
   }
@@ -1822,6 +1828,7 @@ export class BridgeService {
   }
 
   private async enqueueNativeMessage(message: ChannelMessage, text: string, items: PromptBufferItem[]): Promise<void> {
+    const actorId = this.actor.getStore() ?? message.senderId;
     const session = this.executionSession(message.senderId);
     if (!session?.threadId || session.mode === "qa") {
       await this.reply(message.senderId, "原生队列需要已绑定且已创建的普通 session；请先绑定会话。QA 和首次创建不支持原生排队。");
@@ -1833,21 +1840,26 @@ export class BridgeService {
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, "会话存在未确认轮次，消息未入队；请先重新加载 Codex App 并核对状态。"); return;
     }
-    // The current Desktop follower cannot refresh/start the native server
-    // queue safely. Never acknowledge a queued task that no owner can consume.
-    if (state.executionOwner === "desktop") {
-      await this.reply(message.senderId, "当前 Desktop 转发协议尚不支持可靠的原生队列消费，消息未提交。请在 Codex App 中排队，或使用共享 App Server 会话。"); return;
-    }
     const preview = buildPromptPreview(text, items) ?? text;
     const knowledge = this.options.stateStore.relevantKnowledge(preview, session.projectId);
     const { prompt } = buildPromptParts(text, await this.stagePromptItems(items, session, message), channelPromptSource(this.channel.channel), knowledge);
     this.options.inputReceipts?.submitting({ sessionId: session.id, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId });
+    const assertCurrent = () => {
+      this.options.assertRuntimeWritable?.();
+      const current = this.executionSession(message.senderId);
+      if (this.audienceSuspended || current?.id !== session.id || current.threadId !== session.threadId || (this.sessionHostId(current) ?? "local") !== hostId)
+        throw new CodexInterventionError("渠道或会话绑定已改变，排队消息未提交。");
+      if (!this.access.requireAccess(actorId, message.senderId).allowed || !roleAllows(this.role(message.senderId, actorId), "participant"))
+        throw new CodexInterventionError("当前准入或角色权限已改变，排队消息未提交。");
+    };
+    assertCurrent();
     const receipt = await this.nativeQueue.enqueue({
       accountId: this.options.accountId ?? "standalone", conversationId: message.senderId,
-      actorId: this.actor.getStore() ?? message.senderId, messageId: message.id,
+      actorId, messageId: message.id,
       sessionId: session.id, hostId, backend: this.runner.backendInfo(hostId).id, threadId: session.threadId,
       ...(this.participant.getStore()?.mention ? { mention: this.participant.getStore()!.mention } : {})
     }, prompt, this.runner, {
+      assertCurrent,
       onApproval: request => this.approvals.request(message.senderId, request),
       onApprovalResult: (request, result) => this.approvals.reportResult(message.senderId, request, result),
       onUserInput: request => this.requestUserInput(message.senderId, request, hostId),
@@ -2334,7 +2346,7 @@ export class BridgeService {
       catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }
     }
     const progressEnabled = session.streamReplies ?? this.options.config.streamReplies;
-    const stillBound = () => this.executionSession(message.senderId)?.id === session.id;
+    const stillBound = () => !this.audienceSuspended && this.executionSession(message.senderId)?.id === session.id;
     const wantsProgress = () => stillBound()
       && (this.options.stateStore.getSession(session.id)?.streamReplies ?? this.options.config.streamReplies);
     const sentProgress = new Set<string>();
@@ -2432,6 +2444,8 @@ export class BridgeService {
         // A web/IM detach during preparation must not submit a new native input.
         // Already accepted native queue items remain owned by Codex.
         if (!queued && !stillBound()) { await replyStream?.suspend(); return; }
+        this.options.assertRuntimeWritable?.();
+        if (this.audienceSuspended) throw new CodexInterventionError("渠道已停止，消息未提交。");
         backendEntered = true;
         const result = queued
           ? await this.runner.runQueuedSubmission!({ ...runInput, threadId: queued.receipt.threadId,

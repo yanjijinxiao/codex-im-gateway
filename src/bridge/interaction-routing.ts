@@ -1,3 +1,4 @@
+import { writeJsonFile } from "../state/json-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { readJsonFile } from "../state/json-store.js";
@@ -121,10 +122,7 @@ export class InteractionRoutingJournal {
   }
   diagnostics(): NonNullable<Journal["unsupported"]> { return structuredClone(this.state.unsupported ?? []); }
   private save(): void {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
-    const temporary = `${this.filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(this.state), { mode: 0o600 });
-    fs.renameSync(temporary, this.filePath);
+    writeJsonFile(this.filePath, this.state, { durable: true });
   }
 }
 

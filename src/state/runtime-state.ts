@@ -5,7 +5,7 @@ import path from "node:path";
 
 import type { ProjectInteractionMode } from "../channels/channel-mode-settings.js";
 
-import { readJsonFile, writeJsonFile } from "./json-store.js";
+import { readJsonObjectFile, isJsonObject, writeJsonFile } from "./json-store.js";
 import {
   cleanKnowledgeInput,
   knowledgeIdentity,
@@ -157,7 +157,13 @@ export class RuntimeStateStore {
     const revision = stateRevision(this.paths.statePath);
     if (this.state && revision === this.revision) return;
     if (this.state && this.revision && !revision) throw Error("账号状态文件丢失，未初始化为空状态。");
-    const loaded = readJsonFile<Partial<RuntimeState>>(this.paths.statePath, {});
+    const loaded = readJsonObjectFile<Partial<RuntimeState>>(this.paths.statePath, {});
+    for (const key of ["activeSessionIds", "activeQaSessionIds", "activeProjectIds", "contextTokens", "conversationRoles"] as const) {
+      if (loaded[key] !== undefined && !isJsonObject(loaded[key])) throw new Error(`Invalid runtime ${key}; original state preserved`);
+    }
+    for (const key of ["sessions", "projects", "knowledgeBases", "pairedSenderIds"] as const) {
+      if (loaded[key] !== undefined && !Array.isArray(loaded[key])) throw new Error(`Invalid runtime ${key}; original state preserved`);
+    }
     this.revision = revision;
     const before = structuredClone(loaded);
     this.state = normalizeRuntimeState(loaded);

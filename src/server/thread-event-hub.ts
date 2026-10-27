@@ -12,7 +12,7 @@ import type { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { parseActionBlocks } from "../bridge/actions.js";
 import { SessionControlQueue } from "../bridge/session-control.js";
 import { followSyncFailure, type FollowSyncFailure, type SessionFollowStatus, type FollowSyncOptions } from "../bridge/session-follow.js";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { readJsonObjectFile, isJsonObject, writeJsonFile } from "../state/json-store.js";
 import { isLegacyCommunicationNotice } from "../codex/communication-error.js";
 import { afterFollowBoundary, followBoundary, type FollowHistoryBoundary } from "./follow-history-boundary.js";
 
@@ -97,7 +97,9 @@ export class ThreadEventHub {
   private readonly previousRecoveries = new Map<string, Promise<void>>();
   private readonly previousRetryAt = new Map<string, number>();
   constructor(private readonly options: Options) {
-    this.states = readJsonFile(options.filePath, {});
+    this.states = readJsonObjectFile(options.filePath, {});
+    if (Object.values(this.states).some(state => !isJsonObject(state)))
+      throw new Error("Invalid thread event journal; original file preserved");
     for (const state of Object.values(this.states)) {
       if (state.syncStatus === "syncing") state.syncStatus = "pending";
       if (state.eventVersion !== 2) {

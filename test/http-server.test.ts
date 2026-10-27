@@ -5,13 +5,24 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { AccountManager } from "../src/server/account-manager.js";
+import { AccountManager, RuntimeConfigurationBusyError } from "../src/server/account-manager.js";
 import { checkCodex, startLocalHttpServer } from "../src/server/http-server.js";
 import { defaultConfig, loadConfig, saveConfig } from "../src/state/config.js";
 import { accountStatePaths, resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { SessionBindingConflictError } from "../src/state/runtime-state.js";
 import { saveAccount } from "../src/weixin/accounts.js";
+
+test("busy runtime configuration returns 409 before persistence or Taskboard side effects", async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-http-config-busy-")),paths=resolveStatePaths(root);
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  saveConfig(paths,defaultConfig(root));const before=fs.readFileSync(paths.configPath,"utf8");let taskboardChanges=0;
+  const server=await startLocalHttpServer({paths,port:0,onTaskboardConfig:async()=>{taskboardChanges++;},
+    accountManager:{async reconfigureRuntime(){throw new RuntimeConfigurationBusyError();}} as never});t.after(()=>server.close());
+  const response=await fetch(`${server.url}/api/config`,{method:"PUT",headers:{"Content-Type":"application/json","X-Codex-Weixin-Token":server.requestToken,Origin:server.url},body:JSON.stringify({...defaultConfig(root),streamReplies:false})});
+  assert.equal(response.status,409);assert.match(await response.text(),/任务未中断/);
+  assert.equal(taskboardChanges,0);assert.equal(fs.readFileSync(paths.configPath,"utf8"),before);
+});
 
 test("Codex status probe reuses the runner command resolver", async () => {
   const codexBin = fileURLToPath(new URL("./fixtures/fake-codex-version.mjs", import.meta.url));

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { readJsonObjectFile, isJsonObject, writeJsonFile } from "../state/json-store.js";
 import type { ChannelCompletedCard, ChannelMention, ChannelTextClient } from "../channels/types.js";
 import { isDirectedMentionId } from "../channels/mentions.js";
 
@@ -38,8 +38,13 @@ export class TurnAudienceJournal {
   /** Local in-flight receipt observations, not durable input or execution work. */
   private readonly observations = new Map<string, number>();
   private readonly deferred = new Map<string, () => Promise<void>>();
-  constructor(private readonly filePath: string) { this.records = readJsonFile(filePath, { records: {} }).records; }
-  private save(): void { writeJsonFile(this.filePath, { records: this.records }); }
+  constructor(private readonly filePath: string) {
+    const loaded = readJsonObjectFile(filePath, { records: {} as Record<string, Audience> });
+    if (!isJsonObject(loaded.records) || Object.values(loaded.records).some(value => !isJsonObject(value)))
+      throw new Error("Invalid turn audience journal; original file preserved");
+    this.records = loaded.records;
+  }
+  private save(): void { writeJsonFile(this.filePath, { records: this.records }, { durable: true }); }
 
   hold(scope: TurnAudienceScope): () => void {
     const key = keyOf(scope);

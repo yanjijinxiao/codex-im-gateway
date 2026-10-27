@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { readJsonFile, isJsonObject as record, writeJsonFile } from "../state/json-store.js";
 import type { CodexInputReceipt } from "../codex/backend.js";
 import { CodexInterventionError } from "../codex/backend.js";
 import type { PromptBufferItem } from "./prompt-buffer.js";
@@ -41,9 +41,15 @@ export class SessionControlJournal {
   readonly queue = new SessionControlQueue();
   private state: { receipts: Record<string, Receipt>; choices: Record<string, PendingIntervention> };
   constructor(private readonly filePath: string) {
-    this.state = readJsonFile(filePath, { receipts: {}, choices: {} });
+    const data = readJsonFile<unknown>(filePath, { receipts: {}, choices: {} });
+    if (!record(data) || !record(data.receipts) || !record(data.choices)
+      || Object.values(data.receipts).some(value => !record(value) || !["sending", "accepted", "uncertain"].includes(String(value.status)))
+      || Object.values(data.choices).some(value => !record(value) || !["pending", "submitted", "cancelled"].includes(String(value.status))
+        || typeof value.id !== "string" || typeof value.expiresAt !== "number"))
+      throw new Error("Invalid session control journal; original file preserved");
+    this.state = data as typeof this.state;
   }
-  private save(): void { writeJsonFile(this.filePath, this.state); }
+  private save(): void { writeJsonFile(this.filePath, this.state, { durable: true }); }
 
   steer(key: string, messageId: string, action: () => Promise<CodexInputReceipt>, hostId?: string, origin?: TurnParticipantOrigin): Promise<CodexInputReceipt> {
     return this.submit(key, messageId, action, hostId, origin);

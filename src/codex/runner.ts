@@ -1,3 +1,4 @@
+import { assertQueueAdmissionCurrent, CodexQueueAdmissionError } from "./backend.js";
 import { AppServerCodexRunner } from "./app-server-runner.js";
 import path from "node:path";
 import {
@@ -217,7 +218,15 @@ export class CodexBackendRouter implements CodexBridgeBackend {
 
   async addQueuedSubmission(input: CodexQueueAddInput, hostId?: string) {
     this.options.onThreadMutation?.(input.threadId, hostId ?? "local");
-    return this.nativeQueue(hostId).addQueuedSubmission(input);
+    const backend = this.nativeQueue(hostId);
+    const state = await this.inspectThread(input.threadId, hostId);
+    assertCodexThreadRunnable(state);
+    // Selection is based on the fresh native owner, never a project name or
+    // an old queue receipt. External ownership only changes admission, not the
+    // selected backend or the native FIFO/receipt format.
+    if (state.threadId !== input.threadId) throw new CodexQueueAdmissionError(new Error("队列目标身份不匹配，消息未提交。"));
+    assertQueueAdmissionCurrent(input);
+    return backend.addQueuedSubmission({ ...input, ...(state.executionOwner === "desktop" ? { enqueueOnly: true } : {}) });
   }
   async listQueuedSubmissions(threadId: string, cursor?: string, hostId?: string) {
     return this.nativeQueue(hostId).listQueuedSubmissions(threadId, cursor);
@@ -545,14 +554,12 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }
 
-  close(): void {
-    this.metadataReader.close();
-    this.appServer.close();
-    this.exec.close();
-    this.desktop.close();
-    for (const runner of this.remoteAppServers.values()) runner.close();
+  async close(): Promise<void> {
+    const stopping = [this.metadataReader.close(), this.appServer.close(), this.exec.close(), this.desktop.close(),
+      ...[...this.remoteAppServers.values()].map(runner => runner.close())];
     this.remoteAppServers.clear();
     this.remoteTransports.clear();
+    await Promise.all(stopping);
   }
 
   backendInfo(hostId?: string) {

@@ -132,6 +132,10 @@ import { IDEApprovalService } from "../ide/approval-service.js";
 import { BindingExpiryCoordinator, type ExpiringBinding } from "./binding-expiry.js";
 import type { BindingExpiry } from "../state/binding-expiry.js";
 
+export class RuntimeConfigurationBusyError extends Error {
+  constructor() { super("Gateway 正在处理消息、等待原生回执或应用配置；此次操作未提交、任务未中断，请稍后重试。"); }
+}
+
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
 
 export type AccountSummary = PublicWeixinAccount & {
@@ -319,6 +323,7 @@ export class AccountManager {
   private readonly recentTaskboardNotifications = new Map<string, number>();
   private readonly llmWiki: LlmWikiMcpClientPool;
   private readonly channelCapabilities: ChannelCapabilityProvider;
+  private runtimeConfigurationChanging = false;
   private runner?: CodexBridgeBackend;
   private codexSessionMonitor?: CodexSessionCompletionMonitor;
   private codexDesktopRequestMonitor?: CodexDesktopRequestMonitor;
@@ -473,11 +478,25 @@ export class AccountManager {
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => this.stopAccount(account.accountId, false)));
-    this.closeRunner();
+    await this.closeRunner();
     this.llmWiki.close();
   }
 
-  async restartRunning(): Promise<void> {
+  private assertRuntimeWritable(): void {
+    if (this.runtimeConfigurationChanging) throw new RuntimeConfigurationBusyError();
+  }
+
+  async reconfigureRuntime(update: () => Promise<void>): Promise<void> {
+    if (this.runtimeConfigurationChanging || this.respondingSessions.size
+      || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
+    this.runtimeConfigurationChanging = true;
+    try { await update(); await this.restartIdleRuntimes(); }
+    finally { this.runtimeConfigurationChanging = false; }
+  }
+
+  async restartRunning(): Promise<void> { return this.reconfigureRuntime(async () => {}); }
+
+  private async restartIdleRuntimes(): Promise<void> {
     const running = listAccounts(this.options.paths)
       .filter((account) => this.entries.get(account.accountId)?.status === "running")
       .map((account) => account.accountId);
@@ -487,7 +506,7 @@ export class AccountManager {
     this.taskboardController = undefined;
     this.taskboardTask = undefined;
     this.taskboard = undefined;
-    this.closeRunner();
+    await this.closeRunner();
     await Promise.all(running.map((accountId) => this.startAccount(accountId, false)));
     this.startTaskboardMonitor();
   }
@@ -525,6 +544,7 @@ export class AccountManager {
     const client = adapter.client;
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
+      assertRuntimeWritable: () => this.assertRuntimeWritable(),
       ideApprovals: this.ideApprovals,
       ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
       ideEntry: async session => (await this.ide.freshEntry(account.accountId, session.id))?.url,
@@ -642,6 +662,7 @@ export class AccountManager {
         text: messageWithConversation.text,
         attachments: messageWithConversation.attachments.map(({ kind, label }) => ({ kind, label }))
       });
+      this.assertRuntimeWritable();
       await this.receiptsFor(account.accountId).handle(messageWithConversation, () => service.handleMessage(messageWithConversation));
     };
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
@@ -1348,6 +1369,7 @@ export class AccountManager {
 
   private async runWebSession(accountId: string, sessionId: string, text: string, uploads: SessionUpload[],
     onProgress?: (message: string) => Promise<void> | void): Promise<SessionChatResult> {
+    this.assertRuntimeWritable();
     const prompt = text.trim();
     if (!prompt && !uploads.length) {
       throw new Error("Message text or attachment is required");
@@ -1607,12 +1629,13 @@ export class AccountManager {
     return runner;
   }
 
-  private closeRunner(): void {
+  private async closeRunner(): Promise<void> {
     this.bindingExpiry.stop();
     if (this.nativeQueueTimer) clearInterval(this.nativeQueueTimer);
     this.nativeQueueTimer = undefined;
-    this.runner?.close();
+    const runner = this.runner;
     this.runner = undefined;
+    await runner?.close();
   }
 
   private ensureNativeQueueRecovery(): void {

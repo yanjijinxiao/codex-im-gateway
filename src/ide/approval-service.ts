@@ -1,3 +1,4 @@
+import { writeJsonFile } from "../state/json-store.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -130,9 +131,7 @@ export class IDEApprovalService {
   }
   private write(file: string, value: unknown) {
     const directory = path.dirname(file); fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700);
-    const temporary = `${file}.${crypto.randomBytes(8).toString("hex")}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-    try { fs.renameSync(temporary, file); } catch (error) { fs.unlinkSync(temporary); throw error; }
+    writeJsonFile(file, value, { durable: true });
   }
   /** Local mutation-token protected API and IM share this commit boundary. */
   async approveLocal(requestId: string, entryId: string, trustWorkspace: boolean) {

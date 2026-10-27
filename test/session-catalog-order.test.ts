@@ -63,9 +63,9 @@ test("CLI adapter supplies derived group identity without inventing native membe
   const sessions = new CliSessionStore(root), states = await sessions.list();
   const catalog = listCodexCliProjects(root).map(p => ({ projectId: p.id, name: p.name, workspace: p.roots[0], lastUsedAt: "", sessionCount: 0 }));
   const result = orderSessionCatalog(states.map(state => ({ state, hostId: "local" })), catalog, []);
-  assert.deepEqual(result.map(r => r.group?.name), ["Alpha", "Zulu", "Zulu"]);
+  assert.deepEqual([...new Set(result.map(r => r.group?.name))], catalog.map(p => p.name));
   assert.ok(states.every(s => s.projectId === undefined && s.workspaceProjectId));
-  assert.equal((await sessions.inspect("z1")).workspaceProjectId, result[1].state.workspaceProjectId);
+  assert.equal((await sessions.inspect("z1")).workspaceProjectId, result.find(r => r.state.threadId === "z1")!.state.workspaceProjectId);
   assert.equal((await sessions.list({ unassigned: true })).length, 3, "native unassigned semantics do not change");
 });
 

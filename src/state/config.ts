@@ -2,7 +2,7 @@ import path from "node:path";
 
 import { parseCodexExecSandbox, type CodexExecSandbox } from "../codex/sandbox.js";
 import type { AppServerConnectionMode } from "../codex/app-server-daemon.js";
-import { readJsonFile, writeJsonFile } from "./json-store.js";
+import { readJsonObjectFile, writeJsonFile } from "./json-store.js";
 import { defaultStateDir, type StatePaths } from "./paths.js";
 import { DEFAULT_BINDING_IDLE_DAYS, idleDays } from "./binding-expiry.js";
 
@@ -54,7 +54,7 @@ export function defaultConfig(cwd = defaultStateDir()): CodexImGatewayConfig {
 
 export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfig {
   const base = defaultConfig(cwd ?? paths.root);
-  const loaded = readJsonFile<Partial<CodexImGatewayConfig>>(paths.configPath, {});
+  const loaded = readJsonObjectFile<Partial<CodexImGatewayConfig>>(paths.configPath, {});
   const codexExecSandbox = parseCodexExecSandbox(loaded.codexExecSandbox);
   return {
     ...base,

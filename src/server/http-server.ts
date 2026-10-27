@@ -1,5 +1,6 @@
 import { TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
 import { readBuildInfo } from "./build-info.js";
+import { RuntimeConfigurationBusyError } from "./account-manager.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
 import crypto from "node:crypto";
@@ -798,9 +799,9 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       model: optionalString(input.model),
       effort: optionalString(input.effort)
     };
-    await context.onTaskboardConfig?.(next);
-    saveConfig(context.paths, next);
-    await context.accountManager.restartRunning();
+    const commit = async () => { await context.onTaskboardConfig?.(next); saveConfig(context.paths, next); };
+    if (context.accountManager.reconfigureRuntime) await context.accountManager.reconfigureRuntime(commit);
+    else { await commit(); await context.accountManager.restartRunning(); } // Older embedded test/integration port.
     sendJson(response, 200, {
       config: loadConfig(context.paths),
       codexRuntime: await readCodexRuntime(context),
@@ -994,7 +995,7 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function errorStatus(error: unknown, message: string): number {
-  if (error instanceof SessionBindingConflictError || error instanceof ApprovalDecisionConflictError) return 409;
+  if (error instanceof RuntimeConfigurationBusyError || error instanceof SessionBindingConflictError || error instanceof ApprovalDecisionConflictError) return 409;
   if (error instanceof z.ZodError) return 400;
   if (/not found/i.test(message)) return 404;
   if (/already in progress|no newer/i.test(message)) return 409;

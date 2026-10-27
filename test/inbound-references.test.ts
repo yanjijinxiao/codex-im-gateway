@@ -10,6 +10,18 @@ import { normalizeWeixinMessage } from "../src/weixin/messages.js";
 import { responseBytes } from "../src/channels/inbound-bytes.js";
 import type { ChannelMessage } from "../src/channels/message.js";
 import { BridgeService } from "../src/bridge/service.js";
+
+for(const raw of ["{invalid", "{}", '[{"conversationId":"chat","messageId":"original","text":"unsafe","at":1,"attachments":{}}]'])
+test("corrupt optional reference caches preserve evidence without blocking an account",t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),"reference-corruption-"));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const file=path.join(dir,"cache.json");fs.writeFileSync(file,raw);
+ const cache=new InboundReferenceStore(file),preserved=fs.readdirSync(dir).find(name=>name.endsWith(".corrupt"));
+ assert.ok(preserved);assert.equal(fs.readFileSync(path.join(dir,preserved),"utf8"),raw);
+ const message:ChannelMessage={id:"reply",senderId:"actor",replyTargetId:"chat",text:"read quote",raw:{},references:[{messageId:"original",type:"text",attachments:[],availability:"metadata-only"}]};
+ assert.equal(cache.resolve(message).references![0].availability,"metadata-only");
+ cache.remember({...message,id:"new",text:"new reference"},[]);
+ assert.equal(JSON.parse(fs.readFileSync(file,"utf8"))[0].messageId,"new");
+});
 import { defaultConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";

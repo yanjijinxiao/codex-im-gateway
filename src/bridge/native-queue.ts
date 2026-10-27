@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
-import { readJsonFile, writeJsonFile } from "../state/json-store.js";
+import { readJsonFile, isJsonObject as record, writeJsonFile } from "../state/json-store.js";
 import { SessionControlQueue } from "./session-control.js";
-import { CodexBackendCapabilityError, type CodexBridgeBackend, type CodexQueuedSubmission, type CodexQueueAddInput } from "../codex/backend.js";
+import { CodexBackendCapabilityError, CodexQueueAdmissionError, type CodexBridgeBackend, type CodexQueuedSubmission, type CodexQueueAddInput } from "../codex/backend.js";
 
 export type QueueOrigin = {
   mention?: import("../channels/types.js").ChannelMention;
@@ -27,9 +27,16 @@ export class NativeQueueCoordinator {
   private readonly controls = new SessionControlQueue();
   private readonly dispatching = new Set<string>();
   constructor(private readonly filePath: string) {
-    this.receipts = readJsonFile(filePath, { receipts: {} }).receipts;
+    const data = readJsonFile<unknown>(filePath, { receipts: {} });
+    if (!record(data) || !record(data.receipts) || Object.entries(data.receipts).some(([id, value]) =>
+      !record(value) || !/^[a-f0-9]{64}$/.test(id) || value.id !== id || value.clientUserMessageId !== `gateway-${id}`
+      || !["submitting", "queued", "starting", "running", "completed", "uncertain", "cancelled", "rejected"].includes(String(value.status))
+      || !["app-server", "exec"].includes(String(value.backend))
+      || ["accountId", "conversationId", "actorId", "messageId", "sessionId", "hostId", "threadId", "updatedAt"].some(key => typeof value[key] !== "string" || !value[key])))
+      throw new Error("Invalid native queue receipt journal; original file preserved");
+    this.receipts = data.receipts as Record<string, QueueReceipt>;
   }
-  private save(): void { writeJsonFile(this.filePath, { receipts: this.receipts }); }
+  private save(): void { writeJsonFile(this.filePath, { receipts: this.receipts }, { durable: true }); }
   private update(r: QueueReceipt, changes: Partial<QueueReceipt>): void {
     if (Object.entries(changes).every(([key, value]) => r[key as keyof QueueReceipt] === value)) return;
     Object.assign(r, changes, { updatedAt: new Date().toISOString() }); this.save();
@@ -43,7 +50,7 @@ export class NativeQueueCoordinator {
       && (unsettled.has(r.status) || r.status === "completed" && !r.delivered));
   }
   async enqueue(origin: QueueOrigin, prompt: string, backend: CodexBridgeBackend,
-    handlers: Pick<CodexQueueAddInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult"> = {}): Promise<QueueReceipt> {
+    handlers: Pick<CodexQueueAddInput, "onApproval" | "onApprovalResult" | "onUserInput" | "onUserInputResult" | "assertCurrent"> = {}): Promise<QueueReceipt> {
     if (!backend.addQueuedSubmission || backend.backendInfo(origin.hostId).capabilities.nativeQueue === false) {
       throw new CodexBackendCapabilityError("nativeQueue", backend.backendInfo(origin.hostId).id);
     }
@@ -60,6 +67,7 @@ export class NativeQueueCoordinator {
         // Accepted and ambiguous submissions alike must never be replayed.
         return structuredClone(existing);
       }
+      handlers.assertCurrent?.();
       const r: QueueReceipt = { ...origin, id, clientUserMessageId: `gateway-${id}`,
         status: "submitting", updatedAt: new Date().toISOString() };
       this.receipts[id] = r; this.save(); // Durable BEFORE the external write.
@@ -69,8 +77,8 @@ export class NativeQueueCoordinator {
           onAccepted: turnId => this.update(r, { status: "running", turnId }) }, origin.hostId);
         this.update(r, { status: r.turnId ? "running" : "queued", queuedSubmissionId: item.id, reason: undefined });
       } catch (error) {
-        this.update(r, { status: error instanceof CodexBackendCapabilityError ? "rejected" : "uncertain",
-          reason: error instanceof CodexBackendCapabilityError ? "后端不支持原生队列，消息未提交。" : "提交结果未确认，恢复时只核对，不自动重发。" });
+        this.update(r, { status: error instanceof CodexBackendCapabilityError || error instanceof CodexQueueAdmissionError ? "rejected" : "uncertain",
+          reason: error instanceof CodexQueueAdmissionError ? error.message : error instanceof CodexBackendCapabilityError ? "后端不支持原生队列，消息未提交。" : "提交结果未确认，恢复时只核对，不自动重发。" });
         throw error;
       }
       return structuredClone(r);

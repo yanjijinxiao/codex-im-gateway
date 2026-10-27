@@ -101,3 +101,26 @@ test("Web serializes explicit plan/independent settings and stages remote upload
   assert.equal(f.inputs[0].projectBinding, "none"); assert.equal(f.inputs[0].collaborationMode, "plan");
   assert.match(f.inputs[0].clientUserMessageId, /^gateway-/);
 });
+
+test("global reconfiguration refuses an active Web turn before changing config or closing its owner", async t => {
+  const f = fixture(t), s = f.manager.createSession("one", "chat", f.root, "Running");
+  await f.manager.startAccount("one", false);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let closes = 0, changes = 0;
+  f.runner.close = () => {closes++;};
+  f.setRun(async input => { entered.resolve(); await release.promise; return {threadId:input.threadId??"thread",turnId:"turn",text:"done",raw:""}; });
+  const pending = f.manager.continueSession("one", s.id, "continue"); await entered.promise;
+  await assert.rejects(f.manager.reconfigureRuntime(async()=>{changes++;}), /此次操作未提交/);
+  assert.equal(changes,0); assert.equal(closes,0);
+  release.resolve(); await pending;
+  await f.manager.reconfigureRuntime(async()=>{changes++;});
+  assert.equal(changes,1); assert.equal(closes,1);
+});
+
+test("configuration transition excludes concurrent configuration and Web submissions, then releases on failure", async t => {
+  const f=fixture(t),s=f.manager.createSession("one","chat",f.root,"Idle");await f.manager.startAccount("one",false);
+  const release=Promise.withResolvers<void>();const changing=f.manager.reconfigureRuntime(()=>release.promise);
+  await assert.rejects(f.manager.reconfigureRuntime(async()=>{assert.fail("concurrent commit");}), /此次操作未提交/);
+  await assert.rejects(f.manager.continueSession("one",s.id,"new input"), /此次操作未提交/);assert.equal(f.inputs.length,0);
+  release.reject(Error("prepare failed"));await assert.rejects(changing,/prepare failed/);
+  await f.manager.continueSession("one",s.id,"allowed after failed preparation");assert.equal(f.inputs.length,1);
+});

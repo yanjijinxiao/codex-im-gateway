@@ -132,6 +132,9 @@ export type CodexQueuedSubmission = {
 export type CodexQueuePage = { data: CodexQueuedSubmission[]; nextCursor?: string };
 export type CodexQueueAddInput = {
   threadId: string; prompt: string; clientUserMessageId: string;
+  /** Append to native storage without resuming/subscribing another owner's thread. */
+  enqueueOnly?: boolean;
+  assertCurrent?: () => void;
   onApproval?: CodexApprovalHandler;
   onApprovalResult?: CodexApprovalResultHandler;
   onUserInput?: CodexUserInputHandler;
@@ -177,6 +180,13 @@ export class CodexBackendCapabilityError extends Error {
 }
 export class CodexInterventionError extends Error {
   constructor(message: string) { super(message); this.name = "CodexInterventionError"; }
+}
+export class CodexQueueAdmissionError extends CodexInterventionError {
+  constructor(cause: unknown) { super(cause instanceof Error ? cause.message : "队列提交前核验失败，消息未提交。"); this.name = "CodexQueueAdmissionError"; }
+}
+/** May be called only before the native queue mutation is sent. */
+export function assertQueueAdmissionCurrent(input: Pick<CodexQueueAddInput, "assertCurrent">): void {
+  try { input.assertCurrent?.(); } catch (error) { throw new CodexQueueAdmissionError(error); }
 }
 export class CodexTurnExecutionError extends Error {
   readonly failureCode: CodexFailureCode;
@@ -435,7 +445,7 @@ export interface CodexBackendAdapter extends CodexBackendControls {
   stop(threadId?: string): Promise<CodexStopResult>;
   warmUp(cwd: string): Promise<void>;
   listProjects(): Promise<CodexProjectCatalog>;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 /** @deprecated Use CodexBackendAdapter. */
@@ -451,7 +461,7 @@ export interface CodexThreadContinuation {
   steer(input: CodexSteerInput): Promise<CodexSteerResult>;
   submitThreadMessage?(input: CodexThreadMessageInput): Promise<CodexInputReceipt>;
   stop(threadId?: string): Promise<CodexStopResult>;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 /** Every backend implements this boundary; unavailable operations reject explicitly. */
@@ -520,7 +530,7 @@ export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
   archiveThread(threadId: string, hostId?: string): Promise<void>;
   unarchiveThread(threadId: string, hostId?: string): Promise<CodexThreadState>;
   deleteThread(threadId: string, hostId?: string): Promise<void>;
-  close(): void;
+  close(): void | Promise<void>;
 }
 
 export const EXEC_BACKEND_CAPABILITIES: CodexBackendCapabilities = Object.freeze({

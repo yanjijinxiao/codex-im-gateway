@@ -1,3 +1,4 @@
+import { assertQueueAdmissionCurrent } from "./backend.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -155,6 +156,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly approvalRequests = new Map<string, { request: CodexApprovalRequest; submitted: boolean; notify?: CodexApprovalResultHandler }>();
   private readonly observedApprovalIds = new Set<string>();
   private closed = false;
+  private closePromise?: Promise<void>;
+  private retiringTransport?: Promise<void>;
   private nextId = 1;
   private stderr = "";
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
@@ -479,9 +482,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const child = this.child;
     if (!child || child.exitCode !== null) return;
 
-    const exited = new Promise<boolean>((resolve) => {
-      child.once("exit", () => resolve(true));
-    });
+    const terminate = setTimeout(() => child.kill(), 1_000);
+    const stopped = waitForProcessExit(child).finally(() => clearTimeout(terminate));
+    this.retiringTransport = stopped;
     this.child = undefined;
     this.subscribedThreads.clear();
     this.initialized = false;
@@ -492,11 +495,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     } catch {
       child.kill();
     }
-    const graceful = await Promise.race([
-      exited,
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))
-    ]);
-    if (!graceful && child.exitCode === null) child.kill();
+    try { await stopped; }
+    finally { if (this.retiringTransport === stopped) this.retiringTransport = undefined; }
   }
 
   async inspectThread(threadId: string, observation?: { includeTurns: false; timeoutMs: number }): Promise<CodexThreadState> {
@@ -918,6 +918,18 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   async addQueuedSubmission(input: CodexQueueAddInput): Promise<CodexQueuedSubmission> {
     if (!input.prompt.trim() || !input.clientUserMessageId) throw new Error("Queue input and client message id are required");
+    if (input.enqueueOnly || ((this.options.transport?.mode === "remote-daemon" || this.options.transport?.mode === "daemon-proxy") && !this.activeTurns.has(input.threadId))) {
+      // Native queue storage observes cross-process revisions. Its live owner
+      // consumes the item; this client must not resume, change permissions, or
+      // retain execution handlers for that external owner's turn.
+      const result = await this.queueOperation("thread/queue/add", {
+        threadId: input.threadId, clientUserMessageId: input.clientUserMessageId,
+        input: [{ type: "text", text: input.prompt, text_elements: [] }]
+      }, () => assertQueueAdmissionCurrent(input)) as { queuedSubmission?: CodexQueuedSubmission };
+      if (!result.queuedSubmission?.id || result.queuedSubmission.clientUserMessageId !== input.clientUserMessageId)
+        throw new Error("Native queue acknowledgement is incomplete; do not resubmit");
+      return result.queuedSubmission;
+    }
     // add can start immediately on a loaded idle thread. Retain the transport
     // and approval origin BEFORE writing, even before the add ack arrives.
     this.nativeQueueOrigins.set(input.clientUserMessageId, input);
@@ -933,6 +945,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
           ...(!this.activeTurns.has(input.threadId) && input.onApproval ? { approvalPolicy: "on-request" } : {}) }));
         this.subscribedThreads.add(input.threadId);
       }
+      assertQueueAdmissionCurrent(input);
       result = await this.queueRequest("thread/queue/add", {
         threadId: input.threadId, clientUserMessageId: input.clientUserMessageId,
         input: [{ type: "text", text: input.prompt, text_elements: [] }]
@@ -1065,9 +1078,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return await this.waitForTurn(input.threadId, turnId);
   }
 
-  private async queueOperation(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private async queueOperation(method: string, params: Record<string, unknown>, assertCurrent?: () => void): Promise<unknown> {
     this.operationLeases++;
-    try { await this.ensureConnected(); return await this.queueRequest(method, params); }
+    try { await this.ensureConnected(); assertCurrent?.(); return await this.queueRequest(method, params); }
     finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
   }
 
@@ -1189,12 +1202,18 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return "interrupted";
   }
 
-  close(): void {
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    const child = this.child;
     this.closed = true;
+    const stopped = Promise.all([child ? waitForProcessExit(child) : Promise.resolve(), this.retiringTransport]).then(() => {});
     this.failTransport(new Error("Codex app-server runner closed"), true);
+    this.closePromise = stopped;
+    return stopped;
   }
 
   private async ensureConnected(): Promise<void> {
+    while (this.retiringTransport) await this.retiringTransport;
     if (this.closed) {
       throw new Error("Codex app-server runner is closed");
     }
@@ -2408,4 +2427,19 @@ function unixSecondsToIso(value: unknown): string | undefined {
     return undefined;
   }
   return new Date(value * 1_000).toISOString();
+}
+
+/** A replacement executor must not race the previous process's writer lock. */
+function waitForProcessExit(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let forced: NodeJS.Timeout | undefined;
+    const cleanup = () => { clearTimeout(graceful); if (forced) clearTimeout(forced); child.removeListener("exit", exited); };
+    const exited = () => { cleanup(); resolve(); };
+    const graceful = setTimeout(() => {
+      child.kill("SIGKILL");
+      forced = setTimeout(() => { cleanup(); reject(Error("Codex client process did not exit; replacement was not started")); }, 5_000);
+    }, 5_000);
+    child.once("exit", exited);
+  });
 }

@@ -31,7 +31,7 @@ test("replaces a stale service process lock", (t) => {
   lock.release();
 });
 
-test("replaces a stale lock whose PID belongs to another account", (t) => {
+test("preserves a lock when process inspection is denied", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-eperm-lock-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const lockPath = path.join(root, "service.lock");
@@ -50,10 +50,35 @@ test("replaces a stale lock whose PID belongs to another account", (t) => {
   }) as typeof process.kill;
 
   try {
-    const lock = acquireServiceProcessLock(root);
-    assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).pid, process.pid);
-    lock.release();
+    assert.throws(() => acquireServiceProcessLock(root), /already running/);
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).pid, 424_242);
   } finally {
     process.kill = originalKill;
   }
+});
+
+test("two starters recovering the same stale lock cannot both become state writers", async t => {
+  const {fork} = await import("node:child_process");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-lock-race-"));
+  const child = fork(new URL("./fixtures/process-lock-contender.mjs", import.meta.url), [root], {execArgv: ["--import", "tsx"], silent: true});
+  t.after(() => { child.kill(); fs.rmSync(root, {recursive: true, force: true}); });
+  fs.writeFileSync(path.join(root, "service.lock"), JSON.stringify({pid: 2147483647, startedAt: new Date().toISOString()}));
+  const result = new Promise<{acquired: boolean}>(resolve => child.once("message", message => resolve(message as {acquired: boolean})));
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(path.join(root, "paused")) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(fs.existsSync(path.join(root, "paused")));
+  assert.throws(() => acquireServiceProcessLock(root), /recovery is already claimed/);
+  fs.writeFileSync(path.join(root, "proceed"), "yes");
+  assert.equal((await result).acquired, true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, "service.lock"), "utf8")).pid, child.pid);
+  child.send("release"); await new Promise(resolve => child.once("exit", resolve));
+});
+
+test("an old handle cannot release a replacement lock with the same PID", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-lock-token-"));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const first = acquireServiceProcessLock(root), file = path.join(root, "service.lock");
+  fs.rmSync(file); const replacement = acquireServiceProcessLock(root);
+  first.release(); assert.equal(fs.existsSync(file), true);
+  replacement.release(); assert.equal(fs.existsSync(file), false);
 });
