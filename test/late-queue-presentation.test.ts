@@ -6,13 +6,13 @@ import test from "node:test";
 import { ThreadEventHub, type ThreadSubscription } from "../src/server/thread-event-hub.js";
 import type { CodexThreadSnapshot } from "../src/codex/backend.js";
 
-function fixture(t: test.TestContext, ghost = false) {
+function fixture(t: test.TestContext, ghost = false, queuePlaceholder = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-late-queue-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const filePath = path.join(root, "follow.json"), starts: string[] = [], updates: Array<{messageId: string; text: string; finalize?: boolean}> = [];
   let reject = false;
   const checkpoint = { streamId: ghost ? "ghost" : "current", messageId: ghost ? "ghost" : "current", startedAt: 1,
-    progressEntries: [], thought: ghost ? "原生队列任务已开始…" : "新任务的进展", answerPreview: "", finished: false };
+    progressEntries: [], thought: ghost && queuePlaceholder ? "原生队列任务已开始…" : "新任务的进展", answerPreview: "", finished: false };
   fs.writeFileSync(filePath, JSON.stringify({ binding: { eventVersion: 2, deliveryVersion: 1, hostId: "local", threadId: "thread",
     turnId: ghost ? "done" : "new", checkpointTurnId: ghost ? "done" : "new", sequence: 0, delivered: [], completed: ["done"], baseline: [], initialized: true, checkpoint } }));
   const sub: ThreadSubscription = { key: "binding", hostId: "local", threadId: "thread", recipientId: "room", managed: true,
@@ -20,13 +20,14 @@ function fixture(t: test.TestContext, ghost = false) {
       async startTextStream(input) { starts.push(input.text); return {messageId: input.streamId!}; },
       async updateTextStream(input) { updates.push(input); if (reject) throw Error("lost update"); } } };
   let status: "completed" | "inProgress" = "completed";
+  let unavailable = false;
   const hub = new ThreadEventHub({ filePath, subscriptions: () => [sub], backend: () => ({ async readThreadSnapshot(): Promise<CodexThreadSnapshot> {
-    return {state: {threadId: "thread", persistence: "active", runtimeStatus: status === "completed" ? "idle" : "active",
+    return {state: {threadId: "thread", persistence: "active", runtimeStatus: unavailable ? "systemError" : status === "completed" ? "idle" : "active",
       activeFlags: [], ...(status === "inProgress" ? {activeTurnId: "done"} : {})}, turns: [{id: "done", status, messages: [{id: "final", role: "assistant", text: "ORIGINAL_FINAL"}]}]};
   } }) });
   t.after(() => hub.stop());
   return {hub, sub, starts, updates, read: () => JSON.parse(fs.readFileSync(filePath, "utf8")).binding,
-    reject(value: boolean) {reject = value;}, nativeRunning() {status = "inProgress";} };
+    reject(value: boolean) {reject = value;}, nativeRunning() {status = "inProgress";}, unavailable() {unavailable = true;} };
 }
 
 test("late queue acceptance for an already delivered turn cannot rotate a newer presentation or create progress", async t => {
@@ -56,6 +57,14 @@ for (const retry of [false, true]) test(`an already delivered exact turn closes 
 test("a native still-running observation is not closed by an old completion ledger", async t => {
   const f = fixture(t, true); f.nativeRunning(); await f.hub.refresh();
   assert.equal(f.updates.filter(update => update.finalize).length, 0);
+});
+
+test("a system-error snapshot cannot authorize closing a queue placeholder", async t => {
+  const f = fixture(t, true); f.unavailable(); await f.hub.refresh(); assert.equal(f.updates.length, 0);
+});
+
+test("other unfinished presentations are outside the narrow queue-placeholder repair", async t => {
+  const f = fixture(t, true, false); await f.hub.refresh(); assert.equal(f.updates.length, 0);
 });
 
 for (const status of ["completed", "failed", "interrupted"] as const) test(`queue recovery carries observed ${status} status without a native start`, async t => {

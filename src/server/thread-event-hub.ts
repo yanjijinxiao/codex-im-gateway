@@ -615,7 +615,9 @@ export class ThreadEventHub {
     if (!this.isLive(sub) || !sub.client.resumableTextStream || !checkpoint?.messageId || checkpoint.terminal
       || !turnId || turnId !== state.turnId || !state.completed.includes(turnId)
       || checkpoint.finished && !checkpoint.presentationCorrection || checkpoint.presentationCorrection?.delivered
-      || snapshot.state.activeTurnId === turnId) return;
+      || snapshot.state.persistence !== "active" || !["idle", "active"].includes(snapshot.state.runtimeStatus)
+      || snapshot.state.activeTurnId === turnId
+      || checkpoint.thought !== "原生队列任务已开始…" || checkpoint.progressEntries.length > 0 || checkpoint.answerPreview) return;
     const native = snapshot.turns.find(turn => turn.id === turnId);
     if (!native || !["completed", "failed", "interrupted"].includes(native.status)) return;
     const stream = this.stream(sub);
