@@ -482,6 +482,7 @@ export type CodexThreadGoal = {
 
 /** Shared contract implemented independently by the CLI and app-server backends. */
 export interface CodexBackendAdapter extends CodexBackendControls {
+  hasInFlightWork?(): boolean;
   readonly id: CodexBackendId;
   readonly capabilities: CodexBackendCapabilities;
   run(input: CodexRunnerInput): Promise<CodexRunResult>;
@@ -545,6 +546,8 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  /** Native ownership may outlive a channel handler after an ambiguous receipt. */
+  hasInFlightWork?(): boolean;
   readThreadProvenance?(threadId: string, hostId?: string): Promise<CodexThreadProvenance | undefined>;
   readonly systemErrorLifecycleRecovery?: boolean;
   recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;

@@ -215,6 +215,8 @@ export class CodexExecRunner implements CodexBackendAdapter {
     };
   }
 
+  hasInFlightWork(): boolean { return this.activeRuns.length > 0; }
+
   close(): void {
     for (const run of this.activeRuns.splice(0)) {
       run.child.kill();

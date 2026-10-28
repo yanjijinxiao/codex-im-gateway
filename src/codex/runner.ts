@@ -608,6 +608,11 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     if (!isRemoteHost(hostId)) await this.refreshDesktopTaskList();
   }
 
+  hasInFlightWork(): boolean {
+    return Boolean(this.runTails.size || this.appServerRuns || this.appServer.hasInFlightWork?.()
+      || this.exec.hasInFlightWork?.() || [...this.remoteAppServers.values()].some(runner => runner.hasInFlightWork?.()));
+  }
+
   async close(): Promise<void> {
     const stopping = [this.metadataReader.close(), this.statusReader.close(), this.appServer.close(), this.exec.close(), this.desktop.close(),
       ...[...this.remoteAppServers.values()].map(runner => runner.close())];

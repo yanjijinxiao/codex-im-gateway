@@ -544,7 +544,7 @@ export class AccountManager {
   }
 
   private assertRuntimeIdle(): void {
-    if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
+    if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.runner?.hasInFlightWork?.() || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
       || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
   }
 

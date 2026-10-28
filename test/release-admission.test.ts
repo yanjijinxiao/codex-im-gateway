@@ -9,6 +9,7 @@ import { BridgeService } from "../src/bridge/service.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { saveAccount } from "../src/weixin/accounts.js";
+import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
 import { startLocalHttpServer } from "../src/server/http-server.js";
 import { defaultConfig } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
@@ -24,10 +25,11 @@ function fixture(t: test.TestContext) {
   return { manager, paths, internal: manager as any };
 }
 
-for (const kind of ["responding", "preparing", "queue dispatch", "capacity recovery", "system recovery", "configuration", "shutdown"]) {
+for (const kind of ["responding", "preparing", "queue dispatch", "native owner", "capacity recovery", "system recovery", "configuration", "shutdown"]) {
   test(`release refuses ${kind} without closing the runner or freezing the existing task`, t => {
     const f = fixture(t); let closes = 0;
     f.internal.runner = { close() { closes++; } };
+    if (kind === "native owner") f.internal.runner.hasInFlightWork = () => true;
     if (kind === "responding") f.internal.respondingSessions.set("task", 1);
     if (kind === "preparing" || kind === "queue dispatch") f.internal.entries.set("one", { service: { hasInFlightWork: () => true } });
     if (kind === "capacity recovery") t.mock.method(f.internal.capacityRecovery, "hasInFlightWork", () => true);
@@ -40,6 +42,17 @@ for (const kind of ["responding", "preparing", "queue dispatch", "capacity recov
     f.internal.entries.clear();
   });
 }
+
+for (const work of ["operationLeases", "activeTurns", "unconfirmedStarts", "nativeQueueOrigins"]) test(`private app-server reports ${work} even after a channel handler returns`, async () => {
+  const runner = new AppServerCodexRunner({}), owner = runner as any;
+  assert.equal(runner.hasInFlightWork(), false);
+  if (work === "operationLeases") owner.operationLeases = 1;
+  else if (work === "unconfirmedStarts") owner[work].add("thread");
+  else owner[work].set("thread", "turn");
+  assert.equal(runner.hasInFlightWork(), true);
+  if (work === "operationLeases") owner.operationLeases = 0; else owner[work].clear();
+  assert.equal(runner.hasInFlightWork(), false); await runner.close();
+});
 
 test("release admission is synchronous, owner scoped, and blocks shared mutation/reconfiguration until cancellation", async t => {
   const f = fixture(t), id = crypto.randomUUID();

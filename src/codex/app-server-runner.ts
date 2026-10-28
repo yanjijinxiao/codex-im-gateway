@@ -1364,6 +1364,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     return "interrupted";
   }
 
+  hasInFlightWork(): boolean {
+    return Boolean(this.operationLeases || this.activeTurns.size || this.unconfirmedStarts.size || this.nativeQueueOrigins.size);
+  }
+
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     const child = this.child;
