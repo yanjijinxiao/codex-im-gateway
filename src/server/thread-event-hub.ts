@@ -317,20 +317,6 @@ export class ThreadEventHub {
         this.requestProvenanceRepair(sub, snapshot);
         await this.repairQueueTerminals(sub);
         if (this.stopped || !this.isLive(sub) || this.readVersions.get(sub.key) !== version) return this.changedBinding();
-        const observedActive = snapshot.state.activeTurnId;
-        const observedTurn = snapshot.turns.find(turn => turn.id === observedActive && turn.status === "inProgress");
-        if (snapshot.state.runtimeStatus === "active" && observedActive
-          && (state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
-            || state.turnId && state.turnId !== observedActive && observedTurn?.startedAt && state.startedAt
-              && Date.parse(state.startedAt) > Date.parse(observedTurn.startedAt))) {
-          // Validate before selectTurn: otherwise the conflicting old slot is
-          // closed as a supposed new turn before the proof can be checked.
-          state.runtime = snapshot.state; state.observedAt = new Date().toISOString();
-          const reason = state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
-            ? "旧展示已有完成回执，与原生状态相互冲突" : "旧展示时间线与原生当前轮次冲突";
-          this.failSync(sub, { code: "unconfirmed", message: `${reason}；正在核对来源，未中断或重跑主任务。` }, "unconfirmed");
-          return this.status(sub.key);
-        }
         // Pre-upgrade Gateway shutdown could poison a suspended card with a
         // local transport error. Only a loaded writer confirming the SAME
         // still-running turn may recover an unacknowledged presentation error.
@@ -359,6 +345,20 @@ export class ThreadEventHub {
             state.delivered = [];
           }
           this.save();
+        }
+        const observedActive = snapshot.state.activeTurnId;
+        const observedTurn = snapshot.turns.find(turn => turn.id === observedActive && turn.status === "inProgress");
+        if (snapshot.state.runtimeStatus === "active" && observedActive
+          && (state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
+            || state.turnId && state.turnId !== observedActive && observedTurn?.startedAt && state.startedAt
+              && Date.parse(state.startedAt) > Date.parse(observedTurn.startedAt))) {
+          // Validate before selectTurn: otherwise the conflicting old slot is
+          // closed as a supposed new turn before the proof can be checked.
+          state.runtime = snapshot.state; state.observedAt = new Date().toISOString();
+          const reason = state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
+            ? "旧展示已有完成回执，与原生状态相互冲突" : "旧展示时间线与原生当前轮次冲突";
+          this.failSync(sub, { code: "unconfirmed", message: `${reason}；正在核对来源，未中断或重跑主任务。` }, "unconfirmed");
+          return this.status(sub.key);
         }
         const restoreCard = !this.streams.has(sub.key) && Boolean(state.checkpoint?.messageId && !state.checkpoint.finished);
         await this.reconcile(sub, snapshot, force, options);
