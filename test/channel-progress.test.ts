@@ -20,7 +20,7 @@ test("cumulative compaction progress is atomic, deduplicated and ends at the lat
   await stream.progress([start, done, failure].join("\n\n")); await stream.flush();
   const checkpoint = stream.checkpoint();
   assert.deepEqual(checkpoint.progressEntries, [start, done, failure]); assert.equal(checkpoint.toolActivity?.failed, 1);
-  assert.match(frames.at(-1)!, /\*\*当前进展\*\*\n\n✅ 上下文整理完成/);
+  assert.match(frames.at(-1)!, /\n\n✅ 上下文整理完成/);
   assert.equal((frames.at(-1)!.match(/🧹 正在整理长会话上下文/g) ?? []).length, 1);
   await stream.progress([start, done, failure].join("\n\n"));
   assert.equal(stream.checkpoint().toolActivity?.failed, 1, "snapshot replay is not another failed tool");

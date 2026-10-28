@@ -343,8 +343,9 @@ export type CodexRunnerInput = {
   threadId?: string;
   threadTitle?: string;
   onThreadCreated?: (threadId: string) => Promise<void> | void;
-  /** Persist the accepted turn identity before waiting for its output. */
-  onTurnStarted?: (event: { threadId: string; turnId: string }) => Promise<void> | void;
+  /** Persist accepted identity. Queue recovery can observe an already ended
+   * turn; its status must not be presented as a new live start. */
+  onTurnStarted?: (event: { threadId: string; turnId: string; status?: CodexTurnStatus }) => Promise<void> | void;
   queueKey?: string;
   model?: string;
   effort?: string;

@@ -161,7 +161,7 @@ export type BridgeServiceOptions = {
   onSubscriptionsChanged?: () => Promise<void>;
   sessionFollow?: SessionFollowPort;
   sessionInteractions?: SessionInteractionPort;
-  onTurnStarted?: (session: ManagedSession, turnId: string) => Promise<void> | void;
+  onTurnStarted?: (session: ManagedSession, turnId: string, status?: import("../codex/backend.js").CodexTurnStatus) => Promise<void> | void;
   config: CodexImGatewayConfig;
   stateStore: RuntimeStateStore;
   channel?: ChannelClient;
@@ -2525,16 +2525,17 @@ export class BridgeService {
             saveNativeThread(createdThreadId);
             return this.options.onSubscriptionsChanged?.();
           },
-          onTurnStarted: async ({ threadId: startedThreadId, turnId }: { threadId: string; turnId: string }) => {
+          onTurnStarted: async ({ threadId: startedThreadId, turnId, status }) => {
             acceptedTurnId = turnId;
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             saveNativeThread(startedThreadId);
             recordParticipant(startedThreadId, turnId);
-            if (queued) { await prepareReplyStream(turnId); markActive(); }
+            const running = status === undefined || status === "inProgress";
+            if (queued && running) { await prepareReplyStream(turnId); markActive(); }
             const presentation = this.activePresentations.get(session.id);
             if (presentation) { presentation.threadId = startedThreadId; presentation.turnId = turnId; }
-            await this.options.onTurnStarted?.(session, turnId);
-            if (queued && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
+            await this.options.onTurnStarted?.(session, turnId, status);
+            if (queued && running && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
           },
           ...(qaContext ? {
             dynamicTools: llmWikiDynamicTools(),

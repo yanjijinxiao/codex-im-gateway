@@ -62,13 +62,13 @@ test("compact progress view uses normal text, bounded history and a plain native
   const text = renderTurnProgressCard({ activity: "running", elapsed: "2 分钟", current: "正在检查最新改动",
     recent: ["旧记录", "较早记录", "❌ 工具操作失败", "已通过静态检查"],
     tools: { completed: 3, failed: 1 }, answerPreview: "" });
-  assert.ok(text.startsWith("**进行中** · 已用时 2 分钟"));
+  assert.ok(text.startsWith("**进行中** ⏳ · 2 分钟"));
   assert.doesNotMatch(text, /^#{1,6} |🔵|🟡|🟠/mu);
   assert.doesNotMatch(text, /旧记录/);
   assert.match(text, /工具操作失败/);
   assert.equal((text.match(/\/stop/g) ?? []).length, 1);
-  assert.ok(text.endsWith("任务仍在执行"));
-  assert.ok(text.lastIndexOf("```") < text.lastIndexOf("任务仍在执行"));
+  assert.ok(text.endsWith("停止任务：`/stop`"));
+  assert.equal(Lexer.lex(text).filter(token => token.type === "code").length, 0);
   for (const outcome of ["running", "completed", "failed", "interrupted", "continued", "detached"] as const) {
     assert.doesNotMatch(turnStatusHeading(outcome), /^#|🔵|✅|❌/u);
   }
@@ -97,11 +97,11 @@ test("an incomplete code preview cannot swallow the stop control or native-curso
   const text = renderTurnProgressCard({ activity: "running", elapsed: "1 秒", current: "公开进展",
     recent: [], tools: { completed: 0, failed: 0 }, answerPreview: "```ts\n" + "const data = 1;\n".repeat(100) });
   const tokens = Lexer.lex(text);
-  assert.deepEqual(tokens.filter(token => token.type === "code").map(token => token.text), ["/stop"]);
+  assert.deepEqual(tokens.filter(token => token.type === "code"), []);
   assert.match(text, /`const data = 1;`/);
   assert.doesNotMatch(text, /代码将在最终答复中完整显示/);
   assert.equal(tokens.at(-1)?.type, "paragraph");
-  assert.equal(tokens.at(-1)?.raw, "任务仍在执行");
+  assert.equal(tokens.at(-1)?.raw, "停止任务：`/stop`");
   assert.match(text, /回复预览（尚未完成）/);
 });
 

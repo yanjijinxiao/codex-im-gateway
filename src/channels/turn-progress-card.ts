@@ -1,4 +1,3 @@
-import { copyBlock } from "./copyable.js";
 import { progressKind } from "./progress-summary.js";
 import { closeMarkdownFence } from "./result-pages.js";
 import { turnStatusHeading, type TurnActivity } from "./turn-status.js";
@@ -19,42 +18,50 @@ type ProgressFacts = {
 
 export function renderTurnProgressCard(input: ProgressFacts): string {
   const { sections, status, controls } = progressParts(input);
-  return [...sections, controls, status].join("\n\n");
+  return [...sections, controls, status].filter(Boolean).join("\n\n");
 }
 
 export function renderTurnProgressLayout(input: ProgressFacts): ChannelProgressLayout {
   const { sections, status, controls } = progressParts(input);
-  return { body: [...sections, status].join("\n\n"), footer: controls };
+  return { body: [...sections, status].filter(Boolean).join("\n\n"), footer: controls };
 }
 
 function progressParts(input: ProgressFacts) {
   const status = {
-    running: "任务仍在执行",
+    running: "",
     "waiting-input": "等待你的回答，任务尚未完成",
     "waiting-approval": "等待你的审批，任务尚未完成",
     recovering: "正在恢复原任务，尚未确认完成",
     unconfirmed: "执行状态待确认，未重发或停止原任务"
   }[input.activity];
   const tools = input.tools;
-  const metadata = [`已用时 ${input.elapsed}`];
-  if (tools.completed) metadata.push(`工具完成 ${tools.completed} 次`);
+  const metadata = [input.elapsed];
   if (tools.failed) metadata.push(`工具异常 ${tools.failed} 次（非任务终态）`);
-  const sections = [`${turnStatusHeading(input.activity)} · ${metadata.join(" · ")}`,
-    `**${input.notice ? "状态说明" : "当前进展"}**\n\n${bounded(input.notice || input.current, 360)}`];
-  if (!input.notice && input.thought && input.thought !== input.current) {
-    sections.push(`**公开摘要**\n\n${bounded(input.thought, 160)}`);
+  const icon = { running: "⏳", "waiting-input": "💬", "waiting-approval": "🔐", recovering: "↻", unconfirmed: "⚠️" }[input.activity];
+  const current = progressProse(input.notice || input.current, 360);
+  const thought = input.thought && progressProse(input.thought, 160);
+  const sections = [`${turnStatusHeading(input.activity)} ${icon} · ${metadata.join(" · ")}`, current];
+  if (!input.notice && thought && !current.includes(thought)) {
+    sections.push(`💭 ${thought}`);
   }
   // Keep errors visible without making a mobile progress card a growing log.
   const milestones = input.recent.filter(entry => progressKind(entry) !== "failure").slice(-2);
   const errors = input.recent.filter(entry => progressKind(entry) === "failure").slice(-2);
   const recent = input.recent.filter(entry => milestones.includes(entry) || errors.includes(entry));
-  if (recent.length) sections.push(`**关键记录**\n\n${recent.map(entry => `- ${bounded(entry, 140).replace(/\n/g, "\n  ")}`).join("\n")}`);
-  if (tools.active) sections.push(`**当前操作**\n\n${bounded(tools.active, 100)}`);
-  if (input.answerPreview) sections.push(`**回复预览（尚未完成）**\n\n${markdownPreview(input.answerPreview, 600)}`);
-  const controls = `---\n\n停止会中断当前任务：\n\n${copyBlock("/stop")}`;
+  if (recent.length) sections.push(recent.map(entry => `- ${progressProse(entry, 140).replace(/\n/g, "\n  ")}`).join("\n"));
+  if (tools.active) sections.push(progressProse(tools.active, 100));
+  if (input.answerPreview) sections.push(`回复预览（尚未完成）\n\n${markdownPreview(input.answerPreview, 600)}`);
+  // This is an optional command reference, not a required user response. A
+  // full copy widget dominates short mobile cards; required approvals/answers
+  // keep their own exact-reply controls on the corresponding interaction card.
+  const controls = "停止任务：`/stop`";
   // Always end on a normal paragraph, not a code fence/list/blockquote. The
   // native streaming cursor belongs to DingTalk, never to generated dot frames.
   return { sections, status, controls };
+}
+
+function progressProse(value: string, length: number): string {
+  return markdownPreview(bounded(value, length), length, { emphasis: false });
 }
 
 function bounded(value: string, length: number): string {

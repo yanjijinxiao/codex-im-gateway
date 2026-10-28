@@ -316,6 +316,7 @@ export class ThreadEventHub {
         if (snapshot.state.threadId !== sub.threadId) throw new Error("Backend returned another thread snapshot");
         this.requestProvenanceRepair(sub, snapshot);
         await this.repairQueueTerminals(sub);
+        await this.closeDeliveredProgress(sub, snapshot);
         if (this.stopped || !this.isLive(sub) || this.readVersions.get(sub.key) !== version) return this.changedBinding();
         // Pre-upgrade Gateway shutdown could poison a suspended card with a
         // local transport error. Only a loaded writer confirming the SAME
@@ -604,6 +605,23 @@ export class ThreadEventHub {
         repair.complete = true; state.sequence++; this.save();
       } catch { console.warn("[codex-im-gateway] queue terminal correction deferred; original input was not replayed"); }
     }
+  }
+
+  /** Retire only a proved stray live card for an already delivered exact turn.
+   * This corrects display ownership, never replays the answer or starts/stops a
+   * native task. Uncertain or still-running native observations remain intact. */
+  private async closeDeliveredProgress(sub: ThreadSubscription, snapshot: CodexThreadSnapshot): Promise<void> {
+    const state = this.state(sub), checkpoint = state.checkpoint, turnId = state.checkpointTurnId;
+    if (!this.isLive(sub) || !sub.client.resumableTextStream || !checkpoint?.messageId || checkpoint.terminal
+      || !turnId || turnId !== state.turnId || !state.completed.includes(turnId)
+      || checkpoint.finished && !checkpoint.presentationCorrection || checkpoint.presentationCorrection?.delivered
+      || snapshot.state.activeTurnId === turnId) return;
+    const native = snapshot.turns.find(turn => turn.id === turnId);
+    if (!native || !["completed", "failed", "interrupted"].includes(native.status)) return;
+    const stream = this.stream(sub);
+    const delivered = await stream.invalidatePresentation("本轮已经结束，完整结果已在上方。这张进度卡由迟到的队列回执误建，现已关闭。");
+    state.sequence++; this.save();
+    if (delivered) { await stream.suspend(); this.streams.delete(sub.key); }
   }
 
   private async reconcile(sub: ThreadSubscription, snapshot: CodexThreadSnapshot, force = false, options: FollowSyncOptions = {}): Promise<void> {
@@ -969,6 +987,7 @@ export class ThreadEventHub {
   managedStarted(sub: ThreadSubscription, turnId: string): void {
     if (!this.isLive(sub)) return;
     const state = this.state(sub);
+    if (state.completed.includes(turnId)) return;
     if (state.turnId !== turnId && !this.preparedStreams.has(sub.key)) this.rotateStream(sub);
     if (state.turnId !== turnId) state.presentationInputBaseline = this.presentationInputs(sub, turnId).map(input => input.id);
     state.turnId = turnId;
@@ -991,6 +1010,13 @@ export class ThreadEventHub {
   async prepareManagedStream(sub: ThreadSubscription, acceptedTurnId?: string): Promise<ChannelTurnPresentation> {
     return this.queue.run(sub.key, async () => {
       if (acceptedTurnId) {
+        if (this.state(sub).completed.includes(acceptedTurnId)) {
+          // A delayed queue receipt is identity, never authority to rotate a
+          // newer card or open a second live card after acknowledged delivery.
+          return new ChannelTurnPresentation(sub.client, sub.recipientId, { save() {}, restore: {
+            startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: true
+          } });
+        }
         if (!await this.selectTurn(sub, acceptedTurnId, true)) throw new Error("Accepted queue binding changed");
         return this.stream(sub);
       }

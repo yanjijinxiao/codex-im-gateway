@@ -653,8 +653,9 @@ export class AccountManager {
         this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.refresh();
       },
-      onTurnStarted: (session, turnId) => {
+      onTurnStarted: (session, turnId, status) => {
         this.rememberInteractionOrigin(account.accountId, session, turnId);
+        if (status && status !== "inProgress") return;
         this.ensureCodexSessionMonitor();
         this.refreshDesktopRequestSubscriptions();
         return this.threadEvents.managedTurnStarted({

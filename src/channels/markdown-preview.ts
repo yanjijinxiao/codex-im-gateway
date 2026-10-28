@@ -14,7 +14,7 @@ const inlineCode = (text: string) => {
  * list or code-block widgets: these can disappear when a streaming card rewrites.
  * The final document remains unchanged. Only visible payload consumes the budget.
  */
-export function markdownPreview(source: string, limit = 600): string {
+export function markdownPreview(source: string, limit = 600, options: { emphasis?: boolean } = {}): string {
   let remaining = Math.max(0, limit), clipped = false;
   const take = (text: string) => {
     const chars = Array.from(text);
@@ -28,11 +28,11 @@ export function markdownPreview(source: string, limit = 600): string {
     switch (token.type) {
       case "space": case "hr": return "\n\n";
       case "br": return "\n";
-      case "strong": return wrapped("**", children(token.tokens));
-      case "em": return wrapped("_", children(token.tokens));
+      case "strong": return options.emphasis === false ? children(token.tokens) : wrapped("**", children(token.tokens));
+      case "em": return options.emphasis === false ? children(token.tokens) : wrapped("_", children(token.tokens));
       case "del": return wrapped("~~", children(token.tokens));
       case "codespan": return inlineCode(take(token.text));
-      case "heading": return wrapped("**", children(token.tokens)) + "\n\n";
+      case "heading": return (options.emphasis === false ? children(token.tokens) : wrapped("**", children(token.tokens))) + "\n\n";
       case "paragraph": return children(token.tokens) + "\n\n";
       case "blockquote": return (token.tokens ?? []).map((part: Token) => render(part)).join("").trim().split("\n").map(line => "│ " + line).join("\n") + "\n\n";
       case "list": return (token as Tokens.List).items.map((item, index) => {

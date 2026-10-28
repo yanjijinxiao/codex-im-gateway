@@ -1151,7 +1151,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         if (observed.source === "unknown") observed = await this.readNativeTurnLifecycle(input.threadId, turnId);
         if (observed.status === "unknown" || observed.status === "inProgress" || observed.source === "unknown")
           throw new CodexCommunicationError("observation", "queue/observe", input.threadId, turnId);
-        await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+        await input.onTurnStarted?.({ threadId: input.threadId, turnId, status: observed.status });
         if (observed.status !== "completed") throw new CodexTurnExecutionError(observed.status, "原生轮次已确认结束", observed.failureCode);
         return { threadId: input.threadId, turnId, text: observed.text || "任务已完成。", raw: "" };
       }
@@ -1213,11 +1213,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   private async observeQueuedTurn(input: CodexQueuedRunInput, turn: Record<string, unknown>): Promise<CodexRunResult> {
     const turnId = String(turn.id), key = turnKey(input.threadId, turnId);
+    const status = normalizeTurnStatus(turn.status);
+    if (!status) throw new CodexCommunicationError("observation", "queue/observe", input.threadId, turnId);
     if (turn.status === "inProgress") {
       if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
       this.bindUserInputHandlers(input.threadId, input);
     }
-    await input.onTurnStarted?.({ threadId: input.threadId, turnId });
+    await input.onTurnStarted?.({ threadId: input.threadId, turnId, status });
     this.turnStreams.set(key, { onDelta: input.onDelta, onProgress: input.onProgress, onRecovery: input.onRecovery, chain: Promise.resolve() });
     for (const event of this.queuedTurnEvents.get(key) ?? []) this.enqueueTurnEvent(key, event);
     this.queuedTurnEvents.delete(key);
