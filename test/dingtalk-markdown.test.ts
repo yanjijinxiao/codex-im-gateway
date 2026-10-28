@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { marked } from "marked";
-import { dingTalkLoadingBody, dingTalkPlainText, dingTalkVisibleOrdinals } from "../src/channels/dingtalk-markdown.js";
+import { dingTalkLoadingBody, dingTalkPlainText, dingTalkProgressContent, dingTalkVisibleOrdinals } from "../src/channels/dingtalk-markdown.js";
 import { DingTalkHttpsAICardClient, DingTalkSdkAICardClient, normalizeDingTalkCardContent } from "../src/channels/dingtalk.js";
 import { resultPages } from "../src/channels/result-pages.js";
+
+test("active DingTalk paragraphs use one display break per boundary without changing terminal Markdown", () => {
+  for (const newline of ["\n", "\r\n"]) {
+    const source = ["**进行中** · 已用时 0 秒", "", "**当前进展**", "", "正在理解任务并规划下一步…", "", "",
+      "**公开摘要**", "", "**Locating work item ID**", "", "**Setting up isolated worktree**", "", "**当前操作**", "", "🔎 正在执行Git 操作",
+      "", "任务仍在执行"].join(newline);
+    const actual = dingTalkProgressContent(source);
+    assert.doesNotMatch(actual, /(?:<br>\s*){2,}|[\r\n]/);
+    assert.equal((actual.match(/<br>/g) ?? []).length, 8);
+    assert.match(actual, /\*\*公开摘要\*\*<br>\*\*Locating work item ID\*\*<br>\*\*Setting up isolated worktree\*\*/);
+  }
+  const final = "结论\n\n```text\n/answer Q1 --text 第一行\n第二行\n```\n\n| 项 | 值 |\n|---|---|\n| A | B |";
+  const staticBody = normalizeDingTalkCardContent(final);
+  assert.match(staticBody, /```text\n\/answer Q1 --text 第一行\n第二行\n```/);
+  assert.match(marked.parse(staticBody) as string, /<table>/);
+});
 
 test("DingTalk loose numbered sections keep visible ordinals around tables, citations and child lists", () => {
   const source = [

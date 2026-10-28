@@ -11,11 +11,13 @@ export function dingTalkLoadingBody(source: string): string {
 }
 
 /** The native streaming Markdown parser can retain/drop block widgets when a
- * whole multi-block document is rewritten. Task snapshots use one paragraph;
- * the static footer owns copy widgets/links. Terminal documents retain Markdown.
+ * whole multi-block document is rewritten. Task snapshots use one paragraph
+ * with one display break per boundary: converting paragraph blank lines one
+ * for one produces consecutive HTML breaks and oversized empty card rows.
+ * The static footer owns copy widgets/links. Terminal documents retain Markdown.
  */
 export function dingTalkProgressContent(source: string): string {
-  return markdownPreview(source, Number.MAX_SAFE_INTEGER).replace(/\n/g, "<br>");
+  return markdownPreview(source, Number.MAX_SAFE_INTEGER).replace(/\n+/g, "<br>");
 }
 
 /** Plain webhook transport has no Markdown renderer. Remove only code-block

@@ -50,6 +50,7 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
     assert.deepEqual(JSON.parse(values.sys_full_json_obj).order, ["msgContent", "staticMsgContent"]);
     assert.match(values.msgContent, /任务仍在执行$/);
     assert.deepEqual(Lexer.lex(values.msgContent).map(token => token.type), ["paragraph"], "rewrites never replace native block widgets");
+    assert.doesNotMatch(values.msgContent, /(?:<br>\s*){2,}|\n/, "active snapshots have no empty display rows");
     assert.match(values.msgContent, /当前进展/);
     assert.match(values.msgContent, /正在检查选项定义/);
     assert.doesNotMatch(values.msgContent, /\/stop|打开项目 Web IDE|203\.0\.113/);
@@ -59,6 +60,13 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
     if (expected) assert.ok(values.staticMsgContent.endsWith(`(${expected})`));
   };
   await stream.progress("正在检查选项定义"); running(first);
+  // Reproduce the reported public-summary layout through the real projection
+  // and both transports, not just a manually assembled Markdown string.
+  await stream.progress("🤔 **Locating work item ID**\n\n**Setting up isolated worktree**");
+  await stream.progress("🔎 正在执行命令：git status"); await stream.flush(); running(first);
+  assert.match(values.msgContent, /Locating work item ID/);
+  assert.match(values.msgContent, /Setting up isolated worktree/);
+  assert.match(values.msgContent, /当前操作.*正在执行Git 操作/);
   await stream.progress("🤔 正在核对三类 property 规则"); await stream.flush();
   assert.match(values.msgContent, /\*\*公开摘要\*\*.*核对三类/);
   const id = stream.checkpoint().messageId;
