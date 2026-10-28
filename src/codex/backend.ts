@@ -73,6 +73,26 @@ export type CodexThreadState = {
   catalogOrder?: { pinnedIndex?: number; recency?: number; manualIndex?: number };
 };
 
+/** State-only native rehydration. Never a turn/start, history edit or prompt retry. */
+export type CodexSystemRecoveryInput = {
+  threadId: string;
+  failedTurnId: string;
+  assertCurrent: () => void;
+};
+export type CodexSystemRecoveryResult = {
+  status: "recovered" | "deferred" | "unsupported" | "failed";
+  reason?: "busy" | "changed" | "unconfirmed" | "owner-unsupported" | "still-system-error" | "connection" | "awaiting-unload";
+  state?: CodexThreadState;
+};
+
+export function canRecoverSystemError(snapshot: CodexThreadSnapshot, failedTurnId: string): boolean {
+  const s = snapshot.state, tail = snapshot.turns.at(-1);
+  return s.persistence === "active" && ["systemError", "notLoaded"].includes(s.runtimeStatus) && !s.internal
+    && !s.activeTurnId && !s.pendingTurnWithoutId && !s.activeFlags.length
+    && s.lastTurnFailure?.turnId === failedTurnId && tail?.id === failedTurnId && tail.status === "failed"
+    && !snapshot.turns.some(turn => turn.status === "inProgress");
+}
+
 export type CodexThreadListInput = {
   cwd?: string;
   projectId?: string;
@@ -478,6 +498,7 @@ export interface CodexThreadContinuation {
 
 /** Every backend implements this boundary; unavailable operations reject explicitly. */
 export interface CodexBackendControls {
+  recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;
   getHistory(threadId: string): Promise<CodexHistoryMessage[]>;
   getHistoryPage(threadId: string, input?: CodexHistoryPageInput): Promise<CodexHistoryPage>;
   readThreadSnapshot(threadId: string): Promise<CodexThreadSnapshot>;
@@ -510,6 +531,7 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   stageAttachments?: import("./inbound-files.js").StageInboundFiles;
   backendInfo(hostId?: string): { id: CodexBackendAdapter["id"]; capabilities: CodexBackendCapabilities };

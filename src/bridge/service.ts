@@ -73,7 +73,7 @@ import type {
   CodexThreadGoal,
   CodexThreadGoalStatus
 } from "../codex/backend.js";
-import { assertCodexThreadRunnable, capacityFailureScope, CodexBackendCapabilityError } from "../codex/backend.js";
+import { assertCodexThreadRunnable, capacityFailureScope, CodexBackendCapabilityError, CodexThreadStateError } from "../codex/backend.js";
 import type { CodexApprovalDecision, CodexApprovalRequest } from "../codex/approval.js";
 import { CodexBackendRouter } from "../codex/runner.js";
 import {
@@ -149,6 +149,7 @@ export type BridgeServiceOptions = {
   ideProgressEntry?: (session: ManagedSession) => string | undefined;
   deferCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   requestCapacityRecovery?: (scope: { hostId: string; threadId: string; turnId: string }, assertCurrent: () => void) => Promise<boolean>;
+  requestSystemRecovery?: (scope: { hostId: string; threadId: string; turnId: string }, assertCurrent: () => void) => Promise<CodexThreadState | undefined>;
   accountId?: string;
   nativeQueue?: NativeQueueCoordinator;
   sessionControls?: SessionControlJournal;
@@ -1225,6 +1226,17 @@ export class BridgeService {
     };
   }
 
+  private async recoverSystemPreflight(senderId: string, session: ManagedSession, state: CodexThreadState): Promise<CodexThreadState> {
+    if (state.runtimeStatus !== "systemError" || !state.lastTurnFailure || state.lastTurnFailure.code === "model-capacity"
+      || !this.options.requestSystemRecovery) return state;
+    const recovered = await this.options.requestSystemRecovery({ hostId: this.sessionHostId(session), threadId: state.threadId,
+      turnId: state.lastTurnFailure.turnId }, this.controlGuard(senderId, session, "participant"));
+    if (recovered) return recovered;
+    const progress = this.options.sessionFollow?.status(session).runtimeRecovery;
+    throw new CodexThreadStateError("system-error", state.threadId,
+      `${progress?.turnId === state.lastTurnFailure.turnId ? progress.message : "systemError 恢复检查尚未确认成功，请查看恢复进展。"}\n本条输入尚未提交到 Codex。`, state.lastTurnFailure);
+  }
+
   private assertSessionCapability(senderId: string, capability: "liveFollow" | "collaborationModes" | "goals" | "progress"): void {
     const session = this.executionSession(senderId);
     const info = this.runner.backendInfo?.(session ? this.sessionHostId(session) : undefined);
@@ -1696,6 +1708,7 @@ export class BridgeService {
       return true;
     }
     if (await this.recoverCapacityPreflight(message.senderId, session, state)) return true;
+    state = await this.recoverSystemPreflight(message.senderId, session, state);
     assertCodexThreadRunnable(state);
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, copyableChoices("Codex App 存在未确认轮次，实际任务已空闲，消息未提交。请重新加载 App 后核对状态。", [{ label: "核对状态", value: "/status" }]));
@@ -1858,7 +1871,8 @@ export class BridgeService {
     }
     const binding = sessionExecutionScope(this.options.stateStore, session, message.senderId);
     const hostId = this.sessionHostId(session) ?? "local";
-    const state = await this.runner.inspectThread(session.threadId, hostId);
+    const state = await this.recoverSystemPreflight(message.senderId, session,
+      await this.runner.inspectThread(session.threadId, hostId));
     assertCodexThreadRunnable(state);
     if (state.pendingTurnWithoutId && state.runtimeStatus !== "active") {
       await this.reply(message.senderId, "会话存在未确认轮次，消息未入队；请先重新加载 Codex App 并核对状态。"); return;
@@ -2365,8 +2379,9 @@ export class BridgeService {
     const threadId = session.threadId || undefined;
     if (threadId && typeof this.runner.inspectThread === "function") {
       try {
-        const state = await this.runner.inspectThread(threadId, this.sessionHostId(session));
+        let state = await this.runner.inspectThread(threadId, this.sessionHostId(session));
         if (!queued && await this.recoverCapacityPreflight(message.senderId, session, state)) return;
+        if (!queued) state = await this.recoverSystemPreflight(message.senderId, session, state);
         assertCodexThreadRunnable(state);
       }
       catch (error) { throw communicationError(error, { phase: "preflight", operation: "thread/read", threadId }); }

@@ -104,3 +104,11 @@ test("view session is navigation-only and resolves the exact account/managed rec
   assert.equal(selected[0], one); assert.deepEqual(views, ["sessions"]);
   assert.equal(state.selectedAccountId, "one"); assert.equal(state.collapsedProjectKeys.has("one\nshared"), false);
 });
+
+test("system recovery progress is visible and escaped on the current exact binding", () => {
+  const f = fixture();
+  f.state.sessions[0] = { ...f.state.sessions[0], runtimeRecovery: { phase: "recovering", message: "正在恢复 <script>unsafe</script>" } };
+  f.overview.render(); const markup = f.control("#bindingsList").innerHTML;
+  assert.match(markup, /系统恢复：正在恢复 &lt;script&gt;unsafe&lt;\/script&gt;/);
+  assert.doesNotMatch(markup, /<script>unsafe/);
+});

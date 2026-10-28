@@ -25,6 +25,7 @@ import { CodexCommunicationError } from "../codex/communication-error.js";
 import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import { CapacityRecoveryCoordinator } from "./capacity-recovery.js";
+import { SystemErrorRecoveryCoordinator, type SystemRecoveryScope } from "./system-error-recovery.js";
 import {
   userFacingMessageHandlingError,
   wasMessageHandlingErrorReported
@@ -154,6 +155,7 @@ export type AccountSummary = PublicWeixinAccount & {
 };
 
 export type AccountSession = ManagedSession & {
+  runtimeRecovery?: ReturnType<ThreadEventHub["status"]>["runtimeRecovery"];
   accountId: string;
   active: boolean;
   responding: boolean;
@@ -322,6 +324,7 @@ export class AccountManager {
   private readonly turnAudience: TurnAudienceJournal;
   private readonly nativeQueue: NativeQueueCoordinator;
   private readonly capacityRecovery: CapacityRecoveryCoordinator;
+  private readonly systemRecovery: SystemErrorRecoveryCoordinator;
   private readonly bindingExpiry: BindingExpiryCoordinator;
   private nativeQueueTimer?: NodeJS.Timeout;
   private readonly nativeQueueWarningAt = new Map<string, number>();
@@ -379,6 +382,8 @@ export class AccountManager {
         return withIDEEntry(text, url);
       },
       onThreadState: (sub, state) => { this.observeThreadMembership(sub.hostId, state); },
+      onSystemError: (sub, snapshot) => this.systemRecovery.offer(snapshot, sub.hostId),
+      onRecoveryObservation: (sub, snapshot) => this.systemRecovery.offer(snapshot, sub.hostId),
       filePath: path.join(options.paths.runtimeDir, "thread-subscriptions.json"),
       turnAudience: this.turnAudience,
       subscriptions: () => this.threadSubscriptions(),
@@ -387,6 +392,17 @@ export class AccountManager {
       holdsCapacityStart: scope => this.capacityRecovery.holdsStart(scope),
       acceptedInputs: () => [ ...this.sessionControls.acceptedPresentationInputs(),
         ...[...this.entries.values()].flatMap(entry => entry.service?.acceptedPresentationInputs?.() ?? []) ]
+    });
+    this.systemRecovery = new SystemErrorRecoveryCoordinator({
+      filePath: path.join(options.paths.runtimeDir, "system-error-recovery.json"),
+      backend: () => this.runnerFor(this.configProvider()),
+      lease: scope => this.systemRecoveryLease(scope),
+      blocked: scope => this.capacityRecovery?.hasPending(scope.threadId, scope.hostId)
+        || [...this.entries.keys()].some(accountId => this.nativeQueue.list(accountId).some(receipt => receipt.threadId === scope.threadId
+          && receipt.hostId === scope.hostId && ["submitting", "starting", "running", "uncertain"].includes(receipt.status)))
+        || [...this.inputReceipts.values()].some(journal => Object.values(journal.snapshot()).some(receipt => receipt.threadId === scope.threadId
+          && (receipt.hostId ?? "local") === scope.hostId && ["submitting", "unconfirmed"].includes(receipt.phase))),
+      notice: (scope, status, state, assertSource) => this.threadEvents.systemRecoveryNotice(scope, status, state, assertSource),
     });
     this.capacityRecovery = new CapacityRecoveryCoordinator({
       filePath: path.join(options.paths.runtimeDir, "capacity-recovery.json"),
@@ -445,7 +461,7 @@ export class AccountManager {
       appServerTransport: config.codexAppServerTransport,
       codexBin: config.codexBin,
       execSandbox: config.codexExecSandbox,
-      onThreadMutation: (threadId, hostId) => this.capacityRecovery.cancel(threadId, hostId)
+      onThreadMutation: (threadId, hostId) => { this.capacityRecovery.cancel(threadId, hostId); this.systemRecovery.cancel(threadId, hostId); }
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));
@@ -483,6 +499,7 @@ export class AccountManager {
     try {
       await attempt(() => this.bindingExpiry.stop());
       await attempt(() => this.capacityRecovery.stop());
+      await attempt(() => this.systemRecovery.stop());
       // Abort all ingress before waiting for any observer or journal cleanup.
       const accounts = [...this.entries.keys()].map(id => attempt(() => this.accountOperations.run(id, () => this.stopRuntime(id))));
       this.taskboardController?.abort();
@@ -511,7 +528,7 @@ export class AccountManager {
   }
 
   async reconfigureRuntime(update: () => Promise<void | (() => Promise<void>)>): Promise<void> {
-    if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.capacityRecovery.hasInFlightWork()
+    if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
       || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
     this.runtimeConfigurationChanging = true;
     const accounts = [...this.entries].filter(([, entry]) => entry.controller && !entry.controller.signal.aborted).map(([id]) => id);
@@ -602,10 +619,12 @@ export class AccountManager {
       nativeQueue: this.nativeQueue,
       deferCapacityFailure: scope => this.capacityRecovery.offer(scope),
       requestCapacityRecovery: (scope, assertCurrent) => this.capacityRecovery.request(scope, assertCurrent),
+      requestSystemRecovery: (scope, assertCurrent) => this.systemRecovery.request(scope, assertCurrent),
       sessionControls: this.sessionControls,
       turnAudience: this.turnAudience,
       onAcceptedInput: input => {
         this.capacityRecovery.cancel(input.threadId, input.hostId);
+        this.systemRecovery.cancel(input.threadId, input.hostId);
         return this.threadEvents.acceptedInput(input);
       },
       sessionFollow: {
@@ -1655,11 +1674,13 @@ export class AccountManager {
   private sessionSummary(accountId: string, session: ManagedSession, active: boolean): AccountSession {
     const expiry = this.storeFor(accountId).getBindingExpiry(session.senderId, this.configProvider().bindingIdleDays);
     const conversation = this.entries.get(accountId)?.client?.conversationIdentity?.(session.senderId);
+    const runtimeRecovery = this.threadEvents.status(JSON.stringify([accountId, session.id])).runtimeRecovery;
     return {
       ...session,
       accountId,
       active,
       responding: this.isSessionResponding(accountId, session.id),
+      ...(runtimeRecovery ? { runtimeRecovery } : {}),
       binding: { ...this.storeFor(accountId).sessionBindingTarget(session), bound: active,
         ...(conversation ? { conversation } : {}),
         ...(active && session.threadId ? { interaction: this.getSessionInteractionRoute(accountId, session.id),
@@ -1671,6 +1692,24 @@ export class AccountManager {
 
   private isSessionResponding(accountId: string, sessionId: string): boolean {
     return (this.respondingSessions.get(sessionRuntimeKey(accountId, sessionId)) ?? 0) > 0;
+  }
+
+  private systemRecoveryLease(scope: SystemRecoveryScope): (() => void) | undefined {
+    const leases = this.threadSubscriptions().filter(sub => sub.enabled !== false && sub.hostId === scope.hostId && sub.threadId === scope.threadId)
+      .flatMap(sub => {
+        const [accountId, sessionId] = JSON.parse(sub.key) as string[];
+        const entry = this.entries.get(accountId), session = entry?.store?.getSession(sessionId);
+        if (!entry?.store || !session) return [];
+        const lease = sessionExecutionScope(entry.store, session);
+        return [() => entry.status === "running" && entry.client === sub.client && lease.current()
+          && this.threadSubscriptions().some(current => current.key === sub.key && current.enabled !== false && current.client === sub.client
+            && current.hostId === scope.hostId && current.threadId === scope.threadId)];
+      });
+    if (!leases.length) return;
+    return () => {
+      this.assertRuntimeWritable();
+      if (!leases.some(current => current())) throw Error("System recovery binding changed");
+    };
   }
 
   private setSessionResponding(accountId: string, sessionId: string, active: boolean): void {

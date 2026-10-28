@@ -687,6 +687,7 @@ function renderSessions() {
           : session.binding?.interaction ? `<span class="session-binding-id">提问入口：${session.binding.interaction.current ? "当前对话" : session.binding.interaction.destination ? "其他跟随对话" : "未确定或原入口失效"}</span>` : ""}
         ${session.binding?.deliveryRoute === "unconfirmed" ? `<span class="session-binding-id">投递身份待确认：在此 IM 对话向机器人发消息后自动补齐</span>` : ""}
         ${renderBindingExpiry(session)}
+        ${session.runtimeRecovery ? `<span class="session-binding-id">系统恢复：${escapeHtml(session.runtimeRecovery.message)}</span>` : ""}
         <span class="session-workspace" title="${escapeAttr(session.workspace)}">${escapeHtml(session.workspace)}</span>
         <span class="session-thread${session.responding ? " is-responding" : ""}">${session.binding?.nativeUnavailable ? "已归档或不可用 · 交互暂停"
           : !session.binding?.bound && session.threadId ? "历史关联 · 非当前绑定"

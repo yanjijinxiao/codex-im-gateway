@@ -156,3 +156,66 @@ test("a binding change during final decoration cannot deliver into the replaceme
   assert.deepEqual(f.updates, []);
   assert.deepEqual(f.texts, []);
 });
+
+test("system recovery progress uses one separate card and never rewrites a failed task as successful", async t => {
+  const f = fixture(t), writes: Array<{ messageId: string; text: string; finalize?: boolean }> = [];
+  let starts = 0;
+  f.sub.client.startTextStream = async () => ({ messageId: `recovery-${++starts}` });
+  f.sub.client.updateTextStream = async input => { writes.push(input); };
+  const hub = f.create(); await hub.synchronize("binding");
+  const scope = { hostId: "local", threadId: "thread", turnId: "turn" };
+  await hub.systemRecoveryNotice(scope, { turnId: "turn", phase: "recovering", attempts: 1, message: "检测到错误，正在恢复", updatedAt: 1 });
+  await hub.systemRecoveryNotice(scope, { turnId: "turn", phase: "recovering", attempts: 1, message: "正在核对原生重载结果", updatedAt: 2 });
+  await hub.systemRecoveryNotice(scope, { turnId: "turn", phase: "recovered", attempts: 1, message: "系统已恢复，旧消息未重发", updatedAt: 3 },
+    { ...f.snapshot.state, runtimeStatus: "idle" });
+  assert.equal(starts, 1);
+  assert.equal(writes.filter(row => row.messageId === "original").length, 1);
+  assert.match(writes.find(row => row.messageId === "original")!.text, /原生轮次已确认失败/);
+  assert.equal(writes.at(-1)?.messageId, "recovery-1"); assert.equal(writes.at(-1)?.finalize, true);
+  assert.equal(hub.status("binding").runtimeRecovery?.phase, "recovered");
+  assert.equal(hub.status("binding").runtime?.runtimeStatus, "idle");
+  assert.equal(f.read().checkpoint.terminal.outcome, "failed");
+});
+
+test("disabled progress still exposes system recovery metadata without creating cards", async t => {
+  const f = fixture(t), hub = f.create(); f.sub.progressEnabled = false;
+  await hub.systemRecoveryNotice({ hostId: "local", threadId: "thread", turnId: "turn" },
+    { turnId: "turn", phase: "unsupported", attempts: 1, message: "当前执行者不支持重载", updatedAt: 1 });
+  assert.equal(hub.status("binding").runtimeRecovery?.phase, "unsupported"); assert.deepEqual(f.updates, []);
+});
+test("a late verified idle result cannot downgrade a newly observed active native turn", async t => {
+  const f = fixture(t), hub = f.create();
+  f.snapshot.state = { ...f.snapshot.state, runtimeStatus: "active", activeTurnId: "new-turn" };
+  f.snapshot.turns.push({ id: "new-turn", status: "inProgress", messages: [] });
+  await hub.synchronize("binding");
+  await hub.systemRecoveryNotice({ hostId: "local", threadId: "thread", turnId: "turn" },
+    { turnId: "turn", phase: "recovered", attempts: 1, message: "previous recovery", updatedAt: 1 },
+    { threadId: "thread", persistence: "active", runtimeStatus: "idle", activeFlags: [] });
+  assert.equal(hub.status("binding").runtime?.activeTurnId, "new-turn");
+  assert.equal(hub.status("binding").runtime?.runtimeStatus, "active");
+});
+
+test("a replacement client cannot receive an old delayed system recovery notification", async t => {
+  const f = fixture(t), gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+  let writes = 0;
+  f.sub.client.startTextStream = async () => { writes++; return { messageId: "wrong" }; };
+  const hub = f.create({ decorateFinal: async () => { entered.resolve(); await gate.promise; return "old result"; } });
+  const pending = hub.systemRecoveryNotice({ hostId: "local", threadId: "thread", turnId: "turn" },
+    { turnId: "turn", phase: "recovered", attempts: 1, message: "done", updatedAt: 1 });
+  await entered.promise;
+  f.sub.client = { async sendText() { writes++; return { messageId: "new" }; } };
+  gate.resolve(); await assert.rejects(pending, /owner changed/);
+  assert.equal(writes, 0);
+});
+
+test("a revoked source lease prevents recovery delivery even when the channel client is unchanged", async t => {
+  const f = fixture(t), entered = Promise.withResolvers<void>(), gate = Promise.withResolvers<void>();
+  let allowed = true, writes = 0;
+  f.sub.client.startTextStream = async () => { writes++; return { messageId: "late" }; };
+  const hub = f.create({ decorateFinal: async () => { entered.resolve(); await gate.promise; return "late"; } });
+  const pending = hub.systemRecoveryNotice({ hostId: "local", threadId: "thread", turnId: "turn" },
+    { turnId: "turn", phase: "recovered", attempts: 1, message: "done", updatedAt: 1 }, undefined,
+    () => { if (!allowed) throw Error("source revoked"); });
+  await entered.promise; allowed = false; gate.resolve();
+  await assert.rejects(pending, /source revoked/); assert.equal(writes, 0);
+});

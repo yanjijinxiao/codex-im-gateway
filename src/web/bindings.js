@@ -48,6 +48,7 @@ window.createBindingOverview = function createBindingOverview(hooks) {
       </div>
       <div class="binding-status"><span class="binding-column-label">状态与提问入口</span>
         <span class="binding-badge ${badgeClass}">${stateLabel}</span><span>${route}</span>
+        ${current && session.runtimeRecovery ? `<small>系统恢复：${html(session.runtimeRecovery.message)}</small>` : ""}
         ${current && routeUnknown ? `<small>投递身份需由此对话的下一条机器人消息确认。</small>` : ""}
         ${current && !unavailable && !stopped && session.threadId && !binding?.deliveryRoute ? `<small>投递通道尚未检查</small>` : ""}
       </div>

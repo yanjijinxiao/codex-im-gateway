@@ -1,4 +1,5 @@
 import { assertQueueAdmissionCurrent, CodexQueueAdmissionError, CodexInterventionError } from "./backend.js";
+import { canRecoverSystemError, type CodexSystemRecoveryInput, type CodexSystemRecoveryResult } from "./backend.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -864,6 +865,55 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       this.operationLeases--;
       await this.recyclePrivateTransportIfIdle();
     }
+  }
+
+  async recoverSystemError(input: CodexSystemRecoveryInput): Promise<CodexSystemRecoveryResult> {
+    this.operationLeases++;
+    try {
+      const before = await this.readThreadSnapshot(input.threadId);
+      input.assertCurrent();
+      if (before.state.threadId !== input.threadId || !canRecoverSystemError(before, input.failedTurnId))
+        return { status: "deferred", reason: "changed", state: before.state };
+      if (this.activeTurns.has(input.threadId) || this.unconfirmedStarts.has(input.threadId))
+        return { status: "deferred", reason: "unconfirmed" };
+      let queue: CodexQueuePage;
+      try { queue = await this.listQueuedSubmissions(input.threadId); }
+      catch (error) {
+        if (error instanceof CodexBackendCapabilityError) return { status: "unsupported", reason: "owner-unsupported" };
+        throw error;
+      }
+      if ([...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)
+        || queue.data.length || queue.nextCursor)
+        return { status: "deferred", reason: "busy" };
+      // Rehydrate the exact native identity with inherited settings. No
+      // turn/start, injected history, empty prompt or private-reader fallback.
+      await this.ensureConnected();
+      const current = await this.readThreadSnapshot(input.threadId);
+      input.assertCurrent();
+      if (current.state.threadId !== input.threadId || !canRecoverSystemError(current, input.failedTurnId)
+        || current.state.runtimeStatus !== before.state.runtimeStatus || this.activeTurns.has(input.threadId)
+        || this.unconfirmedStarts.has(input.threadId)) return { status: "deferred", reason: "changed", state: current.state };
+      if (before.state.runtimeStatus === "systemError") {
+        // Resume on a loaded errored thread does not clear its native status.
+        // Release only this connection's subscription; native idle unload
+        // decides when it is safe. Never kill a shared server or other owner.
+        const released = await this.request("thread/unsubscribe", { threadId: input.threadId }, 5_000) as { status?: string };
+        if (!["notLoaded", "notSubscribed", "unsubscribed"].includes(released?.status ?? ""))
+          return { status: "deferred", reason: "unconfirmed" };
+        this.subscribedThreads.delete(input.threadId);
+        input.assertCurrent();
+        return { status: "deferred", reason: "awaiting-unload", state: before.state };
+      }
+      const response = await this.request("thread/resume", { threadId: input.threadId }, 5_000) as { thread?: { id?: string } };
+      if (response?.thread?.id !== input.threadId) return { status: "deferred", reason: "unconfirmed" };
+      this.subscribedThreads.add(input.threadId);
+      input.assertCurrent();
+      const after = await this.readThreadSnapshot(input.threadId);
+      input.assertCurrent();
+      return after.state.persistence === "active" && ["idle", "active"].includes(after.state.runtimeStatus)
+        ? { status: "recovered", state: after.state }
+        : { status: "failed", reason: "still-system-error", state: after.state };
+    } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
   }
 
   async readNativeTurnLifecycle(threadId: string, turnId: string): Promise<import("./backend.js").CodexTurnObservation> {

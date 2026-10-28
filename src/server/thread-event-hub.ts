@@ -46,6 +46,7 @@ type FollowState = {
   checkpointTurnId?: string;
   initialized: boolean;
   runtime?: CodexThreadState;
+  runtimeRecovery?: NonNullable<SessionFollowStatus["runtimeRecovery"]> & { checkpoint?: ChannelStreamCheckpoint };
   observedAt?: string;
   syncStatus?: "pending" | "syncing" | "synced" | "unconfirmed" | "failed";
   lastAttemptAt?: string;
@@ -66,6 +67,8 @@ type Options = {
   decorateFinal?: (sub: ThreadSubscription, text: string) => string | Promise<string>;
   decorateProgress?: (sub: ThreadSubscription, text: string) => string;
   onThreadState?: (sub: ThreadSubscription, state: CodexThreadState) => void;
+  onSystemError?: (sub: ThreadSubscription, snapshot: CodexThreadSnapshot) => void;
+  onRecoveryObservation?: (sub: ThreadSubscription, snapshot: CodexThreadSnapshot) => void;
   onCapacityFailure?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   holdsCapacityStart?: (scope: { hostId: string; threadId: string; turnId: string }) => boolean;
   turnAudience?: TurnAudienceJournal;
@@ -207,6 +210,8 @@ export class ThreadEventHub {
     const pending = (matching?.terminalPending ? 1 : 0) + Object.keys(matching?.pendingTerminals ?? {}).length
       + (matching?.repairTurnId && matching.repairTurnId !== matching.terminalPending?.turnId ? 1 : 0);
     return { status, lastAttemptAt: matching?.lastAttemptAt, lastSyncedAt: matching?.lastSyncedAt,
+      ...(matching?.runtimeRecovery ? { runtimeRecovery: { turnId: matching.runtimeRecovery.turnId, phase: matching.runtimeRecovery.phase,
+        attempts: matching.runtimeRecovery.attempts, message: matching.runtimeRecovery.message, updatedAt: matching.runtimeRecovery.updatedAt } } : {}),
       snapshotAt: matching?.observedAt, runtime: matching?.runtime, failure: matching?.syncFailure,
       presentation: matching?.presentation,
       ...(matching?.checkpoint && !matching.checkpoint.finished && (matching.checkpoint.bootstrap
@@ -347,9 +352,14 @@ export class ThreadEventHub {
           await this.stream(sub).flush();
         }
         if (runtime.runtimeStatus === "systemError" && runtime.persistence === "active") {
-          this.failSync(sub, { code: "unavailable", message: ["会话处于系统错误状态（systemError）；绑定已保留，未自动恢复或重发任务。",
+          this.options.onSystemError?.(sub, snapshot);
+          this.failSync(sub, { code: "unavailable", message: [this.options.onSystemError
+            ? runtime.lastTurnFailure ? "会话处于系统错误状态（systemError）；已进入受控恢复检查，绑定保留，旧消息未重发。"
+              : "会话处于系统错误状态（systemError）；缺少可信失败轮次，暂不能自动重载，绑定保留。"
+            : "会话处于系统错误状态（systemError）；绑定已保留，未自动恢复或重发任务。",
             ...(runtime.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(runtime.lastTurnFailure.code)}`] : []),
-            "请在对应 Codex 后端原会话中查看并处理错误。"].join("\n") });
+            ...(this.options.onSystemError ? [] : ["请在对应 Codex 后端原会话中查看并处理错误。"])
+          ].join("\n") });
         } else if (["archived", "missing"].includes(runtime.persistence) || runtime.runtimeStatus === "systemError") {
           this.failSync(sub, { code: "unavailable", message: "会话已归档、不存在或发生系统错误；请在对应 Codex 后端检查。" });
         } else if (runtime.pendingTurnWithoutId && runtime.runtimeStatus !== "active") {
@@ -518,6 +528,7 @@ export class ThreadEventHub {
     const state = this.state(sub);
     state.runtime = snapshot.state;
     this.options.onThreadState?.(sub, snapshot.state);
+    if (snapshot.state.runtimeStatus !== "systemError") this.options.onRecoveryObservation?.(sub, snapshot);
     if (snapshot.state.activeTurnId && this.options.holdsCapacityStart?.({ hostId: sub.hostId,
       threadId: sub.threadId, turnId: snapshot.state.activeTurnId })) return;
     state.observedAt = new Date().toISOString();
@@ -762,6 +773,45 @@ export class ThreadEventHub {
       })));
   }
 
+  async systemRecoveryNotice(scope: { hostId: string; threadId: string; turnId: string },
+    progress: NonNullable<SessionFollowStatus["runtimeRecovery"]>, verifiedState?: CodexThreadState, assertSource?: () => void): Promise<void> {
+    await Promise.all(this.options.subscriptions().filter(sub => sub.enabled !== false && sub.hostId === scope.hostId
+      && sub.threadId === scope.threadId).map(sub => this.queue.run(sub.key, async () => {
+      if (this.stopped || !this.isLive(sub)) return;
+      assertSource?.();
+      const state = this.state(sub), previous = state.runtimeRecovery;
+      const reuse = previous?.turnId === progress.turnId && !(progress.phase === "recovering" && previous.checkpoint?.finished);
+      const record = { ...progress, ...(reuse ? { checkpoint: previous!.checkpoint } : {}) };
+      state.runtimeRecovery = record;
+      if (progress.phase === "recovered" && verifiedState?.threadId === scope.threadId && verifiedState.persistence === "active"
+        && ["idle", "active"].includes(verifiedState.runtimeStatus)
+        && (!state.runtime?.activeTurnId || state.runtime.activeTurnId === verifiedState.activeTurnId)
+        && (state.runtime?.runtimeStatus !== "systemError" || state.runtime.lastTurnFailure?.turnId === scope.turnId)) {
+        state.runtime = structuredClone(verifiedState); state.observedAt = state.lastSyncedAt = new Date().toISOString();
+        state.syncStatus = "synced"; delete state.syncFailure;
+      }
+      this.save();
+      if (sub.progressEnabled === false) return;
+      const stream = new ChannelTurnPresentation(this.presentationClient(sub, undefined, undefined, assertSource), sub.recipientId, {
+        restore: record.checkpoint, contextToken: sub.contextToken,
+        decorateProgress: this.options.decorateProgress ? text => this.options.decorateProgress!(sub, text) : undefined,
+        save: checkpoint => {
+          assertSource?.();
+          if (!this.isLive(sub) || state.runtimeRecovery !== record) throw Error("System recovery presentation owner changed");
+          record.checkpoint = checkpoint; this.save();
+        }
+      });
+      try {
+        if (progress.phase === "recovering" || progress.phase === "waiting") { await stream.progress(progress.message); await stream.flush(); }
+        else {
+          let text = progress.message;
+          try { text = await this.options.decorateFinal?.(sub, text) ?? text; } catch { /* optional IDE metadata */ }
+          await stream.finalize(text, progress.phase !== "recovered");
+        }
+      } finally { await stream.suspend(); }
+    })));
+  }
+
   /** Presentation-only repair for historical capacity cards accidentally
    * reopened by an older startup projector. Native outcome/binding stay intact. */
   async retireCapacityProjection(scope: { hostId: string; threadId: string; turnId: string }, text: string): Promise<void> {
@@ -979,13 +1029,15 @@ export class ThreadEventHub {
     this.streamOwners.set(stream, captured);
     return stream;
   }
-  private presentationClient(sub: ThreadSubscription, barrier = Promise.resolve(), closing?: (method: string, args: unknown[]) => boolean): ThreadSubscription["client"] {
+  private presentationClient(sub: ThreadSubscription, barrier = Promise.resolve(), closing?: (method: string, args: unknown[]) => boolean,
+    assertCurrent?: () => void): ThreadSubscription["client"] {
     const client = Object.create(sub.client) as ThreadSubscription["client"];
     for (const method of ["sendText", "sendProgressText", "startTextStream", "updateTextStream"] as const) {
       if (typeof sub.client[method] !== "function") continue;
       Object.defineProperty(client, method, { value: async (...args: unknown[]) => {
         await barrier;
         if (!closing?.(method, args) && (this.stopped || !this.isLive(sub))) throw new Error("Channel presentation owner changed; no write attempted");
+        assertCurrent?.();
         const send = Reflect.get(sub.client, method);
         if (typeof send !== "function") throw new Error("Channel presentation transport is unavailable");
         return Reflect.apply(send, sub.client, args);

@@ -1,7 +1,8 @@
 /** Public failure metadata is a closed vocabulary, not a provider response body.
  * Never forward additionalDetails, stacks, prompts, paths or credentials to IM. */
 export type CodexFailureCode = "unintended-activity" | "safety-blocked" | "context-window" | "usage-limit"
-  | "unauthorized" | "rate-limit" | "model-capacity" | "model-unavailable" | "upstream-connection" | "upstream-error";
+  | "unauthorized" | "rate-limit" | "model-capacity" | "model-unavailable" | "upstream-connection" | "upstream-error"
+  | "workspace-routing" | "network-proxy";
 
 export function codexFailureCode(error: unknown): CodexFailureCode {
   const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : undefined;
@@ -21,6 +22,8 @@ export function codexFailureCode(error: unknown): CodexFailureCode {
   if (nativeCode === "ratelimitexceeded" || /rate limit|too many requests/i.test(message)) return "rate-limit";
   if (nativeCode === "serveroverloaded" || /(?:selected )?model is at capacity|model.*(?:overloaded|capacity)|server overloaded/i.test(message)) return "model-capacity";
   if (/model.*(?:not found|does not exist|not available|not supported)/i.test(message)) return "model-unavailable";
+  if (/workspace routing discovery failed/i.test(message)) return "workspace-routing";
+  if (/(?:tunnel|CONNECT|proxy).*(?:503|502|failed|refused)/i.test(message)) return "network-proxy";
   if (["httpconnectionfailed", "responsestreamconnectionfailed", "responsestreamdisconnected", "responsetoomanyfailedattempts"].includes(nativeCode)
     || /(?:connection|stream).*(?:failed|disconnect)|timed out|timeout/i.test(message)) return "upstream-connection";
   return "upstream-error";
@@ -36,6 +39,8 @@ export function codexFailureSummary(code: CodexFailureCode): string {
     case "rate-limit": return "上游报告请求频率达到限制。";
     case "model-capacity": return "上游报告所选模型当前容量不足（model at capacity / server overloaded）。";
     case "model-unavailable": return "上游报告所选模型不存在、不可用或不受支持。";
+    case "workspace-routing": return "Codex 账号工作区路由发现失败。";
+    case "network-proxy": return "访问上游的代理或 CONNECT 隧道失败。";
     case "upstream-connection": return "原生轮次已明确失败，并报告连接、响应流或超时错误；这不是 Gateway 提交回执未知。";
     default: return "Codex 已确认本轮执行失败；上游未提供可安全展示的已知错误摘要，请在 Codex App 原轮次查看详情。";
   }

@@ -28,6 +28,8 @@ export type SessionFollowStatus = {
   /** Delivery acknowledgements are independent of the backend execution state. */
   resultDelivery?: { pending: number; deferred?: number; lastDeliveredTurnId?: string };
   progressDelivery?: { stage: ChannelStreamBootstrap["stage"] | "legacy-unconfirmed"; requiresConfirmation: boolean; failure?: ChannelStreamFailure };
+  runtimeRecovery?: { turnId: string; phase: "recovering" | "waiting" | "recovered" | "deferred" | "unsupported" | "failed" | "cancelled";
+    attempts: number; message: string; updatedAt: number };
 };
 
 export function followSyncFailure(error: unknown): FollowSyncFailure {
@@ -50,6 +52,7 @@ export function formatFollowStatus(state: SessionFollowStatus): string[] {
   const runtimeLabel = state.status === "synced" ? "已确认状态" : "最近快照状态（不代表当前）";
   return [
     `跟随同步：${labels[state.status]}`,
+    ...(state.runtimeRecovery ? [`系统状态恢复：${state.runtimeRecovery.message}`] : []),
     `最后成功同步：${state.lastSyncedAt ? time(state.lastSyncedAt) : "尚未成功同步"}`,
     ...(state.lastAttemptAt ? [`最近尝试：${time(state.lastAttemptAt)}`] : []),
     ...(state.snapshotAt ? [`最近快照读取：${time(state.snapshotAt)}`] : []),

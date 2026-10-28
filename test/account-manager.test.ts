@@ -324,10 +324,46 @@ test("account manager routes follow sync through the shared hub and rejects an o
   assert.equal((await options.sessionFollow.synchronize(session)).status, "synced");
   assert.deepEqual(reads, [{ threadId: "thread", hostId: "remote-host" }]);
   assert.equal(options.sessionFollow.status(session).status, "synced");
+  assert.equal(Object.hasOwn(f.manager.listSessions().find(s => s.id === session.id)!, "runtimeRecovery"), false,
+    "sessions without recovery keep the existing API response shape");
   options.stateStore.createSession("group", f.root, "New");
   assert.equal((await options.sessionFollow.synchronize(session)).failure?.code, "binding-changed");
   assert.equal(reads.length, 1);
   assert.equal(f.runs.length, 0);
+});
+
+for (const supported of [true, false]) test(`system-error follow observations reach the exact recovery owner and Web status, supported=${supported}`, async t => {
+  const f = setup(t);
+  let runtimeStatus = "systemError", calls = 0;
+  const snapshot = () => ({ state: { threadId: "failed-thread", persistence: "active", runtimeStatus, activeFlags: [],
+    lastTurnFailure: { turnId: "failed-turn", code: "workspace-routing" } },
+    turns: [{ id: "failed-turn", status: "failed", messages: [] }] });
+  Object.assign(f.runner, {
+    async readThreadSnapshot(threadId: string, hostId: string) {
+      assert.equal(threadId, "failed-thread"); assert.equal(hostId, "remote-one"); return snapshot();
+    },
+    async recoverSystemError(input: { threadId: string; failedTurnId: string; assertCurrent(): void }, hostId: string) {
+      input.assertCurrent(); calls++; assert.equal(hostId, "remote-one"); assert.equal(input.failedTurnId, "failed-turn");
+      if (supported) runtimeStatus = "idle";
+      return { status: supported ? "recovered" : "unsupported" };
+    }
+  });
+  await f.manager.startAccount("account-one", false);
+  const options = f.bridges.get("account-one")!, store = options.stateStore;
+  const created = store.createSession("group", f.root, "Recovery", undefined, "session", undefined,
+    { standalone: true, hostId: "remote-one" });
+  store.setSessionThread(created.id, "failed-thread");
+  const session = store.getSession(created.id)!;
+  await options.sessionFollow!.synchronize(session);
+  for (let i = 0; i < 100 && options.sessionFollow!.status(session).runtimeRecovery?.phase !== (supported ? "recovered" : "unsupported"); i++)
+    await new Promise(resolve => setImmediate(resolve));
+  const status = options.sessionFollow!.status(session);
+  assert.equal(status.runtimeRecovery?.phase, supported ? "recovered" : "unsupported");
+  assert.equal(f.manager.listSessions().find(s => s.id === session.id)?.runtimeRecovery?.phase, status.runtimeRecovery?.phase);
+  assert.equal(store.getBoundSession("group")?.threadId, "failed-thread"); assert.equal(calls, 1);
+  assert.equal(f.runs.length, 0, "no user prompt is submitted by recovery");
+  await options.sessionFollow!.synchronize(session);
+  assert.equal(calls, 1, "a second status tick does not repeat recovery");
 });
 
 test("notifies Taskboard review state once as an actionable card with the latest evidence", async (t) => {

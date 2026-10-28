@@ -10,6 +10,7 @@ import { CodexExecRunner } from "./exec-runner.js";
 import type { CodexExecSandbox } from "./sandbox.js";
 import { DesktopCodexRunner } from "./desktop-runner.js";
 import { assertCodexThreadRunnable, assertCapacityResume, CodexBackendCapabilityError, CodexOwnerUnavailableError, CodexInterventionError, type CodexCapacityResumeInput } from "./backend.js";
+import { canRecoverSystemError, type CodexSystemRecoveryInput, type CodexSystemRecoveryResult } from "./backend.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { resolveRemoteCodexTransport } from "./remote-host.js";
 import { CodexMetadataReader, type MetadataConnection } from "./metadata-reader.js";
@@ -191,6 +192,19 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     const owner = snapshot.state.executionOwner === "desktop" ? this.desktop : this.appServerFor(input.hostId);
     if (!owner.resumeAfterCapacity) throw new CodexInterventionError("当前执行者不支持空输入容量恢复，未切换执行者。");
     return owner.resumeAfterCapacity(input);
+  }
+
+  async recoverSystemError(input: CodexSystemRecoveryInput, hostId = "local"): Promise<CodexSystemRecoveryResult> {
+    if (this.selectedBackend === "exec") return { status: "unsupported", reason: "owner-unsupported" };
+    const snapshot = await this.readThreadSnapshot(input.threadId, hostId);
+    input.assertCurrent();
+    if (snapshot.state.threadId !== input.threadId || !canRecoverSystemError(snapshot, input.failedTurnId))
+      return { status: "deferred", reason: "changed", state: snapshot.state };
+    // Desktop IPC currently exposes no state-only reload operation. A private
+    // stdio reader cannot clear the live Desktop owner's runtime failure.
+    if (snapshot.state.executionOwner === "desktop") return { status: "unsupported", reason: "owner-unsupported" };
+    const owner = this.appServerFor(hostId);
+    return owner.recoverSystemError ? owner.recoverSystemError(input) : { status: "unsupported", reason: "owner-unsupported" };
   }
 
   async submitThreadMessage(input: CodexThreadMessageInput, hostId?: string): Promise<CodexInputReceipt> {
