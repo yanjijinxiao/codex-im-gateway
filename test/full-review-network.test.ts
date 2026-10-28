@@ -75,14 +75,16 @@ test("Weixin API stops oversized untrusted JSON before parsing it", async () => 
   await assert.rejects(api.getUpdates(), /byte limit/);
 });
 
-test("Weixin QR polling cannot confirm a login that expired during the request", async () => {
+test("Weixin QR polling cannot confirm a login that expired during the request", async t => {
+  let now = 1000;
+  t.mock.method(Date, "now", () => now);
   let release!: () => void;
   const session = await createQrLoginSession({ timeoutMs: 15, fetch: async url => String(url).includes("get_bot_qrcode")
     ? new Response(JSON.stringify({ qrcode: "synthetic", qrcode_url: "synthetic" }))
     : new Promise<Response>(resolve => { release = () => resolve(new Response(JSON.stringify({ status: "confirmed", bot_token: "synthetic", ilink_bot_id: "test" }))); }) });
-  const pending = session.poll();
-  await new Promise(resolve => setTimeout(resolve, 35)); release();
-  assert.equal((await pending).status, "expired");
+  const pending = session.poll().then(value => ({ value }), error => ({ error }));
+  now += 35; release();
+  assert.deepEqual(await pending, { value: { status: "expired" } });
 });
 
 test("Weixin outbound file budget is checked before requesting an upload", async t => {

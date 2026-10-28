@@ -5,7 +5,38 @@ import path from "node:path";
 import test from "node:test";
 
 import { resolveStatePaths } from "../src/state/paths.js";
-import { createQrLoginSession, loginWithQr } from "../src/weixin/login.js";
+import { createQrLoginSession, loginWithQr, WeixinQrLoginSession } from "../src/weixin/login.js";
+
+test("the QR-owned expiry wins even if the wall clock has not reached its millisecond deadline", async t => {
+  t.mock.method(Date, "now", () => 1000);
+  const expiry = new AbortController();
+  t.mock.method(AbortSignal, "timeout", (ms: number) => ms === 15 ? expiry.signal : new AbortController().signal);
+  const session = new WeixinQrLoginSession("synthetic", "synthetic", "https://example.test",
+    async () => new Promise<Response>(() => {}), 1015);
+  const outcome = session.poll().then(value => ({ value }), error => ({ error }));
+  expiry.abort(new DOMException("fixture deadline", "TimeoutError"));
+  assert.deepEqual(await outcome, { value: { status: "expired" } });
+});
+
+test("the request budget timeout does not expire a QR code with remaining lifetime", async t => {
+  t.mock.method(Date, "now", () => 1000);
+  const request = new AbortController();
+  t.mock.method(AbortSignal, "timeout", () => request.signal);
+  const reason = new DOMException("fixture request budget", "TimeoutError");
+  const session = new WeixinQrLoginSession("synthetic", "synthetic", "https://example.test",
+    async () => new Promise<Response>(() => {}), 61000);
+  const rejected = assert.rejects(session.poll(), error => error === reason);
+  request.abort(reason);
+  await rejected;
+});
+
+test("an upstream timeout before the QR-owned expiry remains a network error", async t => {
+  t.mock.method(Date, "now", () => 1000);
+  t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
+  const reason = new DOMException("fixture upstream failure", "TimeoutError");
+  const session = new WeixinQrLoginSession("synthetic", "synthetic", "https://example.test", async () => { throw reason; }, 1015);
+  await assert.rejects(session.poll(), error => error === reason);
+});
 
 async function withMutedConsole<T>(fn: () => Promise<T>): Promise<T> {
   const originalLog = console.log;

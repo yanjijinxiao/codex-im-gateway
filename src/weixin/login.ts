@@ -59,14 +59,22 @@ export class WeixinQrLoginSession {
     if (Date.now() >= this.deadline) {
       return { status: "expired" };
     }
+    // Keep ownership of the QR's last request budget. A relative timer may
+    // expire just before Date.now reaches the same millisecond (or during a
+    // wall-clock adjustment); that is still this QR's expiry, not a transport
+    // failure. Longer-lived QR codes retain the independent 30-second request
+    // budget, whose timeout must not be mistaken for QR expiry.
+    const remaining = Math.max(1, this.deadline - Date.now());
+    const expiry = remaining <= 30_000 ? AbortSignal.timeout(remaining) : undefined;
     let status: QrStatusResponse;
     try { status = await get<QrStatusResponse>(
       this.fetchImpl,
       this.pollBaseUrl,
       `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(this.qrToken)}`,
-      Math.max(1, Math.min(30_000, this.deadline - Date.now()))
+      30_000,
+      expiry
     ); } catch (error) {
-      if (Date.now() >= this.deadline) return { status: "expired" };
+      if (Date.now() >= this.deadline || expiry?.aborted && error === expiry.reason) return { status: "expired" };
       throw error;
     }
     if (Date.now() >= this.deadline) return { status: "expired" };
@@ -149,10 +157,11 @@ function normalizeRedirectHost(host: string): string {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
-async function get<T>(fetchImpl: FetchLike, baseUrl: string, endpoint: string, timeoutMs = 30_000): Promise<T> {
+async function get<T>(fetchImpl: FetchLike, baseUrl: string, endpoint: string, timeoutMs = 30_000, signal?: AbortSignal): Promise<T> {
   const response = await fetchWithBudget(fetchImpl, `${baseUrl}/${endpoint}`, {
     method: "GET",
     timeoutMs,
+    ...(signal ? { signal } : {}),
     headers: { "iLink-App-ClientVersion": "1" }
   });
   const text = await response.text();
