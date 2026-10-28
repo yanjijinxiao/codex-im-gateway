@@ -160,6 +160,21 @@ test("native-unload waiting is read-only until the exact failed session becomes 
   assert.equal(nativeCalls, 2); assert.equal(f.manager.status(scope)?.phase, "recovered");
   assert.ok(f.notices.length > noticeCount);
 });
+test("an owner held error has a bounded waiting period and is never reported recovered", async t => {
+  const f = fixture(t, { unloadWaitMs: 150 });
+  f.backend.recoverSystemError = async () => ({ status: "deferred", reason: "awaiting-unload" });
+  await f.manager.request(scope); f.clock(1200); await f.manager.request(scope);
+  assert.equal(f.manager.status(scope)?.phase, "unsupported"); assert.match(f.manager.status(scope)!.message, /尚未恢复/);
+});
+test("a deployed lifecycle capability upgrades an existing owner-held wait", async t => {
+  const f = fixture(t); f.backend.recoverSystemError = async () => ({ status: "deferred", reason: "awaiting-unload" });
+  await f.manager.request(scope); f.clock(1200); f.backend.systemErrorLifecycleRecovery = true;
+  f.backend.recoverSystemError = async (input: any) => {
+    input.lifecycle.beforeArchive(); input.lifecycle.archived(); input.lifecycle.restored();
+    f.snapshot().state.runtimeStatus = "idle"; return { status: "recovered" };
+  };
+  await f.manager.request(scope); assert.equal(f.manager.status(scope)?.phase, "recovered");
+});
 test("a restarted unload wait does not repeat native release and throttles failed observations", async t => {
   const f = fixture(t);
   f.backend.recoverSystemError = async () => ({ status: "deferred", reason: "awaiting-unload" });

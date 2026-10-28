@@ -148,6 +148,7 @@ type WireMessage = {
 };
 
 export class AppServerCodexRunner implements CodexAppServerBackend {
+  readonly systemErrorLifecycleRecovery = true;
   readonly id = "app-server" as const;
   readonly capabilities = APP_SERVER_BACKEND_CAPABILITIES;
   private child?: ChildProcessWithoutNullStreams;
@@ -870,7 +871,11 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   async recoverSystemError(input: CodexSystemRecoveryInput): Promise<CodexSystemRecoveryResult> {
     this.operationLeases++;
     try {
-      const before = await this.readThreadSnapshot(input.threadId);
+      if (input.lifecycle?.restoring) {
+        if (!await this.restoreRecoveryPersistence(input, input.lifecycle.archiveConfirmed === true))
+          return { status: "deferred", reason: "unconfirmed" };
+      }
+      let before = await this.readThreadSnapshot(input.threadId);
       input.assertCurrent();
       if (before.state.threadId !== input.threadId || !canRecoverSystemError(before, input.failedTurnId))
         return { status: "deferred", reason: "changed", state: before.state };
@@ -885,6 +890,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if ([...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)
         || queue.data.length || queue.nextCursor)
         return { status: "deferred", reason: "busy" };
+      // A resumed active Goal can start inference autonomously. State repair
+      // must never become implicit permission to continue that objective.
+      if (input.lifecycle && (await this.getGoal(input.threadId))?.status === "active")
+        return { status: "deferred", reason: "busy" };
       // Rehydrate the exact native identity with inherited settings. No
       // turn/start, injected history, empty prompt or private-reader fallback.
       await this.ensureConnected();
@@ -894,6 +903,28 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         || current.state.runtimeStatus !== before.state.runtimeStatus || this.activeTurns.has(input.threadId)
         || this.unconfirmedStarts.has(input.threadId)) return { status: "deferred", reason: "changed", state: current.state };
       if (before.state.runtimeStatus === "systemError") {
+        if (input.lifecycle && !input.lifecycle.restoring) {
+          // A retained native owner prevents idle-unload indefinitely. The
+          // native archive/unarchive lifecycle releases exactly this failed
+          // runtime without executing a turn. Rollback intent must be durable
+          // BEFORE archive, and restoring active persistence is mandatory even
+          // if the source lease changes after that write.
+          input.lifecycle.beforeArchive();
+          let acknowledged = false;
+          try {
+            await this.request("thread/archive", { threadId: input.threadId }, 5_000);
+            acknowledged = true; input.lifecycle.archived();
+          } finally { await this.restoreRecoveryPersistence(input, acknowledged); }
+          input.assertCurrent();
+          before = await this.readThreadSnapshot(input.threadId);
+          input.assertCurrent();
+          if (before.state.threadId !== input.threadId || !canRecoverSystemError(before, input.failedTurnId)
+            || before.state.runtimeStatus !== "notLoaded") return { status: "deferred", reason: "changed", state: before.state };
+          const afterRestoreQueue = await this.listQueuedSubmissions(input.threadId);
+          input.assertCurrent();
+          if (afterRestoreQueue.data.length || afterRestoreQueue.nextCursor || (await this.getGoal(input.threadId))?.status === "active")
+            return { status: "deferred", reason: "busy" };
+        } else {
         // Resume on a loaded errored thread does not clear its native status.
         // Release only this connection's subscription; native idle unload
         // decides when it is safe. Never kill a shared server or other owner.
@@ -903,6 +934,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         this.subscribedThreads.delete(input.threadId);
         input.assertCurrent();
         return { status: "deferred", reason: "awaiting-unload", state: before.state };
+        }
       }
       const response = await this.request("thread/resume", { threadId: input.threadId }, 5_000) as { thread?: { id?: string } };
       if (response?.thread?.id !== input.threadId) return { status: "deferred", reason: "unconfirmed" };
@@ -914,6 +946,23 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         ? { status: "recovered", state: after.state }
         : { status: "failed", reason: "still-system-error", state: after.state };
     } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+  }
+
+  private async restoreRecoveryPersistence(input: CodexSystemRecoveryInput, archiveConfirmed: boolean): Promise<boolean> {
+    const state = (await this.readThreadSnapshot(input.threadId)).state;
+    if (state.threadId !== input.threadId) throw Error("Recovery restore identity changed");
+    let confirmed = archiveConfirmed;
+    if (state.persistence === "archived") {
+      await this.request("thread/unarchive", { threadId: input.threadId }, 5_000);
+      confirmed = true;
+    }
+    const actual = (await this.readThreadSnapshot(input.threadId)).state;
+    if (actual.threadId === input.threadId && actual.persistence === "active" && confirmed) {
+      input.lifecycle!.restored(); return true;
+    }
+    // A timed-out archive may still be executing. Do not clear the durable
+    // restoration obligation, or repeat archive, merely because a read is active.
+    return false;
   }
 
   async readNativeTurnLifecycle(threadId: string, turnId: string): Promise<import("./backend.js").CodexTurnObservation> {

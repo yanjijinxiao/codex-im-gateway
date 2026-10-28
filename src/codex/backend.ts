@@ -78,6 +78,14 @@ export type CodexSystemRecoveryInput = {
   threadId: string;
   failedTurnId: string;
   assertCurrent: () => void;
+  /** Durable rollback obligation, set before a native lifecycle write. */
+  lifecycle?: {
+    restoring?: boolean;
+    archiveConfirmed?: boolean;
+    beforeArchive(): void;
+    archived(): void;
+    restored(): void;
+  };
 };
 export type CodexSystemRecoveryResult = {
   status: "recovered" | "deferred" | "unsupported" | "failed";
@@ -232,7 +240,8 @@ export class CodexThreadStateError extends Error {
     readonly code: CodexThreadStateErrorCode,
     readonly threadId: string,
     message: string,
-    readonly lastTurnFailure?: CodexThreadState["lastTurnFailure"]
+    readonly lastTurnFailure?: CodexThreadState["lastTurnFailure"],
+    readonly systemRecovery?: CodexSystemRecoveryResult["status"] | "waiting" | "recovering" | "cancelled"
   ) {
     super(message);
     this.name = "CodexThreadStateError";
@@ -498,6 +507,7 @@ export interface CodexThreadContinuation {
 
 /** Every backend implements this boundary; unavailable operations reject explicitly. */
 export interface CodexBackendControls {
+  readonly systemErrorLifecycleRecovery?: boolean;
   recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;
   getHistory(threadId: string): Promise<CodexHistoryMessage[]>;
   getHistoryPage(threadId: string, input?: CodexHistoryPageInput): Promise<CodexHistoryPage>;
@@ -531,6 +541,7 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  readonly systemErrorLifecycleRecovery?: boolean;
   recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   stageAttachments?: import("./inbound-files.js").StageInboundFiles;

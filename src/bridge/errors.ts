@@ -45,6 +45,19 @@ export function userFacingMessageHandlingError(error: unknown): string {
           "[codex-im-gateway] 上一轮因模型容量不足失败，这条新消息未提交；绑定已保留。",
           "当前未安排新的容量恢复：自动恢复预算已用尽、原生状态未确认或接口暂不支持。可用 /status、/history 核对；未重发消息或切换模型。"
         ].join("\n");
+        if (error.systemRecovery) {
+          const status = {
+            recovering: "正在核对并恢复原生会话状态，尚未确认恢复成功。",
+            waiting: "原生客户端仍持有故障运行时，自动恢复尚未完成。",
+            recovered: "上次系统状态恢复已确认；本次状态仍需重新核对。",
+            deferred: "恢复因原生执行或提交状态未确认而暂缓。",
+            unsupported: "当前原生执行者没有可用的安全恢复接口，尚未恢复。",
+            failed: "本次系统状态恢复尚未成功，详细进展会持续更新。",
+            cancelled: "本次恢复因会话来源或执行状态改变而停止。"
+          }[error.systemRecovery];
+          return ["[codex-im-gateway] 原会话仍未恢复，这条新消息尚未提交；绑定已保留。",
+            ...(error.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(error.lastTurnFailure.code)}`] : []), status].join("\n");
+        }
         return ["[codex-im-gateway] 当前 Codex session 处于系统错误状态（systemError），这条新消息未提交；绑定已保留。",
           ...(error.lastTurnFailure ? [`上一轮失败原因：${codexFailureSummary(error.lastTurnFailure.code)}`] : []),
           "请先在 Codex App 原会话中查看并处理错误，恢复可用后再发送新消息。Gateway 未自动恢复任务、重试或换后端重发。"].join("\n");

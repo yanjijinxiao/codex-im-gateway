@@ -1234,7 +1234,8 @@ export class BridgeService {
     if (recovered) return recovered;
     const progress = this.options.sessionFollow?.status(session).runtimeRecovery;
     throw new CodexThreadStateError("system-error", state.threadId,
-      `${progress?.turnId === state.lastTurnFailure.turnId ? progress.message : "systemError 恢复检查尚未确认成功，请查看恢复进展。"}\n本条输入尚未提交到 Codex。`, state.lastTurnFailure);
+      `${progress?.turnId === state.lastTurnFailure.turnId ? progress.message : "systemError 恢复检查尚未确认成功，请查看恢复进展。"}\n本条输入尚未提交到 Codex。`, state.lastTurnFailure,
+      progress?.turnId === state.lastTurnFailure.turnId ? progress.phase : "recovering");
   }
 
   private assertSessionCapability(senderId: string, capability: "liveFollow" | "collaborationModes" | "goals" | "progress"): void {

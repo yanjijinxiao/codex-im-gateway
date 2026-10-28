@@ -76,6 +76,7 @@ export type HybridCodexRunnerOptions = CodexBackendRouterOptions;
  * rollouts or reject unsupported capabilities; they never borrow app-server.
  */
 export class CodexBackendRouter implements CodexBridgeBackend {
+  readonly systemErrorLifecycleRecovery = true;
   private readonly appServer: CodexAppServerBackend;
   private readonly exec: CodexBackendAdapter;
   private readonly desktop: Pick<DesktopCodexRunner, "run" | "steer" | "stop" | "close"> &
@@ -195,6 +196,9 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async recoverSystemError(input: CodexSystemRecoveryInput, hostId = "local"): Promise<CodexSystemRecoveryResult> {
+    // Undo only a durable recovery-owned lifecycle write, even if the user
+    // has since switched bindings/backend. No task is run by this compensation.
+    if (input.lifecycle?.restoring) return this.appServerFor(hostId).recoverSystemError!(input);
     if (this.selectedBackend === "exec") return { status: "unsupported", reason: "owner-unsupported" };
     const snapshot = await this.readThreadSnapshot(input.threadId, hostId);
     input.assertCurrent();
@@ -501,6 +505,7 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     assertCurrent?: () => void
   ): Promise<CodexThreadGoal | undefined> {
     assertCurrent?.();
+    this.options.onThreadMutation?.(threadId, hostId ?? "local");
     return this.backendForSharedOperation(hostId).setGoal(threadId, input, assertCurrent);
   }
 

@@ -26,6 +26,7 @@ import { InteractionRoutingJournal, type InteractionDestination, type Interactio
 import { ThreadEventHub, type ThreadSubscription } from "./thread-event-hub.js";
 import { CapacityRecoveryCoordinator } from "./capacity-recovery.js";
 import { SystemErrorRecoveryCoordinator, type SystemRecoveryScope } from "./system-error-recovery.js";
+import { CodexInterventionError } from "../codex/backend.js";
 import {
   userFacingMessageHandlingError,
   wasMessageHandlingErrorReported
@@ -407,7 +408,8 @@ export class AccountManager {
     this.capacityRecovery = new CapacityRecoveryCoordinator({
       filePath: path.join(options.paths.runtimeDir, "capacity-recovery.json"),
       backend: () => this.runnerFor(this.configProvider()),
-      eligible: scope => !this.runtimeConfigurationChanging && !this.stoppingAll && [...this.entries.values()].some(entry => entry.status === "running" && entry.store?.listSessions().some(session =>
+      eligible: scope => !this.runtimeConfigurationChanging && !this.stoppingAll && !this.systemRecovery.hasPendingRestore(scope.threadId, scope.hostId)
+        && [...this.entries.values()].some(entry => entry.status === "running" && entry.store?.listSessions().some(session =>
         session.threadId === scope.threadId && session.follow !== false
         && (session.hostId ?? entry.store?.getProject(session.projectId ?? "")?.hostId ?? "local") === scope.hostId
         && entry.store?.getBoundSession(session.senderId)?.id === session.id)),
@@ -461,7 +463,11 @@ export class AccountManager {
       appServerTransport: config.codexAppServerTransport,
       codexBin: config.codexBin,
       execSandbox: config.codexExecSandbox,
-      onThreadMutation: (threadId, hostId) => { this.capacityRecovery.cancel(threadId, hostId); this.systemRecovery.cancel(threadId, hostId); }
+      onThreadMutation: (threadId, hostId) => {
+        if (this.systemRecovery.hasPendingRestore(threadId, hostId))
+          throw new CodexInterventionError("原生会话正在恢复原活动状态，结果尚未确认；本条输入未提交，请查看系统恢复进展。");
+        this.capacityRecovery.cancel(threadId, hostId); this.systemRecovery.cancel(threadId, hostId);
+      }
     }));
     this.codexSessionMonitorFactory = options.codexSessionMonitorFactory
       ?? ((handlers) => new CodexSessionCompletionMonitor(handlers));

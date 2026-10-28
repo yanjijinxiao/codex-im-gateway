@@ -74,3 +74,12 @@ test("tracks errors already reported through an existing channel stream", () => 
   assert.equal(wasMessageHandlingErrorReported(untouched), false);
   assert.equal(wasMessageHandlingErrorReported("primitive"), false);
 });
+
+for (const phase of ["recovering", "waiting", "failed", "unsupported", "deferred", "cancelled"] as const)
+  test(`system recovery ${phase} survives final channel error formatting without leaking raw error text`, () => {
+    const error = new CodexThreadStateError("system-error", "thread", "secret raw provider data",
+      { turnId: "failed", code: "workspace-routing" }, phase);
+    const text = userFacingMessageHandlingError(error);
+    assert.match(text, /原会话仍未恢复/); assert.match(text, /尚未提交/);
+    assert.doesNotMatch(text, /secret|请先在 Codex App|Gateway 未自动恢复任务/);
+  });
