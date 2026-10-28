@@ -802,7 +802,7 @@ export class ThreadEventHub {
         }
       });
       try {
-        if (progress.phase === "recovering" || progress.phase === "waiting") { await stream.progress(progress.message); await stream.flush(); }
+        if (["recovering", "restoring", "waiting"].includes(progress.phase)) { await stream.progress(progress.message); await stream.flush(); }
         else {
           let text = progress.message;
           try { text = await this.options.decorateFinal?.(sub, text) ?? text; } catch { /* optional IDE metadata */ }

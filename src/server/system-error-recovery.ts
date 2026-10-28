@@ -6,7 +6,7 @@ import { codexFailureSummary } from "../codex/turn-failure.js";
 export type SystemRecoveryScope = { hostId: string; threadId: string; turnId: string };
 const recordSchema = z.object({
   hostId: z.string(), threadId: z.string(), turnId: z.string(), attempts: z.number().int().min(0).max(3),
-  phase: z.enum(["recovering", "waiting", "recovered", "deferred", "unsupported", "failed", "cancelled"]),
+  phase: z.enum(["recovering", "restoring", "waiting", "recovered", "deferred", "unsupported", "failed", "cancelled"]),
   updatedAt: z.number().finite(), nextAt: z.number().finite(), message: z.string(),
   restoreActive: z.boolean().optional(), archiveConfirmed: z.boolean().optional(),
   waitingSince: z.number().finite().optional(),
@@ -180,22 +180,24 @@ export class SystemErrorRecoveryCoordinator {
         : "恢复请求或状态核对未确认成功；保留原会话及错误，未重发消息。";
     }
     if (row.restoreActive) {
-      row.phase = "failed"; row.nextAt = this.now() + 10_000;
+      row.phase = "restoring"; row.nextAt = this.now() + 10_000;
       row.message = "原生活动状态恢复尚未确认，已保留恢复记录并继续核对；该会话的新写入暂缓，旧消息未重发。";
     }
     row.updatedAt = this.now(); this.save(row); this.publish(row, state, sourceGuard); return state;
   }
   private lifecycle(row: SystemRecoveryStatus, guard: () => void, restoring = false) {
     return { restoring, archiveConfirmed: row.archiveConfirmed,
-      beforeArchive: () => { guard(); row.restoreActive = true; row.archiveConfirmed = false; this.save(row); },
+      // This distinct phase also protects rollback: older readers reject the
+      // optional ledger and preserve it, rather than stripping an unknown duty.
+      beforeArchive: () => { guard(); row.phase = "restoring"; row.restoreActive = true; row.archiveConfirmed = false; this.save(row); },
       archived: () => { row.archiveConfirmed = true; this.save(row); },
-      restored: () => { row.restoreActive = false; row.archiveConfirmed = false; this.save(row); }
+      restored: () => { row.restoreActive = false; row.archiveConfirmed = false; row.phase = "recovering"; this.save(row); }
     };
   }
   private async restore(scope: SystemRecoveryScope, guard: () => void, sourceGuard: () => void): Promise<CodexThreadState | undefined> {
     const row = structuredClone(this.records[key(scope)]), backend = this.options.backend();
     let state: CodexThreadState | undefined;
-    row.phase = "recovering"; row.updatedAt = this.now(); row.message = "正在恢复原生会话的原活动状态，不重发或启动任务。";
+    row.phase = "restoring"; row.updatedAt = this.now(); row.message = "正在恢复原生会话的原活动状态，不重发或启动任务。";
     this.save(row); this.publish(row, undefined, sourceGuard);
     try {
       await backend.recoverSystemError?.({ threadId: scope.threadId, failedTurnId: scope.turnId, assertCurrent: guard,
@@ -206,6 +208,7 @@ export class SystemErrorRecoveryCoordinator {
         row.phase = "recovered"; state = actual; row.message = "原生已确认原会话活动状态和系统状态恢复；历史与绑定保留，旧消息未重发。";
       } else { row.phase = "deferred"; row.message = "原生活动状态与系统状态仍需核对，恢复记录已保留。"; }
     } catch { row.phase = "failed"; row.message = "原生活动状态恢复仍未确认，保留恢复记录继续核对；未重发消息。"; }
+    if (row.restoreActive) row.phase = "restoring";
     row.updatedAt = this.now(); row.nextAt = this.now() + (row.restoreActive ? 10_000 : this.options.cooldownMs ?? 60_000);
     this.save(row); this.publish(row, state, sourceGuard); return state;
   }

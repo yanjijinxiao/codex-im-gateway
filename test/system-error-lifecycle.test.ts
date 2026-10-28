@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { z } from "zod";
 import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
 import { CodexBackendRouter } from "../src/codex/runner.js";
 import { SystemErrorRecoveryCoordinator } from "../src/server/system-error-recovery.js";
@@ -112,7 +113,10 @@ test("coordinator makes rollback obligation durable before any native archive", 
     async recoverSystemError(input: any) {
       input.lifecycle.beforeArchive();
       const row = Object.values(JSON.parse(fs.readFileSync(filePath, "utf8")))[0] as any;
-      assert.equal(row.restoreActive, true); input.lifecycle.archived();
+      assert.equal(row.restoreActive, true); assert.equal(row.phase, "restoring");
+      assert.throws(() => z.object({ phase: z.enum(["recovering", "waiting", "recovered", "deferred", "unsupported", "failed", "cancelled"]) }).parse(row),
+        "the old optional-ledger reader rejects and preserves pending compensation instead of stripping it");
+      input.lifecycle.archived();
       throw Error("disconnected after archive");
     } } as any;
   const coordinator = new SystemErrorRecoveryCoordinator({ filePath, backend: () => backend, lease: () => () => {}, notice: async () => {}, now: () => 100 });

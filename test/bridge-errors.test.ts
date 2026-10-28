@@ -75,7 +75,7 @@ test("tracks errors already reported through an existing channel stream", () => 
   assert.equal(wasMessageHandlingErrorReported("primitive"), false);
 });
 
-for (const phase of ["recovering", "waiting", "failed", "unsupported", "deferred", "cancelled"] as const)
+for (const phase of ["recovering", "restoring", "waiting", "failed", "unsupported", "deferred", "cancelled"] as const)
   test(`system recovery ${phase} survives final channel error formatting without leaking raw error text`, () => {
     const error = new CodexThreadStateError("system-error", "thread", "secret raw provider data",
       { turnId: "failed", code: "workspace-routing" }, phase);

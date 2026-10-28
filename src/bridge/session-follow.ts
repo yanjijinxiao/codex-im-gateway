@@ -28,7 +28,7 @@ export type SessionFollowStatus = {
   /** Delivery acknowledgements are independent of the backend execution state. */
   resultDelivery?: { pending: number; deferred?: number; lastDeliveredTurnId?: string };
   progressDelivery?: { stage: ChannelStreamBootstrap["stage"] | "legacy-unconfirmed"; requiresConfirmation: boolean; failure?: ChannelStreamFailure };
-  runtimeRecovery?: { turnId: string; phase: "recovering" | "waiting" | "recovered" | "deferred" | "unsupported" | "failed" | "cancelled";
+  runtimeRecovery?: { turnId: string; phase: "recovering" | "restoring" | "waiting" | "recovered" | "deferred" | "unsupported" | "failed" | "cancelled";
     attempts: number; message: string; updatedAt: number };
 };
 

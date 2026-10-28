@@ -241,7 +241,7 @@ export class CodexThreadStateError extends Error {
     readonly threadId: string,
     message: string,
     readonly lastTurnFailure?: CodexThreadState["lastTurnFailure"],
-    readonly systemRecovery?: CodexSystemRecoveryResult["status"] | "waiting" | "recovering" | "cancelled"
+    readonly systemRecovery?: CodexSystemRecoveryResult["status"] | "waiting" | "recovering" | "restoring" | "cancelled"
   ) {
     super(message);
     this.name = "CodexThreadStateError";

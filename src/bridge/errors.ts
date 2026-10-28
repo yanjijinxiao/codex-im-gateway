@@ -48,6 +48,7 @@ export function userFacingMessageHandlingError(error: unknown): string {
         if (error.systemRecovery) {
           const status = {
             recovering: "正在核对并恢复原生会话状态，尚未确认恢复成功。",
+            restoring: "正在恢复原生活动状态，结果尚未确认，新的输入暂缓提交。",
             waiting: "原生客户端仍持有故障运行时，自动恢复尚未完成。",
             recovered: "上次系统状态恢复已确认；本次状态仍需重新核对。",
             deferred: "恢复因原生执行或提交状态未确认而暂缓。",
