@@ -224,8 +224,8 @@ export class CodexSessionCompletionMonitor {
     try {
       const size = await safeFileSize(filePath);
       if (runId !== undefined && !this.isActiveRun(runId)) return;
-      const cursor = this.cursors.get(filePath) ?? { offset: 0 };
-      if (size < cursor.offset) cursor.offset = 0;
+      let cursor = this.cursors.get(filePath) ?? { offset: 0 };
+      if (size < cursor.offset) cursor = { offset: 0, emitAfter: this.now() };
       if (size === cursor.offset) {
         this.cursors.set(filePath, cursor);
         return;
@@ -256,9 +256,12 @@ export class CodexSessionCompletionMonitor {
     const payload = recordValue(event.payload);
     if (event.type === "session_meta" && payload) {
       const identity = rolloutIdentity(payload);
+      // Forked histories can contain the parent's original session_meta after
+      // the child header. A file's owner never changes with inherited history.
+      if (cursor.sessionId && identity.threadId !== cursor.sessionId) return;
       if (typeof payload.cwd === "string") cursor.workspace = path.resolve(payload.cwd);
       cursor.sessionId = identity.threadId;
-      cursor.internal = identity.internal;
+      cursor.internal ??= !identity.threadId || identity.internal;
       return;
     }
     if (!payload || cursor.internal || !cursor.sessionId) return;

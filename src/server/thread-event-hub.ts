@@ -30,6 +30,7 @@ export type ThreadSubscription = {
   onTextDelivered?: (part: { messageId: string; text: string }) => void;
 };
 type FollowState = {
+  provenanceVersion?: number;
   deliveryVersion?: number;
   eventVersion?: number;
   hostId: string;
@@ -74,7 +75,7 @@ type Options = {
   turnAudience?: TurnAudienceJournal;
   filePath: string;
   subscriptions: () => ThreadSubscription[];
-  backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot"> & Partial<Pick<CodexBridgeBackend, "readTurnLifecycle">>;
+  backend: () => Pick<CodexBridgeBackend, "readThreadSnapshot"> & Partial<Pick<CodexBridgeBackend, "readTurnLifecycle" | "readThreadProvenance">>;
   legacyQueueTerminal?: (sub: ThreadSubscription, turnId: string) => boolean;
   /** Recovery projection of existing native receipts, not an execution queue. */
   acceptedInputs?: () => readonly AcceptedPresentationInput[];
@@ -105,6 +106,8 @@ export class ThreadEventHub {
   private readonly preparedStreams = new Set<string>();
   private readonly previousRecoveries = new Map<string, Promise<void>>();
   private readonly previousRetryAt = new Map<string, number>();
+  private readonly provenanceRepairs = new Map<string, Promise<void>>();
+  private readonly provenanceRetryAt = new Map<string, number>();
   constructor(private readonly options: Options) {
     this.states = readJsonObjectFile(options.filePath, {});
     if (Object.values(this.states).some(state => !isJsonObject(state)))
@@ -188,6 +191,7 @@ export class ThreadEventHub {
     await this.scan;
     await Promise.allSettled(this.manualSyncs.values());
     await Promise.allSettled(this.previousRecoveries.values());
+    await Promise.allSettled(this.provenanceRepairs.values());
     const cleanup = await Promise.allSettled([...this.streams.values()].map(stream => stream.suspend()).concat([...this.retiringStreams.values()]));
     for (const result of cleanup) if (result.status === "rejected") report(result.reason);
     this.streams.clear();
@@ -310,8 +314,23 @@ export class ThreadEventHub {
         }
         // Reject a mismatched response before any progress or cursor can be updated.
         if (snapshot.state.threadId !== sub.threadId) throw new Error("Backend returned another thread snapshot");
+        this.requestProvenanceRepair(sub, snapshot);
         await this.repairQueueTerminals(sub);
         if (this.stopped || !this.isLive(sub) || this.readVersions.get(sub.key) !== version) return this.changedBinding();
+        const observedActive = snapshot.state.activeTurnId;
+        const observedTurn = snapshot.turns.find(turn => turn.id === observedActive && turn.status === "inProgress");
+        if (snapshot.state.runtimeStatus === "active" && observedActive
+          && (state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
+            || state.turnId && state.turnId !== observedActive && observedTurn?.startedAt && state.startedAt
+              && Date.parse(state.startedAt) > Date.parse(observedTurn.startedAt))) {
+          // Validate before selectTurn: otherwise the conflicting old slot is
+          // closed as a supposed new turn before the proof can be checked.
+          state.runtime = snapshot.state; state.observedAt = new Date().toISOString();
+          const reason = state.completed.includes(observedActive) || state.checkpointTurnId === observedActive && state.checkpoint?.finished
+            ? "旧展示已有完成回执，与原生状态相互冲突" : "旧展示时间线与原生当前轮次冲突";
+          this.failSync(sub, { code: "unconfirmed", message: `${reason}；正在核对来源，未中断或重跑主任务。` }, "unconfirmed");
+          return this.status(sub.key);
+        }
         // Pre-upgrade Gateway shutdown could poison a suspended card with a
         // local transport error. Only a loaded writer confirming the SAME
         // still-running turn may recover an unacknowledged presentation error.
@@ -455,6 +474,70 @@ export class ThreadEventHub {
         snapshotAt: state.observedAt, lastSyncedAt: state.lastSyncedAt
       })}`);
     }
+  }
+  /** A loaded owner AND complete native source must agree before repairing
+   * legacy child-output pollution. This scan never blocks /status or ingress. */
+  private requestProvenanceRepair(sub: ThreadSubscription, snapshot: CodexThreadSnapshot): void {
+    const state = this.state(sub), activeId = snapshot.state.activeTurnId;
+    const read = this.options.backend().readThreadProvenance;
+    if (!read || sub.managed || state.provenanceVersion === 3 || this.provenanceRepairs.has(sub.key)
+      || Date.now() < (this.provenanceRetryAt.get(sub.key) ?? 0) || snapshot.state.executionOwner !== "desktop"
+      || snapshot.state.runtimeStatus !== "active" || !activeId
+      || !state.completed.length && !state.baseline?.length && !state.retired?.length && (!state.turnId || state.turnId === activeId)) return;
+    const work = (async () => {
+      const provenance = await boundedRead(read.call(this.options.backend(), sub.threadId, sub.hostId), this.options.readTimeoutMs ?? 25000);
+      if (this.stopped || !this.isLive(sub) || !provenance?.complete || provenance.threadId !== sub.threadId
+        || !provenance.turns.some(turn => turn.id === activeId && turn.status === "inProgress")) return;
+      const fresh = await boundedRead(this.options.backend().readThreadSnapshot(sub.threadId, sub.hostId), this.options.readTimeoutMs ?? 25000);
+      const active = fresh.turns.find(turn => turn.id === activeId && turn.status === "inProgress");
+      if (fresh.state.threadId !== sub.threadId || fresh.state.persistence !== "active" || fresh.state.executionOwner !== "desktop"
+        || fresh.state.runtimeStatus !== "active" || fresh.state.activeTurnId !== activeId || !active) return;
+      await this.queue.run(sub.key, async () => {
+        if (this.stopped || !this.isLive(sub) || state.provenanceVersion === 3
+          || state.runtime?.activeTurnId && state.runtime.activeTurnId !== activeId) return;
+        const known = new Set(provenance.turns.map(turn => turn.id));
+        const repairPresentation = state.completed.includes(activeId) || state.checkpointTurnId === activeId && state.checkpoint?.finished
+          || Boolean(state.turnId && !known.has(state.turnId));
+        const foreignLedger = [...state.completed, ...(state.baseline ?? []), ...(state.retired ?? [])].some(id => !known.has(id));
+        if (!repairPresentation && !foreignLedger) { state.provenanceVersion = 3; this.save(); return; }
+        const correction = repairPresentation
+          ? "此前进度混入了子任务结果，“已完成”不代表主任务结束。主任务仍在执行，已恢复主任务进展同步。"
+          : "此前混入了子任务的完成记录，已校正来源；当前主任务仍在执行。";
+        const oldTurn = state.turnId;
+        if (repairPresentation) {
+          delete state.terminalPending;
+          if (state.pendingTerminals) { delete state.pendingTerminals[activeId]; if (oldTurn) delete state.pendingTerminals[oldTurn]; }
+          if (state.checkpoint && !state.checkpoint.finished) {
+            delete state.checkpoint.terminal;
+            await this.stream(sub).invalidatePresentation(correction);
+          }
+          if (this.stopped || !this.isLive(sub)) return;
+          this.rotateStream(sub);
+          state.turnId = state.checkpointTurnId = activeId;
+          state.presentationInputBaseline = this.presentationInputs(sub, activeId).map(input => input.id);
+          state.checkpoint ??= { startedAt: Date.now(), progressEntries: [], thought: "正在恢复主任务进展…", answerPreview: "", finished: false };
+        }
+        state.completed = state.completed.filter(id => id !== activeId && known.has(id));
+        state.baseline = state.baseline?.filter(id => id !== activeId && known.has(id));
+        state.retired = state.retired?.filter(id => id !== activeId && known.has(id));
+        state.startedAt = active.startedAt;
+        state.historyBoundary = followBoundary(active);
+        if (state.checkpoint && active.startedAt && Number.isFinite(Date.parse(active.startedAt))) state.checkpoint.startedAt = Date.parse(active.startedAt);
+        state.provenanceVersion = 3; state.initialized = true; state.sequence++;
+        state.runtime = fresh.state; state.syncStatus = "synced";
+        state.observedAt = state.lastSyncedAt = new Date().toISOString(); delete state.syncFailure;
+        this.save();
+        if (sub.progressEnabled !== false) {
+          await this.stream(sub).progress(correction);
+          const latest = active.messages.filter(message => message.role === "assistant" && message.kind === "progress").at(-1)?.text;
+          if (latest) await this.deliver(sub, activeId, latest);
+          await this.stream(sub).flush();
+        }
+      });
+    })().catch(report).finally(() => {
+      this.provenanceRepairs.delete(sub.key); this.provenanceRetryAt.set(sub.key, Date.now() + 60000);
+    });
+    this.provenanceRepairs.set(sub.key, work);
   }
   /** Narrow migration for pre-v2 queue terminals. Known cards are updated in
    * place; only a confirmed still-running CURRENT turn gets a fresh stream. */

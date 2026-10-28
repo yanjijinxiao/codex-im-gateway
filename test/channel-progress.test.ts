@@ -4,9 +4,29 @@ import { ChannelTurnTextStream } from "../src/channels/progress.js";
 import { createChannelClient, TEXT_CAPABILITIES } from "../src/channels/client.js";
 import { ChannelCapabilityError, ChannelProgressError, channelProgressError } from "../src/channels/errors.js";
 import { TextProgressBatcher } from "../src/channels/text-progress.js";
-import { summarizeProgress } from "../src/channels/progress-summary.js";
+import { summarizeProgress, meaningfulProgress, splitProgressRecords } from "../src/channels/progress-summary.js";
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("cumulative compaction progress is atomic, deduplicated and ends at the latest phase", async t => {
+  const frames: string[] = [];
+  const stream = new ChannelTurnTextStream({ async sendText() { return { messageId: "text" }; },
+    async startTextStream(input) { frames.push(input.text); return { messageId: "card" }; },
+    async updateTextStream(input) { frames.push(input.text); } }, "chat", { save() {}, restore: { startedAt: Date.now(), progressEntries: [], thought: "", answerPreview: "", finished: false, statusHeader: true } });
+  t.after(() => stream.suspend());
+  const start = "🧹 正在整理长会话上下文", done = "✅ 上下文整理完成";
+  const failure = "❌ 文件检查失败，退出码 2，耗时 122ms";
+  await stream.progress(start); await stream.progress(done);
+  await stream.progress([start, done, failure].join("\n\n")); await stream.flush();
+  const checkpoint = stream.checkpoint();
+  assert.deepEqual(checkpoint.progressEntries, [start, done, failure]); assert.equal(checkpoint.toolActivity?.failed, 1);
+  assert.match(frames.at(-1)!, /\*\*当前进展\*\*\n\n✅ 上下文整理完成/);
+  assert.equal((frames.at(-1)!.match(/🧹 正在整理长会话上下文/g) ?? []).length, 1);
+  await stream.progress([start, done, failure].join("\n\n"));
+  assert.equal(stream.checkpoint().toolActivity?.failed, 1, "snapshot replay is not another failed tool");
+  assert.deepEqual(meaningfulProgress([start, done, start]), [done, start], "a genuinely new start remains current");
+  assert.equal(splitProgressRecords("说明\n\n- 普通 Markdown\n- 第二段").length, 1);
+});
 
 test("presentation correction waits for old progress frames and never claims a native outcome", async t => {
   let release!: () => void;

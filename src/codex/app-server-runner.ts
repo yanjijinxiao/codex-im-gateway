@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
-import { readNativeTurnLifecycle, observeOwnerTurn } from "./native-turn-lifecycle.js";
+import { readNativeTurnLifecycle, observeOwnerTurn, readNativeThreadProvenance } from "./native-turn-lifecycle.js";
 import { communicationError, isCodexCommunicationFailure, CodexCommunicationError } from "./communication-error.js";
 import { parseUserInputRequest } from "./user-input.js";
 import { parseMcpForm, mcpFormResponse, safeElicitationUrl, type McpForm } from "./elicitation.js";
@@ -976,6 +976,16 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (response.thread?.id !== threadId || !response.thread.path || !path.isAbsolute(response.thread.path))
         return { status: "unknown", source: "unknown" };
       return await readNativeTurnLifecycle(response.thread.path, threadId, turnId);
+    } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
+  }
+  async readThreadProvenance(threadId: string): Promise<import("./backend.js").CodexThreadProvenance | undefined> {
+    if (this.options.transport?.mode === "remote-daemon") return;
+    this.operationLeases++;
+    try {
+      await this.ensureConnected();
+      const response = await this.request("thread/read", { threadId, includeTurns: false }, Math.min(this.options.requestTimeoutMs ?? 15000, 15000)) as { thread?: { id?: string; path?: string } };
+      if (response.thread?.id !== threadId || !response.thread.path || !path.isAbsolute(response.thread.path)) return;
+      return await readNativeThreadProvenance(response.thread.path, threadId);
     } finally { this.operationLeases--; await this.recyclePrivateTransportIfIdle(); }
   }
 

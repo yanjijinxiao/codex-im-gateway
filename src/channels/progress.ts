@@ -3,7 +3,7 @@ import { markdownPreview } from "./markdown-preview.js";
 import type { ChannelTextClient, ChannelProgressLayout } from "./types.js";
 import { TextProgressBatcher } from "./text-progress.js";
 import { channelProgressError } from "./errors.js";
-import { summarizeProgress, meaningfulProgress, progressKind } from "./progress-summary.js";
+import { meaningfulProgress, progressKind, splitProgressRecords } from "./progress-summary.js";
 import { DEFAULT_RESULT_PAGE_BYTES, resultPages } from "./result-pages.js";
 import { copyBlock } from "./copyable.js";
 import { TURN_STATUS_BYTES, turnStatusHeading, withTurnStatus, type TurnActivity, type TurnOutcome } from "./turn-status.js";
@@ -21,6 +21,7 @@ export type ChannelStreamCheckpoint = {
   presentationFailure?: ChannelStreamFailure;
   startedAt: number;
   progressEntries: string[];
+  progressReceipts?: string[];
   thought: string;
   answerPreview: string;
   finished: boolean;
@@ -90,6 +91,7 @@ export class ChannelTurnTextStream {
   private opening?: Promise<boolean>;
   private readonly progressEntries: string[] = [];
   private thought = "正在理解任务并规划下一步…";
+  private readonly progressReceipts = new Set<string>();
   private answerPreview = "";
   private updateTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
@@ -130,11 +132,14 @@ export class ChannelTurnTextStream {
       if (this.bootstrap?.stage === "delivered") this.messageId ??= this.bootstrap.messageId;
       this.startedAt = saved.startedAt;
       this.progressEntries.push(...meaningfulProgress(saved.progressEntries));
+      for (const receipt of (Array.isArray(saved.progressReceipts) ? saved.progressReceipts : []).slice(-128))
+        if (/^[a-f0-9]{64}$/.test(receipt)) this.progressReceipts.add(receipt);
       this.toolActivity = saved.toolActivity ? { ...saved.toolActivity } : {
         completed: saved.progressEntries.filter(entry => entry.startsWith("✅")).length,
         failed: saved.progressEntries.filter(entry => entry.startsWith("❌")).length
       };
       this.thought = saved.thought;
+      this.toolActivity.failed = Math.max(this.toolActivity.failed, this.progressEntries.filter(entry => progressKind(entry) === "failure").length);
       this.answerPreview = saved.answerPreview;
       this.finished = saved.finished;
       this.communicationNotice = saved.communicationNotice;
@@ -155,6 +160,7 @@ export class ChannelTurnTextStream {
       ...(this.bootstrap ? { bootstrap: structuredClone(this.bootstrap) } : {}),
       ...(this.presentationFailure ? { presentationFailure: this.presentationFailure } : {}),
       progressEntries: [...this.progressEntries], thought: this.thought,
+      ...(this.progressReceipts.size ? { progressReceipts: [...this.progressReceipts] } : {}),
       answerPreview: this.answerPreview, finished: this.finished,
       ...(this.communicationNotice ? { communicationNotice: this.communicationNotice } : {}),
       ...(this.recoveryNotice ? { recoveryNotice: this.recoveryNotice } : {}),
@@ -215,33 +221,46 @@ export class ChannelTurnTextStream {
 
   async progress(text: string): Promise<boolean> {
     if (this.finished || this.terminal || this.suspended) return true;
-    const content = summarizeProgress(text);
-    if (!content) return false;
+    const records = splitProgressRecords(text).filter(Boolean);
+    if (!records.length) return false;
+    const known = (content: string) => this.progressReceipts.has(crypto.createHash("sha256").update(content).digest("hex")) || this.progressEntries.includes(content);
+    if (records.length > 1 && records.every(known)) return true;
+    const applied: string[] = [];
     this.communicationNotice = undefined;
     this.recoveryNotice = undefined;
     this.activity = "running";
-    const kind = progressKind(content);
-    if (kind === "thought") {
-      this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
-    } else if (kind === "activity" || kind === "failure") {
-      if (this.toolActivity.last !== content) {
-        this.toolActivity.last = content;
-        if (kind === "failure") this.toolActivity.failed++;
-        else if (content.startsWith("✅")) this.toolActivity.completed++;
+    for (const content of records) {
+      const receipt = crypto.createHash("sha256").update(content).digest("hex");
+      if (records.length > 1 && (this.progressReceipts.has(receipt) || this.progressEntries.includes(content))) continue;
+      applied.push(content);
+      this.progressReceipts.delete(receipt); this.progressReceipts.add(receipt);
+      if (this.progressReceipts.size > 128) this.progressReceipts.delete(this.progressReceipts.values().next().value!);
+      const kind = progressKind(content);
+      if (kind === "thought") {
+        this.thought = boundedProgressText(content.replace(/^🤔\s*/, ""), 600);
+      } else if (kind === "activity" || kind === "failure") {
+        if (this.toolActivity.last !== content) {
+          this.toolActivity.last = content;
+          if (kind === "failure") this.toolActivity.failed++;
+          else if (content.startsWith("✅")) this.toolActivity.completed++;
+        }
+        this.toolActivity.active = /^[🔎✏️]/u.test(content) ? boundedProgressText(content, 100) : undefined;
+        if (kind === "failure") this.progressEntries.push(boundedProgressText(content, 600));
+      } else {
+        const entry = boundedProgressText(content, 600);
+        if (entry && this.progressEntries.at(-1) !== entry) {
+          this.progressEntries.push(entry);
+        }
       }
-      this.toolActivity.active = /^[🔎✏️]/u.test(content) ? boundedProgressText(content, 100) : undefined;
-      if (kind === "failure") this.progressEntries.push(boundedProgressText(content, 600));
-    } else {
-      const entry = boundedProgressText(content, 600);
-      if (entry && this.progressEntries.at(-1) !== entry) {
-        this.progressEntries.push(entry);
-      }
+      this.progressEntries.splice(0, this.progressEntries.length, ...meaningfulProgress(this.progressEntries));
     }
-    this.progressEntries.splice(0, this.progressEntries.length, ...meaningfulProgress(this.progressEntries));
     this.persistence?.save(this.checkpoint());
     if (this.supported) { await this.publish(this.render()); return true; }
     // Native text-only channels retain their normal progress presentation.
-    try { return kind === "thought" || kind === "activity" ? true : await this.textProgress!.push(content); }
+    try {
+      for (const content of applied) if (!["thought", "activity"].includes(progressKind(content))) await this.textProgress!.push(content);
+      return true;
+    }
     catch { console.warn("[codex-im-gateway] text progress delivery failed"); return true; }
   }
 

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {readNativeTurnLifecycle, observeOwnerTurn} from "../src/codex/native-turn-lifecycle.js";
+import {readNativeTurnLifecycle, observeOwnerTurn, readNativeThreadProvenance} from "../src/codex/native-turn-lifecycle.js";
 import {CodexBackendRouter} from "../src/codex/runner.js";
 import {APP_SERVER_BACKEND_CAPABILITIES} from "../src/codex/backend.js";
 import {CodexCommunicationError} from "../src/codex/communication-error.js";
@@ -14,6 +14,20 @@ test("partial and contradictory owner snapshots cannot certify an ending", () =>
  assert.equal(observeOwnerTurn({state:{...state,activeTurnId:"new"},turns:[{id:"turn",status:"inProgress",messages:[]}]},"thread","turn").source,"unknown");
  assert.equal(observeOwnerTurn({state:{...state,runtimeStatus:"notLoaded"},turns:[{id:"turn",status:"completed",messages:[]}]},"thread","turn").source,"unknown");
  assert.throws(()=>observeOwnerTurn({state,turns:[]},"other-thread","turn"),/identity mismatch/);
+});
+
+test("complete provenance keeps root ownership and never treats inherited child headers or partial logs as authority", async t => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-complete-provenance-"));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));const file=path.join(dir,"rollout.jsonl");
+ const rows=[{type:"session_meta",payload:{id:"thread",source:"cli"}},
+  {type:"event_msg",payload:{type:"task_started",turn_id:"main"}},
+  {type:"response_item",payload:{type:"agent_message",content:[{type:"input_text",text:'{"type":"task_complete","turn_id":"main"}'}]}}];
+ fs.writeFileSync(file,rows.map(x=>JSON.stringify(x)).join("\n")+"\n");
+ assert.deepEqual(await readNativeThreadProvenance(file,"thread"),{threadId:"thread",complete:true,turns:[{id:"main",status:"inProgress"}]});
+ assert.equal(await readNativeThreadProvenance(file,"other"),undefined);
+ fs.writeFileSync(file,[{type:"session_meta",payload:{id:"child",source:{subagent:{}}}},...rows].map(x=>JSON.stringify(x)).join("\n")+"\n");
+ assert.equal(await readNativeThreadProvenance(file,"thread"),undefined);
+ assert.equal(await readNativeThreadProvenance(file,"child"),undefined);
+ fs.writeFileSync(file,rows.map(x=>JSON.stringify(x)).join("\n"));assert.equal(await readNativeThreadProvenance(file,"thread"),undefined);
 });
 
 test("only exact explicit native endings certify an unloaded turn; partial, guardian and other-turn records do not",async t=>{

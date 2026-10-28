@@ -285,6 +285,10 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     const backend = this.appServerFor(hostId);
     return backend.readNativeTurnLifecycle ? backend.readNativeTurnLifecycle(threadId, turnId) : { status: "unknown", source: "unknown" };
   }
+  async readThreadProvenance(threadId: string, hostId?: string) {
+    if (this.selectedBackend === "exec") return undefined;
+    return this.appServerFor(hostId).readThreadProvenance?.(threadId);
+  }
 
   private async runImmediately(input: CodexRunnerInput): Promise<CodexRunResult> {
     input.assertCurrent?.();

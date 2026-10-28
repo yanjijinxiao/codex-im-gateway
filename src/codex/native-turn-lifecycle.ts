@@ -1,11 +1,55 @@
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
+import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
 import { codexFailureCode } from "./turn-failure.js";
-import type { CodexTurnObservation, CodexThreadSnapshot } from "./backend.js";
+import type { CodexTurnObservation, CodexThreadSnapshot, CodexThreadProvenance } from "./backend.js";
 
 const unknown = (): CodexTurnObservation => ({ status: "unknown", source: "unknown" });
 const HEADER_BYTES = 128 * 1024, TAIL_BYTES = 8 * 1024 * 1024;
+
+/** Stream a complete, size-bounded source once; a tail window cannot prove a
+ * foreign turn absent or contradict an old completion receipt. */
+export async function readNativeThreadProvenance(filePath: string, threadId: string): Promise<CodexThreadProvenance | undefined> {
+  const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || !stat.size || stat.size > 1024 * 1024 * 1024) return;
+    const last = Buffer.alloc(1); await file.read(last, 0, 1, stat.size - 1);
+    if (last[0] !== 10) return; // Torn input cannot certify complete provenance.
+    const input = file.createReadStream({ start: 0, end: stat.size - 1, autoClose: false, signal: AbortSignal.timeout(15000) });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    const turns = new Map<string, CodexThreadProvenance["turns"][number]["status"]>();
+    let first = true, rows = 0;
+    try {
+      for await (const line of lines) {
+        if (++rows % 256 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+        if (first) {
+          first = false;
+          const header = JSON.parse(line), owner = rolloutIdentity(header.payload ?? {});
+          if (header.type !== "session_meta" || owner.threadId !== threadId || owner.internal) return;
+          continue;
+        }
+        // Skip large prompt/tool bodies without parsing their contents.
+        if (!/"type"\s*:\s*"(?:turn_context|token_usage_record)"/.test(line)
+          && !( /"type"\s*:\s*"event_msg"/.test(line) && /"type"\s*:\s*"(?:task_started|task_complete|turn_aborted)"/.test(line))) continue;
+        const row = JSON.parse(line), event = row.payload;
+        if (!event || typeof event.turn_id !== "string") continue;
+        if (row.type === "turn_context" || row.type === "token_usage_record") {
+          if (!turns.has(event.turn_id)) turns.set(event.turn_id, "unknown");
+        } else if (row.type === "event_msg") {
+          if (event.type === "task_started") turns.set(event.turn_id, "inProgress");
+          if (event.type === "task_complete") turns.set(event.turn_id, event.error ? "failed" : "completed");
+          if (event.type === "turn_aborted") turns.set(event.turn_id, "interrupted");
+        }
+        if (turns.size > 50000) return;
+      }
+      const after = await file.stat(), current = await fs.lstat(filePath);
+      if (after.size < stat.size || !current.isFile() || current.dev !== stat.dev || current.ino !== stat.ino) return;
+      return { threadId, complete: true, turns: [...turns].map(([id, status]) => ({ id, status })) };
+    } finally { lines.close(); input.destroy(); }
+  } catch { return; } finally { await file.close(); }
+}
 
 export function observeOwnerTurn(snapshot: CodexThreadSnapshot, threadId: string, turnId: string): CodexTurnObservation {
   if (snapshot.state.threadId !== threadId) throw new Error("Native turn observation identity mismatch");

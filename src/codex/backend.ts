@@ -430,6 +430,8 @@ export type CodexTurnObservation = {
   text?: string;
   failureCode?: CodexFailureCode;
 };
+/** Complete native event provenance, used only to repair pre-upgrade UI state. */
+export type CodexThreadProvenance = { threadId: string; complete: true; turns: Array<{ id: string; status: CodexTurnStatus | "unknown" }> };
 
 export type CodexRuntimeInfo = {
   model?: string;
@@ -532,6 +534,7 @@ export interface CodexBackendControls {
 
 export type CodexMetadataObservation = { includeTurns: false; timeoutMs: number; purpose?: "status" };
 export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<CodexNativeQueue> {
+  readThreadProvenance?(threadId: string): Promise<CodexThreadProvenance | undefined>;
   readNativeTurnLifecycle?(threadId: string, turnId: string): Promise<CodexTurnObservation>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;
   /** Read metadata without loading the complete turn history for message preflight. */
@@ -541,6 +544,7 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  readThreadProvenance?(threadId: string, hostId?: string): Promise<CodexThreadProvenance | undefined>;
   readonly systemErrorLifecycleRecovery?: boolean;
   recoverSystemError?(input: CodexSystemRecoveryInput, hostId?: string): Promise<CodexSystemRecoveryResult>;
   resumeAfterCapacity?(input: CodexCapacityResumeInput): Promise<CodexRunResult>;

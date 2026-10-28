@@ -1682,6 +1682,11 @@ test("streams progress and answer deltas into one channel AI Card and finalizes 
         onProgress?: (message: string) => Promise<void>;
         onDelta?: (delta: string) => Promise<void>;
       }) {
+        for (const phase of ["🧹 正在整理长会话上下文", "✅ 上下文整理完成", "🧹 正在整理长会话上下文", "✅ 上下文整理完成"]) {
+          await input.onProgress?.(phase);
+          await new Promise(resolve => setTimeout(resolve, 550));
+          assert.ok(updates.at(-1)?.text.includes(`**当前进展**\n\n${phase}`), "each real compaction cycle must reach the card");
+        }
         await input.onProgress?.("正在查询资料。");
         await input.onProgress?.("🤔 正在核对查询结果并准备下一步。");
         await new Promise((resolve) => setTimeout(resolve, 550));

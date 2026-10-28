@@ -9,10 +9,22 @@ export function progressKind(text: string): "thought" | "activity" | "failure" |
 
 /** Milestones cannot be evicted by successful tool receipts or changing timings. */
 export function meaningfulProgress(entries: readonly string[]): string[] {
-  const clean = [...new Set(entries.map(entry => summarizeProgress(entry)).filter(Boolean))];
+  const records = entries.flatMap(splitProgressRecords).filter(Boolean);
+  // Preserve the most recent occurrence: start -> complete -> start really is
+  // a new current phase, while cumulative batches end at their latest record.
+  const clean = [...new Set(records.slice().reverse())].reverse();
   const failures = clean.filter(entry => progressKind(entry) === "failure").slice(-2);
   const updates = clean.filter(entry => progressKind(entry) === "update").slice(-4);
   return clean.filter(entry => failures.includes(entry) || updates.includes(entry));
+}
+
+/** Some native snapshots contain a cumulative block of machine progress.
+ * Normalize those records individually; ordinary Markdown remains one update. */
+export function splitProgressRecords(text: string): string[] {
+  const lines = presentAssistantText(text).trim().split(/\r?\n/).map(line => line.trim().replace(/^[-*]\s+/, "")).filter(Boolean);
+  const machine = (line: string) => progressKind(line) === "activity" || progressKind(line) === "failure"
+    || /^🧹\s*正在整理长会话上下文$/u.test(line) || /^✅\s*上下文整理完成$/u.test(line);
+  return lines.length > 1 && lines.every(machine) ? lines.map(line => summarizeProgress(line)) : [summarizeProgress(text)];
 }
 
 export function summarizeProgress(text: string, maxLength = 600): string {

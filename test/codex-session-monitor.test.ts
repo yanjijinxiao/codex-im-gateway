@@ -39,11 +39,11 @@ test("excludes internal reviews at startup, live append and new-file discovery w
   t.after(() => monitor.stop());
   await monitor.ready();
   for (const [i, source] of variants.entries()) {
-    const events = [taskStarted(`fresh-${i}`), responseCommentary("INTERNAL_PROGRESS"), taskComplete(`fresh-${i}`, "INTERNAL_REVIEW")];
+    const events = [meta("main", { source: "cli" }), taskStarted(`fresh-${i}`), responseCommentary("INTERNAL_PROGRESS"), taskComplete(`fresh-${i}`, "INTERNAL_REVIEW")];
     appendLines(path.join(dir, `internal-${i}.jsonl`), events);
     writeLines(path.join(dir, `new-internal-${i}.jsonl`), [meta(`new-internal-${i}`, source), ...events]);
   }
-  appendLines(main, [completedDesktopItem("CommandExecution", "foreign-turn"),
+  appendLines(main, [meta("main", { source: "guardian_review" }), meta("another-child", { source: { subagent: {} } }), completedDesktopItem("CommandExecution", "foreign-turn"),
     taskComplete("foreign-turn", "FOREIGN_COMPLETION"), responseCommentary("正常进展"),
     taskComplete("main-turn", '{"outcome":"allow"}')]);
   await monitor.scanNow();
@@ -52,6 +52,18 @@ test("excludes internal reviews at startup, live append and new-file discovery w
   assert.deepEqual(completions.map((x) => [x.sessionId, x.turnId, x.text]), [["main", "main-turn", '{"outcome":"allow"}']]);
   assert.equal(recovered.length, 0);
   assert.ok(tasks.length > 0 && tasks.every((x) => x.sessionId === "main" && x.turnId === "main-turn"));
+});
+
+test("repeated same-owner metadata cannot turn an internal review into a public thread", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-monitor-sticky-owner-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const dir = path.join(root, "sessions"); fs.mkdirSync(dir);
+  const completed: CodexSessionCompletion[] = [], file = path.join(dir, "child.jsonl");
+  const monitor = new CodexSessionCompletionMonitor({ codexHome: root, pollIntervalMs: 60000, onCompletion: x => { completed.push(x); } });
+  monitor.start(); t.after(() => monitor.stop()); await monitor.ready();
+  writeLines(file, [{ type: "session_meta", payload: { id: "child", cwd: root, source: { subagent: {} } } },
+    { type: "session_meta", payload: { id: "child", cwd: root, source: "cli" } }, taskStarted("child-turn"), taskComplete("child-turn", "PRIVATE")]);
+  await monitor.scanNow(); assert.deepEqual(completed, []);
 });
 
 test("restores progress when a long turn start is outside the bounded tail", async (t) => {

@@ -2483,6 +2483,10 @@ export class BridgeService {
             onProgress: async (progress: string) => {
               if (!wantsProgress() || queued && !acceptedQueueTurn) return;
               const progressText = progress.trim();
+              // Compaction can occur repeatedly in one long turn. Closing one
+              // phase permits its next cycle without weakening replay dedup.
+              if (progressText === "🧹 正在整理长会话上下文") sentProgress.delete("✅ 上下文整理完成");
+              if (progressText === "✅ 上下文整理完成") sentProgress.delete("🧹 正在整理长会话上下文");
               if (!progressText || sentProgress.has(progressText) && !replyStream?.checkpoint().recoveryNotice) return;
               sentProgress.add(progressText);
               if (sentProgress.size > 200) sentProgress.clear();
