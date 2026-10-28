@@ -42,7 +42,7 @@
     "install:local": "node scripts/install-local.mjs",
     "install:check": "node scripts/install-local.mjs --check",
     "build": "npm run build:bridge && npm run build:taskboard",
-    "build:bridge": "tsc -p tsconfig.json && npm run copy:web",
+    "build:bridge": "node scripts/prepare-build.mjs && tsc -p tsconfig.json && npm run copy:web",
     "build:taskboard": "npm run build:web --workspace=codex-taskboard",
     "copy:web": "node scripts/copy-web-assets.mjs",
     "clean": "node -e \"const fs=require('fs'); for (const dir of ['dist','taskboard/dist']) fs.rmSync(dir,{recursive:true,force:true})\"",

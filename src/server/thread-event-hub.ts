@@ -188,13 +188,13 @@ export class ThreadEventHub {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    await this.scan;
-    await Promise.allSettled(this.manualSyncs.values());
-    await Promise.allSettled(this.previousRecoveries.values());
-    await Promise.allSettled(this.provenanceRepairs.values());
+    const pending = await Promise.allSettled([this.scan, ...this.manualSyncs.values(),
+      ...this.previousRecoveries.values(), ...this.provenanceRepairs.values()]);
     const cleanup = await Promise.allSettled([...this.streams.values()].map(stream => stream.suspend()).concat([...this.retiringStreams.values()]));
     for (const result of cleanup) if (result.status === "rejected") report(result.reason);
     this.streams.clear();
+    const failures = pending.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "会话跟随停止时观察任务失败；进度计时器已继续清理");
   }
   async refresh(): Promise<void> {
     if (this.stopped) return;

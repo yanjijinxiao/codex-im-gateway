@@ -36,6 +36,6 @@ export function createGoalFormCard(projectName: string): ChannelTaskFormCard {
       style: "default",
       value: { version: 1, command: "mode", arg: "" }
     }],
-    fallbackText: `文字模式：把“目标内容”替换为实际目标后发送以下模板。\n\n${copyBlock("/goal 目标内容")}`
+    fallbackText: `文字模式：把“目标内容”替换为实际目标后发送以下模板。\n\n${copyBlock("/goal set 目标内容")}`
   };
 }

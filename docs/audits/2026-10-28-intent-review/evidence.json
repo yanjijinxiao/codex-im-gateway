@@ -1,0 +1,468 @@
+{
+  "baseline": "d742feb293281c386e8d6eb470bff2b381c90ff3",
+  "note": "Subset runs overlap. Do not sum them as unique tests. Raw logs are local, temporary; hashes and summaries are retained here. Original baseline fixtures use only APIs present at the baseline; newly introduced helper property tests are not used as baseline evidence. Final release preparation reruns against a fixed commit.",
+  "runs": [
+    {
+      "file": "gateway-intent-boundaries-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "59691e0319e2c1432e13cef11e486b61f1e8f5826cbac5b60fc2a6f0b50a445f",
+      "counts": {
+        "tests": 8,
+        "pass": 1,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "malformed persisted operational and access fields fail closed without rewriting the source",
+        "fractional sub-byte inbound limits never normalize to zero",
+        "HTTP settings reject unsupported managed IPv6 before applying configuration",
+        "remote projects cannot become local directory-backed QA defaults",
+        "Taskboard enable rolls back the owned service if configuration persistence fails",
+        "unsupported IPv6 cannot stop or replace the working IPv4 listener",
+        "Taskboard origin cannot contain ignored paths, credentials, query or fragment"
+      ]
+    },
+    {
+      "file": "gateway-intent-config-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "d9164747956e784bf37ae7d37e87c8ee6a86a752dc81cb058cc3b02b7626868c",
+      "counts": {
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "malformed persisted operational and access fields fail closed without rewriting the source",
+        "fractional sub-byte inbound limits never normalize to zero",
+        "HTTP settings and managed Taskboard share IPv6 loopback validation",
+        "remote projects cannot become local directory-backed QA defaults"
+      ]
+    },
+    {
+      "file": "gateway-intent-build-baseline-complete.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "f4e200d6e4373468bb25b732defd00e7822b86ae53cf9c81b4c513ed7577725e",
+      "counts": {
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "Windows source installer runs npm through Node (inherited CLI: false)",
+        "Windows source installer runs npm through Node (inherited CLI: true)",
+        "a failed ordinary build cannot keep an old sealed artifact identity",
+        "source deployments report their real update capability without querying npm"
+      ]
+    },
+    {
+      "file": "gateway-intent-release-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "f282b5f179e40d3f9a516079fc1a8b1912c019db9e550374965fcf7d131f82ed",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "release cutovers claim exclusive ownership before an asynchronous readiness read"
+      ]
+    },
+    {
+      "file": "gateway-intent-restart-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "fbd530249ba7001b548d7fbca3d69ace6e87195be20121034090dfe0c0de3ac1",
+      "counts": {
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "startup failure still closes HTTP, optional services and the lock if account cleanup rejects",
+        "restart scheduling waits for helper spawn and reports a failed launch"
+      ]
+    },
+    {
+      "file": "gateway-intent-primary-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "c5ca2650c036fdfae5ddaab8c54af22afa35278b24351591f28ef57fe0d67742",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "failed primary-routing configuration cannot publish a different in-memory question destination"
+      ]
+    },
+    {
+      "file": "gateway-intent-actions-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "7de8e898cabd57ea22c7df6893fd7c1d111ce213ced7fea339cf77a8ce60f523",
+      "counts": {
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "an actual action cannot splice an identical earlier fenced example: \"\\n\"",
+        "an actual action cannot splice an identical earlier fenced example: \"\\r\\n\""
+      ]
+    },
+    {
+      "file": "gateway-intent-ide-ui-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "a136cb06f30858df8680cd73efae595535906f0945578144aa3d4967ae6bdb5e",
+      "counts": {
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "first-screen bootstrap renders core views before optional Taskboard responds",
+        "a retired knowledge save cannot close or overwrite a newer dialog: success",
+        "a retired knowledge save cannot close or overwrite a newer dialog: failure",
+        "a late IDE settings read cannot overwrite a newer-read",
+        "a late IDE settings read cannot overwrite a save"
+      ]
+    },
+    {
+      "file": "gateway-intent-ide-cleanup-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "934edbeffd97b5d1c6571067843ba9e8568f5c1ab9fcd722f60c1f05fa33b6e6",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "a failed entrance cleanup cannot skip closing project IDE processes"
+      ]
+    },
+    {
+      "file": "gateway-intent-protocol-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "8db23d06d47ff807ec657756b1c06f50118259b76f3379b9aa019cf5c0d67e6f",
+      "counts": {
+        "tests": 7,
+        "pass": 1,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "reasoning delta accumulation retains whitespace between wire chunks",
+        "storage catalog respects archived persistence when Desktop catalog is absent",
+        "storage catalog respects all persistence when Desktop catalog is absent",
+        "malformed optional file-change entries cannot throw out of the native notification callback",
+        "Desktop history ordering uses the supported legacy start timestamp too",
+        "CLI history does not turn a failed native completion into a successful turn"
+      ]
+    },
+    {
+      "file": "gateway-intent-observer-cleanup-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "2be8bc7c04e7ba2943f6bb15723cebf366f3c57ae23a90ef8f47c3f67b75945e",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "a failed in-flight follow scan cannot skip suspending its local presentation timers"
+      ]
+    },
+    {
+      "file": "gateway-intent-management-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "bf269a9fed216c659bf8076fd253269d521500c70c0ccd6f5e5913ba1f4c3366",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "optional Codex discovery cannot block bootstrap or committed settings, and a hung probe is coalesced"
+      ]
+    },
+    {
+      "file": "gateway-intent-channel-forms-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "7713af3e1c184079ea05444cb51ef35a3b1bde328ef30ccbee3bbb8890d0f21d",
+      "counts": {
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "goal form explicitly sets an objective even when its text is a control word: pause",
+        "goal form explicitly sets an objective even when its text is a control word: clear",
+        "goal form explicitly sets an objective even when its text is a control word: resume",
+        "goal form explicitly sets an objective even when its text is a control word: complete",
+        "goal form explicitly sets an objective even when its text is a control word: form",
+        "goal form explicitly sets an objective even when its text is a control word: set",
+        "goal form explicitly sets an objective even when its text is a control word: 真正的多行",
+        "native Taskboard form retains controls without duplicating them as transfer commands"
+      ]
+    },
+    {
+      "file": "gateway-intent-control-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "15ae3887fdfad6168e14acf009b07fc6aa7c470b09a0ae6653219e431a748186",
+      "counts": {
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "late policy capability read cannot change policy after rebind",
+        "late policy capability read cannot change policy after revoke",
+        "late model lookup cannot change settings after rebind",
+        "late model lookup cannot change settings after revoke",
+        "a late catalog inspect cannot restore a conversation explicitly unbound meanwhile",
+        "an unbound catalog query is invalidated by a later explicit leave: never-bound",
+        "an unbound catalog query is invalidated by a later explicit leave: detached"
+      ]
+    },
+    {
+      "file": "gateway-intent-feishu-boundary-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "0628ec6a00715f4b04d69d1c80bba0a0d7d74a2e1a78431e2c6f94af12f776f5",
+      "counts": {
+        "tests": 7,
+        "pass": 2,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "Feishu message receipt persistence failure reaches the application boundary",
+        "Feishu card receipt persistence failure reaches the application boundary",
+        "Feishu menu receipt persistence failure reaches the application boundary",
+        "Feishu inbound identity retains only provider-confirmed conversation kind: p2p",
+        "Feishu inbound identity retains only provider-confirmed conversation kind: group"
+      ]
+    },
+    {
+      "file": "gateway-intent-exec-identity-baseline.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "3ca602443e4d4d736ca4f57cf441b2f03def9406ec794607e5513312b0f25c41",
+      "counts": {
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "a newly started CLI thread is identified and can be stopped before process completion"
+      ]
+    },
+    {
+      "file": "gateway-intent-projects-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "71f9a140b0192a6e165a96f18886fdba0e4337712fe1794574ec8c2d2ac07d01",
+      "counts": {
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "an unavailable primary project root remains an explicit unavailable native identity and blocks cached IDE scope",
+        "a local session path alias does not duplicate the primary root in a multi-root IDE scope"
+      ]
+    },
+    {
+      "file": "gateway-intent-resources-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "7efe08c600e89b019f780faf0ad7e23f33b46e3f20e4ec2cb57be68d61ecf250",
+      "counts": {
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "an oversized CLI record cannot be returned as a successful partial answer",
+        "App Server raw diagnostics are bounded independently of the complete answer",
+        "unobserved completed turns release payloads while a start acknowledgement race retains its result",
+        "CLI diagnostics cannot accumulate every output chunk or truncate the final answer",
+        "rollout growth is read in chunks, preserving split UTF-8 and an unfinished last record"
+      ]
+    },
+    {
+      "file": "gateway-intent-web-baseline-final.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "8a58518eb1d03806253f0d3a8848b9706ef32b6d12a1086e93eb3e43fff0e49a",
+      "counts": {
+        "tests": 17,
+        "pass": 0,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "first-screen bootstrap renders core views before optional Taskboard responds",
+        "a retired knowledge save cannot close or overwrite a newer dialog: success",
+        "a retired knowledge save cannot close or overwrite a newer dialog: failure",
+        "a late IDE settings read cannot overwrite a newer-read",
+        "a late IDE settings read cannot overwrite a save",
+        "settings commit feedback does not depend on an optional Taskboard refresh",
+        "an old session save cannot close the reopened edit dialog",
+        "an old project save cannot close the reopened edit dialog",
+        "one session form cannot submit the same click twice while its write is pending",
+        "reused account dialog is not closed by the preceding submission",
+        "reused removal dialog is not closed by the preceding submission",
+        "reused channel dialog is not closed by the preceding submission",
+        "reused notification dialog is not closed by the preceding submission",
+        "reused taskboard dialog is not closed by the preceding submission",
+        "retired project discovery cannot overwrite a newer rename dialog",
+        "IDE activity read ownership: refresh",
+        "IDE activity read ownership: coalescing"
+      ]
+    },
+    {
+      "file": "gateway-intent-choice-baseline-complete.log",
+      "purpose": "original-baseline-counterexample",
+      "sha256": "9ac5bdafbee3b351924a2e3b68ea25407da676e8d1b14e0f603d0d3b039f308e",
+      "counts": {
+        "tests": 5,
+        "pass": 2,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failedTestTitles": [
+        "native model choice retains its identity after the catalog is reordered",
+        "native effort choice retains its identity after the catalog is reordered",
+        "a project button from an earlier list cannot silently target the new row at the same index"
+      ]
+    },
+    {
+      "file": "gateway-intent-release-own-fault-before.log",
+      "purpose": "intermediate-implementation-regression",
+      "sha256": "59acb357281b008f2175333b636321a0d747cb9a0e2dac42d636923207282b04",
+      "counts": {
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "note": "Failure is against this audit’s intermediate implementation, not the original baseline.",
+      "failedTestTitles": [
+        "release ownership closes its descriptor and does not erase an unverifiable lock if fstat fails"
+      ]
+    },
+    {
+      "file": "gateway-intent-choice-ambiguous-before.log",
+      "purpose": "intermediate-implementation-regression",
+      "sha256": "5bfaa0a93686f5ecf5fc79f319f80b9466b148def158395435fafb3a3d7a9356",
+      "counts": {
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "note": "Failure is against this audit’s intermediate implementation, not the original baseline.",
+      "failedTestTitles": [
+        "native model choice distinguishes the model ID 1 from command syntax",
+        "native model choice distinguishes the model ID default from command syntax"
+      ]
+    },
+    {
+      "file": "gateway-intent-release-own-fault-fixed.log",
+      "purpose": "regression-fix",
+      "sha256": "c7de4789fded9c42ea438eba2c1a62908e5f55a348d71971914897cf8e34f17f",
+      "counts": {
+        "tests": 6,
+        "pass": 6,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "file": "gateway-intent-choice-ambiguous-fixed.log",
+      "purpose": "regression-fix",
+      "sha256": "1f4eb08b92ab9c7a78d602bab3f2741bbdefa87d7b69cd7f66be9b66e7a7bc14",
+      "counts": {
+        "tests": 20,
+        "pass": 20,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "file": "gateway-intent-observer-isolation.log",
+      "purpose": "scheduler-boundary-not-a-confirmed-defect",
+      "sha256": "d327e6f1eec2872ee0e54a120e80c61ffa4906d70ab71ba9535f8ea4c05c841c",
+      "counts": {
+        "tests": 2,
+        "pass": 2,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "file": "gateway-intent-full-regression-complete.log",
+      "purpose": "full-regression-before-fixture-noop-cleanup",
+      "sha256": "f90bf40bc1edb7a31147e6980d615863bdad34e8d78642432b9c6d8d6e044cd8",
+      "counts": {
+        "tests": 2040,
+        "pass": 2039,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 1
+      }
+    },
+    {
+      "file": "gateway-intent-typecheck-complete.log",
+      "purpose": "typecheck",
+      "sha256": "569495d981c843453331093c461cecbfbef7fb91d51076fc679973fd1262a400",
+      "counts": {}
+    },
+    {
+      "file": "gateway-intent-updater-final-cleanup.log",
+      "purpose": "final-fixture-cleanup-regression",
+      "sha256": "8cb292b488c138720e1487309732975213035a54d98d18659610e6c2c67cb097",
+      "counts": {
+        "tests": 16,
+        "pass": 15,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 1
+      }
+    }
+  ]
+}

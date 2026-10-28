@@ -32,7 +32,8 @@
 
   function populate(account, knowledgeBases, projects) {
     const settings = normalized(account);
-    const accountProjects = projects.filter((candidate) => candidate.accountId === account.accountId);
+    const accountProjects = projects.filter((candidate) => candidate.accountId === account.accountId
+      && (candidate.hostId || "local") === "local" && candidate.projectKind !== "remote");
     const configuredKnowledgeBase = knowledgeBases.find((candidate) => (
       candidate.accountId === account.accountId && candidate.id === settings.qaKnowledgeBaseId
     ));

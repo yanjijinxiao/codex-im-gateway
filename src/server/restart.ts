@@ -10,7 +10,7 @@ export type RestartHelperOptions = {
   port: number;
 };
 
-export function launchRestartHelper(options: RestartHelperOptions): void {
+export async function launchRestartHelper(options: RestartHelperOptions): Promise<void> {
   if (!Number.isInteger(options.parentPid) || options.parentPid <= 0) {
     throw new Error("Invalid parent process id");
   }
@@ -47,8 +47,10 @@ export function launchRestartHelper(options: RestartHelperOptions): void {
   } finally {
     fs.closeSync(logFd);
   }
-  child.once("error", (error) => {
-    console.error(`[codex-im-gateway] unable to launch restart helper: ${error.message}`);
+  await new Promise<void>((resolve, reject) => {
+    const failed = (error: Error) => { child.removeListener("spawn", started); reject(error); };
+    const started = () => { child.removeListener("error", failed); resolve(); };
+    child.once("error", failed); child.once("spawn", started);
   });
   child.unref();
 }

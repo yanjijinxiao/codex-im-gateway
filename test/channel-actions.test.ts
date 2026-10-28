@@ -192,14 +192,14 @@ test("Bridge uses channel-native cards for help and fixed selections", async (t)
     "消息合并"
   ]);
   assert.deepEqual(
-    cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),
+    cards[1].actionGroups.flatMap((group) => group.map((action) => action.value.arg.split("@")[0])),
     [firstProject, secondProject].map((project) =>
       `P${stateStore.listProjects().findIndex((candidate) => candidate.id === project.id) + 1}`
     )
   );
   assert.deepEqual(
     cards[4].actionGroups.flatMap((group) => group.map((action) => action.value.arg)),
-    ["1", "2", "default"]
+    ["low", "medium", "default"]
   );
   assert.equal(texts.length, 0);
   assert.match(cards[0].body, /\/history/);

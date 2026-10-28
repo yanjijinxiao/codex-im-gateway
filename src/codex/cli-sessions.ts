@@ -5,6 +5,7 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import { canonicalCliWorkspace, cliProjectId, listJsonlFilesAsync, readSessionMetaAsync } from "./cli-projects.js";
 import { rolloutIdentity } from "./rollout-identity.js";
+import { codexFailureCode, type CodexFailureCode } from "./turn-failure.js";
 import type { CodexHistoryPage, CodexHistoryPageInput, CodexThreadListInput, CodexThreadSnapshot, CodexThreadState } from "./backend.js";
 /** Local, read-only rollout adapter. Never loads Desktop or starts app-server. */
 export class CliSessionStore {
@@ -69,6 +70,7 @@ export class CliSessionStore {
       return { state: await this.inspect(threadId), turns: [] };
     const turns: CodexThreadSnapshot["turns"] = [];
     let turn: CodexThreadSnapshot["turns"][number] | undefined;
+    let failure: { turnId: string; code: CodexFailureCode } | undefined;
     let sequence = 0;
     const add = (role: "user" | "assistant", text: unknown, timestamp: string | undefined, progress = false) => {
       if(typeof text !== "string" || !text.trim())
@@ -92,13 +94,15 @@ export class CliSessionStore {
       const p = record.payload && typeof record.payload === "object" && !Array.isArray(record.payload) ? record.payload : {};
       if(record.type === "event_msg") {
         if(p.type === "task_started" && typeof p.turn_id === "string") {
+          failure = undefined;
           turn = { id: p.turn_id, status: "inProgress", messages: [] };
           turns.push(turn);
         }
         else if((p.type === "task_complete" || p.type === "turn_aborted") && turn && (!p.turn_id || p.turn_id === turn.id)) {
           if(p.type === "task_complete")
             add("assistant", p.last_agent_message, record.timestamp);
-          turn.status = p.type === "task_complete" ? "completed" : "interrupted";
+          turn.status = p.type === "turn_aborted" ? "interrupted" : p.error ? "failed" : "completed";
+          failure = turn.status === "failed" ? { turnId: turn.id, code: codexFailureCode(p.error) } : undefined;
         }
         else if(p.type === "user_message")
           add("user", p.message, record.timestamp);
@@ -120,6 +124,7 @@ export class CliSessionStore {
     return {
       state: {
         ...entry.state, latestTurnStatus: last?.status,
+        ...(failure?.turnId === last?.id ? { lastTurnFailure: failure } : {}),
         ...(last?.status === "inProgress" ? { activeTurnId: last.id } : {})
       }, turns
     };

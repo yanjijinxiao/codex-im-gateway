@@ -1,5 +1,7 @@
 # codex-weixin Web Multi-Account Design
 
+> 历史设计记录：不作为当前部署或执行约定。当前行为以 [IM 架构](../im-channel-architecture.md)、[后端契约](../codex-backends.md) 和 [运行指南](../local-run.md) 为准；不恢复自动换后端、自动绑定、旧去重窗口或 npm 源码更新流程。
+
 ## Scope
 
 `codex-weixin` is a local, cross-platform Node.js service dedicated to connecting personal WeChat accounts to the Codex CLI. Running the installed executable starts one HTTP service bound to `127.0.0.1`, opens a local management page, and starts every enabled WeChat account. The product has no general-purpose connector system and no public-network mode.

@@ -11,6 +11,7 @@ import { parseServerCommand, serverHelpText } from "./arguments.js";
 import { startLocalHttpServer } from "./http-server.js";
 import { acquireServiceProcessLock } from "./process-lock.js";
 import { launchRestartHelper } from "./restart.js";
+import { cleanupResources } from "./cleanup.js";
 
 async function main(): Promise<void> {
   const stateDir = process.env.CODEX_IM_GATEWAY_STATE_DIR
@@ -28,25 +29,21 @@ async function main(): Promise<void> {
   const accountManager = new AccountManager({ paths });
   let server: Awaited<ReturnType<typeof startLocalHttpServer>> | undefined;
   const taskboard = new TaskboardLifecycle(paths.taskboardDir);
-  let shuttingDown = false;
+  let shutdownTask: Promise<void> | undefined;
   let restartScheduled = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    try {
-      await accountManager.stopAll();
-      await server?.close();
-      await taskboard.close();
-    } finally {
-      processLock.release();
-    }
-  };
+  const shutdown = () => shutdownTask ??= cleanupResources([
+    () => accountManager.stopAll(), () => server?.close(), () => taskboard.close()
+  ], "Gateway 部分资源清理失败，其余资源已继续清理", () => processLock.release());
+  const exitAfterShutdown = () => void shutdown().then(() => process.exit(0), error => {
+    console.error(`[codex-im-gateway] shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  });
   const scheduleRestart = (version: string) => {
     if (restartScheduled) return;
     restartScheduled = true;
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       try {
-        launchRestartHelper({
+        await launchRestartHelper({
           parentPid: process.pid,
           entryPath: fileURLToPath(import.meta.url),
           stateDir: paths.root,
@@ -58,7 +55,7 @@ async function main(): Promise<void> {
         return;
       }
       console.log(`[codex-im-gateway] updated to ${version}; restarting`);
-      void shutdown().finally(() => process.exit(0));
+      exitAfterShutdown();
     }, 500);
     timer.unref();
   };
@@ -68,10 +65,8 @@ async function main(): Promise<void> {
       onTaskboardConfig: next => taskboard.apply(next) });
     await accountManager.startAll();
   } catch (error) {
-    await accountManager.stopAll();
-    await server?.close();
-    await taskboard.close();
-    processLock.release();
+    try { await shutdown(); }
+    catch (cleanup) { throw new AggregateError([error, cleanup], "Gateway 启动失败且清理发生异常；已尝试清理全部资源"); }
     throw error;
   }
 
@@ -86,8 +81,8 @@ async function main(): Promise<void> {
     });
   }
 
-  process.once("SIGINT", () => void shutdown().finally(() => process.exit(0)));
-  process.once("SIGTERM", () => void shutdown().finally(() => process.exit(0)));
+  process.once("SIGINT", exitAfterShutdown);
+  process.once("SIGTERM", exitAfterShutdown);
 }
 
 function parsePort(value: string | undefined): number {

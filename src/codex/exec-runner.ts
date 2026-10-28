@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { DiagnosticTail } from "./diagnostic-tail.js";
 
 import {
   CodexBackendCapabilityError,
@@ -136,26 +138,54 @@ export class CodexExecRunner implements CodexBackendAdapter {
         child.kill();
         reject(new Error(`codex exec timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      const stdout = new DiagnosticTail(), stderr = new DiagnosticTail(64 * 1024);
+      // thread.started identifies the new process while it is still running.
+      // It is not a turn acceptance receipt and must not invent a native turn ID.
+      const decoder = new StringDecoder("utf8");
+      let line = "", lineBytes = 0, skipLine = false, oversizedRecord = false;
+      const output: { text: string; threadId?: string } = { text: "" };
+      let created: Promise<void> = Promise.resolve(), creationFailure: unknown, creationFailed = false;
+      const consumeLine = () => {
+        if (!line.trim()) return;
+        consumeExecLine(line, output);
+        if (!activeRun.threadId && output.threadId) {
+          activeRun.threadId = output.threadId;
+          created = Promise.resolve().then(() => input.onThreadCreated?.(activeRun.threadId!)).then(() => {}, error => { creationFailed = true; creationFailure = error; });
+        }
+      };
+      const inspectOutput = (chunk: string) => {
+        for (const part of chunk.split(/(?<=\n)/)) {
+          if (!skipLine) {
+            lineBytes += Buffer.byteLength(part);
+            if (lineBytes > 16 * 1024 * 1024) {
+              line = ""; skipLine = true; oversizedRecord = true;
+            } else line += part;
+          }
+          if (!part.endsWith("\n")) continue;
+          if (!skipLine) consumeLine();
+          line = ""; lineBytes = 0; skipLine = false;
+        }
+      };
+      child.stdout.on("data", (chunk: Buffer) => { stdout.append(chunk); inspectOutput(decoder.write(chunk)); });
+      child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
       child.on("error", (error) => {
         if (timer) clearTimeout(timer);
         removeActiveRun();
         reject(error);
       });
-      child.on("close", (code) => {
+      child.on("close", async (code) => {
         if (timer) clearTimeout(timer);
         removeActiveRun();
-        const raw = Buffer.concat(stdout).toString("utf8");
-        const err = Buffer.concat(stderr).toString("utf8");
+        inspectOutput(decoder.end());
+        if (!skipLine) consumeLine();
+        await created;
+        if (creationFailed) { reject(creationFailure); return; }
         if (code !== 0) {
-          reject(formatCodexExecFailure(code, err));
+          reject(formatCodexExecFailure(code, stderr.text()));
           return;
         }
-        const parsed = parseCodexExecOutput(raw);
-        resolve({ raw, text: parsed.text, threadId: parsed.threadId });
+        if (oversizedRecord) { reject(new Error("Codex CLI output exceeded the 16 MiB record budget; execution result remains unconfirmed.")); return; }
+        resolve({ raw: stdout.text(), text: output.text || stdout.text().trim(), threadId: activeRun.threadId ?? output.threadId });
       });
     });
   }
@@ -276,34 +306,36 @@ function resolveMacDesktopCodex(
 
 export function parseCodexExecOutput(raw: string): { text: string; threadId?: string } {
   const lines = raw.split(/\r?\n/).filter(Boolean);
-  let lastText = "";
-  let threadId: string | undefined;
-  for (const line of lines) {
-    try {
-      const event = JSON.parse(line) as Record<string, unknown>;
-      const type = String(event.type ?? event.event ?? "");
-      if (type === "thread.started" && typeof event.thread_id === "string") {
-        threadId = event.thread_id;
-        continue;
-      }
+  const output: { text: string; threadId?: string } = { text: "" };
+  for (const line of lines) consumeExecLine(line, output);
+  return { text: output.text || raw.trim(), threadId: output.threadId };
+}
 
-      const item = event.item as Record<string, unknown> | undefined;
-      if (type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
-        lastText = item.text;
-        continue;
-      }
-
-      if (/message|response|final|output/i.test(type)) {
-        const value = event.text ?? event.content ?? event.message;
-        if (typeof value === "string") {
-          lastText = value;
-        }
-      }
-    } catch {
-      lastText = line;
+function consumeExecLine(line: string, output: { text: string; threadId?: string }): void {
+  line = line.replace(/\r?\n$/, "");
+  try {
+    const event = JSON.parse(line) as Record<string, unknown>;
+    const type = String(event.type ?? event.event ?? "");
+    if (type === "thread.started" && typeof event.thread_id === "string" && event.thread_id.trim()) {
+      output.threadId ??= event.thread_id;
+      return;
     }
+
+    const item = event.item as Record<string, unknown> | undefined;
+    if (type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+      output.text = item.text;
+      return;
+    }
+
+    if (/message|response|final|output/i.test(type)) {
+      const value = event.text ?? event.content ?? event.message;
+      if (typeof value === "string") {
+        output.text = value;
+      }
+    }
+  } catch {
+    output.text = line;
   }
-  return { text: lastText || raw.trim(), threadId };
 }
 
 export function extractFinalText(raw: string): string {

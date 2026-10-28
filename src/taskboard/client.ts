@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
+import { taskboardOrigin } from "./config.js";
 
 const taskboardStatusSchema = z.enum([
   "backlog", "todo", "in_progress", "in_review", "blocked", "done", "canceled"
@@ -66,10 +67,7 @@ export class TaskboardClient {
   private readonly timeoutMs: number;
 
   constructor(options: { baseUrl: string; fetch?: TaskboardFetch; timeoutMs?: number }) {
-    const url = new URL(options.baseUrl);
-    if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
-      throw new Error("Taskboard URL must use an HTTP loopback origin");
-    }
+    const url = taskboardOrigin(options.baseUrl);
     url.pathname = url.pathname.replace(/\/+$/, "");
     this.baseUrl = url.toString().replace(/\/$/, "");
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);

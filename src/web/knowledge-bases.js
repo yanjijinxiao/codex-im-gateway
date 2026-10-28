@@ -133,6 +133,8 @@ async function openEditKnowledgeBaseDialog(knowledgeBase) {
 
 function beginKnowledgeBaseDialogSession() {
   knowledgeBaseDialogSession += 1;
+  const save = document.querySelector("#saveKnowledgeBaseButton");
+  if (save) { save.disabled = false; const label = save.querySelector?.("span"); if (label) label.textContent = "验证并保存"; }
   document.querySelectorAll("#knowledgeBaseDialog [data-directory-target]").forEach((button) => {
     button.disabled = false;
     button.querySelector("span").textContent = "选择";
@@ -245,6 +247,7 @@ async function pickKnowledgeBaseDirectory(button) {
 
 async function saveKnowledgeBase(event) {
   event.preventDefault();
+  const dialogSession = knowledgeBaseDialogSession;
   const button = event.submitter;
   const knowledgeBaseId = document.querySelector("#editingKnowledgeBaseId").value;
   const editingAccountId = document.querySelector("#editingKnowledgeBaseAccountId").value;
@@ -264,14 +267,19 @@ async function saveKnowledgeBase(event) {
       : await api("/api/knowledge-bases", { method: "POST", body: { accountId, ...body } });
     const saved = result.knowledgeBase;
     if (result.inspection) knowledgeBaseInspections.set(knowledgeBaseKey(saved), result.inspection);
+    if (!isKnowledgeBaseDialogSessionCurrent(dialogSession)) { void refreshData(false); return; }
     document.querySelector("#knowledgeBaseDialog").close();
     await refreshData(false);
     toast(knowledgeBaseId ? "知识库已更新" : "llm-wiki 已添加");
   } catch (error) {
-    setKnowledgeBaseFormError(error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    if (isKnowledgeBaseDialogSessionCurrent(dialogSession)) setKnowledgeBaseFormError(message);
+    else toast(`先前的知识库保存失败：${message}`, true);
   } finally {
-    button.disabled = false;
-    button.querySelector("span").textContent = "验证并保存";
+    if (dialogSession === knowledgeBaseDialogSession) {
+      button.disabled = false;
+      button.querySelector("span").textContent = "验证并保存";
+    }
   }
 }
 

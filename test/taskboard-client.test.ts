@@ -190,7 +190,7 @@ test("rejects non-loopback Taskboard origins", () => {
     /loopback/i
   );
 });
-test("accepts IPv6 loopback consistently with the embedded Taskboard listener policy", () => {
+test("the standalone client accepts an externally provided IPv6 loopback origin", () => {
   assert.equal(new TaskboardClient({ baseUrl: "http://[::1]:4876" }).baseUrl, "http://[::1]:4876");
 });
 for (const ending of ["\n", "\r\n"]) test(`Taskboard SSE handles split ${JSON.stringify(ending)} delimiters and cancels after a consumer failure`, async () => {

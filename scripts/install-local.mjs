@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { lstat, mkdir, readdir, readlink, realpath, stat, symlink, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -51,6 +52,28 @@ async function run(command, args) {
       else reject(new Error(`${command} ${args.join(" ")} failed (${signal ?? code})`));
     });
   });
+}
+
+// .cmd files cannot be spawned directly without a Windows shell. Run npm's
+// JavaScript entry with Node so paths remain individual, unquoted arguments.
+function npmCommand(args) {
+  const paths = process.platform === "win32" ? path.win32 : path;
+  const nodeDirectory = paths.dirname(process.execPath);
+  const candidates = [
+    process.env.npm_execpath,
+    paths.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
+    paths.join(nodeDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")
+  ];
+  const cli = candidates.find(candidate => candidate && paths.isAbsolute(candidate)
+    && /\.(?:c?js|mjs)$/i.test(candidate) && existsSync(candidate));
+  if (cli) return { command: process.execPath, args: [cli, ...args] };
+  if (process.platform === "win32") throw new Error("无法找到 npm-cli.js；请通过 npm run install:local 运行，或修复 Node.js/npm 安装");
+  return { command: "npm", args };
+}
+
+async function runNpm(args) {
+  const invocation = npmCommand(args);
+  await run(invocation.command, invocation.args);
 }
 
 async function ensureLink(source, destination, checkOnly) {
@@ -106,11 +129,10 @@ async function main() {
   if (Number(process.versions.node.split(".")[0]) < 22) {
     throw new Error(`Node.js 22 or newer is required; current version is ${process.versions.node}`);
   }
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
   if (!options.check && !options.skipDependencies && !await dependenciesAreCurrent()) {
-    await run(npm, ["ci", "--ignore-scripts"]);
+    await runNpm(["ci", "--ignore-scripts"]);
   }
-  if (!options.check && !options.skipBuild) await run(npm, ["run", "build"]);
+  if (!options.check && !options.skipBuild) await runNpm(["run", "build"]);
 
   const home = os.homedir();
   const links = {
@@ -137,7 +159,7 @@ async function main() {
   if (!ok) process.exitCode = 1;
 }
 
-main().catch((error) => {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
 });

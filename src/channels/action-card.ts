@@ -192,7 +192,7 @@ export function formatChannelActionCommand(value: ChannelActionValue, formValue?
       if (typeof raw !== "string") return undefined;
       const objective = raw.trim();
       if (!objective || objective.length > value.field.maximumLength) return undefined;
-      return `/goal ${objective}`;
+      return `/goal set ${objective}`;
     }
     case 4: {
       const fields = z.record(z.string(), z.unknown()).safeParse(formValue ?? {});

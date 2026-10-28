@@ -158,6 +158,9 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         const pendingMessage: ChannelMessage = {
           id: event.message.message_id,
           senderId: actorId,
+          ...(["p2p", "group"].includes(event.message.chat_type) ? {
+            conversationKind: event.message.chat_type === "p2p" ? "direct" as const : "group" as const
+          } : {}),
           ...(event.message.chat_type === "group" ? { mention: { userId: actorId } } : {}),
           replyTargetId: event.message.chat_id,
           text: "",
@@ -166,7 +169,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         };
         if (event.message.parent_id) pendingMessage.references = [{ messageId: event.message.parent_id,
           type: "unknown", attachments: [], availability: "metadata-only", reason: "尚未取得引用正文。" }];
-        if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
+        if (!await claimInbound(options, pendingMessage)) return;
         try {
           if (!["text", "image", "file"].includes(event.message.message_type)) {
             await options.onMessage({ ...pendingMessage, unsupportedMessageType: event.message.message_type });
@@ -201,7 +204,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           attachments: [],
           raw: { channel: "feishu", event: rawEvent }
         };
-        if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
+        if (!await claimInbound(options, pendingMessage)) return;
         return this.cardUpdater.respondToCallback(async () => {
           try {
             await options.onMessage(pendingMessage);
@@ -227,7 +230,7 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
           attachments: [],
           raw: { channel: "feishu", event }
         };
-        if (options.claimMessage && !options.claimMessage(pendingMessage)) return;
+        if (!await claimInbound(options, pendingMessage)) return;
         try {
           await options.onMessage(pendingMessage);
         } catch (error) {
@@ -303,6 +306,16 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
       attachments.push({ ...attachment, item: {}, path: targetPath, label });
     }
     return attachments;
+  }
+}
+
+/** SDK dispatch catches rejected callbacks itself. Durable claim errors belong
+ * to the same application boundary as decoding and execution, before any input. */
+async function claimInbound(options: ChannelMonitorOptions, message: ChannelMessage): Promise<boolean> {
+  try { return !options.claimMessage || options.claimMessage(message); }
+  catch (error) {
+    await reportMessageError(options, error instanceof Error ? error : new Error("Feishu inbound receipt unavailable"), message);
+    return false;
   }
 }
 

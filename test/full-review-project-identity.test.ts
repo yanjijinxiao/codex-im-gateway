@@ -114,15 +114,16 @@ test("Web project registration uses host plus native ID and never widens global 
 
 test("Web picker carries the selected host and project ID even when roots coincide", async () => {
   const source = fs.readFileSync(new URL("../src/web/app.js", import.meta.url), "utf8");
-  const start = source.indexOf("function renderCodexProjectOptions()"), end = source.indexOf("function openRenameProjectDialog", start);
-  const saveStart = source.indexOf("async function saveProject(event)"), saveEnd = source.indexOf("function openRenameSessionDialog", saveStart);
   const fields = new Map<string, any>(); const field = (id: string) => { if (!fields.has(id)) fields.set(id, { value: "", disabled: false, textContent: "", innerHTML: "" }); return fields.get(id); };
   field("#projectAccountInput").value = "one";
   const rows = [candidate("/same", "first"), candidate("/same", "first", "remote")], requests: any[] = [];
-  const context = vm.createContext({ state: { projects: [{ ...rows[0], accountId: "one", sourceProjectId: "first" }], codexProjects: rows },
-    document: { querySelector: field }, escapeAttr: (s: string) => s, escapeHtml: (s: string) => s,
-    api: async (_url: string, input: any) => requests.push(input), els: { projectDialog: { close() {} } }, refreshData: async () => {}, toast(message: string) { assert.fail(message); } });
-  vm.runInContext(source.slice(start, end) + source.slice(saveStart, saveEnd), context);
+  const context = vm.createContext({ document: { querySelector: field, addEventListener() {} }, window: {}, location: { hash: "#sessions" } });
+  vm.runInContext(source, context);
+  context.rows = rows;
+  vm.runInContext('state.projects = [{ ...rows[0], accountId: "one", sourceProjectId: "first" }]; state.codexProjects = rows; els.projectDialog = { open: true, close() {} }', context);
+  context.api = async (_url: string, input: any) => requests.push(input);
+  context.refreshData = async () => {};
+  context.toast = (message: string) => assert.fail(message);
   context.renderCodexProjectOptions();
   assert.equal(field("#projectWorkspaceInput").disabled, false);
   await context.saveProject({ preventDefault() {}, submitter: {} });

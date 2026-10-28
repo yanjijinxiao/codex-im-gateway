@@ -40,6 +40,30 @@ export function assertReleaseDirectory(dir, repo, state) {
 const save = (file, value) => fs.writeFileSync(file, JSON.stringify(value, null, 2), { mode: 0o600 });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+async function withReleaseOwnership(state, action) {
+  const file = path.join(state, 'release.lock');
+  let fd;
+  try { fd = fs.openSync(file, 'wx', 0o600); }
+  catch (error) {
+    if (error.code === 'EEXIST') throw Error(`Another release owns the release lock: ${file}. If its process crashed, verify that owner has exited before removing the stale lock.`);
+    throw error;
+  }
+  let identity;
+  try {
+    identity = fs.fstatSync(fd);
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    fs.fsyncSync(fd);
+    return await action();
+  } finally {
+    try {
+      if (identity) {
+        const current = fs.lstatSync(file);
+        if (current.dev === identity.dev && current.ino === identity.ino) fs.unlinkSync(file);
+      }
+    } finally { fs.closeSync(fd); }
+  }
+}
+
 export async function main(argv) {
   const [action, ...flags] = argv, options = {};
   if (!['prepare', 'seal', 'switch', 'verify'].includes(action) || flags.length % 2) throw Error('Usage: release-local.mjs prepare|seal|switch|verify --dir PATH --state PATH --origin URL --service LABEL --plist PATH');
@@ -54,6 +78,9 @@ export async function main(argv) {
   const origin = new URL(options.origin);
   if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || origin.username || origin.password) throw Error('Release health origin must be local loopback HTTP');
   if (!/^gui\/\d+\/[\w.-]+$/.test(options.service)) throw Error('Invalid launchd service');
+  // Keep ownership across every awaited preflight, switch, verification and
+  // rollback. Separate release directories still target the same live service.
+  return withReleaseOwnership(state, async () => {
   const live = path.join(repo, 'dist'), staged = path.join(dir, 'dist'), backup = path.join(dir, 'dist-previous'), manifest = path.join(dir, 'manifest.json');
   const git = args => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
   const sourceHash = () => hash(git(['ls-files', '-z']).split('\0').filter(Boolean).map(file => `${file}\0${hash(fs.readFileSync(path.join(repo, file)))}`).join('\n'));
@@ -163,5 +190,6 @@ export async function main(argv) {
     if (stopped && oldDead) execFileSync('/bin/launchctl', ['bootstrap', options.service.split('/').slice(0, 2).join('/'), options.plist]);
     m.status = installed ? 'rolled-back' : 'switch-failed'; save(manifest, m); throw error;
   }
+  });
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main(process.argv.slice(2));

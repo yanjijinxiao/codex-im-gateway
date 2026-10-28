@@ -143,7 +143,7 @@ export function parseCommand(
   if (canonicalName === "session" && rest[0]?.toLowerCase() === "new") {
     return { name: "new", arg: rest.slice(1).join(" ") };
   }
-  return { name: canonicalName, arg: ["answer", "queue", "steer"].includes(canonicalName) ? argument : rest.join(" ") };
+  return { name: canonicalName, arg: ["answer", "queue", "steer", "goal"].includes(canonicalName) ? argument : rest.join(" ") };
 }
 
 export type ChannelHelpContext = {

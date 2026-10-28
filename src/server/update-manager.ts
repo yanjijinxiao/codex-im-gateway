@@ -24,7 +24,11 @@ export type UpdateStatus = {
   checkedAt: string;
   registry?: UpdateRegistryId;
   error?: string;
+  updateMethod?: "source";
+  message?: string;
 };
+
+const SOURCE_UPDATE_MESSAGE = "当前通过 Git 源码部署；请更新源码、安装依赖并构建，完成检查后重启服务。此入口不提供 npm 更新。";
 
 export type UpdateInstallResult = {
   version: string;
@@ -64,11 +68,13 @@ export class UpdateManager implements UpdateService {
   private cached?: { expiresAt: number; status: UpdateStatus };
   private checkPromise?: Promise<UpdateStatus>;
   private installing = false;
+  private readonly sourceOnly: boolean;
 
   constructor(private readonly options: UpdateManagerOptions) {
     this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     const platform = options.platform ?? process.platform;
     const installTarget = resolveNpmInstallTarget(options.packageRoot ?? CURRENT_PACKAGE_ROOT, platform);
+    this.sourceOnly = !options.install && !installTarget;
     this.installImpl = options.install ?? ((version, registry) => installCurrentRuntimeVersion(version, registry, {
       installTarget,
       platform,
@@ -82,6 +88,10 @@ export class UpdateManager implements UpdateService {
 
   async check(force = false): Promise<UpdateStatus> {
     const now = this.now();
+    if (this.sourceOnly) return {
+      currentVersion: this.options.currentVersion, updateAvailable: false,
+      checkedAt: new Date(now).toISOString(), updateMethod: "source", message: SOURCE_UPDATE_MESSAGE
+    };
     if (!force && this.cached && this.cached.expiresAt > now) {
       return { ...this.cached.status };
     }
@@ -94,6 +104,7 @@ export class UpdateManager implements UpdateService {
   }
 
   async installLatest(): Promise<UpdateInstallResult> {
+    if (this.sourceOnly) throw new Error(`仅支持本地源码更新：${SOURCE_UPDATE_MESSAGE}`);
     if (this.installing) {
       throw new Error("Update is already in progress");
     }

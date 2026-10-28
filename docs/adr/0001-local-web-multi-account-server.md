@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted for the initial release; historical product name and state-directory decisions below are superseded by the current README and state-path migration contract. The loopback management boundary remains in force; optional authenticated IDE ingress is a separate data plane.
 
 ## Context
 

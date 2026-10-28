@@ -49,6 +49,8 @@ async function resolveQaKnowledgeBase(
       if (!selection.projectId) return undefined;
       const project = store.listProjects().find((candidate) => candidate.id === selection.projectId);
       if (!project) throw new Error(`Managed Codex project not found: ${selection.projectId}`);
+      if ((project.hostId ?? "local") !== "local" || project.projectKind === "remote")
+        throw new Error("远程项目不能作为本机目录知识库；请另行选择已登记的本机知识库或本机目录。");
       return resolveDirectoryKnowledgeBase(store, llmWiki, {
         rootPath: project.workspace,
         fallbackName: project.name

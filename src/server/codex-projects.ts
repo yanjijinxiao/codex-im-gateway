@@ -292,24 +292,24 @@ export function readCodexDesktopProjects(
       if (!isRecord(rawProject)) continue;
       const projectId = stringValue(rawProject.id) ?? fallbackId;
       const workspace = firstString(rawProject.rootPaths);
-      if (!workspace) continue;
+      if (!workspace || !path.isAbsolute(workspace) || /[\r\n\0]/.test(workspace)) continue;
       const resolvedWorkspace = resolveDirectory(workspace);
-      if (!resolvedWorkspace) continue;
+      const primaryWorkspace = resolvedWorkspace || path.normalize(workspace);
       const roots = Array.isArray(rawProject.rootPaths) ? rawProject.rootPaths : [];
       const rootsValid = roots.length > 0 && roots.length <= 32
         && roots.every(root => typeof root === "string" && path.isAbsolute(root) && !/[\r\n\0]/.test(root));
       // Missing sibling directories stay in scope; malformed membership makes
       // only this project unavailable, never the entire channel catalog.
-      const rootPaths = rootsValid ? [...new Set((roots as string[]).map(root => root === workspace ? resolvedWorkspace : path.normalize(root)))] : [];
+      const rootPaths = rootsValid ? [...new Set((roots as string[]).map(root => root === workspace ? primaryWorkspace : path.normalize(root)))] : [];
       candidates.set(projectId, {
         projectId,
         projectKind: "local",
-        name: stringValue(rawProject.name) ?? (path.basename(resolvedWorkspace) || resolvedWorkspace),
-        workspace: resolvedWorkspace,
+        name: stringValue(rawProject.name) ?? (path.basename(primaryWorkspace) || primaryWorkspace),
+        workspace: primaryWorkspace,
         ...(rootPaths.length > 1 ? { rootPaths } : {}),
         lastUsedAt: timestampFromMilliseconds(rawProject.updatedAt ?? rawProject.createdAt),
         sessionCount: desktopProjectSessionCount(sessionsByProject[projectId]),
-        available: rootsValid
+        available: Boolean(resolvedWorkspace) && rootsValid
       });
     }
   }

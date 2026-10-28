@@ -153,12 +153,16 @@ function tryNormalizeKnowledgeAction(raw: unknown): KnowledgeInput | undefined {
 export function parseActionBlocks(text: string, options: { strict?: boolean } = {}): ParsedActionBlocks {
   const actions: BridgeActions = { send: [], control: [], remember: [] };
   const source = markdownSource(text);
-  let visible = "", cursor = 0, invalid = false;
+  let visible = "", cursor = 0, scanCursor = 0, invalid = false;
   // Only explicit, closed, top-level Markdown fences are executable. Quoted
   // source, lists and longer outer example fences remain ordinary content.
   for (const token of Lexer.lex(source.text, { gfm: true })) {
-    const offset = source.text.indexOf(token.raw, cursor);
-    if (offset < 0 || token.type !== "code" || !ACTION_LANGUAGE.test(token.lang ?? "")) continue;
+    const offset = source.text.indexOf(token.raw, scanCursor);
+    if (offset < 0) continue;
+    // Non-executable tokens still consume their source range. Otherwise an
+    // actual action can match identical bytes inside an earlier outer example.
+    scanCursor = offset + token.raw.length;
+    if (token.type !== "code" || !ACTION_LANGUAGE.test(token.lang ?? "")) continue;
     visible += source.original(cursor, offset);
     cursor = offset + token.raw.length;
     try {

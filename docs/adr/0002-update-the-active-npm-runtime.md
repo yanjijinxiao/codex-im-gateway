@@ -4,6 +4,8 @@
 
 Accepted
 
+> 历史兼容设计：当前项目只通过 GitHub 分发源码。源码部署不查询 npm，也不提供 Web npm 安装；下述行为仅保留给既有 npm 运行目录或显式注入的安装器。文中的 codex-weixin 是历史包名。
+
 ## Context
 
 The Web updater previously installed `codex-weixin` globally, then restarted the exact entry path that launched the service. This worked for global installs but failed when a launcher used an isolated local runtime: npm updated the global copy while the restart helper relaunched the unchanged local copy. Installation succeeded, but the Web page timed out waiting for the new version.

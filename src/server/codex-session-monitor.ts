@@ -230,21 +230,31 @@ export class CodexSessionCompletionMonitor {
         this.cursors.set(filePath, cursor);
         return;
       }
-      const buffer = await readFileRange(filePath, cursor.offset, size - cursor.offset);
-      if (runId !== undefined && !this.isActiveRun(runId)) return;
-      const lastNewline = buffer.lastIndexOf(0x0a);
-      if (lastNewline < 0) return;
-      const complete = buffer.subarray(0, lastNewline + 1);
-      cursor.offset += complete.length;
       this.cursors.set(filePath, cursor);
-      for (const line of complete.toString("utf8").split("\n")) {
+      let readOffset = cursor.offset, completed = false;
+      let fragments: Buffer[] = [];
+      // File growth is not a memory allocation budget. Only an individual
+      // complete JSONL record is assembled, preserving UTF-8 across reads.
+      while (readOffset < size) {
         if (runId !== undefined && !this.isActiveRun(runId)) return;
-        if (!line) continue;
-        const event = parseRecord(line);
-        if (!event) continue;
-        await this.processEvent(cursor, event);
+        const buffer = await readFileRange(filePath, readOffset, Math.min(1024 * 1024, size - readOffset));
+        if (!buffer.length) break;
+        readOffset += buffer.length;
+        let start = 0, newline: number;
+        while ((newline = buffer.indexOf(0x0a, start)) >= 0) {
+          if (runId !== undefined && !this.isActiveRun(runId)) return;
+          fragments.push(buffer.subarray(start, newline + 1));
+          const record = Buffer.concat(fragments);
+          cursor.offset += record.length;
+          fragments = []; start = newline + 1; completed = true;
+          const event = parseRecord(record.toString("utf8"));
+          if (event) await this.processEvent(cursor, event);
+        }
+        if (start < buffer.length) fragments.push(buffer.subarray(start));
+        await yieldToEventLoop();
       }
-      cursor.emitAfter = undefined;
+      // An incomplete tail is reread next scan; it never advances the cursor.
+      if (completed) cursor.emitAfter = undefined;
     } catch (error) {
       console.error(`[codex-im-gateway] unable to read Codex session completion: ${String(error)}`);
     } finally {

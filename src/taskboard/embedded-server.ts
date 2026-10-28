@@ -2,6 +2,7 @@ import type { AddressInfo } from "node:net";
 
 import { createTaskboardServer } from "codex-taskboard/server";
 import { TaskboardClient } from "./client.js";
+import { managedTaskboardOrigin } from "./config.js";
 
 export type EmbeddedTaskboard = {
   url: string;
@@ -66,13 +67,9 @@ async function reuseHealthyTaskboard(port: number): Promise<EmbeddedTaskboard | 
 }
 
 export function embeddedTaskboardPort(taskboardUrl: string): number {
-  const url = new URL(taskboardUrl);
-  if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
-    throw new EmbeddedTaskboardStartError(
-      "Managed Taskboard URL must use an HTTP loopback origin",
-      taskboardUrl
-    );
-  }
+  let url: URL;
+  try { url = managedTaskboardOrigin(taskboardUrl); }
+  catch (error) { throw new EmbeddedTaskboardStartError("Managed Taskboard URL must use an HTTP loopback origin", error); }
   return url.port ? Number(url.port) : 80;
 }
 

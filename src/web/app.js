@@ -71,6 +71,33 @@ let streamingRenderFrame = 0;
 let bindingOverview;
 
 const els = {};
+const dialogSessions = new WeakMap();
+
+function showOwnedDialog(dialog, resetSubmit = true) {
+  const owner = { pending: false };
+  dialogSessions.set(dialog, owner);
+  if (resetSubmit) dialog.querySelectorAll?.('button[type="submit"]').forEach(button => { button.disabled = false; });
+  dialog.showModal();
+  return () => dialogSessions.get(dialog) === owner && dialog.open;
+}
+
+/** A request belongs to one opening, even when the same DOM is reused. */
+function claimDialogSubmission(dialog, button) {
+  let owner = dialogSessions.get(dialog);
+  if (!owner) { owner = { pending: false }; dialogSessions.set(dialog, owner); }
+  if (owner.pending) return;
+  owner.pending = true;
+  if (button) button.disabled = true;
+  return {
+    current: () => dialogSessions.get(dialog) === owner && dialog.open,
+    close() { if (this.current()) dialog.close(); },
+    release() {
+      if (dialogSessions.get(dialog) !== owner) return;
+      owner.pending = false;
+      if (button) button.disabled = false;
+    }
+  };
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   Object.assign(els, {
@@ -213,10 +240,7 @@ function bindEvents() {
 
 async function bootstrap() {
   try {
-    const [data, taskboard] = await Promise.all([
-      api("/api/bootstrap", { token: false }),
-      api("/api/taskboard", { token: false })
-    ]);
+    const data = await api("/api/bootstrap", { token: false });
     state.requestToken = data.requestToken;
     state.version = data.version || "";
     state.accounts = data.accounts;
@@ -227,11 +251,10 @@ async function bootstrap() {
     state.codex = data.codex;
     state.codexRuntime = data.codexRuntime;
     state.codexModels = data.codexModels || [];
-    state.taskboard = taskboard;
-    await loadTaskboardIssues();
     renderAll();
     showView(location.hash.slice(1) || "accounts", false);
     window.setInterval(() => void refreshData(false), 5000);
+    void refreshTaskboardIssues(false, { background: true, loadDetail: false });
   } catch (error) {
     toast(error.message, true);
     els.accountsList.innerHTML = emptyState("server-off", "无法连接本机服务", "请重新启动 codex-im-gateway");
@@ -260,6 +283,10 @@ async function checkForUpdateNow() {
   label.textContent = "检查中";
   try {
     const info = await api("/api/update?force=1");
+    if (info.updateMethod === "source") {
+      toast(info.message || "当前通过 Git 源码部署，请按源码发布流程更新");
+      return;
+    }
     if (info.error) throw new Error(info.error);
     if (info.updateAvailable && info.latestVersion) {
       showAvailableUpdate(info);
@@ -1020,13 +1047,15 @@ function openTaskboardActionDialog(identifier, status, version) {
   document.querySelector("#taskboardActionComment").value = "";
   document.querySelector("#taskboardActionComment").required = meta.required;
   document.querySelector("#taskboardActionSubmit span").textContent = meta.submit;
-  els.taskboardActionDialog.showModal();
+  showOwnedDialog(els.taskboardActionDialog);
   drawIcons();
 }
 
 async function submitTaskboardAction(event) {
   event.preventDefault();
   const button = event.submitter;
+  const lease = claimDialogSubmission(els.taskboardActionDialog, button);
+  if (!lease) return;
   const identifier = document.querySelector("#taskboardActionIdentifier").value;
   const status = document.querySelector("#taskboardActionStatus").value;
   const version = Number(document.querySelector("#taskboardActionVersion").value);
@@ -1037,13 +1066,13 @@ async function submitTaskboardAction(event) {
       method: "POST",
       body: { status, version, ...(comment ? { comment } : {}) }
     });
-    els.taskboardActionDialog.close();
+    lease.close();
     await refreshTaskboardIssues(false);
     toast(status === "done" ? "任务已验收完成" : "任务状态已更新");
   } catch (error) {
     toast(error.message, true);
   } finally {
-    button.disabled = false;
+    lease.release();
   }
 }
 
@@ -1210,7 +1239,7 @@ function openAccountSettingsDialog(account) {
     ? "当前已配置。填写新地址将替换；留空则保持不变。"
     : "配置后，该渠道的每条收发消息都会额外推送一次。";
   document.querySelector("#accountDialogTitle").textContent = `${accountDisplayName(account.accountId)} · 渠道设置`;
-  els.accountDialog.showModal();
+  showOwnedDialog(els.accountDialog);
   document.querySelector("#accountRemarkInput").select();
 }
 
@@ -1221,13 +1250,15 @@ function openRemoveAccountDialog(account) {
   const canRetain = (account.channel || "weixin") === "weixin";
   document.querySelector(".account-removal-choices").hidden = !canRetain;
   document.querySelector('input[name="retainHistory"][value="false"]').checked = !canRetain;
-  els.removeAccountDialog.showModal();
+  showOwnedDialog(els.removeAccountDialog);
   drawIcons();
 }
 
 async function removeAccount(event) {
   event.preventDefault();
   const button = event.submitter;
+  const lease = claimDialogSubmission(els.removeAccountDialog, button);
+  if (!lease) return;
   const accountId = document.querySelector("#removingAccountId").value;
   const retainHistory = document.querySelector('input[name="retainHistory"]:checked')?.value === "true";
   try {
@@ -1236,13 +1267,13 @@ async function removeAccount(event) {
       method: "DELETE",
       body: { retainHistory }
     });
-    els.removeAccountDialog.close();
+    lease.close();
     await refreshData(false);
     toast(retainHistory ? "账号已移除，重新扫码后将恢复会话历史" : "账号和会话历史已删除");
   } catch (error) {
     toast(error.message, true);
   } finally {
-    button.disabled = false;
+    lease.release();
   }
 }
 
@@ -1264,6 +1295,8 @@ async function saveAccountSettings(event) {
   if (webhookUrl) body.webhookUrl = webhookUrl;
   else if (clearWebhook) body.webhookUrl = null;
   setAccountFormError("");
+  const lease = claimDialogSubmission(els.accountDialog, button);
+  if (!lease) return;
   try {
     button.disabled = true;
     body.modeSettings = channelModeSettings.serialize();
@@ -1271,11 +1304,12 @@ async function saveAccountSettings(event) {
       method: "PATCH",
       body
     });
-    els.accountDialog.close();
+    lease.close();
     await refreshData(false);
     toast("渠道设置已保存");
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
+    if (!lease.current()) { toast(rawMessage, true); return; }
     const webhookInvalid = /Webhook URL|webhookUrl|Invalid url/i.test(rawMessage);
     const directoryInvalid = document.querySelector("#accountQaDirectoryRootInput").required && !webhookInvalid;
     setAccountFormError(
@@ -1285,7 +1319,7 @@ async function saveAccountSettings(event) {
     if (webhookInvalid) document.querySelector("#accountWebhookInput").focus();
     else if (directoryInvalid) document.querySelector("#accountQaDirectoryRootInput").focus();
   } finally {
-    button.disabled = false;
+    lease.release();
   }
 }
 
@@ -1930,7 +1964,7 @@ async function beginLogin() {
 function openChannelDialog() {
   document.querySelector("#channelForm").reset();
   renderChannelFields();
-  els.channelDialog.showModal();
+  showOwnedDialog(els.channelDialog);
   document.querySelector("#channelTypeInput").focus();
 }
 
@@ -1984,6 +2018,8 @@ async function saveChannel(event) {
     await beginLogin();
     return;
   }
+  const lease = claimDialogSubmission(els.channelDialog, button);
+  if (!lease) return;
   let body;
   if (channel === "wecom") {
     body = {
@@ -2013,13 +2049,13 @@ async function saveChannel(event) {
   try {
     button.disabled = true;
     await api("/api/accounts", { method: "POST", body });
-    els.channelDialog.close();
+    lease.close();
     await refreshData(false);
     toast(`${channelInfo(channel).label}已添加`);
   } catch (error) {
     toast(error.message, true);
   } finally {
-    button.disabled = false;
+    lease.release();
   }
 }
 
@@ -2041,7 +2077,7 @@ function openProjectNotificationDialog(project) {
     || "";
   document.querySelector("#notificationEnabledInput").checked = current?.enabled === true;
   updateNotificationFields();
-  els.projectNotificationDialog.showModal();
+  showOwnedDialog(els.projectNotificationDialog);
 }
 
 function updateNotificationFields() {
@@ -2055,6 +2091,8 @@ function updateNotificationFields() {
 async function saveProjectNotifications(event) {
   event.preventDefault();
   const button = event.submitter;
+  const lease = claimDialogSubmission(els.projectNotificationDialog, button);
+  if (!lease) return;
   const accountId = document.querySelector("#notificationProjectAccountId").value;
   const projectId = document.querySelector("#notificationProjectId").value;
   const enabled = document.querySelector("#notificationEnabledInput").checked;
@@ -2069,13 +2107,13 @@ async function saveProjectNotifications(event) {
       method: "PUT",
       body: { notifications }
     });
-    els.projectNotificationDialog.close();
+    lease.close();
     await refreshData(false);
     toast(enabled ? "项目任务通知已开启" : "项目任务通知已关闭");
   } catch (error) {
     toast(error.message, true);
   } finally {
-    button.disabled = false;
+    lease.release();
   }
 }
 
@@ -2157,7 +2195,7 @@ function openNewSessionDialog(preselectedProject) {
   state.newSessionPreferredProjectId = preselectedProject?.id || "";
   updateNewSessionDefaultTitle();
   updateSessionProjectOptions(preselectedProject?.id);
-  els.sessionDialog.showModal();
+  showOwnedDialog(els.sessionDialog);
   document.querySelector("#sessionTitleInput").focus();
 }
 
@@ -2226,13 +2264,15 @@ async function openNewProjectDialog(preselectedAccountId = "") {
     ? preferredAccountId
     : accounts[0].accountId;
   document.querySelector("#projectNameInput").value = "";
-  els.projectDialog.showModal();
+  const isCurrent = showOwnedDialog(els.projectDialog, false);
   try {
     const result = await api("/api/codex-projects");
+    if (!isCurrent()) return;
     state.codexProjects = result.projects || [];
     renderCodexProjectOptions();
     document.querySelector("#projectWorkspaceInput").focus();
   } catch (error) {
+    if (!isCurrent()) return;
     document.querySelector("#projectWorkspaceHint").textContent = "无法读取 Codex 项目数据，请刷新后重试。";
     workspaceInput.innerHTML = `<option value="">读取失败</option>`;
     toast(error.message, true);
@@ -2287,13 +2327,15 @@ function openRenameProjectDialog(project) {
   document.querySelector("#projectWorkspaceInput").disabled = true;
   document.querySelector("#saveProjectButton").disabled = false;
   document.querySelector("#projectNameInput").value = project.name;
-  els.projectDialog.showModal();
+  showOwnedDialog(els.projectDialog);
   document.querySelector("#projectNameInput").select();
 }
 
 async function saveProject(event) {
   event.preventDefault();
   const submitButton = event.submitter;
+  const lease = claimDialogSubmission(els.projectDialog, submitButton);
+  if (!lease) return;
   const projectId = document.querySelector("#editingProjectId").value;
   const name = document.querySelector("#projectNameInput").value.trim();
   try {
@@ -2320,14 +2362,14 @@ async function saveProject(event) {
           source: "codex-history"
         }
       });
-      state.selectedAccountId = accountId;
+      if (lease.current()) state.selectedAccountId = accountId;
     }
-    els.projectDialog.close();
+    lease.close();
     await refreshData(false);
   } catch (error) {
     toast(error.message, true);
   } finally {
-    if (submitButton) submitButton.disabled = false;
+    lease.release();
   }
 }
 
@@ -2340,12 +2382,14 @@ function openRenameSessionDialog(session) {
   document.querySelector("#sessionSenderInput").disabled = true;
   document.querySelector("#sessionProjectInput").disabled = true;
   document.querySelector("#sessionTitleInput").value = session.title;
-  els.sessionDialog.showModal();
+  showOwnedDialog(els.sessionDialog);
   document.querySelector("#sessionTitleInput").select();
 }
 
 async function saveSession(event) {
   event.preventDefault();
+  const lease = claimDialogSubmission(els.sessionDialog, event.submitter);
+  if (!lease) return;
   const title = document.querySelector("#sessionTitleInput").value.trim();
   const sessionId = document.querySelector("#editingSessionId").value;
   try {
@@ -2365,15 +2409,19 @@ async function saveSession(event) {
           projectId
         }
       });
-      state.selectedAccountId = accountId;
-      state.selectedSessionKey = sessionKey(created.session);
-      state.sessionMessages = [];
-      state.loadedSessionKey = "";
+      if (lease.current()) {
+        state.selectedAccountId = accountId;
+        state.selectedSessionKey = sessionKey(created.session);
+        state.sessionMessages = [];
+        state.loadedSessionKey = "";
+      }
     }
-    els.sessionDialog.close();
+    lease.close();
     await refreshData(false);
   } catch (error) {
     toast(error.message, true);
+  } finally {
+    lease.release();
   }
 }
 
@@ -2402,9 +2450,9 @@ async function saveSettings(event) {
     state.config = result.config;
     state.codexRuntime = result.codexRuntime;
     state.codexModels = result.codexModels || state.codexModels;
-    state.taskboard = await api("/api/taskboard");
     renderAll();
     toast("设置已保存");
+    void refreshTaskboardIssues(false, { background: true, loadDetail: false });
   } catch (error) {
     toast(error.message, true);
   } finally {

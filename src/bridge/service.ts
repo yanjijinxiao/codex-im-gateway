@@ -1,5 +1,6 @@
 import { AdmissionService, admissionPrincipal } from "./admission.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { localProjectsAtWorkspace, managedProjectForNative, nativeProjectForManaged } from "../state/project-identity.js";
@@ -199,7 +200,7 @@ export class BridgeService {
     rows: SessionCatalogRow[];
     page: number; pageSize: number; createdAt: number; label: string; warnings: string[];
   }>();
-  private readonly projectLists = new Map<string, { createdAt: number; codes: Map<string, { projectId?: string; candidate?: CodexProjectCandidate }> }>();
+  private readonly projectLists = new Map<string, { id: string; createdAt: number; codes: Map<string, { projectId?: string; candidate?: CodexProjectCandidate }> }>();
 
   private catalogActorKey(senderId: string): string {
     return JSON.stringify([senderId, this.actor.getStore() ?? senderId]);
@@ -693,6 +694,7 @@ export class BridgeService {
   }
 
   private async handleNewSessionCommand(senderId: string, arg: string): Promise<boolean> {
+    const assertCurrent = this.conversationControlGuard(senderId, "participant");
     const target = parseNewSessionTarget(arg);
     const store = this.options.stateStore;
     if (target.kind === "invalid" || target.kind === "help") {
@@ -726,6 +728,7 @@ export class BridgeService {
       return false;
     }
     if (target.kind === "current" && !await this.validateProjectRoute(senderId, project)) return false;
+    assertCurrent();
     const session = store.createSession(senderId, project.workspace, undefined, project.id);
     store.setInteractionMode(senderId, "session");
     await this.reply(senderId, `已在${target.kind === "current" ? "当前" : "指定"}项目“${project.name}”新建并绑定会话：${session.title}\n\n主机：${project.hostId ?? "local"}\n\n工作目录：${session.workspace}\n\n下一条消息将在这个新会话中开始。`);
@@ -735,6 +738,13 @@ export class BridgeService {
   private selectProject(senderId: string, selector: string, candidates: readonly CodexProjectCandidate[], projects: readonly ManagedProject[]) {
     let selected: ReturnType<typeof selectChannelProject>;
     const snapshot = this.projectLists.get(this.catalogActorKey(senderId));
+    const nativeChoice = /^([pc][1-9]\d*)@([a-f0-9-]{36})$/i.exec(selector);
+    if (nativeChoice) {
+      if (nativeChoice[2] !== snapshot?.id) return {
+        error: copyableChoices("这张项目卡片已被刷新，请从最新列表重新选择。", [{ label: "刷新项目列表", value: "/project" }])
+      };
+      selector = nativeChoice[1];
+    }
     if (/^[pc][1-9]\d*$/i.test(selector) && !snapshot) return {
       error: copyableChoices("当前没有这份项目列表，请刷新后重新选择。", [{ label: "刷新项目列表", value: "/project" }])
     };
@@ -755,7 +765,9 @@ export class BridgeService {
   }
 
   private async resolveSelectedProject(senderId: string, selector: string, catalog?: readonly CodexProjectCandidate[]): Promise<ManagedProject | undefined> {
+    const assertCurrent = this.conversationControlGuard(senderId, "participant");
     const candidates = catalog ?? await this.codexProjectCandidates();
+    assertCurrent();
     this.synchronizeManagedProjects(candidates);
     const projects = this.options.stateStore.listProjects();
     const selected = this.selectProject(senderId, selector, candidates, projects);
@@ -765,6 +777,7 @@ export class BridgeService {
     }
     const target = selected.project ?? selected.candidate!;
     if (!await this.validateProjectRoute(senderId, target)) return;
+    assertCurrent();
     return selected.project ?? this.options.stateStore.createProject(target.name, target.workspace, {
       sourceProjectId: selected.candidate!.projectId,
       rootPaths: selected.candidate!.rootPaths,
@@ -786,7 +799,13 @@ export class BridgeService {
   }
 
   private async handleProjectCommand(senderId: string, arg: string): Promise<boolean> {
+    if (this.cardInteraction.getStore() && /^(?:switch\s+)?[pc][1-9]\d*$/i.test(arg.trim())) {
+      await this.reply(senderId, "这张旧项目卡片缺少列表版本，请发送 /project 刷新后重新选择。");
+      return false;
+    }
+    const assertCurrent = this.conversationControlGuard(senderId, requiredCommandRole("project", arg));
     const candidates = await this.codexProjectCandidates();
+    assertCurrent();
     this.synchronizeManagedProjects(candidates);
     // add is a compatibility alias; discovery alone never creates bindings.
     const input = arg.trim().replace(/^(?:add|a)(?:\s+|$)/i, "");
@@ -794,6 +813,7 @@ export class BridgeService {
     if (addMatch) {
       const project = await this.resolveSelectedProject(senderId, input, candidates);
       if (!project) return false;
+      assertCurrent();
       this.options.stateStore.activateProject(senderId, project.id);
       this.options.stateStore.setInteractionMode(senderId, "session");
       await this.reply(
@@ -890,7 +910,10 @@ export class BridgeService {
         }
       }
       for (const [k,v] of this.projectLists) if (Date.now() - v.createdAt > 15 * 60_000 && k !== key) this.projectLists.delete(k);
-      this.projectLists.set(key, { createdAt: previous && /(?:^|\s)page/i.test(input) ? previous.createdAt : Date.now(), codes });
+      const snapshot = previous && /(?:^|\s)page/i.test(input)
+        ? { id: previous.id, createdAt: previous.createdAt, codes }
+        : { id: randomUUID(), createdAt: Date.now(), codes };
+      this.projectLists.set(key, snapshot);
       const title = `${retained ? "历史项目登记" : "Codex 项目"} · ${displayed.length} 个 · ${page}/${pages} 页`;
       const table: ChannelTable = { columns: ["编号", "项目", "主机", "状态"].map(label => ({ label })),
         rows: pageRows.map(row => [row.code, compactTableCell(row.name, 32), row.host, row.status]) };
@@ -904,13 +927,14 @@ export class BridgeService {
       await this.replyActionCard(senderId, createChoiceCard({ title, body, table, note,
         fallbackText: [title, body, renderTextTable(table), note].filter(Boolean).join("\n\n"),
         copyChoices: [...(pageRows.length ? [{ label: "选择项目模板（将“项目编号”替换为上表的 P 或 C 编号）", value: "/project 项目编号" }] : []), ...navigation],
-        choices: [...pageRows.map(row => ({ label: `${row.code} ${row.name}`, command: "project" as const, arg: row.code })),
+        choices: [...pageRows.map(row => ({ label: `${row.code} ${row.name}`, command: "project" as const, arg: `${row.code}@${snapshot.id}`, copyValue: `/project ${row.code}` })),
           ...navigation.map(item => ({ label: item.label, command: "project" as const, arg: item.value.slice(9) }))] }));
       return false;
     }
     const requestedProject = /^(?:switch)\s+(.+)$/i.exec(input)?.[1]?.trim() ?? input;
     const project = await this.resolveSelectedProject(senderId, requestedProject, candidates);
     if (!project) return false;
+    assertCurrent();
     this.options.stateStore.activateProject(senderId, project.id);
     this.options.stateStore.setInteractionMode(senderId, this.modeSettings.defaultMode);
     const fallbackText = [
@@ -930,6 +954,7 @@ export class BridgeService {
 
   private async handleModeCommand(message: ChannelMessage, arg: string): Promise<void> {
     const senderId = message.senderId;
+    const assertCurrent = this.conversationControlGuard(senderId, requiredCommandRole("mode", arg));
     const project = this.options.stateStore.getActiveProject(senderId);
     if (!project) {
       await this.replyActionCard(senderId, createChoiceCard({
@@ -1007,6 +1032,7 @@ export class BridgeService {
       return;
     }
     const current = this.options.stateStore.getActiveQaSession(senderId);
+    assertCurrent();
     const reusable = current?.projectId === project.id && current.knowledgeBaseId === knowledgeBase.id
       ? current
       : this.options.stateStore.listSessions()
@@ -1226,6 +1252,28 @@ export class BridgeService {
     };
   }
 
+  /** An asynchronous configuration/selection query cannot later retarget its
+   * mutation to a newer binding, or revive a binding explicitly left meanwhile. */
+  private conversationControlGuard(senderId: string, required: SessionRole): () => void {
+    const originalSession = this.executionSession(senderId);
+    const assertCurrent = this.controlGuard(senderId, originalSession, required);
+    const projectId = this.options.stateStore.getActiveProject(senderId)?.id;
+    const mode = this.options.stateStore.getInteractionMode(senderId);
+    // An unbound query has no session execution generation. Existing detach
+    // and activity facts fence a later leave or bind/leave round trip without
+    // invalidating bound controls for unrelated human activity.
+    const detached = this.options.stateStore.isSessionDetached(senderId);
+    const unboundGeneration = !originalSession ? this.options.stateStore.getBindingExpiry(senderId, 0)?.generation : undefined;
+    return () => {
+      assertCurrent();
+      if (this.options.stateStore.getActiveProject(senderId)?.id !== projectId
+        || this.options.stateStore.getInteractionMode(senderId) !== mode
+        || !originalSession && (this.options.stateStore.isSessionDetached(senderId) !== detached
+          || this.options.stateStore.getBindingExpiry(senderId, 0)?.generation !== unboundGeneration))
+        throw new CodexInterventionError("查询期间项目或模式已改变，旧控制操作未应用，请重新操作。");
+    };
+  }
+
   private async recoverSystemPreflight(senderId: string, session: ManagedSession, state: CodexThreadState): Promise<CodexThreadState> {
     if (state.runtimeStatus !== "systemError" || !state.lastTurnFailure || state.lastTurnFailure.code === "model-capacity"
       || !this.options.requestSystemRecovery) return state;
@@ -1421,6 +1469,7 @@ export class BridgeService {
 
   private async bindCatalogSession(senderId: string, threadId: string, hostId?: string): Promise<void> {
     if (!await this.requireRole(senderId, "participant")) return;
+    const assertCurrent = this.conversationControlGuard(senderId, "participant");
     // An unqualified ID already known to this chat must retain its host; IDs
     // alone are not a globally unique routing key. Never probe/resume writers
     // on another backend to guess ownership.
@@ -1447,6 +1496,7 @@ export class BridgeService {
     if (state.persistence !== "active" || state.internal || reason) { await this.reply(senderId, reason ?? "此会话不可绑定，请选择未归档的普通会话。"); return; }
     if (!state.cwd || !path.isAbsolute(state.cwd)) { await this.reply(senderId, "该会话没有可确认的工作目录，未建立绑定。"); return; }
     const store = this.options.stateStore;
+    assertCurrent();
     const existing = store.listSessions().find(s => s.senderId === senderId && s.mode !== "qa" && s.threadId === threadId && this.sessionHostId(s) === hostId);
     let project = state.projectId ? managedProjectForNative({ projectId: state.projectId, hostId, workspace: state.cwd }, store.listProjects()) : undefined;
     if (!project && state.projectId) {
@@ -1675,6 +1725,7 @@ export class BridgeService {
       ]));
       return;
     }
+    const assertPolicyCurrent = this.conversationControlGuard(senderId, requiredCommandRole("policy", arg));
     if (arg === "steer") {
       const hostId = this.sessionHostId(session);
       const desktopOwned = session.threadId && typeof this.runner.inspectThread === "function"
@@ -1692,7 +1743,10 @@ export class BridgeService {
         return;
       }
     }
-    if (arg) this.options.stateStore.setActiveMessagePolicy(session.id, arg as "ask" | "steer" | "queue");
+    if (arg) {
+      assertPolicyCurrent();
+      this.options.stateStore.setActiveMessagePolicy(session.id, arg as "ask" | "steer" | "queue");
+    }
     await this.reply(senderId, "运行中消息处理方式：" + (arg || session.activeMessagePolicy || this.options.config.activeMessagePolicy || "steer") + "（ask 询问，steer 介入，queue 原生排队）。");
   }
 
@@ -2002,8 +2056,14 @@ export class BridgeService {
   }
 
   private async handleModelCommand(senderId: string, arg: string): Promise<void> {
+    if (this.cardInteraction.getStore() && /^\d+$/.test(arg.trim())) {
+      await this.reply(senderId, "这张旧模型卡片只保留了序号，请发送 /model 刷新后重新选择。");
+      return;
+    }
+    const assertCurrent = this.conversationControlGuard(senderId, requiredCommandRole("model", arg));
     const models = await this.listCodexModels();
-    const input = arg.trim();
+    const explicitId = arg.trim().startsWith("--id ");
+    const input = explicitId ? arg.trim().slice(5).trim() : arg.trim();
     if (!input) {
       const runtime = await this.effectiveRuntime(senderId);
       const session = this.executionSession(senderId);
@@ -2022,9 +2082,9 @@ export class BridgeService {
           ? models.map((model) => `${model.model === runtime.model ? `**当前 · ${model.displayName}**` : `**${model.displayName}**`}\n${model.model}`).join("\n\n")
           : `当前模型：${runtime.model ?? "Codex 默认"}\n\n模型列表暂时不可用。`,
         command: "model",
-        choices: models.map((model, index) => ({
+        choices: models.map((model) => ({
           label: conciseButtonLabel(model.displayName),
-          arg: String(index + 1),
+          arg: /^(?:\d+|default)$/i.test(model.model) ? `--id ${model.model}` : model.model,
           active: model.model === runtime.model
         })),
         includeDefault: true,
@@ -2032,14 +2092,15 @@ export class BridgeService {
       }));
       return;
     }
-    if (input.toLowerCase() === "default") {
+    if (!explicitId && input.toLowerCase() === "default") {
+      assertCurrent();
       this.updateExecutionRuntime(senderId, { model: null });
       const runtime = await this.effectiveRuntime(senderId);
       await this.reply(senderId, `已恢复继承 Web/Codex 模型设置。\n当前模型：${runtime.model ?? "Codex 默认"}`);
       return;
     }
 
-    const selected = selectModel(models, input);
+    const selected = explicitId ? models.find(model => model.model === input) : selectModel(models, input);
     if (!selected && (models.length || !isPlausibleModelId(input))) {
       const fallbackText = "模型不存在。发送 /model 查看可用模型，或使用 /model default 恢复继承设置。";
       await this.replyActionCard(senderId, createChoiceCard({
@@ -2051,6 +2112,7 @@ export class BridgeService {
       return;
     }
     const currentRuntime = await this.effectiveRuntime(senderId);
+    assertCurrent();
     const model = selected?.model ?? input;
     this.updateExecutionRuntime(senderId, { model });
     let adjustedEffort: string | undefined;
@@ -2068,6 +2130,11 @@ export class BridgeService {
   }
 
   private async handleEffortCommand(senderId: string, arg: string): Promise<void> {
+    if (this.cardInteraction.getStore() && /^\d+$/.test(arg.trim())) {
+      await this.reply(senderId, "这张旧推理强度卡片只保留了序号，请发送 /effort 刷新后重新选择。");
+      return;
+    }
+    const assertCurrent = this.conversationControlGuard(senderId, requiredCommandRole("effort", arg));
     const models = await this.listCodexModels();
     const runtime = await this.effectiveRuntime(senderId);
     const model = models.find((option) => option.model === runtime.model);
@@ -2091,9 +2158,9 @@ export class BridgeService {
           : formatEffort(effort)
         ).join("\n")}`,
         command: "effort",
-        choices: efforts.map((effort, index) => ({
+        choices: efforts.map((effort) => ({
           label: conciseButtonLabel(formatEffort(effort)),
-          arg: String(index + 1),
+          arg: effort,
           active: effort === runtime.effort
         })),
         includeDefault: true,
@@ -2102,6 +2169,7 @@ export class BridgeService {
       return;
     }
     if (input.toLowerCase() === "default") {
+      assertCurrent();
       this.updateExecutionRuntime(senderId, { effort: null });
       const nextRuntime = await this.effectiveRuntime(senderId);
       await this.reply(senderId, `已恢复继承 Web/Codex 推理强度设置。\n当前推理强度：${formatEffort(nextRuntime.effort)}`);
@@ -2118,6 +2186,7 @@ export class BridgeService {
       }));
       return;
     }
+    assertCurrent();
     this.updateExecutionRuntime(senderId, { effort });
     await this.reply(senderId, `本会话推理强度已切换为：${formatEffort(effort)}\n下一条消息开始生效。`);
   }

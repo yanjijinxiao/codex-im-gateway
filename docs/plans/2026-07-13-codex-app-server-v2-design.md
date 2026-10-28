@@ -1,5 +1,7 @@
 # Codex app-server V2 适配设计
 
+> 历史设计记录：不作为当前部署或执行约定。当前行为以 [IM 架构](../im-channel-architecture.md)、[后端契约](../codex-backends.md) 和 [运行指南](../local-run.md) 为准；不恢复自动换后端、自动绑定、旧去重窗口或 npm 源码更新流程。
+
 ## 目标
 
 保留 `auto` 后端策略：优先使用一个持久的 Codex app-server；当 app-server 无法启动、握手或处理请求时，回退到 `codex exec`。新旧 Codex 会话都必须支持连续对话和 `/stop`。

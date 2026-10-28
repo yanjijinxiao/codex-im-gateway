@@ -379,7 +379,7 @@
             <label>
               <span>本地 Taskboard 地址</span>
               <input id="taskboardUrlInput" name="taskboardUrl" type="url" inputmode="url" autocomplete="off" placeholder="http://127.0.0.1:47823">
-              <small class="field-hint">仅允许 HTTP 回环地址，不会连接公网看板。</small>
+              <small class="field-hint">内置看板仅支持 HTTP IPv4 回环地址（localhost 或 127.0.0.1），不能含路径或凭据。</small>
             </label>
             <section class="taskboard-status-panel" id="taskboardStatusPanel" aria-live="polite"></section>
           </div>
@@ -648,7 +648,7 @@
       <div class="modal-header">
         <div>
           <p class="eyebrow">REMOVE ACCOUNT</p>
-          <h2 id="removeAccountDialogTitle">移除微信账号</h2>
+          <h2 id="removeAccountDialogTitle">移除渠道账号</h2>
         </div>
         <button class="icon-button" type="button" data-close-dialog="removeAccountDialog" title="关闭" aria-label="关闭移除账号窗口">
           <i data-lucide="x"></i>
@@ -656,7 +656,7 @@
       </div>
       <input id="removingAccountId" type="hidden">
       <div class="modal-body account-removal-body">
-        <p class="account-removal-lead">选择如何处理 <strong id="removingAccountName">此微信账号</strong> 的会话数据。</p>
+        <p class="account-removal-lead">选择如何处理 <strong id="removingAccountName">此渠道账号</strong> 的会话数据。</p>
         <div class="account-removal-choices" role="radiogroup" aria-label="会话历史处理方式">
           <label class="account-removal-choice">
             <input type="radio" name="retainHistory" value="true" checked>
@@ -737,7 +737,7 @@
       <input id="editingProjectAccountId" type="hidden">
       <div class="modal-body form-stack">
         <label id="projectAccountField">
-          <span>授权微信</span>
+          <span>渠道账号</span>
           <select id="projectAccountInput" required></select>
         </label>
         <label>

@@ -1,13 +1,33 @@
 import path from "node:path";
+import { z } from "zod";
 
 import { parseCodexExecSandbox, type CodexExecSandbox } from "../codex/sandbox.js";
 import type { AppServerConnectionMode } from "../codex/app-server-daemon.js";
 import { readJsonObjectFile, writeJsonFile } from "./json-store.js";
 import { defaultStateDir, type StatePaths } from "./paths.js";
 import { DEFAULT_BINDING_IDLE_DAYS, idleDays } from "./binding-expiry.js";
+import { validManagedTaskboardOrigin } from "../taskboard/config.js";
 
 export const MAX_INBOUND_BYTES = 100 * 1024 * 1024;
 const LEGACY_DEFAULT_INBOUND_BYTES = 50 * 1024 * 1024;
+
+// Enum/default migrations below are intentionally compatible with older files.
+// Operational types and access lists must not reach consumers through a cast:
+// a string is iterable too, but it is not a list of complete user identities.
+const operationalFields = z.object({
+  defaultCwd: z.string().min(1).optional(),
+  allowedSenderIds: z.array(z.string().min(1)).optional(),
+  allowedWorkspaces: z.array(z.string().min(1)).optional(),
+  codexBin: z.string().min(1).optional(),
+  model: z.string().optional(), effort: z.string().optional(),
+  maxBufferItems: z.number().safe().positive().optional(),
+  promptBufferTtlMs: z.number().finite().positive().optional()
+}).passthrough();
+
+function validateOperationalFields(value: unknown): asserts value is Partial<CodexImGatewayConfig> {
+  const result = operationalFields.safeParse(value);
+  if (!result.success) throw new Error(`Invalid configuration field: ${result.error.issues[0]?.path.join(".") || "root"}; original file preserved`);
+}
 
 export type CodexImGatewayConfig = {
   defaultCwd: string;
@@ -55,10 +75,15 @@ export function defaultConfig(cwd = defaultStateDir()): CodexImGatewayConfig {
 export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfig {
   const base = defaultConfig(cwd ?? paths.root);
   const loaded = readJsonObjectFile<Partial<CodexImGatewayConfig>>(paths.configPath, {});
+  validateOperationalFields(loaded);
   const codexExecSandbox = parseCodexExecSandbox(loaded.codexExecSandbox);
+  const defaultCwd = path.resolve(loaded.defaultCwd ?? base.defaultCwd);
+  const taskboardUrl = typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim() ? loaded.taskboardUrl.trim() : base.taskboardUrl;
+  if (!validManagedTaskboardOrigin(taskboardUrl)) throw new Error("Invalid configuration field: taskboardUrl; expected an HTTP IPv4 loopback origin supported by the bundled server");
   return {
     ...base,
     ...loaded,
+    defaultCwd,
     codexBackend: normalizeCodexBackend(loaded.codexBackend, base.codexBackend),
     codexAppServerTransport: normalizeAppServerTransport(
       loaded.codexAppServerTransport,
@@ -69,12 +94,10 @@ export function loadConfig(paths: StatePaths, cwd?: string): CodexImGatewayConfi
     activeMessagePolicy: normalizeActiveMessagePolicy(loaded.activeMessagePolicy),
     bindingIdleDays: idleDays(loaded.bindingIdleDays),
     taskboardEnabled: typeof loaded.taskboardEnabled === "boolean" ? loaded.taskboardEnabled : base.taskboardEnabled,
-    taskboardUrl: typeof loaded.taskboardUrl === "string" && loaded.taskboardUrl.trim()
-      ? loaded.taskboardUrl.trim()
-      : base.taskboardUrl,
+    taskboardUrl,
     maxInboundBytes: normalizeInboundBytes(loaded.maxInboundBytes, base.maxInboundBytes),
     allowedSenderIds: loaded.allowedSenderIds ?? base.allowedSenderIds,
-    allowedWorkspaces: (loaded.allowedWorkspaces?.length ? loaded.allowedWorkspaces : base.allowedWorkspaces)
+    allowedWorkspaces: (loaded.allowedWorkspaces?.length ? loaded.allowedWorkspaces : [defaultCwd])
       .map((workspace) => path.resolve(workspace))
   };
 }
@@ -94,6 +117,8 @@ function normalizeAppServerTransport(
 }
 
 export function saveConfig(paths: StatePaths, config: CodexImGatewayConfig): void {
+  validateOperationalFields(config);
+  if (!validManagedTaskboardOrigin(config.taskboardUrl)) throw new Error("Invalid configuration field: taskboardUrl; expected an HTTP IPv4 loopback origin supported by the bundled server");
   writeJsonFile(paths.configPath, {
     ...config,
     activeMessagePolicy: normalizeActiveMessagePolicy(config.activeMessagePolicy),
@@ -109,6 +134,7 @@ function normalizeActiveMessagePolicy(value: unknown): CodexImGatewayConfig["act
 function normalizeInboundBytes(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
   const bytes = Math.floor(value);
+  if (bytes < 1) return fallback;
   if (bytes === LEGACY_DEFAULT_INBOUND_BYTES) return MAX_INBOUND_BYTES;
   return Math.min(bytes, MAX_INBOUND_BYTES);
 }

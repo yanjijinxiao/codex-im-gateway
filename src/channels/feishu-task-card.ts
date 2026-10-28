@@ -11,12 +11,10 @@ import type {
   FeishuFormSubmitButton,
   FeishuTaskCardPayload
 } from "./feishu-task-card-types.js";
-import { copyableTaskCard } from "./task-card-copy.js";
 
 export type { FeishuTaskCardPayload } from "./feishu-task-card-types.js";
 
 export function feishuTaskCard(card: ChannelTaskCard): FeishuTaskCardPayload {
-  card = copyableTaskCard(card);
   const elements = elementsFor(card);
   return {
     config: { wide_screen_mode: true, enable_forward: true, update_multi: true },
@@ -24,7 +22,7 @@ export function feishuTaskCard(card: ChannelTaskCard): FeishuTaskCardPayload {
       template: card.template,
       title: { tag: "plain_text", content: card.title }
     },
-    elements: [...elements, ...(card.copyText ? [{ tag: "div" as const, text: { tag: "lark_md" as const, content: card.copyText } }] : [])],
+    elements,
     ...(card.taskboardUrl && card.kind !== "form" ? { card_link: { url: card.taskboardUrl } } : {})
   };
 }

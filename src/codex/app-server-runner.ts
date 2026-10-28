@@ -2,6 +2,7 @@ import { assertQueueAdmissionCurrent, CodexQueueAdmissionError, CodexInterventio
 import { canRecoverSystemError, type CodexSystemRecoveryInput, type CodexSystemRecoveryResult } from "./backend.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import crypto from "node:crypto";
+import { DiagnosticTail } from "./diagnostic-tail.js";
 import path from "node:path";
 import readline from "node:readline";
 import { rolloutIdentity } from "./rollout-identity.js";
@@ -172,7 +173,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly userInputRequests = new Map<string, { request: CodexUserInputRequest;
     submitted: boolean; notify?: CodexUserInputResultHandler }>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
-  private readonly turnEvents = new Map<string, string[]>();
+  private readonly turnEvents = new Map<string, DiagnosticTail>();
   private readonly turnTexts = new Map<string, string>();
   private readonly completedTurns = new Map<string, TurnCompletion>();
   private readonly turnStreams = new Map<string, TurnStream>();
@@ -184,6 +185,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
   private readonly threadStates = new Map<string, CodexThreadState>();
   private operationLeases = 0;
+  private readonly expectedTurnThreads = new Map<string, number>();
   private projectCatalogSupported?: boolean;
   private modelOptions?: CodexModelOption[];
   private readonly nativeQueueOrigins = new Map<string, CodexQueueAddInput>();
@@ -277,6 +279,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       throw new Error("Codex app-server did not return a thread id");
     }
     this.subscribedThreads.add(threadId);
+    this.expectedTurnThreads.set(threadId, (this.expectedTurnThreads.get(threadId) ?? 0) + 1);
     try {
     const currentProjectId = typeof thread?.projectId === "string" ? thread.projectId : undefined;
     if (!input.threadId && input.projectBinding === "none" && currentProjectId) {
@@ -456,6 +459,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     try { return await this.waitForTurn(threadId, turnId); }
     catch (error) { throw communicationError(error, { phase: "observation", operation: "turn/observe", threadId, turnId }); }
     } finally {
+      this.releaseExpectedTurnThread(threadId);
       // A native queued turn may start before this turn's delivery finishes.
       // Keep its subscription (and approval requests) on the same connection.
       if (![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)
@@ -578,7 +582,12 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (catalog) return catalog;
     await this.ensureConnected();
     try {
-      const threads = await this.listThreadsByPersistence(input, false, input.limit ?? Infinity, true);
+      const persistence = input.persistence ?? "active", limit = input.limit ?? Infinity;
+      const listed: CodexThreadState[] = [];
+      if (persistence !== "archived") listed.push(...await this.listThreadsByPersistence(input, false, limit, true));
+      if (persistence !== "active") listed.push(...await this.listThreadsByPersistence(input, true, limit, true));
+      const threads = [...new Map(listed.map(state => [state.threadId, state])).values()]
+        .sort((left, right) => (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "")).slice(0, limit);
       return { backend: this.id, source: "app-server-storage", hostIds: [this.options.hostId ?? "local"], complete: true,
         threads: threads.map(state => ({ ...state,
           // A private reader's notLoaded/idle says nothing about Desktop.
@@ -1132,6 +1141,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   async runQueuedSubmission(input: CodexQueuedRunInput): Promise<CodexRunResult> {
     this.operationLeases++;
+    this.expectedTurnThreads.set(input.threadId, (this.expectedTurnThreads.get(input.threadId) ?? 0) + 1);
     try {
       await this.ensureConnected();
       if (input.observeOnly) {
@@ -1164,6 +1174,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       return await this.runWithLease({ ...input, prompt: "" });
     }
     finally {
+      this.releaseExpectedTurnThread(input.threadId);
       if (this.subscribedThreads.has(input.threadId) && !this.activeTurns.has(input.threadId)
         && ![...this.nativeQueueOrigins.values()].some(origin => origin.threadId === input.threadId)) {
         await this.unsubscribeThread(input.threadId);
@@ -1630,10 +1641,10 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       const delta = typeof params.delta === "string" ? params.delta : "";
       if (!key || !itemId || !delta) return;
       const summaries = this.reasoningSummariesByTurn.get(key) ?? new Map<string, string>();
-      const summary = `${summaries.get(itemId) ?? ""}${delta}`.trim();
+      const summary = `${summaries.get(itemId) ?? ""}${delta}`;
       summaries.set(itemId, summary);
       this.reasoningSummariesByTurn.set(key, summaries);
-      if (summary) this.emitProgress(key, `🤔 ${boundedText(summary, 600)}`);
+      if (summary.trim()) this.emitProgress(key, `🤔 ${boundedText(summary, 600)}`);
       return;
     }
 
@@ -1691,6 +1702,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const cachedState = this.threadStates.get(threadId);
     const currentTurn = this.activeTurns.get(threadId)
       ?? (cachedState?.runtimeStatus === "active" ? cachedState.activeTurnId : undefined);
+    const expectedCompletion = this.expectedTurnThreads.has(threadId) || this.unconfirmedStarts.has(threadId)
+      || [...this.nativeQueueOrigins.values()].some(origin => origin.threadId === threadId)
+      || this.turnStreams.has(turnKey(threadId, turnId));
     const ownsThreadState = !currentTurn || currentTurn === turnId;
     if (ownsThreadState) this.unconfirmedStarts.delete(threadId);
     for (const [key, pending] of this.userInputRequests) if (pending.request.threadId === threadId
@@ -1702,7 +1716,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const completion: TurnCompletion = {
       status,
       text: this.turnTexts.get(key) ?? extractAgentMessageFromTurn(turn),
-      raw: (this.turnEvents.get(key) ?? []).join("\n"),
+      raw: this.turnEvents.get(key)?.text() ?? "",
       failureCode: status === "failed" ? errorValue ? codexFailureCode(errorValue) : this.turnErrorCodes.get(key) ?? "upstream-error" : undefined,
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
@@ -1738,11 +1752,20 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     }
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
-      this.completedTurns.set(key, completion);
+      // Completion may precede a local start acknowledgement. Retain that
+      // race, but do not keep every unrelated daemon turn's payload forever.
+      if (expectedCompletion) this.completedTurns.set(key, completion);
+      else this.clearTurnPayload(key);
       return;
     }
     this.turnWaiters.delete(key);
     void this.finishTurn(threadId, key, completion, waiter.resolve, waiter.reject);
+  }
+
+  private releaseExpectedTurnThread(threadId: string): void {
+    const count = this.expectedTurnThreads.get(threadId) ?? 0;
+    if (count > 1) this.expectedTurnThreads.set(threadId, count - 1);
+    else this.expectedTurnThreads.delete(threadId);
   }
 
   private waitForTurn(threadId: string, turnId: string): Promise<CodexRunResult> {
@@ -1803,11 +1826,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const stream = this.turnStreams.get(key);
     this.turnStreams.delete(key);
     await stream?.chain;
-    this.turnEvents.delete(key);
-    this.turnTexts.delete(key);
-    this.queuedTurnEvents.delete(key);
-    this.itemPhasesByTurn.delete(key);
-    this.reasoningSummariesByTurn.delete(key);
+    this.clearTurnPayload(key);
     if (completion.status === "completed") {
       resolve({ text: completion.text, threadId, turnId: key.slice(threadId.length + 1), raw: completion.raw });
       return;
@@ -1820,9 +1839,18 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private appendTurnEvent(key: string, raw: string): void {
-    const events = this.turnEvents.get(key) ?? [];
-    events.push(raw);
+    const events = this.turnEvents.get(key) ?? new DiagnosticTail();
+    events.append(raw + "\n");
     this.turnEvents.set(key, events);
+  }
+
+  private clearTurnPayload(key: string): void {
+    this.completedTurns.delete(key);
+    this.turnEvents.delete(key);
+    this.turnTexts.delete(key);
+    this.queuedTurnEvents.delete(key);
+    this.itemPhasesByTurn.delete(key);
+    this.reasoningSummariesByTurn.delete(key);
   }
 
   private queueTurnEvent(key: string, event: QueuedTurnEvent): void {
@@ -2093,7 +2121,8 @@ function describeItemProgress(item: Record<string, unknown> | undefined, complet
     case "fileChange": {
       const changes = Array.isArray(item.changes) ? item.changes : [];
       const paths = changes.flatMap((value) => {
-        const change = value as Record<string, unknown>;
+        if (!isRecord(value)) return [];
+        const change = value;
         return typeof change.path === "string" ? [change.path] : [];
       });
       const suffix = paths.length ? `：${paths.slice(0, 3).map(shortPath).join("、")}${paths.length > 3 ? ` 等 ${paths.length} 个文件` : ""}` : "";

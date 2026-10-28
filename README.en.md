@@ -59,6 +59,8 @@ Platform capabilities and setup requirements may change with official APIs. See 
   <img src="docs/images/screenshots/web-session-management.png" alt="Codex IM Gateway Web session management" width="100%" />
 </p>
 
+The screenshot is a historical UI example, not current layout or capability verification.
+
 The console adds and controls channels, authorizes senders, binds projects, displays sessions and running tasks, resumes conversations, and configures models, reasoning effort, progress, and completion notifications.
 
 ## Quick start
@@ -110,7 +112,7 @@ Common commands:
 ```text
 /help                       Show all commands
 /status                     Show project, session, backend, model, and task status
-/sessions                   Unarchived sessions grouped by project, newest within each group; 30 per page
+/sessions                   Pinned sessions, native project order, then other sessions; 10 per page
 /sessions size 50           Set page size (5-50, saved per conversation and user)
 /sessions detail R1         Read title, host, workspace and ID without switching
 /sessions more              Next page (prev for previous, page 3 to jump)
@@ -147,15 +149,15 @@ Channels use one project, session, execution, history, approval, and status inte
 
 `codexBackend: "auto"` prefers app-server and may select CLI during initial discovery or a compatible new turn. The selected backend is then pinned; existing-thread failures never switch backends. Both backends implement catalog and history APIs separately. CLI never reads Desktop's registry; unsupported live following, steering and goals fail explicitly. See [Codex backend architecture](./docs/codex-backends.md).
 
-Lists sort by recent activity. Page numbers remain stable until refresh/search or a 15-minute expiry. App includes sessions from known remote hosts, with explicit partial-results warnings for unavailable hosts. Archived, internal child and unavailable sessions are excluded.
+Lists preserve native pin order, then native project order, then other sessions. Groups use native manual or activity order. Page numbers remain stable until refresh/search or a 15-minute expiry. App includes sessions from known remote hosts, with explicit partial-results warnings for unavailable hosts. Archived, internal child and unavailable sessions are excluded.
 
 ## Long tasks, progress, and session lifecycle
 
 - Once accepted, an agent task runs until completion, explicit `/stop`, or transport failure. Its total lifetime is not extended only when activity occurs.
 - The gateway shows readable Codex reasoning summaries, commentary, tool/command/file state, and recent results. Hidden raw reasoning is never forwarded.
-- Messages targeting a thread already running in another channel, the Web console, or Codex Desktop wait in order instead of writing concurrently.
+- During an active turn, ordinary IM messages follow the saved policy (steer by default); explicit queue uses the native backend queue. Web submissions retain single-writer validation. Unsupported operations are rejected explicitly.
 - Active, running, archived, missing, and system-error session states pass through the backend lifecycle contract. Archived sessions are omitted from the resumable list and return a clear error when addressed.
-- Native cards update in place when available. Card failures fall back to text without blocking the final reply.
+- Native progress cards update in place. Failures retain the original handle and delivery evidence, without automatically creating replacement cards or text. Text-only progress uses merged updates; a definitively rejected one-off command card has its own fallback policy.
 
 ## Codex Desktop integration
 

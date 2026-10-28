@@ -33,7 +33,7 @@
 4. 发布应用，在管理页选择“飞书自建应用”，填写凭据后连接。
 5. 向机器人发送一条消息，让服务登记可用于通知的会话或用户 ID。
 
-飞书消息与卡片回调会分别保留“操作人”和“回复会话”。请在 Bridge 管理页明确允许具体飞书用户，或明确允许一个会话 ID；允许会话 ID 表示授予该群内所有成员相同的 Bridge 与 Taskboard 操作权限。服务不会因收到一条新消息而自动授权操作人或群聊。
+飞书消息与卡片回调会分别保留“操作人”和“回复会话”。请在 Bridge 管理页明确允许具体飞书用户，或明确允许一个会话 ID；允许会话 ID 表示群成员可进入该聊天的准入范围；实际操作仍按各人的 viewer / participant / controller 角色检查，不授予所有成员相同控制权，也不构成个人 Web IDE 配对资格。服务不会因收到一条新消息而自动授权操作人或群聊。
 
 - [打开飞书开发者后台](https://open.feishu.cn/app)
 - [飞书长连接事件订阅文档](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration-case?lang=zh-CN)
@@ -48,11 +48,11 @@
 
 每次启动钉钉监听后，首条通过去重的有效回调会在本机服务日志中输出一次 `DingTalk callback identity`，仅包含账号 ID、`source: "callback"` 和原始 `robotCode`。字段缺失时记录 `null`，不会以配置中的 Client ID 代替；空字符串原样记录。该诊断不记录消息正文、用户身份、Webhook、Token 或 Secret，也不会逐条刷日志。它用于核对回调实际携带的机器人标识，不代表机器人已获得加群权限。
 
-钉钉消息会把真实操作人作为授权身份、conversation ID 作为回复和 session 作用域；因此同一群聊会复用同一组选中项目和活动会话。文本命令 `/sessions`、`/session R1`、`/new` 和 `/stop` 与其他渠道完全一致。`picture` 和含图片的 `richText` 消息会通过 `/v1.0/robot/messageFiles/download` 换取临时下载地址，保存到账号独立的入站目录并作为图片附件交给当前 Codex session；下载失败会直接在原会话提示。Bridge 收到消息后会调用机器人表情接口，在原消息上贴 `🤔思考中`，处理完成或失败后自动撤回；表情接口失败只写本机告警，不影响主流程。配置模板后，Bridge 使用钉钉 OpenAPI 创建并投放 `callbackType: STREAM` 的 AI Card，以 500 ms 节流显示当前思考描述、最近命令/工具/文件步骤、可读 reasoning summary、累计用时和回答预览，最终以 `isFinalize: true` 关闭；原始隐藏推理不会发送到渠道。网络协议由独立的生命周期传输层管理：“自动”只允许在本轮首个请求被接受前尝试 IPv4/IPv6，一旦确定，图片、思考表情、卡片进度、最终帧和错误帧都会固定使用同一协议；显式选择 IPv4 或 IPv6 时完全不回退。已接受的 Agent 任务没有总时长上限，会运行到完成、主动停止或底层连接中断。创建或更新失败会自动退回 `sessionWebhook` 普通文本。没有配置模板时仍沿用临时 `sessionWebhook`，服务重启或地址过期后需先再发一条消息。
+钉钉消息会把真实操作人作为授权身份、conversation ID 作为回复和 session 作用域；因此同一群聊会复用同一组选中项目和活动会话。文本命令 `/sessions`、`/session R1`、`/new` 和 `/stop` 与其他渠道完全一致。`picture` 和含图片的 `richText` 消息会通过 `/v1.0/robot/messageFiles/download` 换取临时下载地址，保存到账号独立的入站目录并作为图片附件交给当前 Codex session；下载失败会直接在原会话提示。Bridge 收到消息后会调用机器人表情接口，在原消息上贴 `🤔思考中`，处理完成或失败后自动撤回；表情接口失败只写本机告警，不影响主流程。配置模板后，Bridge 使用钉钉 OpenAPI 创建并投放 `callbackType: STREAM` 的 AI Card，以 500 ms 节流显示当前思考描述、最近命令/工具/文件步骤、可读 reasoning summary、累计用时和回答预览，最终以 `isFinalize: true` 关闭；原始隐藏推理不会发送到渠道。网络协议由独立的生命周期传输层管理：“自动”只允许在本轮首个请求被接受前尝试 IPv4/IPv6，一旦确定，图片、思考表情、卡片进度、最终帧和错误帧都会固定使用同一协议；显式选择 IPv4 或 IPv6 时完全不回退。已接受的 Agent 任务没有总时长上限，会运行到完成、主动停止或底层连接中断。原生进度卡创建、投递或更新失败保留原检查点，不自动改发文本；未知创建/投递回执不重发，已知卡片仅按恢复策略更新原实例。明确拒绝创建的一次性命令卡可以使用自己的文字回退策略。没有配置模板时仍沿用临时 `sessionWebhook`，服务重启或地址过期后需先再发一条消息。
 
 钉钉现在支持把 Gateway 本机文件作为机器人文件消息发送到当前群聊或私聊，不需要 AI Card 模板。可以在对话中要求“把生成的文件发给我”；后端产生统一 `send` 文件动作后，Gateway 负责上传和发送。单文件需非空、不超过 20 MiB；远程主机的文件须先传到 Gateway 所在电脑。原文件名和内容保持不变，不会把 `.crt` 等文件伪装成其他类型；最终是否接受由钉钉的文件类型、大小和企业安全策略决定。
 
-请确保应用具备媒体上传与机器人群聊/单聊发送接口所需权限，接收人处于应用可见范围，群聊中已加入机器人。上传失败、无效接收人、限流、缺少回执会明确提示，不能仅凭“HTTP 200”认定发送成功。超时或网络中断后不会自动重发，请先检查原会话。文件上传和发送沿用本轮固定的 IPv4/IPv6；单步网络超时不会改变 Agent 长任务本身的时长策略。钉钉的出站图片/视频/音频和入站普通文件仍不在本次实现范围内。
+请确保应用具备媒体上传与机器人群聊/单聊发送接口所需权限，接收人处于应用可见范围，群聊中已加入机器人。上传失败、无效接收人、限流、缺少回执会明确提示，不能仅凭“HTTP 200”认定发送成功。超时或网络中断后不会自动重发，请先检查原会话。文件上传和发送沿用本轮固定的 IPv4/IPv6；单步网络超时不会改变 Agent 长任务本身的时长策略。钉钉已支持入站普通文件；出站图片/视频/音频仍未实现。
 
 文件优先使用当前有效会话回复，过期或不可用时才使用主动发送接口。如果遇到 `chatbotId.notAllow.sendOTO`，含义是机器人主动私聊发送被拒绝，不是文件后缀有问题。请先向机器人重新发送一条消息，再要求发送文件，Gateway 会使用新的会话回复地址。长期无人交互的主动文件推送还需要检查开发者后台的机器人启用/发布状态和主动单聊能力。无论是哪种发送路径，返回结果不明时都不会自动换接口重发。
 
@@ -142,7 +142,7 @@ Feishu messages and card callbacks keep the human actor separate from the reply 
 
 ### DingTalk
 
-Create an internal app in the DingTalk developer console, add a bot using Stream mode, and optionally create an AI Card template with a Markdown field. Enter the Client ID, Client Secret, optional template ID, and the template's content field name (for example `content` or `msgContent`) in Bridge. The account can use automatic, IPv4-only, or IPv6-only networking. Automatic mode may probe both families only before the first accepted request; it then pins that family for inbound media, the thinking emotion, all card updates, and the terminal frame until the turn ends. Explicit IPv4 or IPv6 never falls back mid-turn. `picture` messages and image-bearing `richText` messages are resolved through the robot message-file download API, stored in the account inbound directory, and attached to the active Codex session; download failures are reported in the originating conversation. Bridge attaches a `🤔 Thinking` emotion to the original inbound message while processing and recalls it on completion; emotion failures remain non-blocking. With a template, progress and answer deltas stream into one card and finalize at completion; failures fall back to the conversation-scoped session Webhook. DingTalk text commands reuse the same `/sessions`, `/session R1`, and `/new` router as every other channel.
+Create an internal app in the DingTalk developer console, add a bot using Stream mode, and optionally create an AI Card template with a Markdown field. Enter the Client ID, Client Secret, optional template ID, and the template's content field name (for example `content` or `msgContent`) in Bridge. The account can use automatic, IPv4-only, or IPv6-only networking. Automatic mode may probe both families only before the first accepted request; it then pins that family for inbound media, the thinking emotion, all card updates, and the terminal frame until the turn ends. Explicit IPv4 or IPv6 never falls back mid-turn. `picture` messages and image-bearing `richText` messages are resolved through the robot message-file download API, stored in the account inbound directory, and attached to the active Codex session; download failures are reported in the originating conversation. Bridge attaches a `🤔 Thinking` emotion to the original inbound message while processing and recalls it on completion; emotion failures remain non-blocking. With a template, progress and answer deltas stream into one card and finalize at completion. Progress-card failures retain the checkpoint and never automatically resend as text; unknown create/delivery receipts are not replayed. A rejected one-shot command card has its own text fallback policy. DingTalk text commands reuse the same `/sessions`, `/session R1`, and `/new` router as every other channel.
 
 Without AI Card, the session Webhook stays in process memory only. After a service restart or Webhook expiry, send the bot another message before expecting text fallback replies.
 

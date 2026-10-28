@@ -968,10 +968,16 @@ export class AccountManager {
           && (project.sourceProjectId ? candidate.projectId === project.sourceProjectId : candidate.workspace === project.workspace));
       if (nativeProject?.available === false) return;
       const roots = nativeProject?.rootPaths ?? (nativeProject ? [nativeProject.workspace] : project.rootPaths);
+      const sameRoot = (left: string, right: string): boolean => {
+        if (left === right) return true;
+        if (hostId !== "local") return false;
+        try { return fs.realpathSync(left) === fs.realpathSync(right); } catch { return false; }
+      };
       // A worktree session replaces its project's primary checkout, rather
       // than exposing both checkouts. Sibling roots remain explicit members.
-      const rootPaths = roots?.length && !roots.includes(session.workspace)
-        ? [session.workspace, ...roots.filter(root => root !== project.workspace)] : roots;
+      const rootPaths = roots?.length ? roots.some(root => sameRoot(root, session.workspace))
+        ? roots.map(root => sameRoot(root, session.workspace) ? session.workspace : root)
+        : [session.workspace, ...roots.filter(root => !sameRoot(root, project.workspace))] : roots;
       return { owner: "gateway-owner", sessionId, hostId, workspace: session.workspace, projectName: project.name,
         projectId: project.id, nativeThreadId: session.threadId,
         ...(rootPaths && rootPaths.length > 1 ? { rootPaths: [...rootPaths] } : {}) };

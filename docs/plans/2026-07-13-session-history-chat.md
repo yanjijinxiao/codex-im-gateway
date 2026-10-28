@@ -1,5 +1,7 @@
 # Session History and Web Chat Implementation Plan
 
+> 历史设计记录：不作为当前部署或执行约定。当前行为以 [IM 架构](../im-channel-architecture.md)、[后端契约](../codex-backends.md) 和 [运行指南](../local-run.md) 为准；不恢复自动换后端、自动绑定、旧去重窗口或 npm 源码更新流程。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Let users inspect managed Codex thread history and continue a session from the local Web UI, while preventing duplicate WeChat message processing.

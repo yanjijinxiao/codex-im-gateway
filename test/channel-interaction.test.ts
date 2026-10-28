@@ -124,7 +124,7 @@ test("formats native goal form input as a goal command", () => {
     field: { name: "objective" as const, required: true as const, maximumLength: 2_000 }
   };
   assert.equal(formatChannelActionCommand(value, {}), undefined);
-  assert.equal(formatChannelActionCommand(value, { objective: "  完成知识库渠道集成  " }), "/goal 完成知识库渠道集成");
+  assert.equal(formatChannelActionCommand(value, { objective: "  完成知识库渠道集成  " }), "/goal set 完成知识库渠道集成");
 });
 
 test("maps natural-language task mutations to native forms and explicit confirmation cards", async () => {

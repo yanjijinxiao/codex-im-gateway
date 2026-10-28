@@ -18,7 +18,9 @@ npm 仅用于安装锁定依赖和构建 TypeScript/Web 资源。服务启动不
 
 ## 更新
 
-先停止当前 Node.js 进程，再执行：
+以下步骤适用于手动前台运行。正在提供服务的 macOS LaunchAgent 使用[隔离发布流程](release-local.md)，在停服前完成构建和测试，不在其 live dist 上运行 build。
+
+手动前台运行时，先停止当前 Node.js 进程，再执行：
 
 ```bash
 git pull --ff-only
@@ -43,4 +45,4 @@ CODEX_IM_GATEWAY_OPEN=0
 
 ## English
 
-Codex IM Gateway is distributed only as GitHub source and is protected with `private: true`. npm installs locked dependencies and builds assets, but does not install, publish, or start the service. Run it directly with `node dist/server/index.js`. Stop the current Node.js process before pulling, rebuilding, and restarting. New installs default to `~/.codex-im-gateway/`; existing `~/.codex-channel-bridge/` or `~/.codex-weixin/` data is reused automatically. `CODEX_IM_GATEWAY_STATE_DIR` selects an explicit private path.
+Codex IM Gateway is distributed only as GitHub source and is protected with `private: true`. npm installs locked dependencies and builds assets, but does not install, publish, or start the service. Run it directly with `node dist/server/index.js`. For a manually started foreground process, stop it before pulling, rebuilding, and restarting. A running macOS LaunchAgent uses the [isolated release workflow](release-local.md): prepare and test before stopping the service, and never rebuild its live dist. New installs default to `~/.codex-im-gateway/`; existing `~/.codex-channel-bridge/` or `~/.codex-weixin/` data is reused automatically. `CODEX_IM_GATEWAY_STATE_DIR` selects an explicit private path.

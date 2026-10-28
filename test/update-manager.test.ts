@@ -30,6 +30,7 @@ test("checks and caches the npm latest version", async () => {
   let fetchCalls = 0;
   let now = Date.parse("2026-07-15T00:00:00.000Z");
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     now: () => now,
     cacheTtlMs: 60_000,
@@ -58,6 +59,7 @@ test("uses the first valid registry and installs from that same registry", async
   const requested: string[] = [];
   const installed: Array<{ version: string; registry: string }> = [];
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     fetch: async (input, init) => {
       const url = String(input);
@@ -84,6 +86,7 @@ test("uses the first valid registry and installs from that same registry", async
 
 test("falls back when one registry returns invalid metadata", async () => {
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     fetch: async (input) => String(input).includes("npmmirror")
       ? new Response(JSON.stringify({ version: "latest" }), { status: 200 })
@@ -97,6 +100,7 @@ test("falls back when one registry returns invalid metadata", async () => {
 
 test("does not let a stale fast mirror hide a newer official version", async () => {
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     fetch: async (input) => String(input).includes("npmmirror")
       ? new Response(JSON.stringify({ version: "1.2.3" }), { status: 200 })
@@ -112,6 +116,7 @@ test("does not let a stale fast mirror hide a newer official version", async () 
 
 test("keeps update-check failures non-fatal", async () => {
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     fetch: async () => {
       throw new Error("offline");
@@ -131,6 +136,7 @@ test("installs only the server-verified latest version and rejects concurrent up
     finishInstall = resolve;
   });
   const manager = new UpdateManager({
+    packageRoot: "/fixture/node_modules/codex-im-gateway",
     currentVersion: "1.2.3",
     fetch: async () => new Response(JSON.stringify({ version: "1.2.4" }), { status: 200 }),
     install: async (version, registry) => {

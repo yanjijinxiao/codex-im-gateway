@@ -1,5 +1,7 @@
 # Codex IM Gateway Design System
 
+Current runtime contracts are maintained in README.md and docs/im-channel-architecture.md. Earlier component designs below describe visual intent; they do not override explicit-command routing, personal admission, native project identity or current backend capabilities. In particular, ordinary natural language goes to Codex and group admission does not grant controller or IDE approval rights.
+
 ## 0. Research Log
 
 - Existing product: extracted the current local management UI from `src/web/styles.css` and `src/web/index.html`.

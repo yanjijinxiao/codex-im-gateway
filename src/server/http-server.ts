@@ -2,6 +2,7 @@ import { channelPrincipalSchema } from "../channels/principal.js";
 import { AdmissionConflictError, admissionId, admissionVersion } from "../bridge/admission.js";
 import { TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
 import { readBuildInfo } from "./build-info.js";
+import { cleanupResources } from "./cleanup.js";
 import { RuntimeConfigurationBusyError } from "./account-manager.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { userFacingMessageHandlingError } from "../bridge/errors.js";
@@ -22,8 +23,10 @@ import type { CodexModelOption, CodexRuntimeInfo } from "../codex/backend.js";
 import type { AccountManager, SessionAttachmentFile, SessionHistoryMessage, SessionUpload } from "./account-manager.js";
 import { LoginManager, LoginCompletionPendingError } from "./login-manager.js";
 import { UpdateManager, type UpdateService } from "./update-manager.js";
+import { OptionalObservation } from "./optional-observation.js";
 import type { CodexProjectCandidate } from "./codex-projects.js";
 import { handleTaskboardHttp } from "./taskboard-http.js";
+import { validManagedTaskboardOrigin } from "../taskboard/config.js";
 import { WEBHOOK_PROVIDERS } from "../webhooks/webhook-provider.js";
 import { PROJECT_INTERACTION_MODES } from "../channels/channel-mode-settings.js";
 import { selectLocalDirectory } from "./directory-picker.js";
@@ -174,10 +177,7 @@ const configSchema = z.object({
   effort: z.string().optional(),
   streamReplies: z.boolean().optional(),
   taskboardEnabled: z.boolean().optional(),
-  taskboardUrl: z.string().url().refine((value) => {
-    const url = new URL(value);
-    return url.protocol === "http:" && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
-  }, "Taskboard URL must use an HTTP loopback origin").optional()
+  taskboardUrl: z.string().url().refine(validManagedTaskboardOrigin, "Managed Taskboard requires an HTTP IPv4 loopback origin supported by the bundled server").optional()
 });
 const MAX_WEB_UPLOAD_FILES = 10;
 const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
@@ -194,6 +194,8 @@ export type LocalHttpServerOptions = {
   codexCheck?: () => Promise<{ ready: boolean; version?: string; error?: string }>;
   codexRuntimeCheck?: () => Promise<CodexRuntimeInfo>;
   codexModelsCheck?: () => Promise<CodexModelOption[]>;
+  /** Test/embedding read deadline; independent of task execution timeouts. */
+  metadataTimeoutMs?: number;
   codexProjectsProvider?: () => readonly CodexProjectCandidate[] | Promise<readonly CodexProjectCandidate[]>;
   directoryPicker?: (defaultPath?: string) => Promise<string | undefined>;
   updateService?: UpdateService;
@@ -221,6 +223,12 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
     accountManager: options.accountManager
   });
   const updateService = options.updateService ?? new UpdateManager({ currentVersion: productVersion });
+  const observations = new OptionalObservation(options.metadataTimeoutMs);
+  let configurationTail: Promise<unknown> = Promise.resolve();
+  const configure = <T>(action: () => Promise<T>): Promise<T> => {
+    const work = configurationTail.catch(() => undefined).then(action);
+    configurationTail = work; return work;
+  };
   let actualPort = options.port ?? 8787;
   const server = http.createServer((request, response) => {
     void handleRequest(request, response, {
@@ -230,6 +238,8 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
       requestToken,
       updateService,
       ideAccess,
+      configure,
+      observations,
       port: actualPort
     }).catch((error: unknown) => {
       const message = requestErrorMessage(error);
@@ -251,14 +261,16 @@ export async function startLocalHttpServer(options: LocalHttpServerOptions): Pro
     url: `http://127.0.0.1:${actualPort}`,
     requestToken,
     close: async () => {
-      detachApprovals?.();
-      await ideAccess?.close();
-      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await cleanupResources([() => { detachApprovals?.(); }, () => ideAccess?.close(),
+        () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+      ], "Gateway HTTP/IDE 清理部分失败，其余资源已继续清理");
     }
   };
 }
 
 type HandlerContext = LocalHttpServerOptions & {
+  observations: OptionalObservation;
+  configure: <T>(action: () => Promise<T>) => Promise<T>;
   ideAccess?: IDEEndpointManager;
   loginManager: LoginManager;
   productVersion: string;
@@ -393,7 +405,8 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (method === "GET" && url.pathname === "/api/bootstrap") {
     const config = loadConfig(context.paths);
     const [codex, codexRuntime, codexModels] = await Promise.all([
-      (context.codexCheck ?? (() => checkCodex(config.codexBin)))(),
+      context.observations.read(`binary:${config.codexBin}`, context.codexCheck ?? (() => checkCodex(config.codexBin)),
+        { ready: false, error: "Codex 状态核验暂未完成；管理功能仍可使用，请稍后重新检查。" }),
       readCodexRuntime(context),
       readCodexModels(context)
     ]);
@@ -513,10 +526,11 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
   if (method === "POST" && url.pathname === "/api/taskboard/start") {
     z.object({}).strict().parse(await readJsonBody(request));
     if (!context.onTaskboardConfig) { sendJson(response, 409, { error: "当前启动方式不支持动态启用任务面板，请重启 Gateway。" }); return; }
-    const next = { ...loadConfig(context.paths), taskboardEnabled: true };
-    await context.onTaskboardConfig(next);
-    saveConfig(context.paths, next);
-    sendJson(response, 200, await context.accountManager.getTaskboardStatus()); return;
+    await context.configure(async () => {
+      const current = loadConfig(context.paths), next = { ...current, taskboardEnabled: true };
+      await commitConfiguration(context, current, next);
+      sendJson(response, 200, await context.accountManager.getTaskboardStatus());
+    }); return;
   }
   if (await handleTaskboardHttp({ request, response, pathname: url.pathname, accountManager: context.accountManager })) return;
   if (method === "POST" && url.pathname === "/api/projects") {
@@ -815,6 +829,7 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
 
   if (method === "PUT" && url.pathname === "/api/config") {
     const input = configSchema.parse(await readJsonBody(request));
+    await context.configure(async () => {
     const current = loadConfig(context.paths);
     const defaultCwd = path.resolve(input.defaultCwd);
     const allowedWorkspaces = [...new Set([...input.allowedWorkspaces.map((workspace) => path.resolve(workspace)), defaultCwd])];
@@ -827,21 +842,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
       model: optionalString(input.model),
       effort: optionalString(input.effort)
     };
-    const restore = async () => { await context.onTaskboardConfig?.(current); saveConfig(context.paths, current); };
-    const commit = async () => {
-      try { await context.onTaskboardConfig?.(next); saveConfig(context.paths, next); }
-      catch (error) {
-        try { await restore(); } catch (rollback) { throw new AggregateError([error, rollback], "配置保存及旧配置恢复失败"); }
-        throw error;
-      }
-      return restore;
-    };
+    const commit = () => commitConfiguration(context, current, next);
     if (context.accountManager.reconfigureRuntime) await context.accountManager.reconfigureRuntime(commit);
     else { const rollback = await commit(); try { await context.accountManager.restartRunning(); } catch (error) { await rollback(); throw error; } }
     sendJson(response, 200, {
       config: loadConfig(context.paths),
       codexRuntime: await readCodexRuntime(context),
       codexModels: await readCodexModels(context)
+    });
     });
     return;
   }
@@ -851,6 +859,18 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   sendJson(response, 404, { error: "Not found" });
+}
+
+/** All configuration mutation routes share the same apply/persist/compensate
+ * boundary. Optional Taskboard enable does not restart native task runtimes. */
+async function commitConfiguration(context: HandlerContext, current: CodexImGatewayConfig, next: CodexImGatewayConfig): Promise<() => Promise<void>> {
+  const restore = async () => { await context.onTaskboardConfig?.(current); saveConfig(context.paths, current); };
+  try { await context.onTaskboardConfig?.(next); saveConfig(context.paths, next); }
+  catch (error) {
+    try { await restore(); } catch (rollback) { throw new AggregateError([error, rollback], "配置保存及旧配置恢复失败"); }
+    throw error;
+  }
+  return restore;
 }
 
 async function readCodexProjects(context: HandlerContext): Promise<readonly CodexProjectCandidate[]> {
@@ -867,11 +887,19 @@ function readProductVersion(): string {
 }
 
 function readCodexRuntime(context: HandlerContext): Promise<CodexRuntimeInfo> {
-  return (context.codexRuntimeCheck ?? (() => context.accountManager.getCodexRuntimeInfo()))();
+  const config = loadConfig(context.paths);
+  return context.observations.read(metadataKey("runtime", config), context.codexRuntimeCheck ?? (() => context.accountManager.getCodexRuntimeInfo()),
+    { ...(config.model ? { model: config.model } : {}), ...(config.effort ? { effort: config.effort } : {}) });
 }
 
 function readCodexModels(context: HandlerContext): Promise<CodexModelOption[]> {
-  return (context.codexModelsCheck ?? (() => context.accountManager.getCodexModels()))();
+  return context.observations.read(metadataKey("models", loadConfig(context.paths)),
+    context.codexModelsCheck ?? (() => context.accountManager.getCodexModels()), []);
+}
+
+function metadataKey(kind: string, config: CodexImGatewayConfig): string {
+  return JSON.stringify([kind, config.codexBackend, config.codexAppServerTransport, config.codexBin,
+    config.defaultCwd, config.model, config.effort, config.codexExecSandbox]);
 }
 
 function serveStatic(response: ServerResponse, pathname: string): void {

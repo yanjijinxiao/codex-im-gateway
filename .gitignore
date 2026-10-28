@@ -6,6 +6,8 @@ output/
 .omo/
 .env
 .codex-weixin/
+.codex-channel-bridge/
+.codex-im-gateway/
 taskboard/.data/
 *.log
 *.tsbuildinfo

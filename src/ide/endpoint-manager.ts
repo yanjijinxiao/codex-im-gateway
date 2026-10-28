@@ -275,8 +275,11 @@ export class IDEEndpointManager {
     return this.enqueue(async () => {
       this.manager.accessAvailable = false;
       const records = [...this.endpoints.values()]; this.endpoints.clear();
-      await Promise.all(records.map(record => this.closeEndpoint(record)));
-      await this.manager.close(); this.applied = undefined;
+      const results = await Promise.allSettled(records.map(record => this.closeEndpoint(record)));
+      const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      try { await this.manager.close(); } catch (error) { errors.push(error); }
+      this.applied = undefined;
+      if (errors.length) throw new AggregateError(errors, "部分 IDE 资源关闭失败；其他入口及项目进程已尝试停止");
     });
   }
   private async closeEndpoint(record: Endpoint): Promise<void> { try { await record.ingress?.close(); } finally { await record.server.close(); } }

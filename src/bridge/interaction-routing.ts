@@ -30,7 +30,7 @@ const same = (a: InteractionDestination, b: InteractionDestination) =>
 
 /** IDs only: never stores prompts, answers, credentials or provider payloads. */
 export class InteractionRoutingJournal {
-  private readonly state: Journal;
+  private state: Journal;
   constructor(private readonly filePath: string) {
     this.state = readJsonFile(filePath, { version: 1, primary: {}, origins: {} } as Journal);
     if (!this.state || this.state.version !== 1 || typeof this.state.primary !== "object" || !this.state.primary
@@ -38,8 +38,9 @@ export class InteractionRoutingJournal {
       || Array.isArray(this.state.primary) || Array.isArray(this.state.origins)) throw new Error("Invalid interaction routing journal");
   }
   setPrimary(destination: InteractionDestination): void {
-    this.state.primary[scope(destination.hostId, destination.threadId)] = { destination: { ...destination }, explicit: true };
-    this.save();
+    this.save({ ...this.state, primary: { ...this.state.primary,
+      [scope(destination.hostId, destination.threadId)]: { destination: { ...destination }, explicit: true }
+    } });
   }
   /** Reconcile only configured accounts, never transport availability. A
    * reconnect must not revoke ownership. Keep invalid owners as tombstones so
@@ -124,8 +125,9 @@ export class InteractionRoutingJournal {
     this.state.unsupported = records.slice(-200); this.save();
   }
   diagnostics(): NonNullable<Journal["unsupported"]> { return structuredClone(this.state.unsupported ?? []); }
-  private save(): void {
-    writeJsonFile(this.filePath, this.state, { durable: true });
+  private save(next = this.state): void {
+    writeJsonFile(this.filePath, next, { durable: true });
+    this.state = next;
   }
 }
 

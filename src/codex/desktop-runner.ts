@@ -855,7 +855,7 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
   // not the conversation order. Never mistake an older page for the active tail.
   const rawTurns = (entities ? Object.values(entities) : Array.isArray(owner.turns) ? owner.turns : [])
     .map(recordValue).filter((turn): turn is Record<string, unknown> => Boolean(turn))
-    .sort((a, b) => Number(a.turnStartedAtMs ?? 0) - Number(b.turnStartedAtMs ?? 0));
+    .sort((a, b) => desktopTurnStart(a) - desktopTurnStart(b));
   const turns: CodexThreadSnapshot["turns"] = [];
   let pendingTurnWithoutId = false;
   for (const value of rawTurns) {
@@ -865,8 +865,7 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     const status = turn.status as CodexTurnStatus;
     if (!["inProgress", "completed", "interrupted", "failed"].includes(status)) continue;
     if (!id) { pendingTurnWithoutId ||= status === "inProgress"; continue; }
-    const startedAtMs = typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs
-      : typeof turn.startedAt === "number" ? turn.startedAt * 1_000 : NaN;
+    const startedAtMs = desktopTurnStart(turn);
     turns.push({ id, status, ...(Number.isFinite(new Date(startedAtMs).getTime()) && startedAtMs > 0
       ? { startedAt: new Date(startedAtMs).toISOString() } : {}), messages: parseThreadHistory({ turns: [{ ...turn, id,
       startedAt: typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs / 1_000 : turn.startedAt
@@ -894,6 +893,12 @@ export function parseDesktopSnapshot(threadId: string, owner: Record<string, unk
     ...(stringValue(owner.title) ? { title: stringValue(owner.title) } : {}),
     ...(stringValue(owner.projectId) ? { projectId: stringValue(owner.projectId) } : {})
   }, turns };
+}
+
+function desktopTurnStart(turn: Record<string, unknown>): number {
+  const value = typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs
+    : typeof turn.startedAt === "number" ? turn.startedAt * 1_000 : 0;
+  return Number.isFinite(value) ? value : 0;
 }
 
 function isDesktopOwnerUnavailable(error: unknown): boolean {

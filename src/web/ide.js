@@ -1,6 +1,8 @@
 window.gatewayIDE = (() => {
   let current, busy = false, opening = false, approval, requests = [], requestMarkup = "", instanceMarkup = "", endpointMarkup = "", sessionDuration = "以服务端显示为准";
   const receipts = new Map();
+  let refreshGeneration = 0;
+  let activityGeneration = 0, activityPending = false;
   let approverMarkup = "", approverAccountsMarkup = "", approverBusy = false;
   const $ = selector => document.querySelector(selector);
   const rootFields = item => `<ul class="ide-root-list">${(item.rootPaths || [item.workspace]).map(root => `<li><code>${escapeHtml(root || "")}</code></li>`).join("")}</ul>`;
@@ -16,7 +18,7 @@ window.gatewayIDE = (() => {
     if (busy || !current) return;
     const address = $("#ideTLSAddress").value, port = Number($("#idePort").value), button = $("#ideTLSGenerate");
     if (!address || !Number.isInteger(port) || port < 1024 || port > 65535) { $("#ideTLSStatus").textContent = "请先选择当前可用的本机 IP，并填写有效的 IDE 端口。"; return; }
-    busy = true; button.disabled = true; $("#ideSave").disabled = true;
+    ++refreshGeneration; busy = true; button.disabled = true; $("#ideSave").disabled = true;
     const fields = ["#ideTLSAddress", "#idePort", "#ideOrigin", "#ideTLSEnabled", "#ideTLSCert", "#ideTLSKey"].map($);
     fields.forEach(field => { field.disabled = true; });
     $("#ideTLSStatus").textContent = "正在生成或复用本地证书；不会修改系统信任库，也不会立即改变网络入口…";
@@ -132,8 +134,12 @@ window.gatewayIDE = (() => {
   }
   async function refresh() {
     if (busy) return;
+    const generation = ++refreshGeneration;
+    const activity = ++activityGeneration;
     try {
-      current = await api("/api/ide"); const config = current.config;
+      const data = await api("/api/ide");
+      if (busy || generation !== refreshGeneration) return;
+      current = data; const config = current.config;
       $("#ideEnabled").checked = config.enabled; $("#ideOrigin").value = config.publicOrigin; $("#idePort").value = config.port;
       $("#idePerHostRouting").checked = config.routing === "per-host";
       const ingressHosts = config.hosts.filter(host => host.hostId !== "local");
@@ -166,12 +172,12 @@ window.gatewayIDE = (() => {
       routingFields();
       $("#ideExtensions").innerHTML = current.extensionChoices.map(id => `<label><input type="checkbox" value="${escapeAttr(id)}" ${config.profile.extensions.includes(id) ? "checked" : ""}>${escapeHtml(id)}</label>`).join("");
       message(current.error || (current.running ? "IDE 访问入口已就绪；实例按需启动。" : "未启用 IDE 访问入口，IM 与 Codex 不受影响。"), Boolean(current.error));
-      renderActivity(current);
-    } catch (error) { message(error.message, true); }
+      if (activity === activityGeneration) renderActivity(current);
+    } catch (error) { if (!busy && generation === refreshGeneration) message(error.message, true); }
   }
   async function save(event) {
     event.preventDefault(); if (busy || !current) return;
-    const button = $("#ideSave"); busy = true; button.disabled = true;
+    const button = $("#ideSave"); ++refreshGeneration; busy = true; button.disabled = true;
     try {
       const perHost = $("#idePerHostRouting").checked;
       const accessFor = hostId => {
@@ -294,8 +300,15 @@ window.gatewayIDE = (() => {
     });
   });
   setInterval(async () => {
-    if (busy || $("#ideView")?.hidden || document.hidden) return;
-    try { renderActivity(await api("/api/ide")); } catch { /* Explicit refresh shows connectivity errors. */ }
+    if (busy || activityPending || $("#ideView")?.hidden || document.hidden) return;
+    activityPending = true;
+    const generation = ++activityGeneration, configGeneration = refreshGeneration;
+    try {
+      const data = await api("/api/ide");
+      if (!busy && generation === activityGeneration && configGeneration === refreshGeneration
+        && !$("#ideView")?.hidden && !document.hidden) renderActivity(data);
+    } catch { /* Explicit refresh shows connectivity errors. */ }
+    finally { activityPending = false; }
   }, 3000);
   return { refresh };
 })();
