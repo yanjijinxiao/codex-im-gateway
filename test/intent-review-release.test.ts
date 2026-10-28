@@ -50,7 +50,7 @@ test("release ownership closes its descriptor and does not erase an unverifiable
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-release-fstat-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const source = fs.readFileSync(new URL("../scripts/release-local.mjs", import.meta.url), "utf8");
-  const helper = source.slice(source.indexOf("async function withReleaseOwnership("), source.indexOf("export async function main("));
+  const helper = source.slice(source.indexOf("async function withReleaseOwnership("), source.indexOf("/** Fail closed against old runtimes."));
   let closed = 0, actions = 0;
   const context = vm.createContext({ fs: { ...fs, fstatSync() { throw Error("injected fstat failure"); }, closeSync(fd: number) { closed++; fs.closeSync(fd); } }, path, process, Date });
   vm.runInContext(helper, context);

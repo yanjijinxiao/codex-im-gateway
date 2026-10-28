@@ -1,6 +1,7 @@
 import { AdmissionService } from "../bridge/admission.js";
 import crypto from "node:crypto";
 import { migrateCardBootstrap } from "./migrate-card-bootstrap.js";
+import { clearReleaseOwner, readReleaseOwner, saveReleaseOwner, validReleaseOwner } from "./release-admission.js";
 import { InboundReferenceStore } from "../bridge/inbound-references.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -137,7 +138,7 @@ import { BindingExpiryCoordinator, type ExpiringBinding } from "./binding-expiry
 import type { BindingExpiry } from "../state/binding-expiry.js";
 
 export class RuntimeConfigurationBusyError extends Error {
-  constructor() { super("Gateway 正在处理消息、等待原生回执或应用配置；此次操作未提交、任务未中断，请稍后重试。"); }
+  constructor(message = "Gateway 正在处理消息、等待原生回执或应用配置；此次操作未提交、任务未中断，请稍后重试。") { super(message); }
 }
 
 export type AccountRunStatus = "stopped" | "starting" | "running" | "error";
@@ -297,6 +298,8 @@ export type AccountManagerOptions = {
 export class AccountManager {
   private readonly accountOperations = new SessionControlQueue();
   private stoppingAll = false;
+  private releaseOwner?: string;
+  private releasePersistent = false;
   readonly ide: WorkspaceIDEManager;
   readonly ideApprovals: IDEApprovalService;
   readonly admission: AdmissionService;
@@ -343,6 +346,10 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    const persistedRelease = readReleaseOwner(options.paths.root);
+    if (persistedRelease) {
+      this.releaseOwner = persistedRelease; this.releasePersistent = true; this.runtimeConfigurationChanging = true;
+    }
     const principalAccounts = () => listAccounts(options.paths).map(account => ({ accountId: account.accountId, channel: accountChannel(account),
       providerId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId }));
     this.ideApprovals = new IDEApprovalService({ root: options.paths.root,
@@ -490,7 +497,9 @@ export class AccountManager {
     }
     await Promise.all(listAccounts(this.options.paths)
       .filter((account) => account.enabled)
-      .map((account) => this.startAccount(account.accountId, false)));
+      // Startup may initialize read/transport resources behind a release gate;
+      // every IM/Web/queue native admission still checks assertRuntimeWritable.
+      .map((account) => this.accountOperations.run(account.accountId, () => this.startAccountOwned(account.accountId, false))));
     this.ensureCodexDesktopRequestMonitor();
     this.ensureCodexSessionMonitor();
     this.threadEvents.start();
@@ -530,12 +539,45 @@ export class AccountManager {
   }
 
   private assertRuntimeWritable(): void {
+    if (this.releaseOwner) throw new RuntimeConfigurationBusyError("Gateway 正在准备发布，暂不接收新任务；这条消息未提交，请稍后重试。");
     if (this.runtimeConfigurationChanging || this.stoppingAll) throw new RuntimeConfigurationBusyError();
   }
 
-  async reconfigureRuntime(update: () => Promise<void | (() => Promise<void>)>): Promise<void> {
+  private assertRuntimeIdle(): void {
     if (this.runtimeConfigurationChanging || this.stoppingAll || this.respondingSessions.size || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
       || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
+  }
+
+  /** Same event-loop boundary as native admission. No await between the busy
+   * check and freeze: a preflight alone leaves a check/stop race. Observed
+   * Desktop turns have independent owners and do not block this lease. */
+  prepareRelease(id: string, persistAcrossRestart = false): { id: string; pid: number; prepared: true } {
+    if (!validReleaseOwner(id)) throw Error("Invalid release owner");
+    if (this.releaseOwner !== id) {
+      this.assertRuntimeIdle();
+      if (persistAcrossRestart) saveReleaseOwner(this.options.paths.root, id);
+      this.releasePersistent = persistAcrossRestart;
+      this.releaseOwner = id;
+      this.runtimeConfigurationChanging = true;
+    }
+    return { id, pid: process.pid, prepared: true };
+  }
+
+  cancelRelease(id: string): boolean {
+    if (this.releaseOwner !== id) return false;
+    if (this.releasePersistent) clearReleaseOwner(this.options.paths.root, id);
+    this.releasePersistent = false;
+    this.releaseOwner = undefined;
+    this.runtimeConfigurationChanging = false;
+    return true;
+  }
+
+  releaseStatus(): { id?: string; pid: number; prepared: boolean } {
+    return { ...(this.releaseOwner ? { id: this.releaseOwner } : {}), pid: process.pid, prepared: Boolean(this.releaseOwner) };
+  }
+
+  async reconfigureRuntime(update: () => Promise<void | (() => Promise<void>)>): Promise<void> {
+    this.assertRuntimeIdle();
     this.runtimeConfigurationChanging = true;
     const accounts = [...this.entries].filter(([, entry]) => entry.controller && !entry.controller.signal.aborted).map(([id]) => id);
     let rollback: void | (() => Promise<void>) = undefined;

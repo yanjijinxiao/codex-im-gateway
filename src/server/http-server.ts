@@ -315,6 +315,17 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     sendJson(response, 200, { requestToken: context.requestToken }); return;
   }
 
+  if (method === "POST" && url.pathname === "/api/release/status") {
+    z.object({}).strict().parse(await readJsonBody(request));
+    sendJson(response, 200, context.accountManager.releaseStatus()); return;
+  }
+  if (method === "POST" && ["/api/release/prepare", "/api/release/cancel"].includes(url.pathname)) {
+    const { id } = z.object({ id: z.uuid() }).strict().parse(await readJsonBody(request));
+    sendJson(response, 200, url.pathname.endsWith("/prepare") ? context.accountManager.prepareRelease(id, true)
+      : { released: context.accountManager.cancelRelease(id) });
+    return;
+  }
+
   const ide = context.accountManager.ide;
   if (url.pathname.startsWith("/api/ide") && ide) {
     if (method === "GET" && url.pathname === "/api/ide") {
@@ -441,18 +452,22 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse,
     return;
   }
   if (method === "POST" && url.pathname === "/api/update") {
-    const result = await context.updateService.installLatest();
+    const lease = context.accountManager.prepareRelease(crypto.randomUUID());
+    let result;
+    try { result = await context.updateService.installLatest(); }
+    catch (error) { context.accountManager.cancelRelease(lease.id); throw error; }
     sendJson(response, 200, { ok: true, ...result, restarting: Boolean(context.onUpdateInstalled) });
     if (context.onUpdateInstalled) {
       const timer = setTimeout(() => {
         try {
           context.onUpdateInstalled?.(result.version);
         } catch (error) {
+          context.accountManager.cancelRelease(lease.id);
           console.error(`[codex-im-gateway] unable to schedule restart: ${error instanceof Error ? error.message : String(error)}`);
         }
       }, 250);
       timer.unref();
-    }
+    } else context.accountManager.cancelRelease(lease.id);
     return;
   }
   if (method === "GET" && url.pathname === "/api/accounts") {

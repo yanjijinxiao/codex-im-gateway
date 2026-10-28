@@ -64,6 +64,58 @@ async function withReleaseOwnership(state, action) {
   }
 }
 
+/** Fail closed against old runtimes. Only the running owner can atomically
+ * freeze submissions and certify that its private native work is idle. */
+export async function claimRuntimeRelease(origin, expectedPid, request = fetch) {
+  const read = await request(new URL('/api/request-context', origin), { signal: AbortSignal.timeout(5000) });
+  if (!read.ok) throw Error('Cannot acquire runtime release admission; service was not stopped');
+  const { requestToken } = await read.json();
+  if (typeof requestToken !== 'string' || !requestToken) throw Error('Invalid runtime request context');
+  const id = crypto.randomUUID();
+  const post = async (route, token = requestToken, body = { id }) => {
+    const response = await request(new URL(`/api/release/${route}`, origin), { method: 'POST',
+      headers: { Origin: origin.origin, 'Content-Type': 'application/json', 'X-Codex-Im-Gateway-Token': token },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw Error(`Runtime release admission HTTP ${response.status}; service was not stopped. Busy or unsupported runtimes cannot be forced through.`);
+    return response.json();
+  };
+  const cancel = async () => { await post('cancel'); };
+  try {
+    const lease = await post('prepare');
+    if (lease.id !== id || lease.pid !== expectedPid || lease.prepared !== true) throw Error('Runtime release owner/PID changed; service was not stopped');
+    return { id, cancel, finish: newPid => finishRuntimeRelease(origin, id, newPid, request) };
+  } catch (error) {
+    // A lost HTTP acknowledgement may still have installed our gate. An exact
+    // owner cancellation cannot clear another release's lease.
+    try { await cancel(); } catch { /* Preserve the original fail-closed reason. */ }
+    throw error;
+  }
+}
+
+export async function finishRuntimeRelease(origin, id, newPid, request = fetch) {
+  const response = await request(new URL('/api/request-context', origin), { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw Error('Replacement runtime request context unavailable; release admission remains closed');
+  const context = await response.json();
+  const post = async (route, body) => {
+    const response = await request(new URL(`/api/release/${route}`, origin), { method: 'POST',
+      headers: { Origin: origin.origin, 'Content-Type': 'application/json', 'X-Codex-Im-Gateway-Token': context.requestToken },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw Error(`Replacement release admission HTTP ${response.status}`);
+    return response.json();
+  };
+  const status = await post('status', {});
+  if (status.pid !== newPid || status.prepared && status.id !== id) throw Error('Replacement runtime release owner/PID changed; admission was not reopened');
+  if (!status.prepared) return; // Idempotent verify after a successful reopening.
+  const result = await post('cancel', { id });
+  if (result.released !== true) throw Error('Replacement runtime did not reopen release admission');
+}
+
+export function assertRollbackAdmission(state, id) {
+  const row = JSON.parse(fs.readFileSync(path.join(state, 'release-admission.json'), 'utf8'));
+  if (row.version !== 1 || row.id !== id || Object.keys(row).sort().join(',') !== 'id,version')
+    throw Error('Rollback admission is no longer held; replacement was not stopped');
+}
+
 export async function main(argv) {
   const [action, ...flags] = argv, options = {};
   if (!['prepare', 'seal', 'switch', 'verify'].includes(action) || flags.length % 2) throw Error('Usage: release-local.mjs prepare|seal|switch|verify --dir PATH --state PATH --origin URL --service LABEL --plist PATH');
@@ -167,21 +219,33 @@ export async function main(argv) {
     if (git(['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0] !== m.commit) throw Error('origin/main differs from release');
     m.status = 'sealed'; save(manifest, m); console.log(JSON.stringify({ sealed: true, commit: m.commit })); return;
   }
-  if (action === 'verify') { if (m.status !== 'verified') throw Error('Release has not completed cutover'); console.log(JSON.stringify(await verify(m))); return; }
-  if (m.status === 'verified') { console.log(JSON.stringify(await verify(m))); return; }
+  const verifyAndReopen = async () => { const result = await verify(m); if (m.releaseOwner) await finishRuntimeRelease(origin, m.releaseOwner, result.pid); return result; };
+  if (action === 'verify') { if (m.status !== 'verified') throw Error('Release has not completed cutover'); console.log(JSON.stringify(await verifyAndReopen())); return; }
+  if (m.status === 'verified') { console.log(JSON.stringify(await verifyAndReopen())); return; }
   clean(); if (m.status !== 'sealed' || sourceHash() !== m.source || pid() !== m.previousPid || treeHash(live) !== m.previous || treeHash(staged) !== m.compiled || fs.existsSync(backup)) throw Error('Cutover preconditions changed');
-  const before = { health: await health(), grants: grants(), permissions: permissions() };
-  if (before.health.authorizationError || before.health.ideRunning && before.health.endpoints.some(e => e.state !== 'ready')) throw Error('Existing Gateway is not ready for cutover');
-  save(path.join(dir, 'before.json'), before);
+  const releaseGate = await claimRuntimeRelease(origin, m.previousPid);
+  m.releaseOwner = releaseGate.id;
   let stopped = false, oldDead = false, installed = false;
   try {
+    const before = { health: await health(), grants: grants(), permissions: permissions() };
+    if (before.health.authorizationError || before.health.ideRunning && before.health.endpoints.some(e => e.state !== 'ready')) throw Error('Existing Gateway is not ready for cutover');
+    save(path.join(dir, 'before.json'), before);
     m.status = 'switching'; save(manifest, m);
     execFileSync('/bin/launchctl', ['bootout', options.service]); stopped = true; await dead(m.previousPid); oldDead = true;
     fs.renameSync(live, backup); try { fs.renameSync(staged, live); } catch (error) { fs.renameSync(backup, live); throw error; } installed = true;
     execFileSync('/bin/launchctl', ['bootstrap', options.service.split('/').slice(0, 2).join('/'), options.plist]);
-    const result = await verify(m); m.status = 'verified'; save(manifest, m); console.log(JSON.stringify(result));
+    const result = await verify(m);
+    // Commit verification before reopening. Subsequent failures must never kill
+    // a replacement which has already accepted new work.
+    m.status = 'verified'; save(manifest, m);
+    await releaseGate.finish(result.pid);
+    console.log(JSON.stringify(result));
   } catch (error) {
+    if (m.status === 'verified') throw error;
     if (installed) {
+      // If an operator already reopened traffic, readiness failure is no
+      // longer permission to kill the replacement's newly accepted tasks.
+      assertRollbackAdmission(state, m.releaseOwner);
       let failedPid; try { failedPid = pid(); } catch {}
       try { execFileSync('/bin/launchctl', ['bootout', options.service]); } catch {}
       if (failedPid) await dead(failedPid);
@@ -189,6 +253,8 @@ export async function main(argv) {
     }
     if (stopped && oldDead) execFileSync('/bin/launchctl', ['bootstrap', options.service.split('/').slice(0, 2).join('/'), options.plist]);
     m.status = installed ? 'rolled-back' : 'switch-failed'; save(manifest, m); throw error;
+  } finally {
+    if (!oldDead) await releaseGate.cancel();
   }
   });
 }
