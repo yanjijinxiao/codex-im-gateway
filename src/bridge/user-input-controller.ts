@@ -362,8 +362,11 @@ export class ChannelUserInputController {
       && ["pending", "answered", "submitting", "unconfirmed"].includes(record.status));
   }
   hasRestartBlockingWork(): boolean {
+    // An unknown receipt is already durable and must never be replayed. It is
+    // not a live handoff: old detached questions otherwise block every release
+    // forever, even after their native turn and source binding have ended.
     return [...this.waiters.keys()].some(id => this.state.records.find(record => record.id === id)?.kind !== "async")
-      || this.state.records.some(record => ["answered", "submitting", "unconfirmed"].includes(record.status));
+      || this.state.records.some(record => ["answered", "submitting"].includes(record.status));
   }
   hasRequest(senderId: string, request: CodexUserInputRequest): boolean {
     return this.state.records.some(record => record.requestKey === requestKey(senderId, request)

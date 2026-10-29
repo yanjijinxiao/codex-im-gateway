@@ -92,6 +92,26 @@ test("restart reconciles orphan questions without replaying an unknown native su
   const records = JSON.parse(fs.readFileSync(f.filePath,"utf8")).records;
   assert.equal(records[0].status,"withdrawn"); assert.equal(records[1].status,"unconfirmed");
   assert.ok(records.every((r: any) => r.bindingDetached)); assert.equal(f.cards.length,1);
+  assert.equal(restored.hasRestartBlockingWork(), false, "a preserved unknown receipt is not an active answer handoff");
+});
+
+for (const kind of ["sync", "async"] as const) test(`restart protects live ${kind} answers until their native receipt, without blocking on historical uncertainty`, async t => {
+  const f = fixture(t), native = { ...request, kind };
+  const pending = f.controller.request("room", native);
+  assert.equal(f.controller.hasRestartBlockingWork(), kind === "sync");
+  f.controller.answer("room", "Q1 answer");
+  assert.equal(f.controller.hasRestartBlockingWork(), true, "a saved answer has not been handed off yet");
+  await pending;
+  assert.equal(f.controller.hasRestartBlockingWork(), true, "native answer acknowledgement is still in flight");
+  await f.controller.reportResult("room", native, "failed");
+  assert.equal(f.controller.hasRestartBlockingWork(), false);
+  const raw = fs.readFileSync(f.filePath, "utf8");
+  assert.equal(JSON.parse(raw).records[0].status, "unconfirmed");
+  f.controller.close();
+  const restored = f.create();
+  assert.equal(restored.hasRestartBlockingWork(), false);
+  assert.match(restored.answer("room", "Q1 do not replay"), /未提交/);
+  assert.equal(fs.readFileSync(f.filePath, "utf8"), raw, "restart neither erases nor replays the unknown answer");
 });
 
 test("wrong conversation or switched binding cannot answer or skip a question", async t => {
