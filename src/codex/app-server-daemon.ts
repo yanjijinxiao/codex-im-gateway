@@ -4,10 +4,13 @@ import os from "node:os";
 import path from "node:path";
 
 import type { AppServerTransport } from "./app-server-transport.js";
+import { resolveCodexCommand } from "./exec-runner.js";
+import { APP_SERVER_SOCKET_RELAY } from "./app-server-socket-relay.js";
 
 export type AppServerConnectionMode = "auto" | "daemon" | "stdio";
 
 export type LocalAppServerTransportOptions = {
+  readonly codexBin?: string;
   readonly mode?: AppServerConnectionMode;
   readonly codexHome?: string;
   readonly platform?: NodeJS.Platform;
@@ -16,9 +19,9 @@ export type LocalAppServerTransportOptions = {
 };
 
 /**
- * Selects the managed app-server daemon when the standalone Codex install is
- * present. `auto` keeps source/npm installations working by falling back to a
- * private stdio app-server; `daemon` fails with an actionable preflight error.
+ * Connects to the independent managed daemon using the native CLI (standalone
+ * or explicitly configured). Custom script/test commands can opt into stdio;
+ * daemon initialization failure must never silently create a private executor.
  */
 export function resolveLocalAppServerTransport(
   options: LocalAppServerTransportOptions = {}
@@ -28,7 +31,7 @@ export function resolveLocalAppServerTransport(
 
   const platform = options.platform ?? process.platform;
   const codexHome = options.codexHome ?? path.join(os.homedir(), ".codex");
-  const executable = path.join(
+  const managedExecutable = path.join(
     codexHome,
     "packages",
     "standalone",
@@ -36,22 +39,25 @@ export function resolveLocalAppServerTransport(
     platform === "win32" ? "codex.exe" : "codex"
   );
   const existsSync = options.existsSync ?? fs.existsSync;
-  if (!existsSync(executable) && mode === "auto") return undefined;
+  const managed = existsSync(managedExecutable);
+  if (!managed && !options.codexBin && mode === "auto") return undefined;
+  const executable = managed ? managedExecutable : options.codexBin ?? managedExecutable;
+  const command = resolveCodexCommand(executable);
 
   const ensureAvailable = async () => {
-    if (!existsSync(executable)) {
+    if (!managed && !options.codexBin) {
       throw new Error(
         `Codex app-server daemon requires the managed standalone Codex install at ${executable}. ` +
         "Install Codex with the official standalone installer or set codexAppServerTransport to stdio."
       );
     }
-    await runCodexDaemonCommand(executable, ["app-server", "daemon", "start"], options.commandTimeoutMs, codexHome);
+    await runCodexDaemonCommand(command.command, [...command.argsPrefix, "app-server", "daemon", "start"], options.commandTimeoutMs, codexHome);
   };
 
   return {
-    command: executable,
-    args: ["app-server", "proxy"],
-    label: "managed-daemon",
+    command: process.execPath,
+    args: ["-e", APP_SERVER_SOCKET_RELAY, path.join(codexHome, "app-server-control", "app-server-control.sock")],
+    label: managed ? "managed-daemon" : "configured-daemon",
     mode: "daemon-proxy",
     prepare: ensureAvailable
   };

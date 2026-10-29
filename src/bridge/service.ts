@@ -56,6 +56,8 @@ import { compactTableCell, renderTextTable, escapeTableMarkdown, type ChannelTab
 import { isSessionPageSize, MIN_SESSION_PAGE_SIZE, MAX_SESSION_PAGE_SIZE } from "../state/session-list-settings.js";
 import { readSessionPurposes, SessionPurposeIndex } from "../state/session-purposes.js";
 import { ChannelUserInputController } from "./user-input.js";
+import { RestartWork } from "./restart-work.js";
+import type { TurnResultAction } from "./turn-result-actions.js";
 import { TaskboardChannelController } from "./taskboard-channel-controller.js";
 import {
   conciseButtonLabel,
@@ -183,6 +185,7 @@ export type BridgeServiceOptions = {
   channelCapabilities?: ChannelCapabilityProvider;
   approvalTimeoutMs?: number;
   assertRuntimeWritable?: () => void;
+  isRuntimeDraining?: () => boolean;
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
   onTurnCompleted?: (result: {
     senderId: string;
@@ -209,6 +212,7 @@ export class BridgeService {
   private readonly actor = new AsyncLocalStorage<string>();
   private readonly participant = new AsyncLocalStorage<Pick<TurnParticipantOrigin, "actorId" | "conversationId" | "mention">>();
   private readonly conversationWork = new Map<string, number>();
+  private readonly restartWork = new RestartWork();
   private readonly turnAudience: TurnAudienceJournal;
   private audienceSuspended = false;
   private readonly controls: SessionControlJournal;
@@ -324,7 +328,16 @@ export class BridgeService {
     return this.conversationWork.size > 0 || this.runningSessions.size > 0 || this.recoveringQueue;
   }
 
+  hasRestartBlockingWork(): boolean {
+    return this.restartWork.hasBlockingWork(scope => this.runner.isIndependentObservation?.(scope) === true)
+      || this.approvals.list().length > 0 || this.userInputs.hasRestartBlockingWork();
+  }
+
   async handleMessage(message: ChannelMessage): Promise<void> {
+    return this.restartWork.run(() => this.handleMessageNow(message));
+  }
+
+  private async handleMessageNow(message: ChannelMessage): Promise<void> {
     this.options.assertRuntimeWritable?.();
     if (this.audienceSuspended) throw new CodexInterventionError("渠道正在停止或重新配置，消息未提交，请稍后重试。");
     const conversationId = message.replyTargetId ?? message.senderId;
@@ -1980,6 +1993,7 @@ export class BridgeService {
         this.warnNativeQueueRecovery();
       }
       await this.nativeQueue.dispatch(accountId, this.runner, async (receipt, starting, started, item) => {
+        return this.restartWork.run(async () => {
         if (!this.access.requireAccess(receipt.actorId, receipt.conversationId).allowed) {
           throw new Error("Queued origin access was revoked; native item preserved");
         }
@@ -1995,6 +2009,7 @@ export class BridgeService {
         await this.actor.run(receipt.actorId, () => this.runCodexTurn({
           id: receipt.messageId, senderId: receipt.conversationId, text: "", attachments: [], raw: {}
         }, item?.input.map(x => x.type === "text" ? x.text ?? "" : "").join("\n") ?? "", [], { receipt, starting, started }));
+        });
       });
     } finally { this.recoveringQueue = false; }
   }
@@ -2514,6 +2529,7 @@ export class BridgeService {
         const prepared = await prepareTurnSubmission({ runner: this.runner, session, project, config: this.options.config,
           accountId: this.options.accountId, conversationId: message.senderId, text, items: attachments,
           source: channelPromptSource(this.channel.channel), knowledge });
+        const acceptedWork = this.restartWork.capture();
         const runInput: CodexRunnerInput = {
           ...prepared,
           prompt: qaContext ? buildQaPrompt(prepared.prompt, project!, qaContext) : prepared.prompt,
@@ -2536,6 +2552,7 @@ export class BridgeService {
             if (presentation) { presentation.threadId = startedThreadId; presentation.turnId = turnId; }
             await this.options.onTurnStarted?.(session, turnId, status);
             if (queued && running && wantsProgress() && replyStream?.supported) await replyStream.progress("🤔 原生队列任务已开始…");
+            if (running) acceptedWork({ hostId: this.sessionHostId(session) ?? "local", threadId: startedThreadId, turnId });
           },
           ...(qaContext ? {
             dynamicTools: llmWikiDynamicTools(),
@@ -2591,12 +2608,12 @@ export class BridgeService {
         }
         if (result.threadId && result.turnId) recordParticipant(result.threadId, result.turnId);
         const parsed = parseActionBlocks(result.text, { strict: false });
-        for (const memory of parsed.actions.remember) {
+        const bound = stillBound();
+        const journaled = bound && result.turnId && this.options.deliverTurnResult;
+        for (const memory of !bound || journaled ? [] : parsed.actions.remember) {
           this.options.stateStore.rememberKnowledge(memory, session.projectId, session.id);
         }
-        const bound = stillBound();
         let finalText = parsed.visibleText.trim() || "处理完成。";
-        const journaled = bound && result.turnId && this.options.deliverTurnResult;
         // The journal owns decoration when present; standalone delivery uses
         // the same presentation policy, never a second enrichment pass.
         if (!journaled) {
@@ -2605,7 +2622,7 @@ export class BridgeService {
           finalText = withIDEEntry(finalText, url);
         }
         const streamed = journaled
-          ? await this.options.deliverTurnResult!(session, result.turnId!, finalText)
+          ? await this.options.deliverTurnResult!(session, result.turnId!, result.text)
           : bound && replyStream ? await replyStream.finalize(finalText) : false;
         let resultDelivered = Boolean(streamed);
         if (!bound) {
@@ -2623,7 +2640,7 @@ export class BridgeService {
         if (!journaled && bound && result.turnId && resultDelivered) {
           void this.notifyTurnParticipants(session, result.turnId, stillBound, replyStream?.checkpoint());
         }
-        for (const action of parsed.actions.send) {
+        for (const action of journaled ? [] : parsed.actions.send) {
           if (!stillBound()) break;
           await this.sendLocalMedia(message.senderId, action, this.sessionHostId(session));
         }
@@ -2651,6 +2668,7 @@ export class BridgeService {
         await this.options.onSubscriptionsChanged?.(); throw error;
       }
       if (error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
+        if (this.options.isRuntimeDraining?.()) { markMessageHandlingErrorReported(error); throw error; }
         console.warn(`[codex-im-gateway] backend communication ${JSON.stringify({ timestamp: new Date().toISOString(),
           phase: error.phase, operation: error.operation, submission: error.submission, code: error.code,
           threadId: error.threadId, turnId: error.turnId })}`);
@@ -2710,6 +2728,15 @@ export class BridgeService {
       if (!binding.current()) break;
       await this.sendLocalMedia(session.senderId, action, native.hostId);
     }
+  }
+
+  async applyRecoveredAction(sessionId: string, native: { hostId: string; threadId: string }, action: TurnResultAction): Promise<void> {
+    this.options.stateStore.refresh();
+    const session = this.options.stateStore.getSession(sessionId);
+    if (!session || session.threadId !== native.threadId || this.sessionHostId(session) !== native.hostId
+      || !sessionExecutionScope(this.options.stateStore, session).current()) throw new CodexInterventionError("Result application binding changed");
+    if (action.kind === "remember") this.options.stateStore.rememberKnowledge(action.value, session.projectId, session.id);
+    else await this.sendLocalMedia(session.senderId, action.value, native.hostId);
   }
 
   private async codexProjectCandidates(): Promise<readonly CodexProjectCandidate[]> {

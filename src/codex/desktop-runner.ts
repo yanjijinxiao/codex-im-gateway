@@ -405,6 +405,14 @@ export class DesktopCodexRunner implements CodexThreadContinuation {
     }
   }
 
+  detachIndependentObservations(): void {
+    for (const [key, waiter] of this.waiters) {
+      const [threadId, turnId] = key.split("\n");
+      waiter.reject(new CodexCommunicationError("observation", "turn/observe", threadId, turnId));
+    }
+    this.waiters.clear(); this.activities.clear();
+  }
+
   close(): void {
     this.closed = true;
     this.observationShutdown.abort();

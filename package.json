@@ -54,7 +54,7 @@
     "taskboard:start": "npm run start --workspace=codex-taskboard",
     "taskboard:taskctl": "npm run taskctl --workspace=codex-taskboard --",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-timeout=120000 --import tsx test/*.test.ts"
+    "test": "node --test --test-concurrency=4 --test-timeout=120000 --import tsx test/*.test.ts"
   },
   "engines": {
     "node": ">=22"

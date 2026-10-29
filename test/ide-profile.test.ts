@@ -132,9 +132,11 @@ test("old settings migration keeps the instance, comments, explicit choices and 
 });
 
 test("profile progress is visible during startup and closing cancels preparation without a late launch", async t => {
-  const { manager, entry, calls, plan } = fixture(t); plan({ delayInstallMs: 10_000 });
+  // Keep installation pending until cancellation even if fixture process
+  // startup is slow on the shared host; this is a lifecycle test, not a 5s SLA.
+  const { manager, entry, calls, plan } = fixture(t); plan({ delayInstallMs: 60_000 });
   const opening = manager.open(entry.id); const rejected = assert.rejects(opening, /已退出|已改变|已取消/);
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 30_000;
   while (manager.list()[0]?.profile?.phase !== "installing" && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(manager.list()[0]?.profile?.phase, "installing");
   // close() is intentionally bounded by the guardian's lifecycle. It must not

@@ -65,6 +65,7 @@ type FollowState = {
   presentationInputBaseline?: string[];
 };
 type Options = {
+  applyResult?: (sub: ThreadSubscription, turnId: string, text: string) => Promise<string | undefined>;
   decorateFinal?: (sub: ThreadSubscription, text: string) => string | Promise<string>;
   decorateProgress?: (sub: ThreadSubscription, text: string) => string;
   onThreadState?: (sub: ThreadSubscription, state: CodexThreadState) => void;
@@ -99,6 +100,8 @@ export class ThreadEventHub {
   private timer?: NodeJS.Timeout;
   private scan?: Promise<void>;
   private stopped = false;
+  private restartPaused = false;
+  private finishing = 0;
   private readSequence = 0;
   private readonly readVersions = new Map<string, number>();
   private readonly manualSyncs = new Map<string, Promise<SessionFollowStatus>>();
@@ -197,11 +200,15 @@ export class ThreadEventHub {
     if (failures.length) throw new AggregateError(failures, "会话跟随停止时观察任务失败；进度计时器已继续清理");
   }
   async refresh(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.restartPaused) return;
     if (this.scan) return this.scan;
     this.scan = this.scanSubscriptions();
     try { await this.scan; } finally { this.scan = undefined; }
   }
+
+  hasRestartBlockingWork(): boolean { return this.finishing > 0 || this.previousRecoveries.size > 0; }
+  pauseForRestart(): void { this.restartPaused = true; }
+  resumeAfterCancelledRestart(): void { this.restartPaused = false; void this.refresh().catch(report); }
 
   status(key: string): SessionFollowStatus {
     const sub = this.options.subscriptions().find(item => item.key === key);
@@ -1209,13 +1216,20 @@ export class ThreadEventHub {
   }
   private async finish(sub: ThreadSubscription, turnId: string, text: string, allowSwitch = false,
     recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; outcome?: TurnOutcome } = {}): Promise<void> {
+    this.finishing++;
+    try { await this.finishNow(sub, turnId, text, allowSwitch, recovery); }
+    finally { this.finishing--; }
+  }
+  private async finishNow(sub: ThreadSubscription, turnId: string, text: string, allowSwitch = false,
+    recovery: { recoverBootstrap?: boolean; confirmUncertainDelivery?: boolean; outcome?: TurnOutcome } = {}): Promise<void> {
     const current = this.currentSubscription(sub);
     if (!current) return;
     sub = current;
     const state = this.state(sub);
     if (state.completed.includes(turnId)) { void this.notifyParticipants(sub, turnId); return; }
     if (!await this.selectTurn(sub, turnId, allowSwitch)) return;
-    const visible = visibleText(text).trim() || "任务已结束。";
+    const notice = !recovery.outcome || recovery.outcome === "completed" ? await this.options.applyResult?.(sub, turnId, text) : undefined;
+    const visible = [visibleText(text).trim() || "任务已结束。", notice].filter(Boolean).join("\n\n");
     let clean = visible;
     try { clean = await this.options.decorateFinal?.(sub, visible) ?? visible; }
     catch { /* Optional IDE metadata must never prevent result delivery. */ }
@@ -1264,6 +1278,7 @@ export class ThreadEventHub {
   }
 
   private currentSubscription(sub: ThreadSubscription): ThreadSubscription | undefined {
+    if (this.restartPaused) return;
     return this.options.subscriptions().find(current => current.enabled !== false && current.key === sub.key
       && current.hostId === sub.hostId && current.threadId === sub.threadId
       && current.recipientId === sub.recipientId && current.client === sub.client);

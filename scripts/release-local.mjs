@@ -197,7 +197,7 @@ export async function main(argv) {
     const previousPid = pid(); if (!Number.isSafeInteger(previousPid) || previousPid <= 1) throw Error('Managed Gateway is not running');
     save(manifest, { status: 'preparing', commit, source });
     runLog('typecheck.log', process.execPath, ['node_modules/typescript/bin/tsc', '--noEmit']);
-    runLog('tests.log', process.execPath, ['--test', '--import', 'tsx', '--test-reporter=spec', '--test-timeout=120000', ...fs.readdirSync(path.join(repo, 'test')).filter(name => name.endsWith('.test.ts')).map(name => 'test/' + name)]);
+    runLog('tests.log', process.execPath, ['--test', '--test-concurrency=4', '--import', 'tsx', '--test-reporter=spec', '--test-timeout=120000', ...fs.readdirSync(path.join(repo, 'test')).filter(name => name.endsWith('.test.ts')).map(name => 'test/' + name)]);
     const tests = testCounts(fs.readFileSync(path.join(dir, 'tests.log'), 'utf8'));
     runLog('build.log', process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.json', '--outDir', staged]);
     fs.cpSync(path.join(repo, 'src/web'), path.join(staged, 'web'), { recursive: true });

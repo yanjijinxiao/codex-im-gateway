@@ -322,20 +322,26 @@ test("attachment boundary rejects symlink escapes and oversized files for every 
   assert.throws(() => validateLocalAttachments(image("large"), inbound, 3), InboundMediaTooLargeError);
 });
 
-test("text-only progress coalesces bursts and cannot send after the final answer", async () => {
+test("text-only progress coalesces bursts and cannot send after the final answer", async t => {
+  // CPU contention in the full suite can make the burst itself exceed 10ms.
+  // Advance the clock explicitly so this tests the coalescing window, rather
+  // than the speed of unrelated test workers on the developer's machine.
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const writes: string[] = [];
   const batch = new TextProgressBatcher(async (text) => { writes.push(text); }, 10);
   await batch.push("first");
   for (let i = 0; i < 100; i++) await batch.push(`progress ${i}`);
   assert.equal(writes.length, 1);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  t.mock.timers.tick(20);
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(writes.length, 2);
   assert.match(writes[1], /progress 99/);
   assert.ok(writes[1].length < 1500);
   await batch.push("late");
   await batch.close();
   writes.push("FINAL");
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  t.mock.timers.tick(20);
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(writes.at(-1), "FINAL");
 });
 

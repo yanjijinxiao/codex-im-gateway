@@ -188,14 +188,15 @@ test("daemon app-server transport exposes a proxy and fails preflight clearly", 
   });
 
   assert.equal(transport?.mode, "daemon-proxy");
-  assert.deepEqual(transport?.args, ["app-server", "proxy"]);
+  assert.equal(transport?.command, process.execPath);
+  assert.equal(transport?.args.at(-1), path.join(codexHome, "app-server-control", "app-server-control.sock"));
   await assert.rejects(
     transport?.prepare?.(),
     /managed standalone Codex install.*codexAppServerTransport to stdio/i
   );
 });
 
-test("daemon app-server transport targets the managed standalone executable", () => {
+test("daemon app-server transport connects to the selected Codex home's control socket", () => {
   const codexHome = path.join(path.sep, "test-codex-home");
   const transport = resolveLocalAppServerTransport({
     mode: "daemon",
@@ -206,7 +207,7 @@ test("daemon app-server transport targets the managed standalone executable", ()
 
   assert.equal(
     transport?.command,
-    path.join(codexHome, "packages", "standalone", "current", "codex")
+    process.execPath
   );
   assert.equal(transport?.label, "managed-daemon");
 });

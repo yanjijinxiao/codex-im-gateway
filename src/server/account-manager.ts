@@ -2,6 +2,8 @@ import { AdmissionService } from "../bridge/admission.js";
 import crypto from "node:crypto";
 import { migrateCardBootstrap } from "./migrate-card-bootstrap.js";
 import { clearReleaseOwner, readReleaseOwner, saveReleaseOwner, validReleaseOwner } from "./release-admission.js";
+import { RestartWork } from "../bridge/restart-work.js";
+import { TurnResultActions } from "../bridge/turn-result-actions.js";
 import { InboundReferenceStore } from "../bridge/inbound-references.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -313,6 +315,9 @@ export class AccountManager {
   private readonly stores = new Map<string, RuntimeStateStore>();
   private readonly inputReceipts = new Map<string, InboundReceiptJournal>();
   private readonly respondingSessions = new Map<string, number>();
+  private readonly webRestartWork = new RestartWork();
+  private readonly resultRestartWork = new RestartWork();
+  private readonly resultActions: TurnResultActions;
   private readonly configProvider: () => CodexImGatewayConfig;
   private readonly adapterFactory: ChannelAdapterFactory;
   private readonly bridgeFactory: (input: ConstructorParameters<typeof BridgeService>[0]) => BridgeService;
@@ -346,6 +351,7 @@ export class AccountManager {
   private taskboardTask?: Promise<void>;
 
   constructor(private readonly options: AccountManagerOptions) {
+    this.resultActions = new TurnResultActions(path.join(options.paths.runtimeDir, "turn-result-actions.json"));
     const persistedRelease = readReleaseOwner(options.paths.root);
     if (persistedRelease) {
       this.releaseOwner = persistedRelease; this.releasePersistent = true; this.runtimeConfigurationChanging = true;
@@ -371,6 +377,7 @@ export class AccountManager {
     this.nativeQueue = new NativeQueueCoordinator(path.join(options.paths.runtimeDir, "native-submissions.json"));
     migrateCardBootstrap(options.paths);
     this.threadEvents = new ThreadEventHub({
+      applyResult: (sub, turnId, text) => this.applyNativeResult(sub, turnId, text),
       legacyQueueTerminal: (sub, turnId) => {
         const [accountId, sessionId] = JSON.parse(sub.key) as string[];
         return this.nativeQueue.hasLegacyTerminal({ accountId, sessionId, hostId: sub.hostId, threadId: sub.threadId, turnId });
@@ -401,6 +408,7 @@ export class AccountManager {
       acceptedInputs: () => [ ...this.sessionControls.acceptedPresentationInputs(),
         ...[...this.entries.values()].flatMap(entry => entry.service?.acceptedPresentationInputs?.() ?? []) ]
     });
+    if (this.releaseOwner) this.threadEvents.pauseForRestart();
     this.systemRecovery = new SystemErrorRecoveryCoordinator({
       filePath: path.join(options.paths.runtimeDir, "system-error-recovery.json"),
       backend: () => this.runnerFor(this.configProvider()),
@@ -548,17 +556,30 @@ export class AccountManager {
       || [...this.entries.values()].some(entry => entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
   }
 
+  private assertReleaseIdle(): void {
+    if (!this.runner?.hasRestartBlockingWork || !this.runner.isIndependentObservation) { this.assertRuntimeIdle(); return; }
+    if (this.runtimeConfigurationChanging || this.stoppingAll || this.runner.hasRestartBlockingWork()
+      || this.threadEvents.hasRestartBlockingWork()
+      || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
+      || this.webRestartWork.hasBlockingWork(scope => this.runner!.isIndependentObservation!(scope))
+      || this.resultRestartWork.hasBlockingWork()
+      || [...this.entries.values()].some(entry => entry.service?.hasRestartBlockingWork
+        ? entry.service.hasRestartBlockingWork() : entry.service?.hasInFlightWork?.())) throw new RuntimeConfigurationBusyError();
+  }
+
   /** Same event-loop boundary as native admission. No await between the busy
    * check and freeze: a preflight alone leaves a check/stop race. Observed
    * Desktop turns have independent owners and do not block this lease. */
   prepareRelease(id: string, persistAcrossRestart = false): { id: string; pid: number; prepared: true } {
     if (!validReleaseOwner(id)) throw Error("Invalid release owner");
     if (this.releaseOwner !== id) {
-      this.assertRuntimeIdle();
+      this.assertReleaseIdle();
       if (persistAcrossRestart) saveReleaseOwner(this.options.paths.root, id);
       this.releasePersistent = persistAcrossRestart;
       this.releaseOwner = id;
       this.runtimeConfigurationChanging = true;
+      try { this.threadEvents.pauseForRestart(); this.runner?.detachIndependentObservations?.(); }
+      catch (error) { this.cancelRelease(id); throw error; }
     }
     return { id, pid: process.pid, prepared: true };
   }
@@ -569,6 +590,7 @@ export class AccountManager {
     this.releasePersistent = false;
     this.releaseOwner = undefined;
     this.runtimeConfigurationChanging = false;
+    this.threadEvents.resumeAfterCancelledRestart();
     return true;
   }
 
@@ -658,6 +680,7 @@ export class AccountManager {
     const runner = this.runnerFor(config);
     const service = this.bridgeFactory({
       assertRuntimeWritable: () => this.assertRuntimeWritable(),
+      isRuntimeDraining: () => Boolean(this.releaseOwner || this.stoppingAll),
       ideApprovals: this.ideApprovals,
       admission: this.admission,
       ideProviderId: account.channel === "dingtalk" ? account.clientId : account.channel === "feishu" ? account.appId : account.botId ?? account.accountId,
@@ -1502,6 +1525,12 @@ export class AccountManager {
     onProgress?: (message: string) => Promise<void> | void,
     requestId: string = crypto.randomUUID()
   ): Promise<SessionChatResult> {
+    this.assertRuntimeWritable();
+    return this.webRestartWork.run(() => this.continueSessionNow(accountId, sessionId, text, uploads, onProgress, requestId));
+  }
+
+  private async continueSessionNow(accountId: string, sessionId: string, text: string, uploads: SessionUpload[],
+    onProgress: ((message: string) => Promise<void> | void) | undefined, requestId: string): Promise<SessionChatResult> {
     if (!/^[a-zA-Z0-9-]{1,100}$/.test(requestId)) throw Error("Invalid Web request id");
     const session = requireSession(this.storeFor(accountId), sessionId);
     let result: SessionChatResult | undefined;
@@ -1554,6 +1583,7 @@ export class AccountManager {
       const prepared = await prepareTurnSubmission({ runner: this.runnerFor(config), session, project, config,
         accountId, conversationId: session.senderId, text: prompt, items: attachments, source: "Web",
         knowledge: store.relevantKnowledge(promptPreview ?? prompt, session.projectId) });
+      const acceptedWork = this.webRestartWork.capture();
       const result = await submission.run(this.runnerFor(config), {
         ...prepared,
         onThreadCreated: (createdThreadId) => {
@@ -1564,6 +1594,7 @@ export class AccountManager {
         onTurnStarted: ({ threadId, turnId }) => {
           if (stillCurrent()) this.rememberInteractionOrigin(accountId, { ...session, threadId }, turnId);
           this.refreshDesktopRequestSubscriptions();
+          acceptedWork({ hostId: session.hostId ?? project?.hostId ?? "local", threadId, turnId });
         },
         onApproval: (request: CodexApprovalRequest) => this.requestSessionApproval(accountId, session, request),
         onApprovalResult: (request, result) => this.reportSessionApprovalResult(request, result),
@@ -1587,15 +1618,22 @@ export class AccountManager {
       }
       if (stillCurrent()) binding.acceptThread(threadId);
       const parsed = parseAssistantMessage(result.text);
-      for (const memory of parsed.actions.remember) {
-        store.rememberKnowledge(memory, session.projectId, session.id);
+      const notice = stillCurrent() && result.turnId ? await this.applyNativeResult({
+        key: JSON.stringify([accountId, sessionId]), hostId: prepared.hostId ?? "local", threadId,
+        recipientId: session.senderId, client: entry.client!, managed: true
+      }, result.turnId, result.text) : undefined;
+      if (stillCurrent() && !result.turnId) {
+        // Legacy exec adapters have no native turn identity and remain release
+        // blocking for this whole handler; preserve their inline application.
+        this.assertRuntimeWritable();
+        for (const memory of parsed.actions.remember) store.rememberKnowledge(memory, session.projectId, session.id);
       }
       const response: SessionChatResult = {
         threadId,
         message: {
           id: crypto.randomUUID(),
           role: "assistant",
-          text: parsed.visibleText.trim(),
+          text: [parsed.visibleText.trim(), notice].filter(Boolean).join("\n\n"),
           createdAt: new Date().toISOString(),
           attachments: parsed.actions.send.map((action, index) => {
             const { path: _path, ...attachment } = sessionAttachment(action, index, session.hostId ?? project?.hostId);
@@ -1718,6 +1756,42 @@ export class AccountManager {
       this.inputReceipts.set(accountId, receipts);
     }
     return receipts;
+  }
+
+  /** Only outputs of an exactly acknowledged Gateway input may carry effects.
+   * A Desktop history/follow subscription alone grants no such authority. The
+   * action journal is shared by the original handler and restart recovery. */
+  private async applyNativeResult(sub: ThreadSubscription, turnId: string, text: string): Promise<string | undefined> {
+    const [accountId, sessionId] = JSON.parse(sub.key) as [string, string];
+    const store = this.storeFor(accountId), session = store.getSession(sessionId), entry = this.entries.get(accountId);
+    const receipts = Object.values(this.receiptsFor(accountId).snapshot()).filter(r => r.sessionId === sessionId
+      && (r.hostId ?? "local") === sub.hostId && r.threadId === sub.threadId && r.turnId === turnId
+      && r.conversationId === sub.recipientId && ["accepted", "handled"].includes(r.phase));
+    const queued = this.nativeQueue.list(accountId).some(r => r.sessionId === sessionId && r.hostId === sub.hostId
+      && r.threadId === sub.threadId && r.turnId === turnId && r.conversationId === sub.recipientId);
+    if (!receipts.length && !queued) return;
+    if (!session || !entry?.service) throw new CodexInterventionError("Result application owner unavailable");
+    const binding = sessionExecutionScope(store, session);
+    const assertCurrent = () => {
+      this.assertRuntimeWritable();
+      store.refresh();
+      const current = store.getSession(sessionId);
+      if (this.entries.get(accountId) !== entry || !["running", "starting"].includes(entry.status)
+        || !binding.current() || current?.threadId !== sub.threadId || current.senderId !== sub.recipientId
+        || (current.hostId ?? store.getProject(current.projectId ?? "")?.hostId ?? "local") !== sub.hostId)
+        throw new CodexInterventionError("Result application binding changed");
+    };
+    return this.resultRestartWork.run(async () => {
+      const imOrigin = queued || receipts.some(r => r.actorId !== "web-admin");
+      const confirmed = await this.resultActions.apply([accountId, sessionId, sub.hostId, sub.threadId, turnId], text,
+        assertCurrent, async action => {
+          if (action.kind === "remember") store.rememberKnowledge(action.value, session.projectId, session.id);
+          else if (imOrigin) await entry.service!.applyRecoveredAction(sessionId, sub, action);
+          // Web-only attachments remain available in native/Web history; they
+          // must not unexpectedly send a second message to the bound IM group.
+        });
+      return confirmed ? undefined : "部分附件或记忆操作未确认，未自动重复执行；请核对接收结果。";
+    });
   }
 
   private isActive(accountId: string, sessionId: string): boolean {

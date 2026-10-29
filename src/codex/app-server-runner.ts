@@ -469,6 +469,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   private async unsubscribeThread(threadId: string): Promise<void> {
+    if (this.closed) return; // Closing the transport already detaches its subscriptions.
     try {
       await this.request(
         "thread/unsubscribe",
@@ -1366,6 +1367,24 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
 
   hasInFlightWork(): boolean {
     return Boolean(this.operationLeases || this.activeTurns.size || this.unconfirmedStarts.size || this.nativeQueueOrigins.size);
+  }
+
+  get executionLifetime(): "gateway" | "independent" {
+    return this.options.transport?.mode === "daemon-proxy" || this.options.transport?.mode === "remote-daemon" ? "independent" : "gateway";
+  }
+
+  hasRestartBlockingWork(): boolean {
+    if (this.executionLifetime === "gateway") return this.hasInFlightWork();
+    // A daemon owns accepted turns. Protect RPC handoff and live synchronous
+    // interactions, not the lifetime of its independently executing turns.
+    const reads = new Set(["initialize", "thread/read", "thread/list", "thread/turns/list", "thread/queue/list", "project/list", "config/read", "model/list", "account/read", "account/rateLimits/read", "thread/goal/get"]);
+    return this.unconfirmedStarts.size > 0 || this.approvalRequests.size > 0 || this.userInputRequests.size > 0
+      || [...this.pending.values()].some(request => !reads.has(request.method));
+  }
+
+  detachIndependentObservations(): void {
+    if (this.executionLifetime !== "independent" || this.hasRestartBlockingWork()) return;
+    this.failTransport(new CodexCommunicationError("observation", "turn/observe"), true);
   }
 
   close(): Promise<void> {

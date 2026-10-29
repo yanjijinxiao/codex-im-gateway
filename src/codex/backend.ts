@@ -42,6 +42,7 @@ export type CodexThreadPersistence = "active" | "archived" | "ephemeral" | "miss
 export type CodexThreadRuntimeStatus = "notLoaded" | "idle" | "active" | "systemError" | "unknown";
 export type CodexThreadActiveFlag = "waitingOnApproval" | "waitingOnUserInput";
 export type CodexTurnStatus = "inProgress" | "completed" | "interrupted" | "failed";
+export type CodexExecutionScope = { hostId: string; threadId: string; turnId: string };
 
 export type CodexThreadState = {
   threadId: string;
@@ -482,6 +483,9 @@ export type CodexThreadGoal = {
 
 /** Shared contract implemented independently by the CLI and app-server backends. */
 export interface CodexBackendAdapter extends CodexBackendControls {
+  detachIndependentObservations?(): void;
+  readonly executionLifetime?: "gateway" | "independent";
+  hasRestartBlockingWork?(): boolean;
   hasInFlightWork?(): boolean;
   readonly id: CodexBackendId;
   readonly capabilities: CodexBackendCapabilities;
@@ -546,6 +550,9 @@ export interface CodexAppServerBackend extends CodexBackendAdapter, Partial<Code
 
 /** Stable facade consumed by channels, Web, intent routing, and account management. */
 export interface CodexBridgeBackend extends Partial<CodexNativeQueue> {
+  detachIndependentObservations?(): void;
+  hasRestartBlockingWork?(): boolean;
+  isIndependentObservation?(scope: CodexExecutionScope): boolean;
   /** Native ownership may outlive a channel handler after an ambiguous receipt. */
   hasInFlightWork?(): boolean;
   readThreadProvenance?(threadId: string, hostId?: string): Promise<CodexThreadProvenance | undefined>;

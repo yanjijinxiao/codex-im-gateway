@@ -361,6 +361,10 @@ export class ChannelUserInputController {
     return this.state.records.some(record => this.matchesBinding(senderId, record)
       && ["pending", "answered", "submitting", "unconfirmed"].includes(record.status));
   }
+  hasRestartBlockingWork(): boolean {
+    return [...this.waiters.keys()].some(id => this.state.records.find(record => record.id === id)?.kind !== "async")
+      || this.state.records.some(record => ["answered", "submitting", "unconfirmed"].includes(record.status));
+  }
   hasRequest(senderId: string, request: CodexUserInputRequest): boolean {
     return this.state.records.some(record => record.requestKey === requestKey(senderId, request)
       && ["pending", "answered", "submitting", "unconfirmed"].includes(record.status));
