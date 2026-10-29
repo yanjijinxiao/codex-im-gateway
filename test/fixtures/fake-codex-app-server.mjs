@@ -136,7 +136,7 @@ rl.on("line", (line) => {
       fail(message.id, "jsonrpc header must be omitted");
       return;
     }
-    if (message.params?.clientInfo?.name !== "codex-im-gateway") {
+    if (!["codex-im-gateway", "codex-im-gateway-metadata", "codex-im-gateway-history"].includes(message.params?.clientInfo?.name)) {
       fail(message.id, "missing codex-im-gateway clientInfo");
       return;
     }
@@ -245,6 +245,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/resume") {
+    if (message.params.excludeTurns !== true) { fail(message.id, "resume must exclude unbounded history"); return; }
     if (archivedThreads.has(message.params.threadId)) {
       fail(message.id, `thread ${message.params.threadId} is archived; unarchive it first`);
       return;
@@ -460,6 +461,9 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/read") {
+    if (process.argv.includes("--bounded-inspection") && message.params.includeTurns !== false) {
+      fail(message.id, "inspection and idle waiting must not hydrate full history"); return;
+    }
     if (process.argv.includes("--bounded-inspection") && message.params.includeTurns !== false) { fail(message.id, "inspection must not load full history"); return; }
     if (message.params.threadId === "thread-read-unresponsive") return;
     if (archivedThreads.has(message.params.threadId)) {
@@ -499,6 +503,7 @@ rl.on("line", (line) => {
     if (process.argv.includes("--bounded-inspection") && (message.params.limit !== 1 || message.params.itemsView !== "notLoaded")) {
       fail(message.id, "inspection must request only the latest turn without items"); return;
     }
+    if (message.params.cursor === "older-page") { respond(message.id, { data: [], nextCursor: null }); return; }
     const turns = historyTurns(activeTurns.get(message.params.threadId) ?? externalObservedTurns.get(message.params.threadId));
     const ordered = message.params?.sortDirection === "asc" ? turns : [...turns].reverse();
     respond(message.id, {

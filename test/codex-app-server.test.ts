@@ -48,6 +48,15 @@ test("ordinary execution inspection gets metadata and one item-free turn, withou
   assert.equal(runner.hasRestartBlockingWork(), false);
 });
 
+test("resuming an old thread and waiting for idle never requests its unbounded history", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 2000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs"), "--bounded-inspection"], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  const result = await runner.run({ threadId: "thread-existing", cwd: "/tmp/project", prompt: "bounded-old-thread" });
+  assert.equal(result.text, "reply:bounded-old-thread");
+});
+
 for (const [prompt, code] of [["fixture-safety-block", "unintended-activity"], ["fixture-coded-failure", "context-window"]] as const) {
   test(`native App Server failures retain normalized reasons and explicit systemError: ${code}`, async t => {
     const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {

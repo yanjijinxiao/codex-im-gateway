@@ -95,6 +95,8 @@ export type AppServerRunnerOptions = {
   transport?: AppServerTransport;
   /** Dedicated project observation: no task controls or native decisions. */
   metadataOnly?: boolean;
+  /** Bulk display history is isolated from metadata and native execution. */
+  historyOnly?: boolean;
 };
 
 type JsonRpcId = number | string;
@@ -258,6 +260,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         alreadySubscribed ? "thread/read" : input.threadId ? "thread/resume" : "thread/start",
         compactObject({
           ...(alreadySubscribed ? { includeTurns: false } : {}),
+          ...(input.threadId && !alreadySubscribed ? { excludeTurns: true } : {}),
           ...(input.threadId ? { threadId: input.threadId } : {}),
           ...(!input.threadId ? { ephemeral: input.ephemeral } : {}),
           cwd: resume ? undefined : input.cwd,
@@ -841,18 +844,25 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   }
 
   async getHistory(threadId: string): Promise<CodexHistoryMessage[]> {
-    await this.ensureConnected();
+    this.operationLeases++;
     try {
-      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
-      const thread = response.thread as Record<string, unknown> | undefined;
-      if (!thread) throw new CodexThreadStateError("missing", threadId, `Codex session ${threadId} 不存在。`);
-      const state = parseThreadState(thread, persistenceFromThread(thread));
-      this.threadStates.set(threadId, state);
+      const state = await this.inspectThread(threadId, { includeTurns: false, timeoutMs: Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000) });
       assertCodexThreadRunnable(state);
-      return parseThreadHistory(thread);
+      const messages: CodexHistoryMessage[] = [];
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const page = await this.getHistoryPage(threadId, { cursor, limit: 100, sortDirection: "asc" });
+        messages.push(...page.messages);
+        cursor = page.nextCursor;
+        if (cursor && cursors.has(cursor)) throw new Error("Native turn history repeated cursor");
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      return messages;
     } catch (error) {
       throw normalizeThreadOperationError(error, threadId);
     } finally {
+      this.operationLeases--;
       await this.recyclePrivateTransportIfIdle();
     }
   }
@@ -867,7 +877,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       if (state.persistence === "missing" || state.persistence === "archived") return { state, turns: [] };
       await this.ensureConnected();
       const response = await this.request("thread/turns/list", {
-        threadId, limit: 20, sortDirection: "desc", itemsView: "full"
+        threadId, limit: 20, sortDirection: "desc", itemsView: "summary"
       }, timeoutMs) as { data?: Array<{ id: string; status: import("./backend.js").CodexTurnStatus; startedAt?: number }> };
       const turns = (response.data ?? []).slice().reverse();
       const failure = lastCodexTurnFailure(turns.at(-1));
@@ -954,7 +964,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         return { status: "deferred", reason: "awaiting-unload", state: before.state };
         }
       }
-      const response = await this.request("thread/resume", { threadId: input.threadId }, 5_000) as { thread?: { id?: string } };
+      const response = await this.request("thread/resume", { threadId: input.threadId, excludeTurns: true }, 5_000) as { thread?: { id?: string } };
       if (response?.thread?.id !== input.threadId) return { status: "deferred", reason: "unconfirmed" };
       this.subscribedThreads.add(input.threadId);
       input.assertCurrent();
@@ -1018,6 +1028,8 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         cursor: input.cursor,
         limit: Math.max(1, Math.min(input.limit ?? 20, 100)),
         sortDirection: input.sortDirection ?? "desc",
+        // Explicit history preserves commentary as well as final replies.
+        // The router confines this bulk read to the history-only connection.
         itemsView: "full"
       })) as Record<string, unknown>;
       const turns = Array.isArray(response.data) ? response.data.slice() : [];
@@ -1094,7 +1106,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
       // thread can auto-consume add, so subscribe before that external write.
       // Never reconfigure an already running turn to attach its queue.
       if (!this.subscribedThreads.has(input.threadId)) {
-        await this.request("thread/resume", compactObject({ threadId: input.threadId,
+        await this.request("thread/resume", compactObject({ threadId: input.threadId, excludeTurns: true,
           ...(!this.activeTurns.has(input.threadId) && input.onApproval ? { approvalPolicy: "on-request" } : {}) }));
         this.subscribedThreads.add(input.threadId);
       }
@@ -1170,7 +1182,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
         if (existing.status === "inProgress" && !this.subscribedThreads.has(input.threadId)) {
           if (input.onApproval) this.approvalHandlersByThread.set(input.threadId, input.onApproval);
           this.bindUserInputHandlers(input.threadId, input);
-          await this.request("thread/resume", { threadId: input.threadId });
+          await this.request("thread/resume", { threadId: input.threadId, excludeTurns: true });
           this.subscribedThreads.add(input.threadId);
           const refreshed = await this.findQueuedTurn(input.threadId, undefined, String(existing.id));
           if (!refreshed) throw new Error("已接收的轮次无法核对，未重复启动。");
@@ -1197,7 +1209,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     const cursors = new Set<string>(); let cursor: string | undefined;
     do {
       const page = await this.request("thread/turns/list", compactObject({ threadId, cursor, limit: 100,
-        sortDirection: "desc", itemsView: "full" }), Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000)) as {
+        sortDirection: "desc", itemsView: "summary" }), Math.min(this.options.requestTimeoutMs ?? 15_000, 15_000)) as {
         data: Array<Record<string, unknown>>; nextCursor?: string;
       };
       const turn = page.data.find(t => turnId ? t.id === turnId : Array.isArray(t.items)
@@ -1459,7 +1471,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     try {
       await this.request("initialize", {
         clientInfo: {
-          name: this.options.metadataOnly ? "codex-im-gateway-metadata" : "codex-im-gateway",
+          name: this.options.metadataOnly ? "codex-im-gateway-metadata" : this.options.historyOnly ? "codex-im-gateway-history" : "codex-im-gateway",
           title: "Codex IM Gateway",
           version: "0.4.0"
         },
@@ -1514,6 +1526,13 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     if (this.options.metadataOnly && (!message.method || !["initialize", "initialized", "thread/read", "thread/list", "project/list", "config/read"].includes(message.method)
       || message.method === "thread/read" && message.params?.includeTurns !== false)) {
       throw new Error("Metadata-only connection cannot submit task controls or approval decisions");
+    }
+    if (this.options.historyOnly && (!message.method
+      || !["initialize", "initialized", "thread/read", "thread/list", "thread/turns/list"].includes(message.method)
+      || message.method === "thread/read" && message.params?.includeTurns !== false
+      || message.method === "thread/turns/list" && (!["summary", "full"].includes(String(message.params?.itemsView))
+        || typeof message.params?.limit !== "number" || message.params.limit < 1 || message.params.limit > 100))) {
+      throw new Error("History-only connection cannot submit task controls, approval decisions or unbounded history hydration");
     }
     if (!this.child || this.child.exitCode !== null || this.child.stdin.destroyed) {
       throw new Error("Codex app-server stdio transport is not connected");
@@ -1825,11 +1844,9 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   ): Promise<void> {
     let notified = false;
     while (true) {
-      const response = await this.request("thread/read", { threadId, includeTurns: true }) as Record<string, unknown>;
-      const thread = response.thread as Record<string, unknown> | undefined;
-      if (!thread) throw new CodexThreadStateError("missing", threadId, `Codex session ${threadId} 不存在。`);
-      const state = parseThreadState(thread, persistenceFromThread(thread));
-      this.threadStates.set(threadId, state);
+      // Waiting for the writer needs status and a latest-turn guard, not every
+      // tool result ever persisted in this conversation (potentially GBs).
+      const state = await this.inspectThread(threadId);
       assertCodexThreadRunnable(state);
       const busy = state.runtimeStatus === "active" || state.latestTurnStatus === "inProgress";
       if (!busy) return;
@@ -1926,7 +1943,7 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
   private handleServerRequest(message: WireMessage): void {
     // Requests observed from a shared native owner remain its responsibility.
     // A read-only client must not even decline somebody else's approval.
-    if (this.options.metadataOnly) return;
+    if (this.options.metadataOnly || this.options.historyOnly) return;
     const id = message.id as JsonRpcId;
     if (isAppServerApprovalMethod(message.method)) {
       const method = message.method;

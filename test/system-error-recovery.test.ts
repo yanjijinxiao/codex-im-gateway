@@ -124,7 +124,7 @@ test("the native adapter only resumes the same identity and never submits an inp
   wire.readThreadSnapshot = async () => structuredClone(state);
   wire.request = async (method: string, params: unknown) => { calls.push([method, params]); state.state.runtimeStatus = "idle"; return { thread: { id: "thread" } }; };
   assert.equal((await wire.recoverSystemError({ threadId: "thread", failedTurnId: "failed", assertCurrent() {} })).status, "recovered");
-  assert.deepEqual(calls, [["thread/resume", { threadId: "thread" }]]);
+  assert.deepEqual(calls, [["thread/resume", { threadId: "thread", excludeTurns: true }]]);
 });
 test("native reset rechecks the binding after connecting and preserves unknown starts", async () => {
   const wire = new AppServerCodexRunner() as any; let allowed = true, writes = 0;
