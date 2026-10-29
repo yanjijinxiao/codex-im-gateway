@@ -53,8 +53,7 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
     assert.doesNotMatch(values.msgContent, /(?:<br>\s*){2,}|\n/, "active snapshots have no empty display rows");
     assert.match(values.msgContent, /正在检查选项定义/);
     assert.doesNotMatch(values.msgContent, /\/stop|打开项目 Web IDE|203\.0\.113/);
-    assert.equal(Lexer.lex(values.staticMsgContent).filter(token => token.type === "code").length, 0);
-    assert.match(values.staticMsgContent, /停止任务：`\/stop`/);
+    assert.deepEqual(Lexer.lex(values.staticMsgContent).filter(token => token.type === "code").map(token => ({ lang: token.lang, text: token.text })), [{ lang: "text", text: "/stop" }]);
     assert.equal(view().split("/stop").length - 1, 1);
     assert.equal(view().split("[打开项目 Web IDE]").length - 1, expected ? 1 : 0);
     if (expected) assert.ok(values.staticMsgContent.endsWith(`(${expected})`));
@@ -87,6 +86,7 @@ for (const mode of ["https", "sdk"] as const) test(`${mode}: real task projectio
   for (const activity of ["waiting-input", "waiting-approval", "unconfirmed"] as const) {
     await stream.setActivity(activity); await stream.flush();
     assert.equal(values.flowStatus, "3"); assert.deepEqual(JSON.parse(values.sys_full_json_obj).order, ["staticMsgContent"]);
+    assert.deepEqual(Lexer.lex(values.staticMsgContent).filter(token => token.type === "code").map(token => ({ lang: token.lang, text: token.text })), [{ lang: "text", text: "/stop" }]);
     assert.equal(view().split("/stop").length - 1, 1);
     assert.equal(calls.at(-1)!.kind, "state", "waiting never finalizes the task stream");
   }

@@ -33,12 +33,11 @@ function fixture(t: test.TestContext) {
 function footer(text: string, url: string) {
   assert.ok(text.endsWith(ideEntryLink(url)), "the single entry is the final card paragraph");
   assert.equal(text.split("[打开项目 Web IDE]").length - 1, 1);
-  assert.equal(Lexer.lex(text).filter(token => token.type === "code").length, 0, "optional stop does not create a full copy widget");
-  assert.match(text, /停止任务：`\/stop`/);
+  assert.deepEqual(Lexer.lex(text).filter(token => token.type === "code").map(token => ({ lang: token.lang, text: token.text })), [{ lang: "text", text: "/stop" }], "only the executable command receives a copy box");
+  assert.match(text, /复制不会发送/);
   const rendered = normalizeDingTalkCardContent(dingTalkLoadingBody(text));
   assert.ok(rendered.endsWith(ideEntryLink(url)));
-  assert.equal(Lexer.lex(rendered).filter(token => token.type === "code").length, 0);
-  assert.match(rendered, /停止任务：`\/stop`/);
+  assert.deepEqual(Lexer.lex(rendered).filter(token => token.type === "code").map(token => ({ lang: token.lang, text: token.text })), [{ lang: "text", text: "/stop" }]);
 }
 
 test("running, waiting, recovering, unconfirmed and answer-preview cards share the bottom entry; terminal decoration stays independent", async t => {

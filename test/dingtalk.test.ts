@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { Lexer } from "marked";
 
 import { TOPIC_ROBOT, type DWClientDownStream, type RobotTextMessage } from "dingtalk-stream";
 
@@ -355,7 +356,7 @@ test("DingTalk card state snapshots use the configured content key", () => {
 });
 
 for (const mode of ["https", "sdk"] as const) {
-  test(`DingTalk ${mode} sends the compact stop hint through one active-body writer across progress, heartbeat and recovery`, async () => {
+  test(`DingTalk ${mode} retains the exact stop copy box through one active-body writer across progress, heartbeat and recovery`, async () => {
     const writes: Array<{ kind: string; body: any }> = [];
     const client = mode === "https" ? new DingTalkHttpsAICardClient(async (url, init) => {
       writes.push({ kind: String(url).endsWith("/streaming") ? "stream" : "state", body: JSON.parse(String(init?.body)) });
@@ -374,7 +375,7 @@ for (const mode of ["https", "sdk"] as const) {
       const bodies = updates.map(w => w.kind === "stream" ? w.body.content : selectedBody(w.body.cardData.cardParamMap)).filter(v => v !== undefined);
       assert.equal(bodies.length, 1, "never send the same active Markdown block via both snapshot and stream");
       assert.equal((bodies[0].match(/停止任务/g) ?? []).length, 1);
-      assert.doesNotMatch(bodies[0], /```/, "optional stop cannot dominate the card with a copy widget");
+      assert.deepEqual(Lexer.lex(bodies[0]).filter(token => token.type === "code").map(token => ({ lang: token.lang, text: token.text })), [{ lang: "text", text: "/stop" }], "keep the exact stop command copyable through mode transitions");
       assert.equal((bodies[0].match(/\/stop/g) ?? []).length, 1);
       if (activity !== "waiting-input") {
         assert.equal(updates.at(-1)!.kind, "stream"); assert.equal(updates.at(-1)!.body.isFull, true);

@@ -3,6 +3,7 @@ import { closeMarkdownFence } from "./result-pages.js";
 import { turnStatusHeading, type TurnActivity } from "./turn-status.js";
 import type { ChannelProgressLayout } from "./types.js";
 import { markdownPreview } from "./markdown-preview.js";
+import { copyBlock } from "./copyable.js";
 
 /** A pure view of task facts. No timers, delivery state or execution decisions. */
 type ProgressFacts = {
@@ -51,10 +52,9 @@ function progressParts(input: ProgressFacts) {
   if (recent.length) sections.push(recent.map(entry => `- ${progressProse(entry, 140).replace(/\n/g, "\n  ")}`).join("\n"));
   if (tools.active) sections.push(progressProse(tools.active, 100));
   if (input.answerPreview) sections.push(`回复预览（尚未完成）\n\n${markdownPreview(input.answerPreview, 600)}`);
-  // This is an optional command reference, not a required user response. A
-  // full copy widget dominates short mobile cards; required approvals/answers
-  // keep their own exact-reply controls on the corresponding interaction card.
-  const controls = "停止任务：`/stop`";
+  // An executable control needs an exact-reply copy widget. Keep it in the
+  // stable footer so body/heartbeat frames cannot recreate or erase it.
+  const controls = `停止任务（发送后会中断执行）：\n\n${copyBlock("/stop")}\n\n复制不会发送。`;
   // Always end on a normal paragraph, not a code fence/list/blockquote. The
   // native streaming cursor belongs to DingTalk, never to generated dot frames.
   return { sections, status, controls };
