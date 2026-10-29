@@ -169,17 +169,20 @@ export class FeishuChannelAdapter implements ChannelAdapter, ChannelTextClient {
         };
         if (event.message.parent_id) pendingMessage.references = [{ messageId: event.message.parent_id,
           type: "unknown", attachments: [], availability: "metadata-only", reason: "尚未取得引用正文。" }];
-        if (!await claimInbound(options, pendingMessage)) return;
         try {
           if (!["text", "image", "file"].includes(event.message.message_type)) {
-            await options.onMessage({ ...pendingMessage, unsupportedMessageType: event.message.message_type });
+            const message = { ...pendingMessage, unsupportedMessageType: event.message.message_type };
+            if (!await claimInbound(options, message)) return;
+            await options.onMessage(message);
             return;
           }
-          await options.onMessage(await this.normalizeMessage(
+          const message = await this.normalizeMessage(
             pendingMessage,
             event.message.message_type as "text" | "image" | "file",
             event.message.content
-          ));
+          );
+          if (!await claimInbound(options, message)) return;
+          await options.onMessage(message);
         } catch (error) {
           if (!(error instanceof Error)) throw error;
           await reportMessageError(options, error, pendingMessage);

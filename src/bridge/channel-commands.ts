@@ -11,6 +11,7 @@ import { copyableChoices } from "../channels/copyable.js";
 export const CHANNEL_COMMAND_REGISTRY = [
   { name: "help", aliases: ["h"] },
   { name: "status", aliases: ["where", "st"] },
+  { name: "inbox", aliases: [] },
   { name: "balance", aliases: ["bal"], capability: "accountRateLimits" },
   { name: "memory", aliases: ["knowledge", "mem"] },
   { name: "project", aliases: ["projects", "p"] },
@@ -92,6 +93,7 @@ const BUILT_IN_HELP_LINES = [
   "",
   "项目与工作模式",
   "/status（/st）- 查看当前任务、项目、模型和运行状态",
+  "/inbox - 查看已保存的待转发消息；可核对原目标，处理已确认未提交的消息",
   "/balance（/bal）- 查看当前 Codex 账号剩余用量",
   "/memory（/mem）[on|off|f 条目ID|c] - 管理账号个人记忆（与 llm-wiki 分开）",
   "/project（/p）[l|P编号|C编号] - 查看或切换项目；不自动绑定 session，使用 /new 或 /session 绑定",

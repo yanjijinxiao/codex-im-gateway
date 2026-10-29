@@ -9,6 +9,7 @@ const channelCommandActionValueSchema = z.object({
     "ide",
     "access",
     "status",
+    "inbox",
     "balance",
     "memory",
     "project",

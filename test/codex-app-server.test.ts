@@ -37,6 +37,17 @@ test("an unconfirmed turn/start receipt neither closes the transport nor repeats
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
+test("ordinary execution inspection gets metadata and one item-free turn, without full history or prompt submission", async t => {
+  const runner = new AppServerCodexRunner({ requestTimeoutMs: 2000, transport: {
+    command: process.execPath, args: [path.join(fixturesDir, "fake-codex-app-server.mjs"), "--bounded-inspection"], mode: "remote-daemon"
+  } });
+  t.after(() => runner.close());
+  const state = await runner.inspectThread("thread-external-busy");
+  assert.equal(state.runtimeStatus, "active"); assert.equal(state.activeTurnId, "external-turn");
+  assert.equal(state.latestTurnStatus, "inProgress");
+  assert.equal(runner.hasRestartBlockingWork(), false);
+});
+
 for (const [prompt, code] of [["fixture-safety-block", "unintended-activity"], ["fixture-coded-failure", "context-window"]] as const) {
   test(`native App Server failures retain normalized reasons and explicit systemError: ${code}`, async t => {
     const runner = new AppServerCodexRunner({ requestTimeoutMs: 2_000, transport: {

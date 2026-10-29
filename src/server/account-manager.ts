@@ -23,6 +23,10 @@ import { SessionControlJournal, SessionControlQueue } from "../bridge/session-co
 import { TurnAudienceJournal } from "../bridge/turn-audience.js";
 import { NativeQueueCoordinator } from "../bridge/native-queue.js";
 import { InboundReceiptJournal } from "../bridge/inbound-receipts.js";
+import { ForwardingInbox, type ForwardingTarget } from "../bridge/forwarding-inbox.js";
+import { ForwardingDeferredError } from "../bridge/forwarding-error.js";
+import { parseCommand } from "../bridge/channel-commands.js";
+import type { ChannelMessage } from "../channels/message.js";
 import { prepareTurnSubmission, TurnSubmission, TurnDeliveryError, TurnApplicationError } from "../bridge/turn-submission.js";
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { InteractionRoutingJournal, type InteractionDestination, type InteractionRouteStatus } from "../bridge/interaction-routing.js";
@@ -314,6 +318,7 @@ export class AccountManager {
   /** Account lifecycle and Web requests share the same state owner, even while stopped. */
   private readonly stores = new Map<string, RuntimeStateStore>();
   private readonly inputReceipts = new Map<string, InboundReceiptJournal>();
+  private readonly forwardingInboxes = new Map<string, ForwardingInbox>();
   private readonly respondingSessions = new Map<string, number>();
   private readonly webRestartWork = new RestartWork();
   private readonly resultRestartWork = new RestartWork();
@@ -421,6 +426,7 @@ export class AccountManager {
       notice: (scope, status, state, assertSource) => this.threadEvents.systemRecoveryNotice(scope, status, state, assertSource),
     });
     this.capacityRecovery = new CapacityRecoveryCoordinator({
+      isRuntimeDraining: () => Boolean(this.releaseOwner || this.stoppingAll),
       filePath: path.join(options.paths.runtimeDir, "capacity-recovery.json"),
       backend: () => this.runnerFor(this.configProvider()),
       eligible: scope => !this.runtimeConfigurationChanging && !this.stoppingAll && !this.systemRecovery.hasPendingRestore(scope.threadId, scope.hostId)
@@ -516,6 +522,7 @@ export class AccountManager {
   }
 
   async stopAll(): Promise<void> {
+    for (const inbox of this.forwardingInboxes.values()) inbox.stop();
     this.stoppingAll = true;
     const errors: unknown[] = [];
     const attempt = async (cleanup: () => unknown) => { try { await cleanup(); } catch (error) { errors.push(error); } };
@@ -560,7 +567,7 @@ export class AccountManager {
     if (!this.runner?.hasRestartBlockingWork || !this.runner.isIndependentObservation) { this.assertRuntimeIdle(); return; }
     if (this.runtimeConfigurationChanging || this.stoppingAll || this.runner.hasRestartBlockingWork()
       || this.threadEvents.hasRestartBlockingWork()
-      || this.capacityRecovery.hasInFlightWork() || this.systemRecovery.hasInFlightWork()
+      || this.capacityRecovery.hasRestartBlockingWork() || this.systemRecovery.hasRestartBlockingWork()
       || this.webRestartWork.hasBlockingWork(scope => this.runner!.isIndependentObservation!(scope))
       || this.resultRestartWork.hasBlockingWork()
       || [...this.entries.values()].some(entry => entry.service?.hasRestartBlockingWork
@@ -746,6 +753,9 @@ export class AccountManager {
       config,
       stateStore: store,
       inputReceipts: this.receiptsFor(account.accountId),
+      forwardingStatus: conversationId => this.forwardingInboxes.get(account.accountId)?.summary(conversationId),
+      forwardingInbox: this.forwardingFor(account.accountId),
+      onAttachmentsPrepared: (messageId, attachments, references) => this.forwardingInboxes.get(account.accountId)?.prepared(messageId, attachments, references),
       channel: client,
       inboundDir: statePaths.inboundDir,
       inboundReferences: new InboundReferenceStore(path.join(statePaths.inboundDir, "references.json")),
@@ -774,33 +784,16 @@ export class AccountManager {
     this.ensureNativeQueueRecovery();
     this.refreshDesktopRequestSubscriptions();
 
-    const handleMessage = async (message: Parameters<BridgeService["handleMessage"]>[0]) => {
-      if (controller.signal.aborted || this.entries.get(account.accountId) !== entry) throw new Error("渠道连接已更换，消息未提交。");
+    const normalizedMessage = (message: ChannelMessage): ChannelMessage => {
       const authorizedConversation = message.source === "native-menu"
         ? store.getAuthorizedConversation(message.senderId)
         : undefined;
-      const messageWithConversation = authorizedConversation
+      return authorizedConversation
         ? { ...message, replyTargetId: authorizedConversation }
         : message;
-      {
-        const replyTargetId = messageWithConversation.replyTargetId ?? messageWithConversation.senderId;
-        const allowedIds = new Set([...config.allowedSenderIds, ...store.listPairedSenderIds()]);
-        store.rememberChannelIdentity(
-          messageWithConversation.senderId,
-          replyTargetId,
-          allowedIds.has(messageWithConversation.senderId) || allowedIds.has(replyTargetId)
-        );
-      }
-      webhook.publish({
-        direction: "inbound",
-        id: messageWithConversation.id,
-        senderId: messageWithConversation.senderId,
-        text: messageWithConversation.text,
-        attachments: messageWithConversation.attachments.map(({ kind, label }) => ({ kind, label }))
-      });
-      this.assertRuntimeWritable();
-      await this.receiptsFor(account.accountId).handle(messageWithConversation, () => service.handleMessage(messageWithConversation));
     };
+    const inbox = this.forwardingFor(account.accountId);
+    const handleMessage = (message: ChannelMessage) => inbox.receive(normalizedMessage(message));
     const onMessageError = async (error: unknown, message: Parameters<BridgeService["handleMessage"]>[0]) => {
       this.receiptsFor(account.accountId).releasePreparation(message.id);
       if (wasMessageHandlingErrorReported(error)) return;
@@ -823,8 +816,7 @@ export class AccountManager {
       },
       claimMessage: (message) => {
         if (controller.signal.aborted || this.entries.get(account.accountId) !== entry) return false;
-        const conversation = message.source === "native-menu" ? store.getAuthorizedConversation(message.senderId) : undefined;
-        if (!this.receiptsFor(account.accountId).claim(conversation ? { ...message, replyTargetId: conversation } : message)) return false;
+        if (!inbox.claim(normalizedMessage(message))) return false;
         // Compatibility tombstone for code rollback. The new journal, rather
         // than this legacy bounded list, decides preparation recovery.
         store.claimProcessedMessage(message.id);
@@ -845,6 +837,7 @@ export class AccountManager {
       entry.connection = { state: "error", detail: "Channel monitor failed" };
       entry.error = error instanceof Error ? error.message : String(error);
     });
+    inbox.start();
     return this.summary(account);
   }
 
@@ -860,6 +853,7 @@ export class AccountManager {
     return this.summary(account);
   }
   private async stopRuntime(accountId: string): Promise<void> {
+    this.forwardingInboxes.get(accountId)?.stop();
     const entry = this.entries.get(accountId);
     const errors: unknown[] = [];
     if (entry) {
@@ -896,6 +890,7 @@ export class AccountManager {
       this.entries.delete(account.accountId);
       this.stores.delete(account.accountId);
       this.inputReceipts.delete(account.accountId);
+      this.forwardingInboxes.delete(account.accountId);
       this.interactionRouting.reconcileBindings([], [account.accountId]);
       this.refreshDesktopRequestSubscriptions();
     });
@@ -1752,10 +1747,57 @@ export class AccountManager {
     const store = this.storeFor(accountId);
     let receipts = this.inputReceipts.get(accountId);
     if (!receipts) {
-      receipts = new InboundReceiptJournal(path.join(this.options.paths.runtimeDir, accountId, "inbound-receipts.jsonl"), store.snapshot.processedMessageIds);
+      receipts = new InboundReceiptJournal(path.join(this.options.paths.runtimeDir, accountId, "inbound-receipts.jsonl"), store.snapshot.processedMessageIds,
+        { onAccepted: receipt => this.forwardingInboxes.get(accountId)?.accepted(receipt) });
       this.inputReceipts.set(accountId, receipts);
     }
     return receipts;
+  }
+
+  private forwardingTarget(accountId: string, message: ChannelMessage): ForwardingTarget | undefined {
+    const store = this.storeFor(accountId), conversation = message.replyTargetId ?? message.senderId;
+    const session = store.getBoundSession(conversation); if (!session) return;
+    const project = session.projectId ? store.getProject(session.projectId) : undefined;
+    return { sessionId: session.id, threadId: session.threadId || undefined, generation: session.executionGeneration,
+      hostId: session.hostId ?? project?.hostId ?? "local", workspace: session.workspace, projectId: session.projectId,
+      projectBinding: session.projectBinding, mode: store.getInteractionMode(conversation), roots: [...project?.rootPaths ?? []].sort() };
+  }
+
+  private forwardingFor(accountId: string): ForwardingInbox {
+    let inbox = this.forwardingInboxes.get(accountId); if (inbox) return inbox;
+    inbox = new ForwardingInbox({ filePath: path.join(this.options.paths.runtimeDir, accountId, "forwarding-inbox.json"),
+      receipts: this.receiptsFor(accountId), target: message => this.forwardingTarget(accountId, message),
+      canDispatch: () => {
+        const entry = this.entries.get(accountId);
+        return !this.releaseOwner && !this.runtimeConfigurationChanging && !this.stoppingAll
+          && Boolean(entry?.service && !entry.controller?.signal.aborted && ["starting", "running"].includes(entry.status));
+      },
+      automatic: message => {
+        if (message.source || message.interaction) return false;
+        const command = parseCommand(message.text);
+        return !command || command.name === "steer" && Boolean(command.arg.trim())
+          || command.name === "queue" && Boolean(command.arg.trim()) && !/^(?:list|cancel)(?:\s|$)/i.test(command.arg.trim());
+      },
+      dispatch: message => this.dispatchChannelMessage(accountId, message),
+      notice: async (message, text) => {
+        const entry = this.entries.get(accountId); if (!entry?.client) throw Error("Forwarding notice channel unavailable");
+        await this.sendChannelText(entry, { recipientId: message.replyTargetId ?? message.senderId, text,
+          contextToken: this.storeFor(accountId).getContextToken(message.replyTargetId ?? message.senderId) ?? message.contextToken });
+      } });
+    this.forwardingInboxes.set(accountId, inbox); return inbox;
+  }
+
+  private async dispatchChannelMessage(accountId: string, message: ChannelMessage): Promise<void> {
+    this.assertRuntimeWritable();
+    const entry = this.entries.get(accountId);
+    if (!entry?.service || entry.controller?.signal.aborted || !["starting", "running"].includes(entry.status))
+      throw new ForwardingDeferredError("渠道正在切换，消息暂缓转发。");
+    const store = this.storeFor(accountId), replyTargetId = message.replyTargetId ?? message.senderId;
+    const allowedIds = new Set([...this.configProvider().allowedSenderIds, ...store.listPairedSenderIds()]);
+    store.rememberChannelIdentity(message.senderId, replyTargetId, allowedIds.has(message.senderId) || allowedIds.has(replyTargetId));
+    entry.webhook?.publish({ direction: "inbound", id: message.id, senderId: message.senderId, text: message.text,
+      attachments: message.attachments.map(({ kind, label }) => ({ kind, label })) });
+    await this.receiptsFor(accountId).handle(message, () => entry.service!.handleMessage(message));
   }
 
   /** Only outputs of an exactly acknowledged Gateway input may carry effects.

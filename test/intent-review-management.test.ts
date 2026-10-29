@@ -17,18 +17,23 @@ test("optional Codex discovery cannot block bootstrap or committed settings, and
     codexCheck:async()=>({ready:true}),codexRuntimeCheck:async()=>{probes++;await gate.promise;return {model:"native-model"};},
     codexModelsCheck:async()=>{probes++;await gate.promise;return [];}});
   t.after(()=>server.close());
-  let response:Response|undefined;
-  const first=fetch(`${server.url}/api/bootstrap`).then(r=>{response=r;return r;});
+  const first=fetch(`${server.url}/api/bootstrap`);
+  let timer:NodeJS.Timeout|undefined;
   try{
-    await new Promise(resolve=>setTimeout(resolve,150));
-    assert.equal(response?.status,200,"core bootstrap must finish while optional native discovery is still hung");
-    assert.equal((await response!.json()).requestToken,server.requestToken);
+    // Prove completion while the native probe gate is still closed. A fixed
+    // 150ms sleep measured machine scheduling under full-suite load instead.
+    const response=await Promise.race([first,new Promise<never>((_,reject)=>{
+      timer=setTimeout(()=>reject(Error("bootstrap waited on optional native discovery")),3000);
+    })]);
+    clearTimeout(timer);
+    assert.equal(response.status,200,"core bootstrap must finish while optional native discovery is still hung");
+    assert.equal((await response.json()).requestToken,server.requestToken);
     const second=await fetch(`${server.url}/api/bootstrap`);assert.equal(second.status,200);await second.json();
     assert.equal(probes,2,"timeouts do not launch duplicate background probes");
     const saved=await fetch(`${server.url}/api/config`,{method:"PUT",headers:{Origin:server.url,"Content-Type":"application/json","X-Codex-Im-Gateway-Token":server.requestToken},body:JSON.stringify(config)});
     assert.equal(saved.status,200,await saved.clone().text());await saved.json();
     assert.equal(loadConfig(paths).taskboardEnabled,false);
-  }finally{gate.resolve();await first;}
+  }finally{clearTimeout(timer);gate.resolve();await first;}
 });
 
 test("Taskboard enable and full settings serialize one coherent persisted configuration",async t=>{

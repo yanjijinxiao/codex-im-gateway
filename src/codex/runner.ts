@@ -193,6 +193,13 @@ export class CodexBackendRouter implements CodexBridgeBackend {
   }
 
   async resumeAfterCapacity(input: CodexCapacityResumeInput): Promise<CodexRunResult> {
+    const lease: { scope?: CodexExecutionScope } = {};
+    this.restartRuns.add(lease);
+    try { return await this.resumeCapacityTracked(input, lease); }
+    finally { this.restartRuns.delete(lease); }
+  }
+
+  private async resumeCapacityTracked(input: CodexCapacityResumeInput, lease: { scope?: CodexExecutionScope }): Promise<CodexRunResult> {
     if (this.selectedBackend === "exec") throw new CodexInterventionError("CLI 后端不支持空输入容量恢复，未重发原消息或切换后端。");
     const snapshot = await this.readThreadSnapshot(input.threadId, input.hostId);
     assertCapacityResume(snapshot, input.failedTurnId);
@@ -202,7 +209,12 @@ export class CodexBackendRouter implements CodexBridgeBackend {
     input.assertCurrent();
     const owner = snapshot.state.executionOwner === "desktop" ? this.desktop : this.appServerFor(input.hostId);
     if (!owner.resumeAfterCapacity) throw new CodexInterventionError("当前执行者不支持空输入容量恢复，未切换执行者。");
-    return owner.resumeAfterCapacity(input);
+    const independent = owner === this.desktop || this.appServerFor(input.hostId).executionLifetime === "independent";
+    return owner.resumeAfterCapacity({ ...input, onTurnStarted: async event => {
+      await input.onTurnStarted(event);
+      if (independent && (event.status === undefined || event.status === "inProgress"))
+        lease.scope = { hostId: input.hostId ?? "local", threadId: event.threadId, turnId: event.turnId };
+    } });
   }
 
   async recoverSystemError(input: CodexSystemRecoveryInput, hostId = "local"): Promise<CodexSystemRecoveryResult> {

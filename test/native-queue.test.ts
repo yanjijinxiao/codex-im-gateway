@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { NativeQueueCoordinator, type QueueOrigin } from "../src/bridge/native-queue.js";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
+import { CodexQueueAdmissionError } from "../src/codex/backend.js";
 import { APP_SERVER_BACKEND_CAPABILITIES, EXEC_BACKEND_CAPABILITIES,
   type CodexBridgeBackend, type CodexHistoryMessage, type CodexQueuedSubmission } from "../src/codex/backend.js";
 
@@ -64,6 +66,43 @@ test("lost add acknowledgement recovers exact client id, never adds again", asyn
   const j = f.journal(); await j.reconcile("ding", f.backend);
   assert.equal(j.list("ding")[0].status, "queued");
   await j.enqueue(f.origin, "payload", f.backend); assert.equal(f.adds, 1);
+});
+
+test("known preflight failure permits a stable-source queue retry after restart", async t => {
+  const f = fixture(t), ids: string[] = [];
+  const backend = { ...f.backend, async addQueuedSubmission(input: any) {
+    ids.push(input.clientUserMessageId);
+    if (ids.length === 1) throw new CodexCommunicationError("preflight", "thread/read", "original");
+    return f.backend.addQueuedSubmission!(input);
+  } } as CodexBridgeBackend;
+  await assert.rejects(f.journal().enqueue(f.origin, "payload", backend), CodexCommunicationError);
+  assert.equal(f.adds, 0);
+  const receipt = await f.journal().enqueue(f.origin, "payload", backend);
+  assert.equal(receipt.status, "queued"); assert.equal(ids[0], ids[1]); assert.equal(f.adds, 1);
+  await f.journal().enqueue(f.origin, "payload", backend); assert.equal(ids.length, 2);
+});
+
+test("definitive native queue admission rejection can be retried with the same identity", async t => {
+  const f = fixture(t); let attempts = 0;
+  const backend = { ...f.backend, async addQueuedSubmission(input: any) {
+    if (++attempts === 1) throw new CodexQueueAdmissionError("not admitted");
+    return f.backend.addQueuedSubmission!(input);
+  } } as CodexBridgeBackend;
+  await assert.rejects(f.journal().enqueue(f.origin, "payload", backend), CodexQueueAdmissionError);
+  assert.equal(f.journal().list("ding")[0].status, "rejected"); assert.equal(f.adds, 0);
+  assert.equal((await f.journal().enqueue(f.origin, "payload", backend)).status, "queued");
+  assert.equal(f.adds, 1);
+});
+
+test("accepted native queue callbacks outrank a later preflight-labelled failure", async t => {
+  const f = fixture(t); let attempts = 0;
+  const backend = { ...f.backend, async addQueuedSubmission(input: any) {
+    attempts++; input.onAccepted("actual-turn");
+    throw new CodexCommunicationError("preflight", "thread/read", "original");
+  } } as CodexBridgeBackend;
+  await assert.rejects(f.journal().enqueue(f.origin, "payload", backend), CodexCommunicationError);
+  const receipt = await f.journal().enqueue(f.origin, "payload", backend);
+  assert.equal(receipt.turnId, "actual-turn"); assert.equal(receipt.status, "running"); assert.equal(attempts, 1);
 });
 
 test("a consumed item is reconciled against older history by id, not similar text", async t => {

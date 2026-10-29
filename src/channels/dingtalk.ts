@@ -606,14 +606,15 @@ export class DingTalkChannelAdapter implements ChannelAdapter, ChannelTextClient
 
   async resolveAttachments(message: ChannelMessage): Promise<ChannelMessage["attachments"]> {
     const target = this.replyContext.getStore() ?? this.replyTargets.get(message.replyTargetId ?? message.senderId);
-    if (!target) throw new Error("DingTalk attachment context unavailable");
+    const robotCode = target?.robotCode ?? this.cardRouting.get(message.replyTargetId ?? message.senderId)?.robotCode;
+    if (!robotCode) throw new Error("DingTalk attachment context unavailable");
     const supplied = message.attachments;
     if (supplied.length > 20) throw new Error("DingTalk message has too many attachments");
     const output: ChannelMessage["attachments"] = [];
     for (const [index, attachment] of supplied.entries()) {
       if (attachment.path) { output.push(attachment); continue; }
       try {
-        const downloaded = await this.mediaClient.download({ accessToken: await this.accessToken(), robotCode: target.robotCode,
+        const downloaded = await this.mediaClient.download({ accessToken: await this.accessToken(), robotCode,
           downloadCode: typeof attachment.item.downloadCode === "string" ? attachment.item.downloadCode : undefined,
           downloadUrl: typeof attachment.item.downloadUrl === "string" ? attachment.item.downloadUrl : undefined,
           maxBytes: this.maxInboundBytes, lifecycleId: message.id });

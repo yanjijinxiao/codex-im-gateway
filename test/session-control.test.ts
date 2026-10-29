@@ -3,7 +3,21 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
 import { SessionControlJournal } from "../src/bridge/session-control.js";
+
+test("a known preflight failure releases the native control claim; a missing write acknowledgement does not", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-control-preflight-")); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const journal = new SessionControlJournal(path.join(root, "control.json")); let calls = 0;
+  const action = async () => { calls++; if (calls === 1) throw new CodexCommunicationError("preflight", "thread/read", "thread", undefined, Error("timeout"));
+    return { status: "accepted" as const, threadId: "thread", turnId: "turn" }; };
+  await assert.rejects(journal.submit("scope", "source", action));
+  assert.equal((await journal.submit("scope", "source", action)).turnId, "turn"); assert.equal(calls, 2);
+  let unknown = 0;
+  const ambiguous = async () => { unknown++; throw new CodexCommunicationError("submission", "turn/steer", "thread", undefined, Error("timeout")); };
+  await assert.rejects(journal.submit("scope", "unknown", ambiguous)); await assert.rejects(journal.submit("scope", "unknown", ambiguous));
+  assert.equal(unknown, 1);
+});
 
 test("serializes controls across actors and deduplicates accepted and uncertain requests after restart", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-controls-"));

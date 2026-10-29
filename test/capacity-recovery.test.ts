@@ -16,6 +16,30 @@ import { InteractionRoutingJournal } from "../src/bridge/interaction-routing.js"
 
 const scope = { hostId: "local", threadId: "thread", turnId: "failed" };
 
+test("durable capacity backoff does not block Gateway restart", async t => {
+  const f = fixture(t);
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, delaysMs: [60_000] }); t.after(() => coordinator.stop());
+  coordinator.offer(scope);
+  assert.equal(coordinator.hasInFlightWork(), true); assert.equal(coordinator.hasRestartBlockingWork(), false);
+  assert.equal(f.calls.length, 0);
+});
+
+test("capacity restart protection ends at durable native acceptance and returns for terminal delivery", async t => {
+  const start = Promise.withResolvers<void>(), allow = Promise.withResolvers<void>(), accepted = Promise.withResolvers<void>();
+  const done = Promise.withResolvers<void>(), terminal = Promise.withResolvers<void>(), delivered = Promise.withResolvers<void>();
+  let independent = false;
+  const f = fixture(t, async input => { start.resolve(); await allow.promise;
+    await input.onTurnStarted({ threadId: "thread", turnId: "resumed" }); independent = true; accepted.resolve(); await done.promise;
+    return { threadId: "thread", turnId: "resumed", text: "result", raw: "" }; });
+  (f.options.backend() as any).isIndependentObservation = () => independent;
+  const coordinator = new CapacityRecoveryCoordinator({ ...f.options, terminal: async () => { terminal.resolve(); await delivered.promise; } });
+  t.after(() => { allow.resolve(); done.resolve(); delivered.resolve(); coordinator.stop(); });
+  coordinator.offer(scope); await start.promise; assert.equal(coordinator.hasRestartBlockingWork(), true);
+  allow.resolve(); await accepted.promise; assert.equal(coordinator.hasRestartBlockingWork(), false);
+  done.resolve(); await terminal.promise; assert.equal(coordinator.hasRestartBlockingWork(), true);
+  delivered.resolve(); await new Promise<void>(r => setImmediate(r)); assert.equal(coordinator.hasRestartBlockingWork(), false);
+});
+
 test("recovery questions wait for accepted identity routing, then return the native answer receipt", async t => {
   const runner = new AppServerCodexRunner({ requestTimeoutMs: 1000, transport: { command: process.execPath,
     args: [path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/fake-capacity-app-server.mjs"), "--ask"], mode: "remote-daemon" } });

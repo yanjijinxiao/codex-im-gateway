@@ -57,6 +57,9 @@ import { isSessionPageSize, MIN_SESSION_PAGE_SIZE, MAX_SESSION_PAGE_SIZE } from 
 import { readSessionPurposes, SessionPurposeIndex } from "../state/session-purposes.js";
 import { ChannelUserInputController } from "./user-input.js";
 import { RestartWork } from "./restart-work.js";
+import { ForwardingDeferredError } from "./forwarding-error.js";
+import type { ForwardingInbox } from "./forwarding-inbox.js";
+import { forwardingCard } from "./forwarding-card.js";
 import type { TurnResultAction } from "./turn-result-actions.js";
 import { TaskboardChannelController } from "./taskboard-channel-controller.js";
 import {
@@ -185,6 +188,9 @@ export type BridgeServiceOptions = {
   channelCapabilities?: ChannelCapabilityProvider;
   approvalTimeoutMs?: number;
   assertRuntimeWritable?: () => void;
+  forwardingStatus?: (conversationId: string) => { waiting: number; held: number; unconfirmed: number } | undefined;
+  forwardingInbox?: Pick<ForwardingInbox, "items" | "retry" | "cancel">;
+  onAttachmentsPrepared?: (messageId: string, attachments: ChannelMessage["attachments"], references?: ChannelMessage["references"]) => void;
   isRuntimeDraining?: () => boolean;
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
   onTurnCompleted?: (result: {
@@ -220,6 +226,7 @@ export class BridgeService {
   private recoveringQueue = false;
   private lastQueueWarningAt = 0;
   private readonly runningSessions = new Set<string>();
+  private readonly submittingSessions = new Map<string, object>();
   private readonly activePresentations = new Map<string, { hostId: string; threadId?: string; turnId?: string; stream: TurnReplyStream }>();
   private readonly catalogControls = new SessionControlQueue();
   private readonly turnDeliveries = new SessionControlQueue();
@@ -413,7 +420,10 @@ export class BridgeService {
       await this.reply(replyTargetId, access.message);
       return;
     }
-    this.options.stateStore.recordBindingHumanActivity(replyTargetId);
+    if (message.receivedAt === undefined
+      || Date.parse(this.options.stateStore.snapshot.bindingActivity[replyTargetId]?.lastHumanAt ?? "") < message.receivedAt
+      || !this.options.stateStore.snapshot.bindingActivity[replyTargetId]?.lastHumanAt)
+      this.options.stateStore.recordBindingHumanActivity(replyTargetId, message.receivedAt);
     const directCommand = parseCommand(scopedMessage.text);
     const diagnosticOnly = directCommand?.name === "status" || directCommand?.name === "queue" && ["", "list"].includes(directCommand.arg.trim());
     if (!diagnosticOnly) {
@@ -544,11 +554,34 @@ export class BridgeService {
               { label: "切换模式", command: "mode", arg: "", style: "primary" },
               { label: "任务面板", command: "task", arg: "list" },
               { label: "会话", command: "sessions", arg: "" },
+              ...(this.options.forwardingInbox ? [{ label: "转发记录", command: "inbox" as const, arg: "" }] : []),
               { label: "目标", command: "goal", arg: "" }
             ]
           }));
         }
         return;
+      case "inbox": {
+        const inbox = this.options.forwardingInbox;
+        if (!inbox) { await this.reply(message.senderId, "当前实例尚未启用持久化转发记录。"); return; }
+        const [action, id, targetVersion, extra] = command.arg.trim().split(/\s+/);
+        const actor = this.actor.getStore() ?? message.senderId;
+        const controller = this.role(message.senderId, actor) === "controller";
+        if (action === "retry" || action === "cancel") {
+          this.conversationControlGuard(message.senderId, "participant")();
+          if (!id || extra || action === "retry" && !targetVersion || action === "cancel" && targetVersion)
+            throw new CodexInterventionError("操作参数不完整，请重新查看转发记录并使用当前操作。");
+          try {
+            if (action === "retry") inbox.retry(id, message.senderId, actor, controller, targetVersion);
+            else inbox.cancel(id, message.senderId, actor, controller);
+          } catch (error) { throw new CodexInterventionError(error instanceof Error ? error.message : "转发操作未完成，请重新查看记录。"); }
+          await this.reply(message.senderId, action === "retry" ? "已安排转发这条已保存消息，接收结果以原生回执为准。" : "已取消这条尚未提交的转发；没有停止 Codex 任务。");
+          return;
+        }
+        const items = inbox.items(message.senderId);
+        await this.replyActionCard(message.senderId, forwardingCard(items, command.arg.trim(), target =>
+          `${this.options.stateStore.getSession(target.sessionId)?.title ?? target.sessionId} · ${target.hostId}`));
+        return;
+      }
       case "balance":
         await this.handleBalanceCommand(message.senderId);
         return;
@@ -1783,10 +1816,7 @@ export class BridgeService {
       return true;
     }
     if (state.runtimeStatus !== "active") {
-      if (this.runningSessions.has(session.id)) {
-        await this.reply(message.senderId, "上一条消息正在提交，尚未确认活动轮次；这条消息未提交。请稍后发送，或显式 /queue 排到下一轮。");
-        return true;
-      }
+      if (this.submittingSessions.has(session.id)) throw new ForwardingDeferredError("上一条输入尚在交接，当前消息暂缓转发。");
       return false;
     }
     const canSteer = Boolean(state.activeTurnId)
@@ -1970,6 +2000,8 @@ export class BridgeService {
       onUserInput: request => this.requestUserInput(message.senderId, request, hostId),
       onUserInputResult: (request, result) => this.reportUserInputResult(message.senderId, request, result, hostId)
     });
+    if ((receipt.status === "queued" || receipt.status === "running") && receipt.queuedSubmissionId)
+      this.options.inputReceipts?.queued(receipt.threadId, receipt.queuedSubmissionId, receipt.turnId);
     this.options.stateStore.setSessionPromptPreview(session.id, preview);
     await this.reply(message.senderId, receipt.status === "queued" || receipt.status === "running"
       ? `已由 Codex 接收${receipt.status === "running" ? "，任务已开始" : "并加入原生队列"}。\n队列ID：${receipt.queuedSubmissionId}\nGateway 重启后只核对回执，不重发消息。任务继承该会话的原生执行设置。`
@@ -2374,12 +2406,14 @@ export class BridgeService {
     if (context) items.push({ kind: "text", text: context });
     const attachments = [...(message.attachments ?? []), ...(message.references ?? []).flatMap(ref => ref.attachments)];
     if (!attachments.length) {
+      this.options.onAttachmentsPrepared?.(message.id, [], message.references);
       this.options.inboundReferences?.remember(message, []);
       return items;
     }
     try {
       const rootDir = this.options.inboundDir ?? path.join(this.options.config.defaultCwd, ".codex-im-gateway-inbound");
       const downloaded = validateLocalAttachments(await this.channel.resolveAttachments(message), rootDir, this.options.config.maxInboundBytes);
+      this.options.onAttachmentsPrepared?.(message.id, downloaded, message.references);
       this.options.inboundReferences?.remember(message, downloaded);
       for (const attachment of downloaded) {
         items.push({
@@ -2389,6 +2423,7 @@ export class BridgeService {
         });
       }
     } catch (error) {
+      if (error instanceof ForwardingDeferredError) throw error;
       if (error instanceof InboundMediaTooLargeError) throw error;
       console.error(
         `[codex-im-gateway] inbound attachment download failed for message ${message.id}: ${error instanceof Error ? error.message : String(error)}`
@@ -2413,6 +2448,7 @@ export class BridgeService {
         return undefined;
       }
       if (error instanceof InboundAttachmentDownloadError) {
+        if (this.options.onAttachmentsPrepared) throw new ForwardingDeferredError("附件尚未转存成功，消息暂缓转发。", { cause: error });
         await this.reply(message.senderId, "收到附件，但当前渠道下载或读取失败。请重新发送；如果仍失败，请检查该渠道的文件权限和连接状态。");
         return message.text.trim() ? [{ kind: "text", text: message.text },
           { kind: "text", text: "本轮附件下载失败，未取得附件正文。不要声称已读取文件或图片；请用户直接重发。" }] : undefined;
@@ -2514,11 +2550,14 @@ export class BridgeService {
     const submission = new TurnSubmission(this.options.inputReceipts, session.id);
     let acceptedTurnId: string | undefined;
     let activeMarked = false;
+    const submitting = {};
+    const submitted = () => { if (this.submittingSessions.get(session.id) === submitting) this.submittingSessions.delete(session.id); };
     const markActive = () => {
       if (activeMarked) return;
       activeMarked = true;
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
       this.runningSessions.add(session.id);
+      this.submittingSessions.set(session.id, submitting);
     };
     if (!queued) markActive();
     try {
@@ -2543,6 +2582,7 @@ export class BridgeService {
           },
           onTurnStarted: async ({ threadId: startedThreadId, turnId, status }) => {
             acceptedTurnId = turnId;
+            submitted();
             if (queued) { queued.started(turnId); acceptedQueueTurn = true; }
             saveNativeThread(startedThreadId);
             recordParticipant(startedThreadId, turnId);
@@ -2701,6 +2741,7 @@ export class BridgeService {
       if (queued && error instanceof CodexTurnExecutionError) return;
       throw error;
     } finally {
+      submitted();
       if (this.activePresentations.get(session.id)?.stream === replyStream) this.activePresentations.delete(session.id);
       if (activeMarked) {
         this.runningSessions.delete(session.id);
@@ -2901,6 +2942,7 @@ export class BridgeService {
   }
 
   private async statusText(senderId: string): Promise<string> {
+    const forwarding = this.options.forwardingStatus?.(senderId);
     const mode = this.options.stateStore.getInteractionMode(senderId);
     const project = this.options.stateStore.getActiveProject(senderId);
     const session = this.executionSession(senderId);
@@ -2950,6 +2992,8 @@ export class BridgeService {
       `工作目录：${workspace}`,
       `thread：${session?.threadId || "尚未创建"}`,
       `运行状态：${execution}`,
+      ...(forwarding && forwarding.waiting + forwarding.held + forwarding.unconfirmed > 0
+        ? [`消息转发：${forwarding.waiting} 条已保存待转发；${forwarding.unconfirmed} 条提交结果未确认；${forwarding.held} 条需核对目标或处理状态。`] : []),
       ...(activeTurnId ? [`运行轮次：${activeTurnId}`] : []),
       `实时跟随：${this.runner.backendInfo?.(session ? this.sessionHostId(session) : undefined).capabilities.liveFollow === false
         ? "当前后端不支持" : session?.follow === false || !session ? "关闭" : "开启"}`,
@@ -3163,6 +3207,9 @@ export class BridgeService {
       conversationId: origin.conversationId, hostId: this.sessionHostId(session) ?? "local", threadId: session.threadId, turnId }) : () => {};
     try {
       const receipt = await submit();
+      if (receipt.status !== "accepted" || receipt.threadId !== session.threadId || !receipt.turnId)
+        throw new CodexCommunicationError("submission", "turn/steer", session.threadId, undefined, { code: "InvalidAcknowledgement" });
+      this.options.inputReceipts?.accepted(receipt.threadId, receipt.turnId);
       await this.presentControlReceipt(session, receipt.turnId);
       return receipt;
     } finally { release(); }

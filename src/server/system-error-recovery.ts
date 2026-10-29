@@ -254,6 +254,9 @@ export class SystemErrorRecoveryCoordinator {
   }
   hasPendingRestore(threadId: string, hostId = "local"): boolean { return Object.values(this.records).some(row => row.threadId === threadId && row.hostId === hostId && row.restoreActive); }
   hasInFlightWork(): boolean { return this.pending.size > 0 || Object.values(this.records).some(row => row.restoreActive); }
+  /** A durable restoration obligation can survive restart. Only the actual
+   * native mutation/receipt handoff currently on the stack needs draining. */
+  hasRestartBlockingWork(): boolean { return this.pending.size > 0; }
   private scheduleRestores(): void {
     if (this.stopped || this.restoreTimer || !Object.values(this.records).some(row => row.restoreActive)) return;
     this.restoreTimer = setTimeout(() => {

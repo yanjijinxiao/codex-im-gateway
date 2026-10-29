@@ -12,6 +12,8 @@ export type ChannelMessage = {
   contextToken?: string;
   interaction?: { readonly kind: "card"; readonly messageId: string };
   text: string;
+  /** Gateway transport receive time; retries must not look like new human activity. */
+  receivedAt?: number;
   /** Quoted content is context/data, never an executable slash command. */
   references?: ChannelReference[];
   /** Known message received, but this adapter cannot decode that format yet. */

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { CodexCommunicationError } from "../codex/communication-error.js";
 import { readJsonFile, isJsonObject as record, writeJsonFile } from "../state/json-store.js";
 import { SessionControlQueue } from "./session-control.js";
 import { CodexBackendCapabilityError, CodexQueueAdmissionError, type CodexBridgeBackend, type CodexQueuedSubmission, type CodexQueueAddInput } from "../codex/backend.js";
@@ -73,7 +74,9 @@ export class NativeQueueCoordinator {
           throw new Error("这条 IM 消息已归属于原会话，不能在切换绑定后重新提交。");
         }
         // Accepted and ambiguous submissions alike must never be replayed.
-        return structuredClone(existing);
+        // A definitive admission rejection contains no native write; an
+        // explicit retry may recheck admission with the same stable source id.
+        if (existing.status !== "rejected") return structuredClone(existing);
       }
       handlers.assertCurrent?.();
       const r: QueueReceipt = { ...origin, id, clientUserMessageId: `gateway-${id}`,
@@ -85,6 +88,12 @@ export class NativeQueueCoordinator {
           onAccepted: turnId => this.update(r, { status: "running", turnId }) }, origin.hostId);
         this.update(r, { status: r.turnId ? "running" : "queued", queuedSubmissionId: item.id, reason: undefined });
       } catch (error) {
+        // A concrete accepted turn outranks the classification of a later
+        // request failure. Never erase it or reopen admission for this source.
+        if (r.turnId) throw error;
+        if (error instanceof CodexCommunicationError && error.submission === "not-submitted") {
+          delete this.receipts[id]; this.save(); throw error;
+        }
         this.update(r, { status: error instanceof CodexBackendCapabilityError || error instanceof CodexQueueAdmissionError ? "rejected" : "uncertain",
           reason: error instanceof CodexQueueAdmissionError ? error.message : error instanceof CodexBackendCapabilityError ? "后端不支持原生队列，消息未提交。" : "提交结果未确认，恢复时只核对，不自动重发。" });
         throw error;

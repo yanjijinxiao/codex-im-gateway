@@ -2,7 +2,7 @@ import type { ProjectInteractionMode } from "../channels/channel-mode-settings.j
 import type { ChannelCommand } from "./channel-intent.js";
 
 const PROJECT_OPTIONAL_COMMANDS = new Set<string>([
-  "help", "ide",
+  "help", "ide", "inbox",
   "h",
   "balance",
   "memory",

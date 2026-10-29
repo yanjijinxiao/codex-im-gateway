@@ -525,14 +525,22 @@ export class AppServerCodexRunner implements CodexAppServerBackend {
     try {
       let response: Record<string, unknown>;
       try {
-        response = await this.request("thread/read", { threadId, includeTurns: observation?.includeTurns ?? true }, observation?.timeoutMs) as Record<string, unknown>;
+        response = await this.request("thread/read", { threadId, includeTurns: false }, observation?.timeoutMs) as Record<string, unknown>;
       } catch (error) {
         if (!/ephemeral threads do not support includeTurns/i.test(String(error))) throw error;
         response = await this.request("thread/read", { threadId, includeTurns: false }) as Record<string, unknown>;
       }
       const thread = response.thread as Record<string, unknown> | undefined;
       if (!thread) throw new Error(`Codex app-server returned no thread for ${threadId}`);
-      const state = membership(parseThreadState(thread, persistenceFromThread(thread)));
+      // Execution preflight needs the latest turn's identity/failure, never its
+      // item bodies or the entire growing conversation. Metadata-only readers
+      // do not issue this additional RPC at all.
+      let latest: Record<string, unknown> | undefined;
+      if (!observation && thread.ephemeral !== true) {
+        const page = await this.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }) as { data?: unknown[] };
+        latest = Array.isArray(page.data) && isRecord(page.data[0]) ? page.data[0] : undefined;
+      }
+      const state = membership(parseThreadState({ ...thread, turns: latest ? [latest] : [] }, persistenceFromThread(thread)));
       const activeTurnId = this.activeTurns.get(threadId);
       if (activeTurnId) {
         state.activeTurnId = activeTurnId;

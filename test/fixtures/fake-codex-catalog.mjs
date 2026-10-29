@@ -7,6 +7,11 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   let result;
   if (m.method === "initialize") result = {};
   else if (m.method === "thread/read") result = { thread: thread(m.params.threadId) };
+  else if (m.method === "thread/turns/list") {
+    if (m.params.limit !== 1 || m.params.sortDirection !== "desc" || m.params.itemsView !== "notLoaded")
+      throw new Error("Catalog inspection must remain bounded and omit item bodies");
+    result = { data: [], nextCursor: null };
+  }
   else if (m.method === "thread/list") {
     if (m.params.projectId) throw new Error("Desktop UI project IDs must not become native project filters");
     const page = Number(m.params.cursor ?? 0);

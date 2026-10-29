@@ -2,6 +2,7 @@ import { CodexInterventionError, CodexThreadStateError, CodexBackendCapabilityEr
 import { CodexCommunicationError } from "../codex/communication-error.js";
 import { codexFailureSummary } from "../codex/turn-failure.js";
 import { copyableChoices } from "../channels/copyable.js";
+import { ForwardingDeferredError } from "./forwarding-error.js";
 
 const channelReportedErrors = new WeakSet<object>();
 
@@ -16,6 +17,7 @@ export function wasMessageHandlingErrorReported(error: unknown): boolean {
 }
 
 export function userFacingMessageHandlingError(error: unknown): string {
+  if (error instanceof ForwardingDeferredError) return error.message;
   if (error instanceof CodexTurnExecutionError) {
     if (error.status === "failed" && error.failureCode === "model-capacity") {
       return `[codex-im-gateway] ${codexFailureSummary(error.failureCode)}\nCodex 原生轮次已确认失败，当前没有继续重试。可稍后在原会话重试或手动选择其他模型；Gateway 未重新执行任务或切换模型。`;

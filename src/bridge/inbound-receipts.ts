@@ -3,13 +3,17 @@ import crypto from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ChannelMessage } from "../channels/message.js";
 import { writeAtomicTextFile } from "../state/json-store.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
+import { CodexBackendCapabilityError, CodexQueueAdmissionError } from "../codex/backend.js";
 
-type Receipt = {
+export type InboundReceipt = {
   phase: "received" | "submitting" | "accepted" | "handled" | "unconfirmed";
   clientUserMessageId: string;
   conversationId?: string; actorId?: string;
   sessionId?: string; hostId?: string; threadId?: string; turnId?: string;
+  queuedSubmissionId?: string;
 };
+type Receipt = InboundReceipt;
 const identity = (id: string) => crypto.createHash("sha256").update(id.trim()).digest("hex");
 
 /** Source receipts only: no bodies, execution backlog, timers or automatic resubmission.
@@ -23,7 +27,8 @@ export class InboundReceiptJournal {
   private readonly receipts: Record<string, Receipt>;
   private writes = 0;
   private appendUnavailable = false;
-  constructor(private readonly filePath: string, legacyIds: readonly string[] = []) {
+  constructor(private readonly filePath: string, legacyIds: readonly string[] = [],
+    private readonly options: { onAccepted?: (receipt: Readonly<InboundReceipt>) => void } = {}) {
     this.receipts = {};
     let raw: Buffer | undefined;
     try { raw = fs.readFileSync(filePath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -89,6 +94,14 @@ export class InboundReceiptJournal {
     } finally { fs.closeSync(fd); }
     if (++this.writes >= 1024) { this.writes = 0; if (fs.statSync(this.filePath).size > 1024 * 1024) this.compact(); }
   }
+  private transition(receipt: Receipt, patch: Partial<Receipt>): void {
+    const previous = structuredClone(receipt); Object.assign(receipt, patch);
+    try { this.save(receipt); }
+    catch (error) {
+      for (const key of Object.keys(receipt)) delete (receipt as Record<string, unknown>)[key];
+      Object.assign(receipt, previous); throw error;
+    }
+  }
   claim(message: Pick<ChannelMessage, "id" | "senderId" | "replyTargetId">): boolean {
     if (!message.id.trim()) return false;
     const key = identity(message.id), prior = this.receipts[key];
@@ -111,9 +124,12 @@ export class InboundReceiptJournal {
     this.claimed.delete(key); this.processing.add(key);
     try {
       await this.context.run(receipt, action);
-      receipt.phase = "handled"; this.save(receipt);
+      this.transition(receipt, { phase: "handled" });
     } catch (error) {
-      if (receipt.phase === "submitting") { receipt.phase = "unconfirmed"; this.save(receipt); }
+      if (receipt.phase === "submitting") {
+        this.transition(receipt, { phase: error instanceof CodexCommunicationError && error.submission === "not-submitted"
+          || error instanceof CodexBackendCapabilityError || error instanceof CodexQueueAdmissionError ? "received" : "unconfirmed" });
+      }
       throw error;
     } finally { this.processing.delete(key); }
   }
@@ -125,10 +141,12 @@ export class InboundReceiptJournal {
     return {
       currentId: () => receipt.clientUserMessageId,
       submitting: (scope: Pick<Receipt, "sessionId" | "hostId" | "threadId">) => {
-        Object.assign(receipt, scope); if (receipt.phase === "received") receipt.phase = "submitting"; this.save(receipt);
+        this.transition(receipt, { ...scope, ...(receipt.phase === "received" ? { phase: "submitting" } : {}) });
       },
       accepted: (threadId: string, turnId: string) => {
-        Object.assign(receipt, { phase: "accepted", threadId, turnId }); this.save(receipt);
+        this.transition(receipt, { phase: "accepted", threadId, turnId });
+        try { this.options.onAccepted?.(structuredClone(receipt)); }
+        catch { console.warn("[codex-im-gateway] accepted input cleanup deferred; durable native receipt retained"); }
       }
     };
   }
@@ -138,5 +156,20 @@ export class InboundReceiptJournal {
   }
   submitting(scope: Pick<Receipt, "sessionId" | "hostId" | "threadId"> = {}): void { this.capture()?.submitting(scope); }
   accepted(threadId: string, turnId: string): void { this.capture()?.accepted(threadId, turnId); }
+  queued(threadId: string, queuedSubmissionId: string, turnId?: string): void {
+    const receipt = this.context.getStore(); if (!receipt) return;
+    this.transition(receipt, { phase: "accepted", threadId, queuedSubmissionId, ...(turnId ? { turnId } : {}) });
+    try { this.options.onAccepted?.(structuredClone(receipt)); }
+    catch { console.warn("[codex-im-gateway] queued input cleanup deferred; durable native receipt retained"); }
+  }
+  abandon(messageId: string): boolean {
+    const key = identity(messageId), receipt = this.receipts[key];
+    if (!receipt || receipt.phase !== "received" || this.processing.has(key)) return false;
+    this.transition(receipt, { phase: "handled" });
+    this.claimed.delete(key); return true;
+  }
   snapshot(): Readonly<Record<string, Receipt>> { return structuredClone(this.receipts); }
+  receipt(messageId: string): Readonly<Receipt> | undefined {
+    const receipt = this.receipts[identity(messageId)]; return receipt && structuredClone(receipt);
+  }
 }

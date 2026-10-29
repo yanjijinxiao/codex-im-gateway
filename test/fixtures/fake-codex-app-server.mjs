@@ -36,6 +36,7 @@ let dynamicToolsEnabled = false;
 const nativeQueue = new Map();
 let nextQueue = 1;
 let resumedApprovalPolicy = "never";
+const externalObservedTurns = new Map();
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -459,6 +460,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/read") {
+    if (process.argv.includes("--bounded-inspection") && message.params.includeTurns !== false) { fail(message.id, "inspection must not load full history"); return; }
     if (message.params.threadId === "thread-read-unresponsive") return;
     if (archivedThreads.has(message.params.threadId)) {
       fail(message.id, `thread ${message.params.threadId} is archived; unarchive it first`);
@@ -472,6 +474,7 @@ rl.on("line", (line) => {
       ?? (message.params.threadId === "thread-external-busy" && externalBusyReads++ < 2
         ? "external-turn"
         : undefined);
+    externalObservedTurns.set(message.params.threadId, activeTurnId);
     respond(message.id, {
       thread: {
         id: message.params.threadId,
@@ -482,20 +485,24 @@ rl.on("line", (line) => {
           : activeTurnId
             ? { type: "active", activeFlags: [] }
             : { type: "idle" },
-        turns: historyTurns(activeTurnId)
+        turns: message.params.includeTurns === false ? [] : historyTurns(activeTurnId)
       }
     });
     return;
   }
 
   if (message.method === "thread/turns/list") {
-    if (message.params?.itemsView !== "full") {
-      fail(message.id, "thread/turns/list requires full itemsView");
+    if (!["notLoaded", "summary", "full"].includes(message.params?.itemsView)) {
+      fail(message.id, "thread/turns/list requires a valid itemsView");
       return;
     }
-    const turns = historyTurns(activeTurns.get(message.params.threadId));
+    if (process.argv.includes("--bounded-inspection") && (message.params.limit !== 1 || message.params.itemsView !== "notLoaded")) {
+      fail(message.id, "inspection must request only the latest turn without items"); return;
+    }
+    const turns = historyTurns(activeTurns.get(message.params.threadId) ?? externalObservedTurns.get(message.params.threadId));
+    const ordered = message.params?.sortDirection === "asc" ? turns : [...turns].reverse();
     respond(message.id, {
-      data: message.params?.sortDirection === "asc" ? turns : [...turns].reverse(),
+      data: (message.params.itemsView === "notLoaded" ? ordered.slice(0, message.params.limit ?? 20).map(t => ({ ...t, items: [], itemsView: "notLoaded" })) : ordered),
       nextCursor: "older-page",
       backwardsCursor: "newer-page"
     });

@@ -4,8 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { InboundReceiptJournal } from "../src/bridge/inbound-receipts.js";
+import { CodexCommunicationError } from "../src/codex/communication-error.js";
 
 const message = { id: "provider-id", senderId: "actor", replyTargetId: "chat" };
+
+test("a proven preflight failure can release a write-ahead claim, while accepted evidence remains stronger", async t => {
+  const f = fixture(t);
+  await assert.rejects(f.journal.handle(message, async () => {
+    f.journal.submitting(); throw new CodexCommunicationError("preflight", "thread/read", "thread", undefined, Error("timeout"));
+  }));
+  assert.equal(f.restart().receipt(message.id)?.phase, "received");
+  await assert.rejects(f.journal.handle(message, async () => {
+    f.journal.submitting(); f.journal.accepted("thread", "turn");
+    throw new CodexCommunicationError("preflight", "thread/read", "thread", undefined, Error("later read timeout"));
+  }));
+  assert.equal(f.restart().receipt(message.id)?.phase, "accepted");
+});
 function fixture(t: test.TestContext, legacy: string[] = []) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-inbound-receipts-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -125,4 +139,16 @@ for (const phase of ['received', 'submitting', 'accepted'] as const) test(`real 
   const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code, f.file], { encoding: 'utf8', timeout: 10000 });
   assert.equal(child.status, 17, child.stderr);
   assert.equal(f.restart().claim(message), phase === 'received');
+});
+
+test("an exact native queue receipt survives a later reply failure without replay", async t => {
+  const f = fixture(t); f.journal.claim(message);
+  await assert.rejects(f.journal.handle(message, async () => {
+    f.journal.submitting({ sessionId: 'session', hostId: 'local', threadId: 'thread' });
+    f.journal.queued('thread', 'native-queue-item');
+    throw Error('channel reply failed');
+  }));
+  const restored = f.restart(), receipt = restored.receipt(message.id)!;
+  assert.equal(receipt.phase, 'accepted'); assert.equal(receipt.queuedSubmissionId, 'native-queue-item');
+  assert.equal(restored.claim(message), false);
 });

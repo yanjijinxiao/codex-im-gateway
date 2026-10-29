@@ -63,7 +63,7 @@ test(`queue preflight rechecks ${change} after asynchronous preparation`, async 
  assert.equal(writes,0);assert.equal(service.hasInFlightWork(),false);
 });
 
-test("last admission guard failure is rejected before native RPC and cannot be replayed",async t=>{
+test("last admission rejection sends no native RPC; a safe retry rechecks admission with the same identity",async t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"gateway-queue-final-guard-")),file=path.join(dir,"methods");t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
  const runner=new AppServerCodexRunner({codexHome:dir,transport:{command:process.execPath,args:[path.resolve("test/fixtures/fake-external-queue.mjs"),file],mode:"stdio"},requestTimeoutMs:1000});t.after(()=>runner.close());
  const journal=new NativeQueueCoordinator(path.join(dir,"receipt.json"));let checks=0;
@@ -72,7 +72,11 @@ test("last admission guard failure is rejected before native RPC and cannot be r
  await assert.rejects(journal.enqueue(origin,"private queued text",backend as never,{assertCurrent(){if(++checks===2)throw Error("binding changed before RPC");}}),CodexQueueAdmissionError);
  assert.equal(journal.list("a")[0].status,"rejected");assert.equal(checks,2);
  assert.doesNotMatch(fs.readFileSync(file,"utf8"),/thread\/queue\/add|thread\/resume/);
- await journal.enqueue(origin,"private queued text",backend as never);assert.doesNotMatch(fs.readFileSync(file,"utf8"),/thread\/queue\/add/);
+ const original=journal.list("a")[0].clientUserMessageId;
+ const accepted=await journal.enqueue(origin,"private queued text",backend as never,{assertCurrent(){checks++;}});
+ assert.equal(checks,4);assert.equal(accepted.clientUserMessageId,original);assert.equal(accepted.status,"queued");
+ assert.equal(fs.readFileSync(file,"utf8").split("\n").filter(x=>x==="thread/queue/add").length,1);
+ await journal.enqueue(origin,"private queued text",backend as never,{assertCurrent(){assert.fail("accepted input must not be replayed");}});
 });
 
 test("unsupported external native queue never falls back to turn/start or replaces Desktop state",async t=>{

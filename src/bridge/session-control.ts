@@ -6,6 +6,7 @@ import type { PromptBufferItem } from "./prompt-buffer.js";
 import type { AcceptedPresentationInput } from "./input-presentation.js";
 import type { TurnParticipantOrigin } from "./turn-audience.js";
 import { copyBlock } from "../channels/copyable.js";
+import { CodexCommunicationError } from "../codex/communication-error.js";
 
 /** Serializes controls for one host/thread, without blocking controls on a running turn. */
 export class SessionControlQueue {
@@ -80,7 +81,8 @@ export class SessionControlJournal {
         this.save();
         return result;
       } catch (error) {
-        this.state.receipts[receiptId] = { status: "uncertain" };
+        if (error instanceof CodexCommunicationError && error.submission === "not-submitted") delete this.state.receipts[receiptId];
+        else this.state.receipts[receiptId] = { status: "uncertain" };
         this.save();
         throw error;
       }

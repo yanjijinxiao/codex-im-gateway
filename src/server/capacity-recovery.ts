@@ -33,6 +33,7 @@ type Options = {
   now?: () => number;
   reconcileTimeoutMs?: number;
   reconcileIntervalMs?: number;
+  isRuntimeDraining?: () => boolean;
 };
 const keyOf = (scope: CapacityFailure) => JSON.stringify([scope.hostId, scope.threadId]);
 class CapacityObservationError extends Error {
@@ -71,6 +72,14 @@ export class CapacityRecoveryCoordinator {
   hasInFlightWork(): boolean {
     return Boolean(this.executing.size || this.checking.size || this.settling.size
       || Object.values(this.records).some(record => !["finished", "cancelled"].includes(record.status)));
+  }
+  hasRestartBlockingWork(): boolean {
+    if (this.checking.size || this.settling.size) return true;
+    return [...this.executing].some(key => {
+      const row = this.records[key];
+      return !row || row.status !== "running" || !row.acceptedTurnId || row.turnId !== row.acceptedTurnId
+        || !this.options.backend().isIndependentObservation?.({ hostId: row.hostId, threadId: row.threadId, turnId: row.acceptedTurnId });
+    });
   }
   private announce(scope: CapacityFailure, text: string): void {
     void this.options.notice(scope, text).catch(() => console.warn("[codex-im-gateway] capacity recovery notice unavailable"));
@@ -377,6 +386,7 @@ export class CapacityRecoveryCoordinator {
       } else if (accepted && !(error instanceof CodexTurnExecutionError)
         || error instanceof CodexCommunicationError && error.submission !== "not-submitted") {
         record.status = "uncertain"; this.save();
+        if (this.options.isRuntimeDraining?.()) return;
         this.announce(record, "自动恢复的接收或执行结果尚未确认，已停止继续提交。保留原卡并只读核对；可用 /status、/history 查看。");
         return;
       } else record.status = "finished";
